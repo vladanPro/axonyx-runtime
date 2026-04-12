@@ -3,8 +3,16 @@ name = "axonix-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
+description = "Core parser, lowering, query model, and SQL draft compiler for Axonix"
+readme = "../../README.md"
+keywords = ["axonix", "parser", "compiler", "ui", "rust"]
+categories = ["compilers", "web-programming"]
 
 [dependencies]
 thiserror.workspace = true
 serde.workspace = true
-axonix-macros = { path = "../axonix-macros" }
+axonix-macros = { version = "0.1.0", path = "../axonix-macros" }

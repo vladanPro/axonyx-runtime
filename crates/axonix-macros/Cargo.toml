@@ -3,6 +3,14 @@ name = "axonix-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
+description = "Procedural macros for ergonomic Axonix component authoring"
+readme = "../../README.md"
+keywords = ["axonix", "macros", "proc-macro", "ui", "rust"]
+categories = ["development-tools", "gui"]
 
 [lib]
 proc-macro = true
@@ -11,4 +19,3 @@ proc-macro = true
 proc-macro2.workspace = true
 quote.workspace = true
 syn.workspace = true
-

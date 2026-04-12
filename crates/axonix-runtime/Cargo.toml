@@ -3,9 +3,17 @@ name = "axonix-runtime"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+documentation.workspace = true
+rust-version.workspace = true
+description = "Runtime contract and execution layer for Axonix applications"
+readme = "../../README.md"
+keywords = ["axonix", "runtime", "ui", "rust", "framework"]
+categories = ["web-programming", "gui"]
 
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
-axonix-core = { path = "../axonix-core" }
+axonix-core = { version = "0.1.0", path = "../axonix-core" }
