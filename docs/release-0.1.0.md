@@ -57,7 +57,7 @@ If any of these still feel unstable, delay publish instead of shipping a mislead
 
 - tighten doctest/doc examples around `axonix-core`
 - decide whether `axonix-core` should remain user-visible or mostly internal
-- add changelog and tagged release notes
+- tag and announce the first release
 - add CI workflow for test + package verification
 - decide whether to expose optional cargo features before `0.2.0`
 
