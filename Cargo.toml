@@ -1,0 +1,26 @@
+[workspace]
+members = [
+  "crates/axonix-core",
+  "crates/axonix-macros",
+  "crates/axonix-runtime",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+thiserror = "2.0.12"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+proc-macro2 = "1.0.106"
+quote = "1.0.45"
+syn = { version = "2.0.117", features = ["full"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
