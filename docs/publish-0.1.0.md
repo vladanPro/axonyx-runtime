@@ -4,7 +4,7 @@ This is the exact release-day flow for the first Axonyx runtime publish.
 
 ## Assumptions
 
-- you are in `H:\CODE\axonix\axonix-runtime`
+- you are in `H:\CODE\axonyx\axonyx-runtime`
 - the working tree is clean
 - you are logged into crates.io with `cargo login`
 - `CHANGELOG.md` and release notes are up to date

@@ -3,7 +3,7 @@
 Standalone runtime workspace for Axonyx applications.
 
 The public framework name and crate identifiers now use `Axonyx` / `axonyx-*`.
-Repository URLs and local workspace folders may still use older `axonix-*` names until the repo migration is finished.
+Repository URLs and local workspace folders are now aligned to `axonyx-*`.
 
 Included crates:
 
@@ -23,7 +23,7 @@ Generated apps can depend on the runtime crate directly from Git:
 
 ```toml
 [dependencies]
-axonyx-runtime = { git = "https://github.com/vladanPro/axonix-runtime" }
+axonyx-runtime = { git = "https://github.com/vladanPro/axonyx-runtime" }
 ```
 
 ## Release Shape

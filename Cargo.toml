@@ -9,9 +9,9 @@ resolver = "2"
 [workspace.package]
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/vladanPro/axonix-runtime"
-homepage = "https://github.com/vladanPro/axonix-runtime"
-documentation = "https://github.com/vladanPro/axonix-runtime"
+repository = "https://github.com/vladanPro/axonyx-runtime"
+homepage = "https://github.com/vladanPro/axonyx-runtime"
+documentation = "https://github.com/vladanPro/axonyx-runtime"
 rust-version = "1.82"
 version = "0.1.0"
 
