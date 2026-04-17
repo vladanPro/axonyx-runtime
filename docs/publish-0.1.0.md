@@ -35,6 +35,7 @@ Interpretation:
 
 - `axonyx-macros` should package immediately
 - `axonyx-core` and `axonyx-runtime` only package cleanly after their upstream crates are available on crates.io
+- before that propagation happens, Cargo is expected to fail with `no matching package named ... found` for downstream Axonyx crates
 
 ## 3. Publish In Dependency Order
 

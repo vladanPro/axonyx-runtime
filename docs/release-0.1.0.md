@@ -24,7 +24,9 @@ That order matches the dependency graph and avoids temporary broken releases.
 ## Preflight
 
 - Confirm `cargo test` passes in the standalone `axonyx-runtime` workspace
-- Confirm `cargo package --allow-dirty --no-verify` succeeds for each crate
+- Confirm `cargo package -p axonyx-macros --allow-dirty --no-verify` succeeds before publish
+- Confirm `axonyx-core` only packages after `axonyx-macros` is published and visible on crates.io
+- Confirm `axonyx-runtime` only packages after `axonyx-core` is published and visible on crates.io
 - Confirm crate metadata is present:
   - `description`
   - `license`
@@ -58,7 +60,6 @@ If any of these still feel unstable, delay publish instead of shipping a mislead
 - tighten doctest/doc examples around `axonyx-core`
 - decide whether `axonyx-core` should remain user-visible or mostly internal
 - tag and announce the first release
-- add CI workflow for test + package verification
 - decide whether to expose optional cargo features before `0.2.0`
 
 ## Definition Of Done
@@ -66,6 +67,7 @@ If any of these still feel unstable, delay publish instead of shipping a mislead
 The release is ready when:
 
 1. the workspace passes tests
-2. each crate packages cleanly
-3. crates publish in dependency order
-4. `create-axonyx --runtime-source registry` generates an app that compiles against the published version
+2. `axonyx-macros` packages cleanly before publish
+3. `axonyx-core` and `axonyx-runtime` package cleanly once their upstream crates are published
+4. crates publish in dependency order
+5. `create-axonyx --runtime-source registry` generates an app that compiles against the published version
