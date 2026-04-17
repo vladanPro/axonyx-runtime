@@ -1,5 +1,5 @@
 [package]
-name = "axonix-macros"
+name = "axonyx-macros"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,9 +7,9 @@ repository.workspace = true
 homepage.workspace = true
 documentation.workspace = true
 rust-version.workspace = true
-description = "Procedural macros for ergonomic Axonix component authoring"
+description = "Procedural macros for ergonomic Axonyx component authoring"
 readme = "../../README.md"
-keywords = ["axonix", "macros", "proc-macro", "ui", "rust"]
+keywords = ["axonyx", "macros", "proc-macro", "ui", "rust"]
 categories = ["development-tools", "gui"]
 
 [lib]

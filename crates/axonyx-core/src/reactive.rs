@@ -244,11 +244,11 @@ mod tests {
         let node = render_component(
             label,
             LabelProps {
-                value: "Axonix".to_string(),
+                value: "Axonyx".to_string(),
             },
         );
 
-        assert_eq!(node, AxNode::Text("Axonix".to_string()));
+        assert_eq!(node, AxNode::Text("Axonyx".to_string()));
     }
 
     #[test]

@@ -1,4 +1,4 @@
-use axonix_runtime::execute_json;
+use axonyx_runtime::execute_json;
 
 fn main() {
     let ir_json = include_str!("../../../examples/ir.posts.card.json");

@@ -2,13 +2,14 @@
 
 Standalone runtime workspace for Axonyx applications.
 
-The public framework name is now `Axonyx`, while the publishable crate identifiers still remain on `axonix-*` names during this compatibility stage.
+The public framework name and crate identifiers now use `Axonyx` / `axonyx-*`.
+Repository URLs and local workspace folders may still use older `axonix-*` names until the repo migration is finished.
 
 Included crates:
 
-- `axonix-runtime`: runtime contract and execution layer
-- `axonix-core`: parser, lowering, query model, and SQL draft compiler
-- `axonix-macros`: component ergonomics macros
+- `axonyx-runtime`: runtime contract and execution layer
+- `axonyx-core`: parser, lowering, query model, and SQL draft compiler
+- `axonyx-macros`: component ergonomics macros
 
 ## Local Development
 
@@ -22,22 +23,22 @@ Generated apps can depend on the runtime crate directly from Git:
 
 ```toml
 [dependencies]
-axonix-runtime = { git = "https://github.com/vladanPro/axonix-runtime" }
+axonyx-runtime = { git = "https://github.com/vladanPro/axonix-runtime" }
 ```
 
 ## Release Shape
 
 The public package model is intentionally simple:
 
-- `axonix-runtime`: main package that applications depend on
-- `axonix-core`: internal-facing but publishable support crate used by the runtime workspace
-- `axonix-macros`: ergonomic procedural macros used by the core layer
+- `axonyx-runtime`: main package that applications depend on
+- `axonyx-core`: internal-facing but publishable support crate used by the runtime workspace
+- `axonyx-macros`: ergonomic procedural macros used by the core layer
 
 The expected long-term install story for applications is:
 
 ```toml
 [dependencies]
-axonix-runtime = "0.1.0"
+axonyx-runtime = "0.1.0"
 ```
 
 ## 0.1.0 Focus

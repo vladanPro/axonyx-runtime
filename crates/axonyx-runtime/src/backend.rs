@@ -2,11 +2,11 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
-use axonix_core::ax_backend_lowering_prelude::{
+use axonyx_core::ax_backend_lowering_prelude::{
     AxAssignmentPlan, AxQueryFilterOpPlan, AxQueryFilterPlan, AxQueryOrderDirectionPlan,
     AxQueryOrderPlan, AxQueryPlan, AxQuerySourcePlan, AxRustExpr,
 };
-use axonix_core::ax_sql_prelude::{
+use axonyx_core::ax_sql_prelude::{
     compile_delete_plan_to_sql, compile_insert_plan_to_sql, compile_query_plan_to_sql,
     compile_update_plan_to_sql, AxSqlDialect,
 };
@@ -1249,8 +1249,8 @@ mod tests {
     fn env_access_can_read_public_and_secret_values() {
         let runtime = MemoryRuntime {
             env: AxEnv::new()
-                .with_public("app_name", "Axonix")
-                .with_secret("db_url", "postgres://local/axonix"),
+                .with_public("app_name", "Axonyx")
+                .with_secret("db_url", "postgres://local/axonyx"),
         };
 
         assert_eq!(
@@ -1258,14 +1258,14 @@ mod tests {
                 .env()
                 .public("app_name")
                 .expect("public key should exist"),
-            "Axonix".to_string()
+            "Axonyx".to_string()
         );
         assert_eq!(
             runtime
                 .env()
                 .secret("db_url")
                 .expect("secret key should exist"),
-            "postgres://local/axonix".to_string()
+            "postgres://local/axonyx".to_string()
         );
     }
 
@@ -1274,18 +1274,18 @@ mod tests {
         let public_prev = std::env::var("AX_PUBLIC_APP_NAME").ok();
         let secret_prev = std::env::var("AX_SECRET_DB_URL").ok();
 
-        std::env::set_var("AX_PUBLIC_APP_NAME", "Axonix");
-        std::env::set_var("AX_SECRET_DB_URL", "postgres://local/axonix");
+        std::env::set_var("AX_PUBLIC_APP_NAME", "Axonyx");
+        std::env::set_var("AX_SECRET_DB_URL", "postgres://local/axonyx");
 
         let env = AxEnv::from_env();
 
         assert_eq!(
             env.public("app_name").expect("public key should exist"),
-            "Axonix".to_string()
+            "Axonyx".to_string()
         );
         assert_eq!(
             env.secret("db_url").expect("secret key should exist"),
-            "postgres://local/axonix".to_string()
+            "postgres://local/axonyx".to_string()
         );
 
         if let Some(value) = public_prev {
@@ -1305,7 +1305,7 @@ mod tests {
     fn env_can_resolve_database_config_for_mysql() {
         let env = AxEnv::new()
             .with_secret("db_dialect", "mysql")
-            .with_secret("db_url", "mysql://root:root@localhost:3306/axonix");
+                .with_secret("db_url", "mysql://root:root@localhost:3306/axonyx");
 
         let config = env.database_config().expect("config should resolve");
 
@@ -1314,7 +1314,7 @@ mod tests {
             AxDatabaseConfig {
                 driver: AxDatabaseDriver::MySql,
                 transport: AxDataTransport::Direct,
-                url: Some("mysql://root:root@localhost:3306/axonix".to_string()),
+                url: Some("mysql://root:root@localhost:3306/axonyx".to_string()),
                 api_url: None,
                 api_key: None,
             }
@@ -1325,7 +1325,7 @@ mod tests {
     fn runtime_from_env_can_select_mysql_adapter() {
         let env = AxEnv::new()
             .with_secret("db_dialect", "mysql")
-            .with_secret("db_url", "mysql://root:root@localhost:3306/axonix");
+                .with_secret("db_url", "mysql://root:root@localhost:3306/axonyx");
         let runtime = runtime_from_env(env).expect("runtime should initialize");
 
         let value = runtime
@@ -1351,7 +1351,7 @@ mod tests {
     fn direct_transport_emits_sql_execution_plan() {
         let env = AxEnv::new()
             .with_secret("db_dialect", "postgres")
-            .with_secret("db_url", "postgres://local/axonix");
+                .with_secret("db_url", "postgres://local/axonyx");
         let runtime = runtime_from_env(env).expect("runtime should initialize");
 
         let value = runtime
@@ -1410,7 +1410,7 @@ mod tests {
     fn direct_update_emits_where_clause_when_filters_exist() {
         let env = AxEnv::new()
             .with_secret("db_dialect", "postgres")
-            .with_secret("db_url", "postgres://local/axonix");
+                .with_secret("db_url", "postgres://local/axonyx");
         let runtime = runtime_from_env(env).expect("runtime should initialize");
 
         let value = runtime
@@ -1437,7 +1437,7 @@ mod tests {
     fn direct_delete_emits_where_clause_when_filters_exist() {
         let env = AxEnv::new()
             .with_secret("db_dialect", "postgres")
-            .with_secret("db_url", "postgres://local/axonix");
+                .with_secret("db_url", "postgres://local/axonyx");
         let runtime = runtime_from_env(env).expect("runtime should initialize");
 
         let value = runtime
@@ -1460,7 +1460,7 @@ mod tests {
 
     #[test]
     fn runtime_defaults_to_postgres_when_driver_is_missing() {
-        let env = AxEnv::new().with_secret("db_url", "postgres://local/axonix");
+        let env = AxEnv::new().with_secret("db_url", "postgres://local/axonyx");
         let config = env.database_config().expect("config should resolve");
 
         assert_eq!(config.driver, AxDatabaseDriver::Postgres);
@@ -1496,7 +1496,7 @@ mod tests {
 
     #[test]
     fn env_defaults_transport_to_direct() {
-        let env = AxEnv::new().with_secret("db_url", "postgres://local/axonix");
+        let env = AxEnv::new().with_secret("db_url", "postgres://local/axonyx");
 
         assert_eq!(
             env.data_transport().expect("transport should resolve"),

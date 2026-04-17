@@ -1,6 +1,6 @@
 pub mod backend;
 
-use axonix_core::{AxonixIr, SourceKind, TransformKind, ViewKind};
+use axonyx_core::{AxonyxIr, SourceKind, TransformKind, ViewKind};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -25,7 +25,7 @@ pub struct ViewPlan {
     pub props: serde_json::Value,
 }
 
-pub fn execute(ir: &AxonixIr) -> RenderPlan {
+pub fn execute(ir: &AxonyxIr) -> RenderPlan {
     let source = match &ir.source.kind {
         SourceKind::Collection { name } => name.clone(),
     };
@@ -51,20 +51,20 @@ pub fn execute(ir: &AxonixIr) -> RenderPlan {
         view: ViewPlan {
             component,
             props: json!({
-                "runtime": "axonix-runtime-v1",
+                "runtime": "axonyx-runtime-v1",
             }),
         },
     }
 }
 
 pub fn execute_json(ir_json: &str) -> Result<RenderPlan, serde_json::Error> {
-    let ir: AxonixIr = serde_json::from_str(ir_json)?;
+    let ir: AxonyxIr = serde_json::from_str(ir_json)?;
     Ok(execute(&ir))
 }
 
 #[cfg(test)]
 mod tests {
-    use axonix_core::compile_pipeline;
+    use axonyx_core::compile_pipeline;
 
     use super::*;
 

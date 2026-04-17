@@ -4,26 +4,26 @@ This document tracks the minimum bar for the first publishable Axonyx runtime re
 
 ## Goal
 
-Ship a small, honest `0.1.0` that gives Axonyx apps a stable runtime dependency and lets `create-axonix --runtime-source registry` become real.
+Ship a small, honest `0.1.0` that gives Axonyx apps a stable runtime dependency and lets `create-axonyx --runtime-source registry` become real.
 
 ## Package Scope
 
-- Publish `axonix-macros`
-- Publish `axonix-core`
-- Publish `axonix-runtime`
-- Keep the app-facing story centered on `axonix-runtime`
+- Publish `axonyx-macros`
+- Publish `axonyx-core`
+- Publish `axonyx-runtime`
+- Keep the app-facing story centered on `axonyx-runtime`
 
 ## Publish Order
 
-1. `axonix-macros`
-2. `axonix-core`
-3. `axonix-runtime`
+1. `axonyx-macros`
+2. `axonyx-core`
+3. `axonyx-runtime`
 
 That order matches the dependency graph and avoids temporary broken releases.
 
 ## Preflight
 
-- Confirm `cargo test` passes in the standalone `axonix-runtime` workspace
+- Confirm `cargo test` passes in the standalone `axonyx-runtime` workspace
 - Confirm `cargo package --allow-dirty --no-verify` succeeds for each crate
 - Confirm crate metadata is present:
   - `description`
@@ -55,8 +55,8 @@ If any of these still feel unstable, delay publish instead of shipping a mislead
 
 ## Known Follow-Up Work
 
-- tighten doctest/doc examples around `axonix-core`
-- decide whether `axonix-core` should remain user-visible or mostly internal
+- tighten doctest/doc examples around `axonyx-core`
+- decide whether `axonyx-core` should remain user-visible or mostly internal
 - tag and announce the first release
 - add CI workflow for test + package verification
 - decide whether to expose optional cargo features before `0.2.0`
@@ -68,4 +68,4 @@ The release is ready when:
 1. the workspace passes tests
 2. each crate packages cleanly
 3. crates publish in dependency order
-4. `create-axonix --runtime-source registry` generates an app that compiles against the published version
+4. `create-axonyx --runtime-source registry` generates an app that compiles against the published version

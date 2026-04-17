@@ -190,7 +190,7 @@ mod tests {
         let node = render_component(
             input,
             InputProps {
-                value: "axonix".to_string(),
+                value: "axonyx".to_string(),
                 placeholder: Some("Search".to_string()),
                 input_type: "text",
             },
@@ -211,7 +211,7 @@ mod tests {
                     },
                     Attribute {
                         name: "value",
-                        value: "axonix".to_string(),
+                        value: "axonyx".to_string(),
                     },
                     Attribute {
                         name: "placeholder",
@@ -230,7 +230,7 @@ mod tests {
             CopyProps {
                 tag: "p",
                 tone: Tone::Accent,
-                children: children([text("Axonix is fast.")]),
+                children: children([text("Axonyx is fast.")]),
             },
         );
 
@@ -248,7 +248,7 @@ mod tests {
                         value: "accent".to_string(),
                     },
                 ],
-                children: vec![AxNode::Text("Axonix is fast.".to_string())],
+                children: vec![AxNode::Text("Axonyx is fast.".to_string())],
             }
         );
     }

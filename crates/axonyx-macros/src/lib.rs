@@ -12,7 +12,7 @@ pub fn component(_attr: TokenStream, item: TokenStream) -> TokenStream {
     let attrs = &input.attrs;
 
     // Draft behavior: keep the function unchanged while reserving a stable
-    // attribute that Axonix can grow into later for component metadata.
+    // attribute that Axonyx can grow into later for component metadata.
     TokenStream::from(quote! {
         #(#attrs)*
         #vis #sig #block

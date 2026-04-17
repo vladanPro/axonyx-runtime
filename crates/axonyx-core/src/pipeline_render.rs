@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use crate::layout::prelude::*;
 use crate::prelude::*;
 use crate::ui::prelude::*;
-use crate::{compile_pipeline, AxonixIr, CompileError, Source, SourceKind, Transform, TransformKind, View, ViewKind};
+use crate::{compile_pipeline, AxonyxIr, CompileError, Source, SourceKind, Transform, TransformKind, View, ViewKind};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PipelineField {
@@ -49,7 +49,7 @@ pub fn render_pipeline_node(
     Ok(render_ir_node(&ir, records))
 }
 
-pub fn render_ir_node(ir: &AxonixIr, records: &[PipelineRecord]) -> AxNode {
+pub fn render_ir_node(ir: &AxonyxIr, records: &[PipelineRecord]) -> AxNode {
     let rendered_records = children(records.iter().map(|record| render_view_node(&ir.view, record)));
     let content = apply_transforms(&ir.transforms, rendered_records);
     wrap_source(&ir.source, content, records.len())
@@ -91,7 +91,7 @@ fn apply_transforms(transforms: &[Transform], rendered_records: Children) -> AxN
     match current {
         StageOutput::Many(nodes) => element_with_attrs(
             "div",
-            vec![attr("data-axonix-stage", "view-list")],
+            vec![attr("data-axonyx-stage", "view-list")],
             nodes,
         ),
         StageOutput::One(node) => node,
@@ -103,7 +103,7 @@ fn wrap_source(source: &Source, content: AxNode, item_count: usize) -> AxNode {
         SourceKind::Collection { name } => element_with_attrs(
             "section",
             vec![
-                attr("data-axonix-source", "collection"),
+                attr("data-axonyx-source", "collection"),
                 attr("data-collection", name.clone()),
                 attr("data-items", item_count.to_string()),
             ],
@@ -202,7 +202,7 @@ mod tests {
                 tag: "section",
                 attrs: vec![
                     Attribute {
-                        name: "data-axonix-source",
+                        name: "data-axonyx-source",
                         value: "collection".to_string(),
                     },
                     Attribute {
@@ -358,7 +358,7 @@ mod tests {
                 tag: "section",
                 attrs: vec![
                     Attribute {
-                        name: "data-axonix-source",
+                        name: "data-axonyx-source",
                         value: "collection".to_string(),
                     },
                     Attribute {
@@ -373,7 +373,7 @@ mod tests {
                 children: vec![AxNode::Element {
                     tag: "div",
                     attrs: vec![Attribute {
-                        name: "data-axonix-stage",
+                        name: "data-axonyx-stage",
                         value: "view-list".to_string(),
                     }],
                     children: vec![AxNode::Element {

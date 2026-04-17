@@ -1,8 +1,8 @@
-use axonix_core::ax;
-use axonix_core::component;
-use axonix_core::layout_prelude::*;
-use axonix_core::prelude::*;
-use axonix_core::ui_prelude::*;
+use axonyx_core::ax;
+use axonyx_core::component;
+use axonyx_core::layout_prelude::*;
+use axonyx_core::prelude::*;
+use axonyx_core::ui_prelude::*;
 
 #[component]
 fn counter_card() -> AxNode {
@@ -165,7 +165,7 @@ fn component_attribute_supports_children_via_props() {
     let node = render_component(
         panel,
         PanelProps {
-            title: "Axonix".to_string(),
+            title: "Axonyx".to_string(),
             children: children([
                 element("p", vec![text("First child")]),
                 element("p", vec![text("Second child")]),
@@ -182,7 +182,7 @@ fn component_attribute_supports_children_via_props() {
                 AxNode::Element {
                     tag: "h2",
                     attrs: vec![],
-                    children: vec![AxNode::Text("Axonix".to_string())],
+                    children: vec![AxNode::Text("Axonyx".to_string())],
                 },
                 AxNode::Element {
                     tag: "p",
@@ -287,7 +287,7 @@ fn container_and_center_compose_with_layout_tree() {
         center,
         CenterProps {
             axis: Some(Axis::Horizontal),
-            children: children([text("Hello Axonix")]),
+            children: children([text("Hello Axonyx")]),
         },
     );
 
@@ -325,7 +325,7 @@ fn container_and_center_compose_with_layout_tree() {
                         value: "horizontal".to_string(),
                     },
                 ],
-                children: vec![AxNode::Text("Hello Axonix".to_string())],
+                children: vec![AxNode::Text("Hello Axonyx".to_string())],
             }],
         }
     );
@@ -445,7 +445,7 @@ fn ui_primitives_compose_inside_layout() {
             children: children([render_component(
                 card,
                 CardProps {
-                    title: Some("Axonix".to_string()),
+                    title: Some("Axonyx".to_string()),
                     children: children([
                         render_component(
                             copy,
@@ -504,7 +504,7 @@ fn ui_primitives_compose_inside_layout() {
                             name: "data-ui",
                             value: "card-header".to_string(),
                         }],
-                        children: vec![AxNode::Text("Axonix".to_string())],
+                        children: vec![AxNode::Text("Axonyx".to_string())],
                     },
                     AxNode::Element {
                         tag: "p",

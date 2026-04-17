@@ -15,7 +15,7 @@ pub mod ui;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-pub use axonix_macros::component;
+pub use axonyx_macros::component;
 pub use ax_ast::prelude as ax_ast_prelude;
 pub use ax_backend_ast::prelude as ax_backend_ast_prelude;
 pub use ax_backend_codegen::prelude as ax_backend_codegen_prelude;
@@ -92,7 +92,7 @@ pub struct Call {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct AxonixIr {
+pub struct AxonyxIr {
     pub source: Source,
     pub transforms: Vec<Transform>,
     pub view: View,
@@ -212,12 +212,12 @@ fn parse_call(stage: &str) -> Result<Call, ParseError> {
     Ok(Call { path, args })
 }
 
-pub fn compile_pipeline(input: &str) -> Result<AxonixIr, CompileError> {
+pub fn compile_pipeline(input: &str) -> Result<AxonyxIr, CompileError> {
     let pipeline = parse_pipeline(input)?;
     compile_ir(&pipeline)
 }
 
-pub fn compile_ir(pipeline: &Pipeline) -> Result<AxonixIr, CompileError> {
+pub fn compile_ir(pipeline: &Pipeline) -> Result<AxonyxIr, CompileError> {
     if pipeline.stages.len() < 2 {
         return Err(CompileError::TooFewStages);
     }
@@ -233,7 +233,7 @@ pub fn compile_ir(pipeline: &Pipeline) -> Result<AxonixIr, CompileError> {
     }
     let view = compile_view(view_call)?;
 
-    Ok(AxonixIr {
+    Ok(AxonyxIr {
         source,
         transforms,
         view,
