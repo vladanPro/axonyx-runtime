@@ -1,6 +1,6 @@
 # Publish Runbook: 0.1.0
 
-This is the exact release-day flow for the first Axonix runtime publish.
+This is the exact release-day flow for the first Axonyx runtime publish.
 
 ## Assumptions
 
@@ -88,7 +88,7 @@ git push origin v0.1.0
 
 The message should stay simple:
 
-- Axonix apps depend on `axonix-runtime`
+- Axonyx apps depend on `axonix-runtime`
 - the workspace remains internally modular
 - `create-axonix --runtime-source registry` is now the normal package flow
 

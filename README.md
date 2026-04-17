@@ -1,6 +1,8 @@
-# Axonix Runtime
+# Axonyx Runtime
 
-Standalone runtime workspace for Axonix applications.
+Standalone runtime workspace for Axonyx applications.
+
+The public framework name is now `Axonyx`, while the publishable crate identifiers still remain on `axonix-*` names during this compatibility stage.
 
 Included crates:
 

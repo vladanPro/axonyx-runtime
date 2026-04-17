@@ -1,10 +1,10 @@
-# Axonix Runtime 0.1.0 Checklist
+# Axonyx Runtime 0.1.0 Checklist
 
-This document tracks the minimum bar for the first publishable Axonix runtime release.
+This document tracks the minimum bar for the first publishable Axonyx runtime release.
 
 ## Goal
 
-Ship a small, honest `0.1.0` that gives Axonix apps a stable runtime dependency and lets `create-axonix --runtime-source registry` become real.
+Ship a small, honest `0.1.0` that gives Axonyx apps a stable runtime dependency and lets `create-axonix --runtime-source registry` become real.
 
 ## Package Scope
 
