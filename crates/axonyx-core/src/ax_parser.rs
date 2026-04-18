@@ -270,10 +270,11 @@ impl Parser {
     fn parse_head_tag(&mut self, kind: &str) -> Result<AxHeadTag, AxParseError> {
         let line = self.current().expect("line exists").clone();
         let body = line.text[kind.len()..].trim();
-        let props = parse_named_props(body, line.line).map_err(|_| AxParseError::InvalidHeadTag {
-            line: line.line,
-            kind: kind.to_string(),
-        })?;
+        let props =
+            parse_named_props(body, line.line).map_err(|_| AxParseError::InvalidHeadTag {
+                line: line.line,
+                kind: kind.to_string(),
+            })?;
 
         if props.is_empty() {
             return Err(AxParseError::InvalidHeadTag {
@@ -284,7 +285,9 @@ impl Parser {
 
         self.pos += 1;
         Ok(AxHeadTag::new(
-            props.into_iter().map(|(name, value)| AxProp::new(name, value)),
+            props
+                .into_iter()
+                .map(|(name, value)| AxProp::new(name, value)),
         ))
     }
 }
@@ -412,6 +415,40 @@ fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
         return Err(AxParseError::InvalidExpression {
             line,
             message: "expression is empty".to_string(),
+        });
+    }
+
+    if let Some(loader_name) = input.strip_prefix("load ") {
+        let loader_name = loader_name.trim();
+        if loader_name.is_empty() {
+            return Err(AxParseError::InvalidExpression {
+                line,
+                message: "load target is empty".to_string(),
+            });
+        }
+
+        let loader_name = loader_name.trim_matches('"').trim_matches('\'').to_string();
+
+        return Ok(AxExpr::Call {
+            path: vec!["load".to_string()],
+            args: vec![AxExpr::string(loader_name)],
+        });
+    }
+
+    if let Some(action_name) = input.strip_prefix("action ") {
+        let action_name = action_name.trim();
+        if action_name.is_empty() {
+            return Err(AxParseError::InvalidExpression {
+                line,
+                message: "action target is empty".to_string(),
+            });
+        }
+
+        let action_name = action_name.trim_matches('"').trim_matches('\'').to_string();
+
+        return Ok(AxExpr::Call {
+            path: vec!["action".to_string()],
+            args: vec![AxExpr::string(action_name)],
         });
     }
 
@@ -696,5 +733,49 @@ page Home
         };
 
         assert_eq!(pipeline.stages.len(), 3);
+    }
+
+    #[test]
+    fn parses_loader_call_sugar() {
+        let input = r#"
+page Posts
+  data posts = load PostsList
+"#;
+
+        let document = parse_ax(input).expect("document should parse");
+
+        let AxStatement::Data(binding) = &document.page.body[0] else {
+            panic!("expected data binding");
+        };
+
+        assert_eq!(
+            binding.value,
+            AxExpr::Call {
+                path: vec!["load".to_string()],
+                args: vec![AxExpr::string("PostsList")],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_action_call_sugar() {
+        let input = r#"
+page Posts
+  form method: "post", action: action CreatePost
+"#;
+
+        let document = parse_ax(input).expect("document should parse");
+
+        let AxStatement::Component(form) = &document.page.body[0] else {
+            panic!("expected form component");
+        };
+
+        assert_eq!(
+            form.props[1].value,
+            AxExpr::Call {
+                path: vec!["action".to_string()],
+                args: vec![AxExpr::string("CreatePost")],
+            }
+        );
     }
 }

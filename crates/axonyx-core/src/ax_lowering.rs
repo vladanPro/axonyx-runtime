@@ -93,7 +93,15 @@ pub fn lower_document(
     document: &AxDocument,
     resolver: &impl AxDataResolver,
 ) -> Result<AxNode, AxLowerError> {
-    let mut scope = BTreeMap::new();
+    lower_document_with_scope(document, BTreeMap::new(), resolver)
+}
+
+pub fn lower_document_with_scope(
+    document: &AxDocument,
+    initial_scope: BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+) -> Result<AxNode, AxLowerError> {
+    let mut scope = initial_scope;
     let children = lower_statements(&document.page.body, &mut scope, resolver)?;
 
     Ok(element_with_attrs(
@@ -216,6 +224,7 @@ fn lower_component(
         }
         "Button" => {
             attrs.insert(0, attr("data-ui", "button"));
+            push_selected_native_props(&mut attrs, &mut props, &["type", "name", "value", "form"]);
             push_remaining_props(&mut attrs, props);
             element_with_attrs("button", attrs, children)
         }
@@ -360,6 +369,18 @@ fn push_remaining_props(attrs: &mut Vec<Attribute>, props: BTreeMap<String, AxVa
     }
 }
 
+fn push_selected_native_props(
+    attrs: &mut Vec<Attribute>,
+    props: &mut BTreeMap<String, AxValue>,
+    names: &[&str],
+) {
+    for name in names {
+        if let Some(value) = props.remove(*name) {
+            attrs.push(attr_boxed((*name).to_string(), value.as_string()));
+        }
+    }
+}
+
 fn push_native_props(attrs: &mut Vec<Attribute>, props: BTreeMap<String, AxValue>) {
     for (name, value) in props {
         attrs.push(attr_boxed(name, value.as_string()));
@@ -392,6 +413,7 @@ fn leak_tag(tag: String) -> &'static str {
 
 pub mod prelude {
     pub use super::lower_document;
+    pub use super::lower_document_with_scope;
     pub use super::AxDataResolver;
     pub use super::AxLowerError;
     pub use super::AxValue;
@@ -594,5 +616,33 @@ page Home
                 }],
             }
         );
+    }
+
+    #[test]
+    fn button_component_keeps_submit_type_as_real_attribute() {
+        let document = parse_ax(
+            r#"
+page Home
+  Button type: "submit", tone: "primary" -> "Create"
+"#,
+        )
+        .expect("document should parse");
+
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { attrs, .. } = &children[0] else {
+            panic!("expected button");
+        };
+
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "type" && attr.value == "submit"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-tone" && attr.value == "primary"));
     }
 }

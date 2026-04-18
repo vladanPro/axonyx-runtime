@@ -1,11 +1,22 @@
 pub mod backend;
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
+
 use axonyx_core::ax_ast_prelude::{
     AxBody, AxComponent, AxDocument, AxExpr, AxHead, AxHeadTag, AxPipeline, AxPipelineStage,
     AxProp, AxStatement,
 };
+use axonyx_core::ax_backend_lowering::AxBackendLowerError;
+use axonyx_core::ax_backend_lowering_prelude::{
+    lower_backend_document, AxHandlerKind, AxHandlerPlan, AxQueryFilterOpPlan,
+    AxQueryOrderDirectionPlan, AxQueryPlan, AxQuerySourcePlan, AxReturnPlan, AxRustExpr,
+    AxStepPlan, AxValuePlan,
+};
+use axonyx_core::ax_backend_parser::AxBackendParseError;
+use axonyx_core::ax_backend_parser_prelude::parse_backend_ax;
 use axonyx_core::ax_lowering::AxLowerError;
-use axonyx_core::ax_lowering_prelude::{lower_document, AxValue};
+use axonyx_core::ax_lowering_prelude::{lower_document_with_scope, AxValue};
 use axonyx_core::ax_parser::AxParseError;
 use axonyx_core::ax_parser_prelude::parse_ax;
 use axonyx_core::prelude::{Attribute, AxNode};
@@ -76,8 +87,22 @@ pub fn execute_json(ir_json: &str) -> Result<RenderPlan, serde_json::Error> {
 pub enum PreviewError {
     #[error("failed to parse .ax file")]
     Parse(#[from] AxParseError),
+    #[error("failed to parse backend .ax file")]
+    BackendParse(#[from] AxBackendParseError),
+    #[error("failed to lower backend .ax file")]
+    BackendLower(#[from] AxBackendLowerError),
     #[error("failed to lower .ax file")]
     Lower(#[from] AxLowerError),
+    #[error("failed to execute preview runtime: {message}")]
+    Runtime { message: String },
+}
+
+impl From<backend::AxRuntimeError> for PreviewError {
+    fn from(error: backend::AxRuntimeError) -> Self {
+        Self::Runtime {
+            message: error.to_string(),
+        }
+    }
 }
 
 pub fn preview_ax_page(ax_source: &str) -> Result<String, PreviewError> {
@@ -96,6 +121,108 @@ pub fn preview_ax_route(
     layout_sources: &[&str],
     page_source: &str,
 ) -> Result<String, PreviewError> {
+    preview_ax_route_with_loaders(layout_sources, &[], page_source)
+}
+
+pub fn preview_ax_route_with_loaders(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    page_source: &str,
+) -> Result<String, PreviewError> {
+    let store = AxPreviewStore::default();
+    preview_ax_route_with_backend(
+        layout_sources,
+        loader_sources,
+        &[],
+        page_source,
+        "/",
+        &store,
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxPreviewStore {
+    collections: BTreeMap<String, Vec<AxValue>>,
+}
+
+impl Default for AxPreviewStore {
+    fn default() -> Self {
+        let mut collections = BTreeMap::new();
+        collections.insert(
+            "posts".to_string(),
+            sample_preview_collection_items("posts"),
+        );
+        collections.insert(
+            "users".to_string(),
+            sample_preview_collection_items("users"),
+        );
+        Self { collections }
+    }
+}
+
+impl AxPreviewStore {
+    pub fn collection_items(&self, collection: &str) -> Vec<AxValue> {
+        self.collections
+            .get(collection)
+            .cloned()
+            .unwrap_or_else(|| sample_preview_collection_items(collection))
+    }
+
+    fn ensure_collection(&mut self, collection: &str) -> &mut Vec<AxValue> {
+        if !self.collections.contains_key(collection) {
+            self.collections.insert(
+                collection.to_string(),
+                sample_preview_collection_items(collection),
+            );
+        }
+
+        self.collections
+            .get_mut(collection)
+            .expect("collection should exist after ensure")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxPreviewActionResult {
+    pub redirect_to: Option<String>,
+    pub value: AxValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxPreviewHttpResponse {
+    pub status: u16,
+    pub content_type: String,
+    pub body: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewHandlers {
+    routes: Vec<AxHandlerPlan>,
+    loaders: BTreeMap<String, AxHandlerPlan>,
+    actions: BTreeMap<String, AxHandlerPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewFilter {
+    field: String,
+    op: AxQueryFilterOpPlan,
+    value: AxValue,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreviewRouteMatch<'a> {
+    handler: &'a AxHandlerPlan,
+    params: BTreeMap<String, AxValue>,
+}
+
+pub fn preview_ax_route_with_backend(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    store: &AxPreviewStore,
+) -> Result<String, PreviewError> {
     let page_document = parse_ax(page_source)?;
     let mut document = page_document;
 
@@ -104,9 +231,994 @@ pub fn preview_ax_route(
         document = compose_layout_with_page(layout_document, document);
     }
 
-    let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
-    let node = lower_document(&document, &resolver)?;
+    let handlers = collect_preview_handlers(loader_sources, action_sources, &[])?;
+    let cache = RefCell::new(BTreeMap::new());
+    let env = backend::AxEnv::from_env();
+    let route_scope = build_preview_route_scope(
+        &BTreeMap::new(),
+        &parse_preview_query_fields(request_target),
+    );
+    let resolver_error = RefCell::new(None);
+    let resolver = |path: &[String], args: &[AxValue]| -> Option<AxValue> {
+        match preview_resolve_call(
+            &handlers,
+            &cache,
+            &env,
+            request_target,
+            &route_scope,
+            store,
+            path,
+            args,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let mut slot = resolver_error.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(error);
+                }
+                None
+            }
+        }
+    };
+
+    let node = match lower_document_with_scope(&document, route_scope.clone(), &resolver) {
+        Ok(node) => node,
+        Err(error) => {
+            if let Some(runtime_error) = resolver_error.into_inner() {
+                return Err(runtime_error);
+            }
+            return Err(error.into());
+        }
+    };
+
+    if let Some(runtime_error) = resolver_error.into_inner() {
+        return Err(runtime_error);
+    }
+
     Ok(render_preview_document(&document, &node))
+}
+
+pub fn preview_ax_route_with_request_context(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    store: &AxPreviewStore,
+) -> Result<String, PreviewError> {
+    let page_document = parse_ax(page_source)?;
+    let mut document = page_document;
+
+    for layout_source in layout_sources.iter().rev() {
+        let layout_document = parse_ax(layout_source)?;
+        document = compose_layout_with_page(layout_document, document);
+    }
+
+    let handlers = collect_preview_handlers(loader_sources, action_sources, &[])?;
+    let cache = RefCell::new(BTreeMap::new());
+    let env = backend::AxEnv::from_env();
+    let route_scope =
+        build_preview_route_scope(route_params, &parse_preview_query_fields(request_target));
+    let resolver_error = RefCell::new(None);
+    let resolver = |path: &[String], args: &[AxValue]| -> Option<AxValue> {
+        match preview_resolve_call(
+            &handlers,
+            &cache,
+            &env,
+            request_target,
+            &route_scope,
+            store,
+            path,
+            args,
+        ) {
+            Ok(value) => value,
+            Err(error) => {
+                let mut slot = resolver_error.borrow_mut();
+                if slot.is_none() {
+                    *slot = Some(error);
+                }
+                None
+            }
+        }
+    };
+
+    let node = match lower_document_with_scope(&document, route_scope.clone(), &resolver) {
+        Ok(node) => node,
+        Err(error) => {
+            if let Some(runtime_error) = resolver_error.into_inner() {
+                return Err(runtime_error);
+            }
+            return Err(error.into());
+        }
+    };
+
+    if let Some(runtime_error) = resolver_error.into_inner() {
+        return Err(runtime_error);
+    }
+
+    Ok(render_preview_document(&document, &node))
+}
+
+pub fn execute_preview_action_sources(
+    action_sources: &[&str],
+    action_name: &str,
+    input_fields: &BTreeMap<String, String>,
+    store: &mut AxPreviewStore,
+) -> Result<AxPreviewActionResult, PreviewError> {
+    let handlers = collect_preview_handlers(&[], action_sources, &[])?;
+    let env = backend::AxEnv::from_env();
+    execute_preview_action(&handlers.actions, action_name, input_fields, &env, store)
+}
+
+pub fn execute_preview_route_sources(
+    route_sources: &[&str],
+    method: &str,
+    request_target: &str,
+    store: &mut AxPreviewStore,
+) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    let handlers = collect_preview_handlers(&[], &[], route_sources)?;
+    let env = backend::AxEnv::from_env();
+    let request_path = normalize_preview_request_path(request_target)?;
+    let query = parse_preview_query_fields(request_target);
+    execute_preview_route(&handlers.routes, method, &request_path, &query, &env, store)
+}
+
+pub fn preview_action_endpoint_path(request_path: &str, action_name: &str) -> String {
+    format!(
+        "/__axonyx/action?path={}&name={}",
+        url_encode(request_path),
+        url_encode(action_name)
+    )
+}
+
+fn collect_preview_handlers(
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    route_sources: &[&str],
+) -> Result<PreviewHandlers, PreviewError> {
+    let mut routes = Vec::new();
+    let mut loaders = BTreeMap::new();
+    let mut actions = BTreeMap::new();
+
+    for source in route_sources {
+        let document = parse_backend_ax(source)?;
+        let plan = lower_backend_document(&document)?;
+
+        for handler in plan.handlers {
+            if !matches!(handler.kind, AxHandlerKind::Route { .. }) {
+                continue;
+            }
+
+            routes.push(handler);
+        }
+    }
+
+    for source in loader_sources {
+        let document = parse_backend_ax(source)?;
+        let plan = lower_backend_document(&document)?;
+
+        for handler in plan.handlers {
+            if matches!(handler.kind, AxHandlerKind::Loader) {
+                loaders.insert(handler.name.clone(), handler);
+            }
+        }
+    }
+
+    for source in action_sources {
+        let document = parse_backend_ax(source)?;
+        let plan = lower_backend_document(&document)?;
+
+        for handler in plan.handlers {
+            if matches!(handler.kind, AxHandlerKind::Action { .. }) {
+                actions.insert(handler.name.clone(), handler);
+            }
+        }
+    }
+
+    Ok(PreviewHandlers {
+        routes,
+        loaders,
+        actions,
+    })
+}
+
+fn preview_resolve_call(
+    handlers: &PreviewHandlers,
+    cache: &RefCell<BTreeMap<String, AxValue>>,
+    env: &backend::AxEnv,
+    request_target: &str,
+    route_scope: &BTreeMap<String, AxValue>,
+    store: &AxPreviewStore,
+    path: &[String],
+    args: &[AxValue],
+) -> Result<Option<AxValue>, PreviewError> {
+    if path == ["load".to_string()] {
+        let [AxValue::String(loader_name)] = args else {
+            return Err(PreviewError::Runtime {
+                message: "load(...) expects a single loader name".to_string(),
+            });
+        };
+
+        if let Some(cached) = cache.borrow().get(loader_name).cloned() {
+            return Ok(Some(cached));
+        }
+
+        let loader = handlers
+            .loaders
+            .get(loader_name)
+            .ok_or_else(|| PreviewError::Runtime {
+                message: format!("loader `{loader_name}` was not found for this route"),
+            })?;
+        let value = execute_preview_loader(loader, route_scope, env, store)?;
+        cache
+            .borrow_mut()
+            .insert(loader_name.clone(), value.clone());
+        return Ok(Some(value));
+    }
+
+    if path == ["action".to_string()] {
+        let [AxValue::String(action_name)] = args else {
+            return Err(PreviewError::Runtime {
+                message: "action(...) expects a single action name".to_string(),
+            });
+        };
+
+        if !handlers.actions.contains_key(action_name) {
+            return Err(PreviewError::Runtime {
+                message: format!("action `{action_name}` was not found for this route"),
+            });
+        }
+
+        return Ok(Some(AxValue::String(preview_action_endpoint_path(
+            request_target,
+            action_name,
+        ))));
+    }
+
+    if path == ["Db".to_string(), "Stream".to_string()] {
+        let [AxValue::String(collection)] = args else {
+            return Err(PreviewError::Runtime {
+                message: "Db.Stream(...) expects a collection name".to_string(),
+            });
+        };
+
+        return Ok(Some(AxValue::List(store.collection_items(collection))));
+    }
+
+    Ok(None)
+}
+
+fn execute_preview_loader(
+    loader: &AxHandlerPlan,
+    initial_scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    store: &AxPreviewStore,
+) -> Result<AxValue, PreviewError> {
+    let mut scope = initial_scope.clone();
+
+    for step in &loader.steps {
+        match step {
+            AxStepPlan::Let { binding, value } => {
+                let value = eval_preview_value(value, &scope, env, store)?;
+                scope.insert(binding.clone(), value);
+            }
+            AxStepPlan::Return(value) => return eval_preview_return(value, &scope, env),
+            AxStepPlan::Insert { .. }
+            | AxStepPlan::Update { .. }
+            | AxStepPlan::Delete { .. }
+            | AxStepPlan::Revalidate { .. }
+            | AxStepPlan::Send { .. } => {}
+        }
+    }
+
+    Ok(AxValue::Null)
+}
+
+fn execute_preview_action(
+    actions: &BTreeMap<String, AxHandlerPlan>,
+    action_name: &str,
+    input_fields: &BTreeMap<String, String>,
+    env: &backend::AxEnv,
+    store: &mut AxPreviewStore,
+) -> Result<AxPreviewActionResult, PreviewError> {
+    let action = actions
+        .get(action_name)
+        .ok_or_else(|| PreviewError::Runtime {
+            message: format!("action `{action_name}` was not found for this route"),
+        })?;
+
+    let AxHandlerKind::Action { input } = &action.kind else {
+        return Err(PreviewError::Runtime {
+            message: format!("handler `{action_name}` is not an action"),
+        });
+    };
+
+    let mut scope = BTreeMap::new();
+    scope.insert(
+        "input".to_string(),
+        build_preview_input_record(input, input_fields),
+    );
+
+    let mut redirect_to = None;
+    let mut value = AxValue::record([("ok", AxValue::Bool(true))]);
+
+    for step in &action.steps {
+        match step {
+            AxStepPlan::Let {
+                binding,
+                value: plan,
+            } => {
+                let evaluated = eval_preview_value(plan, &scope, env, store)?;
+                scope.insert(binding.clone(), evaluated);
+            }
+            AxStepPlan::Insert { collection, fields } => {
+                let mut record = eval_preview_fields(fields, &scope, env)?;
+                assign_preview_id(&mut record, store.collection_items(collection).len());
+                store
+                    .ensure_collection(collection)
+                    .push(AxValue::Record(record));
+            }
+            AxStepPlan::Update {
+                collection,
+                fields,
+                filters,
+            } => {
+                let fields = eval_preview_fields(fields, &scope, env)?;
+                let filters = eval_preview_filters(filters, &scope, env)?;
+                for item in store.ensure_collection(collection).iter_mut() {
+                    if preview_record_matches_all(item, &filters) {
+                        apply_preview_fields(item, &fields);
+                    }
+                }
+            }
+            AxStepPlan::Delete {
+                collection,
+                filters,
+            } => {
+                let filters = eval_preview_filters(filters, &scope, env)?;
+                store
+                    .ensure_collection(collection)
+                    .retain(|item| !preview_record_matches_all(item, &filters));
+            }
+            AxStepPlan::Revalidate { target } => {
+                redirect_to = Some(eval_preview_expr(target, &scope, env)?.as_string());
+            }
+            AxStepPlan::Return(result) => {
+                value = eval_preview_return(result, &scope, env)?;
+            }
+            AxStepPlan::Send { .. } => {}
+        }
+    }
+
+    Ok(AxPreviewActionResult { redirect_to, value })
+}
+
+fn execute_preview_route(
+    routes: &[AxHandlerPlan],
+    method: &str,
+    request_path: &str,
+    query: &BTreeMap<String, String>,
+    env: &backend::AxEnv,
+    store: &mut AxPreviewStore,
+) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    let Some(route_match) = match_preview_route(routes, method, request_path) else {
+        return Ok(None);
+    };
+
+    let mut scope = BTreeMap::new();
+    scope.insert("params".to_string(), AxValue::Record(route_match.params));
+    scope.insert("query".to_string(), build_preview_query_record(query));
+    let mut value = AxValue::Null;
+
+    for step in &route_match.handler.steps {
+        match step {
+            AxStepPlan::Let {
+                binding,
+                value: plan,
+            } => {
+                let evaluated = eval_preview_value(plan, &scope, env, store)?;
+                scope.insert(binding.clone(), evaluated);
+            }
+            AxStepPlan::Insert { collection, fields } => {
+                let mut record = eval_preview_fields(fields, &scope, env)?;
+                assign_preview_id(&mut record, store.collection_items(collection).len());
+                store
+                    .ensure_collection(collection)
+                    .push(AxValue::Record(record));
+            }
+            AxStepPlan::Update {
+                collection,
+                fields,
+                filters,
+            } => {
+                let fields = eval_preview_fields(fields, &scope, env)?;
+                let filters = eval_preview_filters(filters, &scope, env)?;
+                for item in store.ensure_collection(collection).iter_mut() {
+                    if preview_record_matches_all(item, &filters) {
+                        apply_preview_fields(item, &fields);
+                    }
+                }
+            }
+            AxStepPlan::Delete {
+                collection,
+                filters,
+            } => {
+                let filters = eval_preview_filters(filters, &scope, env)?;
+                store
+                    .ensure_collection(collection)
+                    .retain(|item| !preview_record_matches_all(item, &filters));
+            }
+            AxStepPlan::Return(result) => {
+                value = eval_preview_return(result, &scope, env)?;
+            }
+            AxStepPlan::Revalidate { .. } | AxStepPlan::Send { .. } => {}
+        }
+    }
+
+    Ok(Some(render_preview_json_response(&value)?))
+}
+
+fn eval_preview_value(
+    value: &AxValuePlan,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    store: &AxPreviewStore,
+) -> Result<AxValue, PreviewError> {
+    match value {
+        AxValuePlan::Expr(expr) => eval_preview_expr(expr, scope, env),
+        AxValuePlan::Query(query) => eval_preview_query(query, scope, env, store),
+    }
+}
+
+fn eval_preview_return(
+    value: &AxReturnPlan,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+) -> Result<AxValue, PreviewError> {
+    match value {
+        AxReturnPlan::Expr(expr) => eval_preview_expr(expr, scope, env),
+        AxReturnPlan::Ok => Ok(AxValue::record([("ok", AxValue::Bool(true))])),
+    }
+}
+
+fn eval_preview_query(
+    query: &AxQueryPlan,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    store: &AxPreviewStore,
+) -> Result<AxValue, PreviewError> {
+    let AxQuerySourcePlan::Stream { collection } = &query.source;
+    let mut items = store.collection_items(collection);
+
+    for filter in &query.filters {
+        let expected = eval_preview_expr(&filter.value, scope, env)?;
+        items.retain(|item| preview_record_matches(item, &filter.field, filter.op, &expected));
+    }
+
+    for order in query.orders.iter().rev() {
+        items.sort_by(|left, right| {
+            let left_value = preview_record_field(left, &order.field)
+                .map(AxValue::as_string)
+                .unwrap_or_default();
+            let right_value = preview_record_field(right, &order.field)
+                .map(AxValue::as_string)
+                .unwrap_or_default();
+
+            match order.direction {
+                AxQueryOrderDirectionPlan::Asc => left_value.cmp(&right_value),
+                AxQueryOrderDirectionPlan::Desc => right_value.cmp(&left_value),
+            }
+        });
+    }
+
+    if let Some(offset) = query.offset {
+        items = items.into_iter().skip(offset as usize).collect();
+    }
+
+    if let Some(limit) = query.limit {
+        items.truncate(limit as usize);
+    }
+
+    Ok(AxValue::List(items))
+}
+
+fn preview_record_matches(
+    item: &AxValue,
+    field: &str,
+    op: AxQueryFilterOpPlan,
+    expected: &AxValue,
+) -> bool {
+    let Some(value) = preview_record_field(item, field) else {
+        return false;
+    };
+
+    match op {
+        AxQueryFilterOpPlan::Eq => value == expected,
+    }
+}
+
+fn preview_record_field<'a>(item: &'a AxValue, field: &str) -> Option<&'a AxValue> {
+    match item {
+        AxValue::Record(fields) => fields.get(field),
+        _ => None,
+    }
+}
+
+fn eval_preview_expr(
+    expr: &AxRustExpr,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+) -> Result<AxValue, PreviewError> {
+    let code = expr.code.trim();
+
+    if let Some(value) = parse_preview_string(code) {
+        return Ok(AxValue::String(value));
+    }
+
+    if code == "true" {
+        return Ok(AxValue::Bool(true));
+    }
+
+    if code == "false" {
+        return Ok(AxValue::Bool(false));
+    }
+
+    if let Ok(value) = code.parse::<i64>() {
+        return Ok(AxValue::Number(value));
+    }
+
+    if let Some(key) = parse_preview_env_call(code, "public") {
+        return Ok(AxValue::String(env.public(&key)?));
+    }
+
+    if let Some(key) = parse_preview_env_call(code, "secret") {
+        return Ok(AxValue::String(env.secret(&key)?));
+    }
+
+    if let Some(value) = lookup_preview_scope(scope, code) {
+        return Ok(value);
+    }
+
+    Err(PreviewError::Runtime {
+        message: format!("preview loader expression `{code}` is not supported yet"),
+    })
+}
+
+fn lookup_preview_scope(scope: &BTreeMap<String, AxValue>, code: &str) -> Option<AxValue> {
+    let mut parts = code.split('.').map(str::trim);
+    let first = parts.next()?;
+    let mut value = scope.get(first)?.clone();
+
+    for part in parts {
+        let AxValue::Record(fields) = value else {
+            return None;
+        };
+        value = fields.get(part)?.clone();
+    }
+
+    Some(value)
+}
+
+fn parse_preview_string(code: &str) -> Option<String> {
+    if let Some(value) = code.strip_suffix(".to_string()") {
+        return parse_preview_string(value.trim());
+    }
+
+    if (code.starts_with('"') && code.ends_with('"'))
+        || (code.starts_with('\'') && code.ends_with('\''))
+    {
+        return Some(code[1..code.len() - 1].to_string());
+    }
+
+    None
+}
+
+fn parse_preview_env_call(code: &str, namespace: &str) -> Option<String> {
+    let prefix = format!("runtime.env().{namespace}(\"");
+    let suffix = "\")?";
+    let key = code.strip_prefix(&prefix)?.strip_suffix(suffix)?;
+    Some(key.to_string())
+}
+
+fn sample_preview_collection_items(collection: &str) -> Vec<AxValue> {
+    match collection {
+        "posts" => vec![
+            AxValue::record([
+                ("id", AxValue::from("1")),
+                ("title", AxValue::from("Hello Axonyx")),
+                (
+                    "excerpt",
+                    AxValue::from("A fast page rendered from .ax with almost no JavaScript."),
+                ),
+                ("slug", AxValue::from("hello-axonyx")),
+                ("status", AxValue::from("published")),
+                ("created_at", AxValue::from("2026-04-18")),
+            ]),
+            AxValue::record([
+                ("id", AxValue::from("2")),
+                ("title", AxValue::from("Docs Without Bloat")),
+                (
+                    "excerpt",
+                    AxValue::from("Author docs pages directly and keep the runtime tiny."),
+                ),
+                ("slug", AxValue::from("docs-without-bloat")),
+                ("status", AxValue::from("published")),
+                ("created_at", AxValue::from("2026-04-17")),
+            ]),
+            AxValue::record([
+                ("id", AxValue::from("3")),
+                ("title", AxValue::from("Draft Preview")),
+                (
+                    "excerpt",
+                    AxValue::from("A hidden draft entry to prove where filters work."),
+                ),
+                ("slug", AxValue::from("draft-preview")),
+                ("status", AxValue::from("draft")),
+                ("created_at", AxValue::from("2026-04-16")),
+            ]),
+        ],
+        "users" => vec![
+            AxValue::record([
+                ("id", AxValue::from("1")),
+                ("name", AxValue::from("Ana")),
+                ("role", AxValue::from("editor")),
+            ]),
+            AxValue::record([
+                ("id", AxValue::from("2")),
+                ("name", AxValue::from("Luka")),
+                ("role", AxValue::from("author")),
+            ]),
+        ],
+        other => vec![
+            AxValue::record([
+                ("id", AxValue::from("1")),
+                ("title", AxValue::from(format!("{other} item 1"))),
+                (
+                    "excerpt",
+                    AxValue::from("Preview data is coming from Axonyx runtime samples."),
+                ),
+            ]),
+            AxValue::record([
+                ("id", AxValue::from("2")),
+                ("title", AxValue::from(format!("{other} item 2"))),
+                (
+                    "excerpt",
+                    AxValue::from("Connect a real adapter later without changing page syntax."),
+                ),
+            ]),
+        ],
+    }
+}
+
+fn eval_preview_fields(
+    fields: &[axonyx_core::ax_backend_lowering_prelude::AxAssignmentPlan],
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+) -> Result<BTreeMap<String, AxValue>, PreviewError> {
+    let mut map = BTreeMap::new();
+
+    for field in fields {
+        map.insert(
+            field.name.clone(),
+            eval_preview_expr(&field.value, scope, env)?,
+        );
+    }
+
+    Ok(map)
+}
+
+fn eval_preview_filters(
+    filters: &[axonyx_core::ax_backend_lowering_prelude::AxQueryFilterPlan],
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+) -> Result<Vec<PreviewFilter>, PreviewError> {
+    filters
+        .iter()
+        .map(|filter| {
+            Ok(PreviewFilter {
+                field: filter.field.clone(),
+                op: filter.op,
+                value: eval_preview_expr(&filter.value, scope, env)?,
+            })
+        })
+        .collect()
+}
+
+fn build_preview_input_record(
+    fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
+    input_fields: &BTreeMap<String, String>,
+) -> AxValue {
+    AxValue::record(fields.iter().map(|field| {
+        let value = input_fields.get(&field.name).cloned().unwrap_or_default();
+        (
+            field.name.clone(),
+            coerce_preview_input_value(&field.rust_ty, value),
+        )
+    }))
+}
+
+fn coerce_preview_input_value(rust_ty: &str, value: String) -> AxValue {
+    match rust_ty {
+        "bool" => AxValue::Bool(matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "true" | "1" | "on" | "yes"
+        )),
+        "i64" => value
+            .trim()
+            .parse::<i64>()
+            .map(AxValue::Number)
+            .unwrap_or_else(|_| AxValue::String(value)),
+        _ => AxValue::String(value),
+    }
+}
+
+fn preview_record_matches_all(item: &AxValue, filters: &[PreviewFilter]) -> bool {
+    filters
+        .iter()
+        .all(|filter| preview_record_matches(item, &filter.field, filter.op, &filter.value))
+}
+
+fn apply_preview_fields(item: &mut AxValue, fields: &BTreeMap<String, AxValue>) {
+    let AxValue::Record(record) = item else {
+        return;
+    };
+
+    for (name, value) in fields {
+        record.insert(name.clone(), value.clone());
+    }
+}
+
+fn assign_preview_id(record: &mut BTreeMap<String, AxValue>, existing_len: usize) {
+    if record.contains_key("id") {
+        return;
+    }
+
+    record.insert(
+        "id".to_string(),
+        AxValue::String((existing_len + 1).to_string()),
+    );
+}
+
+fn build_preview_query_record(query: &BTreeMap<String, String>) -> AxValue {
+    AxValue::Record(
+        query
+            .iter()
+            .map(|(key, value)| (key.clone(), AxValue::String(value.clone())))
+            .collect(),
+    )
+}
+
+fn build_preview_route_scope(
+    route_params: &BTreeMap<String, String>,
+    query: &BTreeMap<String, String>,
+) -> BTreeMap<String, AxValue> {
+    BTreeMap::from([
+        (
+            "params".to_string(),
+            AxValue::Record(
+                route_params
+                    .iter()
+                    .map(|(key, value)| (key.clone(), AxValue::String(value.clone())))
+                    .collect(),
+            ),
+        ),
+        ("query".to_string(), build_preview_query_record(query)),
+    ])
+}
+
+fn match_preview_route<'a>(
+    routes: &'a [AxHandlerPlan],
+    method: &str,
+    request_path: &str,
+) -> Option<PreviewRouteMatch<'a>> {
+    let method = normalize_preview_method(method);
+    let mut best_match = None;
+    let mut best_score = None;
+
+    for route in routes {
+        let AxHandlerKind::Route {
+            method: route_method,
+            path,
+        } = &route.kind
+        else {
+            continue;
+        };
+
+        if normalize_preview_method(route_method) != method {
+            continue;
+        }
+
+        let Some((params, static_segments)) = match_preview_route_pattern(path, request_path)
+        else {
+            continue;
+        };
+        let score = (static_segments, usize::MAX - path_segments(path).len());
+
+        if best_score.is_some_and(|current| current >= score) {
+            continue;
+        }
+
+        best_score = Some(score);
+        best_match = Some(PreviewRouteMatch {
+            handler: route,
+            params,
+        });
+    }
+
+    best_match
+}
+
+fn match_preview_route_pattern(
+    pattern: &str,
+    request_path: &str,
+) -> Option<(BTreeMap<String, AxValue>, usize)> {
+    let pattern_segments = path_segments(pattern);
+    let request_segments = path_segments(request_path);
+    if pattern_segments.len() != request_segments.len() {
+        return None;
+    }
+
+    let mut params = BTreeMap::new();
+    let mut static_segments = 0;
+
+    for (pattern_segment, request_segment) in pattern_segments.iter().zip(request_segments.iter()) {
+        if let Some(param_name) = pattern_segment.strip_prefix(':') {
+            if param_name.is_empty() {
+                return None;
+            }
+
+            params.insert(
+                param_name.to_string(),
+                AxValue::String(request_segment.clone()),
+            );
+            continue;
+        }
+
+        if pattern_segment != request_segment {
+            return None;
+        }
+
+        static_segments += 1;
+    }
+
+    Some((params, static_segments))
+}
+
+fn normalize_preview_request_path(request_target: &str) -> Result<String, PreviewError> {
+    let raw_path = request_target
+        .split(['?', '#'])
+        .next()
+        .unwrap_or("/")
+        .trim();
+    let raw_path = if raw_path.is_empty() { "/" } else { raw_path };
+    let mut segments = Vec::new();
+
+    for segment in raw_path.trim_start_matches('/').split('/') {
+        if segment.is_empty() {
+            continue;
+        }
+        if segment == "." || segment == ".." || segment.contains('\\') {
+            return Err(PreviewError::Runtime {
+                message: format!("invalid route path `{request_target}`"),
+            });
+        }
+        segments.push(segment.to_string());
+    }
+
+    if segments.is_empty() {
+        Ok("/".to_string())
+    } else {
+        Ok(format!("/{}", segments.join("/")))
+    }
+}
+
+fn parse_preview_query_fields(request_target: &str) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+    let Some((_, query)) = request_target.split_once('?') else {
+        return fields;
+    };
+
+    for pair in query.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        fields.insert(url_decode(key), url_decode(value));
+    }
+
+    fields
+}
+
+fn path_segments(path: &str) -> Vec<String> {
+    path.trim_start_matches('/')
+        .split('/')
+        .filter(|segment| !segment.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn render_preview_json_response(value: &AxValue) -> Result<AxPreviewHttpResponse, PreviewError> {
+    let body = serde_json::to_vec(&preview_value_to_json(value)).map_err(|error| {
+        PreviewError::Runtime {
+            message: format!("failed to serialize preview JSON response: {error}"),
+        }
+    })?;
+
+    Ok(AxPreviewHttpResponse {
+        status: 200,
+        content_type: "application/json; charset=utf-8".to_string(),
+        body,
+    })
+}
+
+fn preview_value_to_json(value: &AxValue) -> serde_json::Value {
+    match value {
+        AxValue::Null => serde_json::Value::Null,
+        AxValue::String(value) => serde_json::Value::String(value.clone()),
+        AxValue::Number(value) => serde_json::Value::Number((*value).into()),
+        AxValue::Bool(value) => serde_json::Value::Bool(*value),
+        AxValue::Record(fields) => serde_json::Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), preview_value_to_json(value)))
+                .collect(),
+        ),
+        AxValue::List(items) => {
+            serde_json::Value::Array(items.iter().map(preview_value_to_json).collect())
+        }
+    }
+}
+
+fn normalize_preview_method(method: &str) -> String {
+    method.trim().to_ascii_uppercase()
+}
+
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = &value[index + 1..index + 3];
+                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
+                    out.push(decoded as char);
+                    index += 3;
+                } else {
+                    out.push('%');
+                    index += 1;
+                }
+            }
+            byte => {
+                out.push(byte as char);
+                index += 1;
+            }
+        }
+    }
+
+    out
+}
+
+fn url_encode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+
+    out
 }
 
 fn compose_layout_with_page(mut layout: AxDocument, page: AxDocument) -> AxDocument {
@@ -439,11 +1551,35 @@ fn preview_styles() -> &'static str {
             font-weight: 700;
             box-shadow: 0 12px 30px rgba(56, 189, 248, 0.22);
         }
+
+        .ax-form {
+            display: grid;
+            gap: 12px;
+            margin-top: 12px;
+        }
+
+        .ax-input,
+        .ax-textarea {
+            width: 100%;
+            padding: 14px 16px;
+            border-radius: 16px;
+            border: 1px solid var(--ax-border);
+            background: rgba(15, 23, 42, 0.72);
+            color: var(--ax-text);
+            font: inherit;
+        }
+
+        .ax-textarea {
+            min-height: 128px;
+            resize: vertical;
+        }
     "#
 }
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use axonyx_core::compile_pipeline;
 
     use super::*;
@@ -567,6 +1703,240 @@ page DocsHome
     }
 
     #[test]
+    fn previews_route_loader_data_inside_page() {
+        let html = preview_ax_route_with_loaders(
+            &[],
+            &[r#"
+loader PostsList
+  data posts = Db.Stream("posts")
+    where status = "published"
+    order created_at desc
+    limit 2
+  return posts
+"#],
+            r#"
+page Posts
+  data posts = load PostsList
+  Grid cols: 2
+    each post in posts
+      Card title: post.title
+        Copy -> post.excerpt
+"#,
+        )
+        .expect("route loader preview should render");
+
+        assert!(html.contains("Hello Axonyx"));
+        assert!(html.contains("Docs Without Bloat"));
+        assert!(!html.contains("Draft Preview"));
+    }
+
+    #[test]
+    fn previews_route_action_endpoint_inside_form() {
+        let store = AxPreviewStore::default();
+        let html = preview_ax_route_with_backend(
+            &[],
+            &[r#"
+loader PostsList
+  data posts = Db.Stream("posts")
+  return posts
+"#],
+            &[r#"
+action CreatePost
+  input:
+    title: string
+    excerpt: string
+
+  insert "posts"
+    title: input.title
+    excerpt: input.excerpt
+
+  revalidate "/posts"
+  return ok
+"#],
+            r#"
+page Posts
+  form method: "post", action: action CreatePost
+    Button type: "submit", tone: "primary" -> "Create"
+"#,
+            "/posts",
+            &store,
+        )
+        .expect("action endpoint should render");
+
+        assert!(html.contains("/__axonyx/action?path=%2Fposts&amp;name=CreatePost"));
+        assert!(html.contains("type=\"submit\""));
+    }
+
+    #[test]
+    fn preview_action_mutates_store_and_redirects() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action CreatePost
+  input:
+    title: string
+    excerpt: string
+
+  insert "posts"
+    title: input.title
+    excerpt: input.excerpt
+
+  revalidate "/posts"
+  return ok
+"#],
+            "CreatePost",
+            &BTreeMap::from([
+                ("title".to_string(), "Axonyx Forms".to_string()),
+                (
+                    "excerpt".to_string(),
+                    "Route-local actions now mutate preview data.".to_string(),
+                ),
+            ]),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert_eq!(result.redirect_to.as_deref(), Some("/posts"));
+
+        let html = preview_ax_route_with_backend(
+            &[],
+            &[r#"
+loader PostsList
+  data posts = Db.Stream("posts")
+  return posts
+"#],
+            &[r#"
+action CreatePost
+  input:
+    title: string
+    excerpt: string
+
+  insert "posts"
+    title: input.title
+    excerpt: input.excerpt
+
+  revalidate "/posts"
+  return ok
+"#],
+            r#"
+page Posts
+  data posts = load PostsList
+  each post in posts
+    Copy -> post.title
+"#,
+            "/posts",
+            &store,
+        )
+        .expect("page should render with mutated store");
+
+        assert!(html.contains("Axonyx Forms"));
+    }
+
+    #[test]
+    fn preview_route_sources_return_json_payload() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_sources(
+            &[r#"
+route GET "/api/posts"
+  data posts = Db.Stream("posts")
+    where status = "published"
+    order created_at desc
+    limit 2
+  return posts
+"#],
+            "GET",
+            "/api/posts",
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "application/json; charset=utf-8");
+
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert!(body.contains("Hello Axonyx"));
+        assert!(body.contains("Docs Without Bloat"));
+        assert!(!body.contains("Draft Preview"));
+    }
+
+    #[test]
+    fn preview_route_sources_can_use_params_and_query() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_sources(
+            &[r#"
+route GET "/api/posts/:slug"
+  data posts = Db.Stream("posts")
+    where slug = params.slug
+    where status = query.status
+  return posts
+"#],
+            "GET",
+            "/api/posts/draft-preview?status=draft",
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert!(body.contains("Draft Preview"));
+        assert!(!body.contains("Hello Axonyx"));
+    }
+
+    #[test]
+    fn preview_route_sources_prefer_static_path_over_dynamic_match() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_sources(
+            &[r#"
+route GET "/api/posts/:slug"
+  return "dynamic"
+
+route GET "/api/posts/featured"
+  return "featured"
+"#],
+            "GET",
+            "/api/posts/featured",
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert_eq!(body, "\"featured\"");
+    }
+
+    #[test]
+    fn previews_page_route_with_request_context_in_page_and_loader() {
+        let store = AxPreviewStore::default();
+        let html = preview_ax_route_with_request_context(
+            &[],
+            &[r#"
+loader PostDetail
+  data posts = Db.Stream("posts")
+    where slug = params.slug
+    where status = query.status
+  return posts
+"#],
+            &[],
+            r#"
+page Post
+  Copy -> params.slug
+  data posts = load PostDetail
+  each post in posts
+    Copy -> post.title
+"#,
+            "/posts/draft-preview?status=draft",
+            &BTreeMap::from([("slug".to_string(), "draft-preview".to_string())]),
+            &store,
+        )
+        .expect("page should render with request context");
+
+        assert!(html.contains("draft-preview"));
+        assert!(html.contains("Draft Preview"));
+        assert!(!html.contains("Hello Axonyx"));
+    }
+
+    #[test]
     fn previews_head_metadata_inside_html_head() {
         let html = preview_ax_page(
             r#"
@@ -581,7 +1951,9 @@ page Home
         .expect("preview should render");
 
         assert!(html.contains("<title>Axonyx Site</title>"));
-        assert!(html.contains("<meta name=\"description\" content=\"Fast pages with minimal JS.\">"));
+        assert!(
+            html.contains("<meta name=\"description\" content=\"Fast pages with minimal JS.\">")
+        );
         assert!(html.contains("<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">"));
         assert!(html.contains("<script src=\"/app.js\" defer=\"true\"></script>"));
     }
