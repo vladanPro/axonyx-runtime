@@ -33,6 +33,7 @@ impl AxPage {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct AxHead {
     pub title: Option<AxExpr>,
+    pub theme: Option<AxExpr>,
     pub metas: Vec<AxHeadTag>,
     pub links: Vec<AxHeadTag>,
     pub scripts: Vec<AxHeadTag>,
@@ -41,6 +42,11 @@ pub struct AxHead {
 impl AxHead {
     pub fn with_title(mut self, value: impl Into<AxExpr>) -> Self {
         self.title = Some(value.into());
+        self
+    }
+
+    pub fn with_theme(mut self, value: impl Into<AxExpr>) -> Self {
+        self.theme = Some(value.into());
         self
     }
 
@@ -62,6 +68,9 @@ impl AxHead {
     pub fn merge(&mut self, other: AxHead) {
         if other.title.is_some() {
             self.title = other.title;
+        }
+        if other.theme.is_some() {
+            self.theme = other.theme;
         }
         self.metas.extend(other.metas);
         self.links.extend(other.links);

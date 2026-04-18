@@ -1295,13 +1295,25 @@ fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
     let mut body = String::new();
     render_node(root, &mut body);
     let head = render_head_html(&document.head);
+    let html_attrs = render_html_attrs(&document.head);
 
     format!(
-        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{}<style>{}</style></head><body>{}</body></html>",
-        head,
+        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>{}</head><body>{}</body></html>",
+        html_attrs,
         preview_styles(),
+        head,
         body
     )
+}
+
+fn render_html_attrs(head: &AxHead) -> String {
+    let mut attrs = String::from(" lang=\"en\"");
+    if let Some(theme) = &head.theme {
+        attrs.push_str(" data-theme=\"");
+        attrs.push_str(&escape_html(&head_expr_to_string(theme)));
+        attrs.push('"');
+    }
+    attrs
 }
 
 fn render_head_html(head: &AxHead) -> String {
@@ -1426,15 +1438,23 @@ fn preview_styles() -> &'static str {
     r#"
         :root {
             color-scheme: dark;
-            --ax-bg: #0b1220;
-            --ax-surface: rgba(15, 23, 42, 0.78);
-            --ax-surface-strong: rgba(30, 41, 59, 0.92);
-            --ax-border: rgba(148, 163, 184, 0.18);
-            --ax-text: #e5eefb;
-            --ax-muted: #9fb0ca;
-            --ax-accent: #7dd3fc;
-            --ax-accent-strong: #38bdf8;
-            --ax-shadow: 0 24px 80px rgba(15, 23, 42, 0.35);
+            --ax-bg: #091019;
+            --ax-surface: #0f1826;
+            --ax-surface-2: #142132;
+            --ax-border: rgba(163, 182, 207, 0.18);
+            --ax-border-strong: rgba(163, 182, 207, 0.28);
+            --ax-text: #f3f6fb;
+            --ax-text-soft: #d7dfeb;
+            --ax-text-muted: #99aabc;
+            --ax-link: #c8a8ff;
+            --ax-cyan: #88d5ff;
+            --ax-card-shadow:
+                0 0 0 1px rgba(163, 182, 207, 0.08),
+                inset 0 1px 0 rgba(255, 255, 255, 0.03),
+                0 14px 30px rgba(0, 0, 0, 0.28);
+            --ax-card-surface:
+                radial-gradient(circle at top left, rgba(120, 155, 220, 0.1), transparent 42%),
+                linear-gradient(180deg, rgba(16, 27, 42, 0.98), rgba(7, 16, 25, 0.98));
         }
 
         * { box-sizing: border-box; }
@@ -1443,9 +1463,7 @@ fn preview_styles() -> &'static str {
             margin: 0;
             min-height: 100vh;
             font-family: "Segoe UI", Inter, sans-serif;
-            background:
-                radial-gradient(circle at top, rgba(56, 189, 248, 0.16), transparent 32rem),
-                linear-gradient(180deg, #020617 0%, #0f172a 100%);
+            background: var(--ax-bg);
             color: var(--ax-text);
         }
 
@@ -1454,91 +1472,86 @@ fn preview_styles() -> &'static str {
             padding: 48px 20px 72px;
         }
 
-        [data-layout="container"] {
-            width: min(100%, 1120px);
+        .ax-container {
+            width: min(100% - 2rem, 88rem);
             margin: 0 auto;
         }
 
-        [data-layout="grid"] {
+        .ax-container[data-max="sm"] { max-width: 42rem; }
+        .ax-container[data-max="md"] { max-width: 56rem; }
+        .ax-container[data-max="lg"] { max-width: 72rem; }
+        .ax-container[data-max="xl"] { max-width: 88rem; }
+
+        .ax-grid {
             display: grid;
-            gap: 20px;
         }
 
-        [data-layout="grid"][data-cols="2"] {
-            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
-        }
+        .ax-grid[data-cols="1"] { grid-template-columns: 1fr; }
+        .ax-grid[data-cols="2"] { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+        .ax-grid[data-cols="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+        .ax-grid[data-cols="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+        .ax-grid[data-cols="5"] { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+        .ax-grid[data-cols="6"] { grid-template-columns: repeat(6, minmax(0, 1fr)); }
 
-        [data-layout="grid"][data-cols="3"] {
-            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-        }
+        .ax-grid[data-gap="sm"] { gap: 0.75rem; }
+        .ax-grid[data-gap="md"] { gap: 1rem; }
+        .ax-grid[data-gap="lg"] { gap: 1.5rem; }
+        .ax-grid[data-gap="xl"] { gap: 2rem; }
 
-        [data-layout="grid"][data-cols="4"] {
-            grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
-        }
-
-        [data-recipe="hello-shell"] {
-            gap: 24px;
-        }
-
-        [data-recipe="app-shell"] {
-            display: grid;
-            gap: 18px;
-        }
-
-        [data-recipe="app-frame"] {
-            gap: 20px;
-        }
-
-        [data-ui="card"] {
+        .ax-card {
             padding: 24px;
             border-radius: 24px;
             border: 1px solid var(--ax-border);
-            background: linear-gradient(180deg, rgba(15, 23, 42, 0.94), rgba(15, 23, 42, 0.74));
-            box-shadow: var(--ax-shadow);
+            background: var(--ax-card-surface);
+            box-shadow: var(--ax-card-shadow);
         }
 
-        [data-recipe="hero-card"] {
+        .ax-card[data-recipe="hero-card"] {
             padding: 32px;
-            background:
-                linear-gradient(135deg, rgba(56, 189, 248, 0.16), rgba(14, 165, 233, 0.04)),
-                linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(15, 23, 42, 0.8));
         }
 
-        [data-ui="card-header"] {
-            margin-bottom: 14px;
-            font-size: clamp(1.5rem, 3vw, 2.8rem);
+        .ax-card__title {
+            margin: 0 0 0.85rem;
+            color: var(--ax-text);
+            font-size: clamp(1.5rem, 2vw, 2.15rem);
             line-height: 1.05;
-            font-weight: 700;
-            letter-spacing: -0.04em;
+            font-weight: 800;
+            letter-spacing: -0.03em;
         }
 
-        [data-ui="copy"] {
-            margin: 0 0 14px;
-            color: var(--ax-muted);
+        .ax-copy {
+            margin: 0 0 0.85rem;
+            color: var(--ax-text-soft);
             font-size: 1rem;
-            line-height: 1.65;
+            line-height: 1.55;
         }
 
-        [data-ui="copy"][data-tone="lead"] {
-            font-size: 1.12rem;
-            color: #d6e4f5;
-            max-width: 60ch;
+        .ax-copy[data-tone="lead"] {
+            font-size: 1.06rem;
+            line-height: 1.6;
+            color: var(--ax-text);
         }
 
-        [data-ui="copy"][data-tone="eyebrow"] {
-            color: var(--ax-accent);
+        .ax-copy[data-tone="eyebrow"] {
+            color: var(--ax-cyan);
             font-size: 0.82rem;
             font-weight: 700;
             text-transform: uppercase;
             letter-spacing: 0.14em;
         }
 
-        [data-ui="copy"][data-tone="muted"] {
-            color: var(--ax-muted);
+        .ax-copy[data-tone="muted"] {
+            color: var(--ax-text-muted);
             font-size: 0.95rem;
         }
 
-        [data-ui="button"] {
+        a {
+            color: var(--ax-link);
+            text-decoration: underline;
+            text-underline-offset: 0.14em;
+        }
+
+        .ax-button {
             display: inline-flex;
             align-items: center;
             justify-content: center;
@@ -1546,10 +1559,66 @@ fn preview_styles() -> &'static str {
             padding: 0 16px;
             border: 0;
             border-radius: 999px;
-            background: linear-gradient(135deg, var(--ax-accent), var(--ax-accent-strong));
+            background: color-mix(in srgb, var(--ax-cyan) 80%, white);
             color: #082032;
             font-weight: 700;
-            box-shadow: 0 12px 30px rgba(56, 189, 248, 0.22);
+        }
+
+        .docs-nav {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.75rem 1rem;
+        }
+
+        [data-recipe="app-shell"] {
+            display: grid;
+            gap: 1.25rem;
+        }
+
+        [data-recipe="hello-shell"] {
+            gap: 1.5rem;
+        }
+
+        [data-recipe="app-frame"] {
+            gap: 1.25rem;
+        }
+
+        img {
+            max-width: 100%;
+            height: auto;
+        }
+
+        .ax-card > *:last-child,
+        .ax-copy:last-child {
+            margin-bottom: 0;
+        }
+
+        @media (max-width: 900px) {
+            .ax-grid[data-cols="2"],
+            .ax-grid[data-cols="3"],
+            .ax-grid[data-cols="4"],
+            .ax-grid[data-cols="5"],
+            .ax-grid[data-cols="6"] {
+                grid-template-columns: 1fr;
+            }
+        }
+
+        @media (prefers-reduced-motion: no-preference) {
+            .ax-card,
+            .ax-copy,
+            .ax-button,
+            a {
+                transition:
+                    transform 180ms ease,
+                    border-color 180ms ease,
+                    color 180ms ease,
+                    background-color 180ms ease;
+            }
+        }
+
+        .ax-card__title,
+        .ax-copy[data-tone="lead"] {
+            margin-bottom: 14px;
         }
 
         .ax-form {
@@ -1625,6 +1694,8 @@ page Home
         assert!(html.contains("Hello Axonyx"));
         assert!(html.contains("data-recipe=\"hero-card\""));
         assert!(html.contains("Edit app/page.ax"));
+        assert!(html.contains("class=\"ax-container\""));
+        assert!(html.contains("class=\"ax-card__title\""));
     }
 
     #[test]
@@ -1633,6 +1704,7 @@ page Home
             Some(
                 r#"
 page RootLayout
+  theme "bronze"
   Container max: "xl", recipe: "app-shell"
     Copy tone: "eyebrow" -> "Axonyx Layout"
     Slot
@@ -1650,6 +1722,7 @@ page Home
         assert!(html.contains("Hello Axonyx"));
         assert!(html.contains("Page content"));
         assert!(html.contains("data-ax-page=\"Home\""));
+        assert!(html.contains("<html lang=\"en\" data-theme=\"bronze\">"));
         assert!(!html.contains("data-component=\"Slot\""));
     }
 

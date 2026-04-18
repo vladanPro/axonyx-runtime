@@ -170,11 +170,11 @@ fn lower_component(
 
     let node = match component.name.as_str() {
         "Container" => {
-            attrs.insert(0, attr("data-layout", "container"));
+            prepend_class_attr(&mut attrs, "ax-container");
             attrs.insert(
-                1,
+                attrs.len().min(1),
                 attr(
-                    "data-max-width",
+                    "data-max",
                     prop_string(&mut props, &["max", "max_width"])
                         .unwrap_or_else(|| "xl".to_string()),
                 ),
@@ -183,16 +183,16 @@ fn lower_component(
             element_with_attrs("div", attrs, children)
         }
         "Grid" => {
-            attrs.insert(0, attr("data-layout", "grid"));
+            prepend_class_attr(&mut attrs, "ax-grid");
             attrs.insert(
-                1,
+                attrs.len().min(1),
                 attr(
                     "data-cols",
                     prop_string(&mut props, &["cols"]).unwrap_or_else(|| "1".to_string()),
                 ),
             );
             attrs.insert(
-                2,
+                attrs.len().min(2),
                 attr(
                     "data-gap",
                     prop_string(&mut props, &["gap"]).unwrap_or_else(|| "md".to_string()),
@@ -202,14 +202,14 @@ fn lower_component(
             element_with_attrs("div", attrs, children)
         }
         "Card" => {
-            attrs.insert(0, attr("data-ui", "card"));
+            prepend_class_attr(&mut attrs, "ax-card");
             let title = prop_string(&mut props, &["title"]);
             push_remaining_props(&mut attrs, props);
             let mut body = Vec::new();
             if let Some(title) = title {
                 body.push(element_with_attrs(
-                    "header",
-                    vec![attr("data-ui", "card-header")],
+                    "h2",
+                    vec![attr("class", "ax-card__title")],
                     vec![text(title)],
                 ));
             }
@@ -217,13 +217,13 @@ fn lower_component(
             element_with_attrs("article", attrs, body)
         }
         "Copy" => {
-            attrs.insert(0, attr("data-ui", "copy"));
+            prepend_class_attr(&mut attrs, "ax-copy");
             let tag = prop_string(&mut props, &["as", "tag"]).unwrap_or_else(|| "p".to_string());
             push_remaining_props(&mut attrs, props);
             element_with_attrs(leak_tag(tag), attrs, children)
         }
         "Button" => {
-            attrs.insert(0, attr("data-ui", "button"));
+            prepend_class_attr(&mut attrs, "ax-button");
             push_selected_native_props(&mut attrs, &mut props, &["type", "name", "value", "form"]);
             push_remaining_props(&mut attrs, props);
             element_with_attrs("button", attrs, children)
@@ -309,6 +309,19 @@ fn style_attrs(
         ));
     }
     Ok(attrs)
+}
+
+fn prepend_class_attr(attrs: &mut Vec<Attribute>, class_name: &str) {
+    if let Some(existing) = attrs.iter_mut().find(|attr| attr.name == "class") {
+        if existing.value.is_empty() {
+            existing.value = class_name.to_string();
+        } else {
+            existing.value = format!("{class_name} {}", existing.value);
+        }
+        return;
+    }
+
+    attrs.insert(0, attr("class", class_name));
 }
 
 fn eval_expr(
@@ -479,11 +492,11 @@ page Home
                     tag: "div",
                     attrs: vec![
                         Attribute {
-                            name: "data-layout",
-                            value: "container".to_string()
+                            name: "class",
+                            value: "ax-container".to_string()
                         },
                         Attribute {
-                            name: "data-max-width",
+                            name: "data-max",
                             value: "xl".to_string()
                         },
                     ],
@@ -491,8 +504,8 @@ page Home
                         tag: "div",
                         attrs: vec![
                             Attribute {
-                                name: "data-layout",
-                                value: "grid".to_string()
+                                name: "class",
+                                value: "ax-grid".to_string()
                             },
                             Attribute {
                                 name: "data-cols",
@@ -511,23 +524,23 @@ page Home
                             AxNode::Element {
                                 tag: "article",
                                 attrs: vec![Attribute {
-                                    name: "data-ui",
-                                    value: "card".to_string()
+                                    name: "class",
+                                    value: "ax-card".to_string()
                                 }],
                                 children: vec![
                                     AxNode::Element {
-                                        tag: "header",
+                                        tag: "h2",
                                         attrs: vec![Attribute {
-                                            name: "data-ui",
-                                            value: "card-header".to_string()
+                                            name: "class",
+                                            value: "ax-card__title".to_string()
                                         }],
                                         children: vec![AxNode::Text("Card A".to_string())],
                                     },
                                     AxNode::Element {
                                         tag: "p",
                                         attrs: vec![Attribute {
-                                            name: "data-ui",
-                                            value: "copy".to_string()
+                                            name: "class",
+                                            value: "ax-copy".to_string()
                                         }],
                                         children: vec![AxNode::Text("Intro A".to_string())],
                                     },
@@ -536,23 +549,23 @@ page Home
                             AxNode::Element {
                                 tag: "article",
                                 attrs: vec![Attribute {
-                                    name: "data-ui",
-                                    value: "card".to_string()
+                                    name: "class",
+                                    value: "ax-card".to_string()
                                 }],
                                 children: vec![
                                     AxNode::Element {
-                                        tag: "header",
+                                        tag: "h2",
                                         attrs: vec![Attribute {
-                                            name: "data-ui",
-                                            value: "card-header".to_string()
+                                            name: "class",
+                                            value: "ax-card__title".to_string()
                                         }],
                                         children: vec![AxNode::Text("Card B".to_string())],
                                     },
                                     AxNode::Element {
                                         tag: "p",
                                         attrs: vec![Attribute {
-                                            name: "data-ui",
-                                            value: "copy".to_string()
+                                            name: "class",
+                                            value: "ax-copy".to_string()
                                         }],
                                         children: vec![AxNode::Text("Intro B".to_string())],
                                     },

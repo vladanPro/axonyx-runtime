@@ -24,6 +24,8 @@ pub enum AxParseError {
     InvalidComponent { line: usize },
     #[error("invalid title syntax at line {line}")]
     InvalidTitle { line: usize },
+    #[error("invalid theme syntax at line {line}")]
+    InvalidTheme { line: usize },
     #[error("invalid {kind} syntax at line {line}")]
     InvalidHeadTag { line: usize, kind: String },
     #[error("invalid expression at line {line}: {message}")]
@@ -84,6 +86,11 @@ impl Parser {
 
             if line.text.starts_with("title ") {
                 head.title = Some(self.parse_title()?);
+                continue;
+            }
+
+            if line.text.starts_with("theme ") {
+                head.theme = Some(self.parse_theme()?);
                 continue;
             }
 
@@ -265,6 +272,17 @@ impl Parser {
 
         self.pos += 1;
         parse_expr(expr, line.line)
+    }
+
+    fn parse_theme(&mut self) -> Result<AxExpr, AxParseError> {
+        let line = self.current().expect("line exists").clone();
+        let expr = line.text["theme ".len()..].trim();
+        if expr.is_empty() {
+            return Err(AxParseError::InvalidTheme { line: line.line });
+        }
+
+        self.pos += 1;
+        parse_expr(expr, line.line).map_err(|_| AxParseError::InvalidTheme { line: line.line })
     }
 
     fn parse_head_tag(&mut self, kind: &str) -> Result<AxHeadTag, AxParseError> {
@@ -700,6 +718,7 @@ page Home
         let input = r#"
 page Home
   title "Hello Axonyx"
+  theme "silver"
   meta name: "description", content: "A Rust-first site."
   link rel: "icon", href: "/favicon.svg", type: "image/svg+xml"
   script src: "/app.js", defer: true
@@ -710,6 +729,7 @@ page Home
         let document = parse_ax(input).expect("document should parse");
 
         assert_eq!(document.head.title, Some(AxExpr::string("Hello Axonyx")));
+        assert_eq!(document.head.theme, Some(AxExpr::string("silver")));
         assert_eq!(document.head.metas.len(), 1);
         assert_eq!(document.head.links.len(), 1);
         assert_eq!(document.head.scripts.len(), 1);
