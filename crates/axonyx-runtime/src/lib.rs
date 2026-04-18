@@ -1,7 +1,8 @@
 pub mod backend;
 
 use axonyx_core::ax_ast_prelude::{
-    AxBody, AxComponent, AxDocument, AxPipeline, AxPipelineStage, AxStatement,
+    AxBody, AxComponent, AxDocument, AxExpr, AxHead, AxHeadTag, AxPipeline, AxPipelineStage,
+    AxProp, AxStatement,
 };
 use axonyx_core::ax_lowering::AxLowerError;
 use axonyx_core::ax_lowering_prelude::{lower_document, AxValue};
@@ -105,11 +106,12 @@ pub fn preview_ax_route(
 
     let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
     let node = lower_document(&document, &resolver)?;
-    Ok(render_preview_document(&node))
+    Ok(render_preview_document(&document, &node))
 }
 
 fn compose_layout_with_page(mut layout: AxDocument, page: AxDocument) -> AxDocument {
     let page_name = page.page.name;
+    let page_head = page.head;
     let page_body = page.page.body;
 
     if !inject_slot_statements(&mut layout.page.body, &page_body) {
@@ -117,6 +119,7 @@ fn compose_layout_with_page(mut layout: AxDocument, page: AxDocument) -> AxDocum
     }
 
     layout.page.name = page_name;
+    layout.head.merge(page_head);
     layout
 }
 
@@ -176,15 +179,95 @@ fn is_slot_component(component: &AxComponent) -> bool {
     component.name == "Slot"
 }
 
-fn render_preview_document(root: &AxNode) -> String {
+fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
     let mut body = String::new();
     render_node(root, &mut body);
+    let head = render_head_html(&document.head);
 
     format!(
-        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>Axonyx Preview</title><style>{}</style></head><body>{}</body></html>",
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">{}<style>{}</style></head><body>{}</body></html>",
+        head,
         preview_styles(),
         body
     )
+}
+
+fn render_head_html(head: &AxHead) -> String {
+    let mut html = String::new();
+
+    match &head.title {
+        Some(title) => {
+            html.push_str("<title>");
+            html.push_str(&escape_html(&head_expr_to_string(title)));
+            html.push_str("</title>");
+        }
+        None => html.push_str("<title>Axonyx Preview</title>"),
+    }
+
+    for tag in &head.metas {
+        html.push_str(&render_head_void_tag("meta", tag));
+    }
+
+    for tag in &head.links {
+        html.push_str(&render_head_void_tag("link", tag));
+    }
+
+    for tag in &head.scripts {
+        html.push_str(&render_head_script_tag(tag));
+    }
+
+    html
+}
+
+fn render_head_void_tag(tag: &str, head_tag: &AxHeadTag) -> String {
+    let mut out = String::new();
+    out.push('<');
+    out.push_str(tag);
+    push_head_attrs(head_tag, &mut out);
+    out.push('>');
+    out
+}
+
+fn render_head_script_tag(head_tag: &AxHeadTag) -> String {
+    let mut out = String::new();
+    out.push_str("<script");
+    push_head_attrs(head_tag, &mut out);
+    out.push_str("></script>");
+    out
+}
+
+fn push_head_attrs(head_tag: &AxHeadTag, out: &mut String) {
+    for attr in &head_tag.attrs {
+        push_head_attr(attr, out);
+    }
+}
+
+fn push_head_attr(attr: &AxProp, out: &mut String) {
+    out.push(' ');
+    out.push_str(&attr.name);
+    out.push_str("=\"");
+    out.push_str(&escape_html(&head_expr_to_string(&attr.value)));
+    out.push('"');
+}
+
+fn head_expr_to_string(expr: &AxExpr) -> String {
+    match expr {
+        AxExpr::String(value) => value.clone(),
+        AxExpr::Number(value) => value.to_string(),
+        AxExpr::Bool(value) => value.to_string(),
+        AxExpr::Identifier(value) => value.clone(),
+        AxExpr::Member { object, property } => {
+            format!("{}.{}", head_expr_to_string(object), property)
+        }
+        AxExpr::Call { path, args } => {
+            let args = args
+                .iter()
+                .map(head_expr_to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{}({args})", path.join("."))
+        }
+    }
 }
 
 fn render_node(node: &AxNode, out: &mut String) {
@@ -481,5 +564,50 @@ page DocsHome
         assert!(html.contains("Docs Shell"));
         assert!(html.contains("Nested page"));
         assert!(html.contains("data-ax-page=\"DocsHome\""));
+    }
+
+    #[test]
+    fn previews_head_metadata_inside_html_head() {
+        let html = preview_ax_page(
+            r#"
+page Home
+  title "Axonyx Site"
+  meta name: "description", content: "Fast pages with minimal JS."
+  link rel: "icon", href: "/favicon.svg", type: "image/svg+xml"
+  script src: "/app.js", defer: true
+  Copy -> "Hello"
+"#,
+        )
+        .expect("preview should render");
+
+        assert!(html.contains("<title>Axonyx Site</title>"));
+        assert!(html.contains("<meta name=\"description\" content=\"Fast pages with minimal JS.\">"));
+        assert!(html.contains("<link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">"));
+        assert!(html.contains("<script src=\"/app.js\" defer=\"true\"></script>"));
+    }
+
+    #[test]
+    fn page_title_overrides_layout_title_while_layout_meta_stays() {
+        let html = preview_ax_app(
+            Some(
+                r#"
+page RootLayout
+  title "Layout Title"
+  meta name: "description", content: "Layout description."
+  Slot
+"#,
+            ),
+            r#"
+page Home
+  title "Page Title"
+  link rel: "icon", href: "/favicon.svg"
+  Copy -> "Body"
+"#,
+        )
+        .expect("layout preview should render");
+
+        assert!(html.contains("<title>Page Title</title>"));
+        assert!(html.contains("<meta name=\"description\" content=\"Layout description.\">"));
+        assert!(html.contains("<link rel=\"icon\" href=\"/favicon.svg\">"));
     }
 }

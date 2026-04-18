@@ -22,6 +22,10 @@ pub enum AxParseError {
     InvalidPipelineStage { line: usize },
     #[error("invalid component syntax at line {line}")]
     InvalidComponent { line: usize },
+    #[error("invalid title syntax at line {line}")]
+    InvalidTitle { line: usize },
+    #[error("invalid {kind} syntax at line {line}")]
+    InvalidHeadTag { line: usize, kind: String },
     #[error("invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
 }
@@ -65,9 +69,44 @@ impl Parser {
         }
 
         self.pos += 1;
-        let body = self.parse_block(2)?;
+
+        let mut head = AxHead::default();
+        let mut body = Vec::new();
+
+        while let Some(line) = self.current() {
+            if line.indent < 2 {
+                break;
+            }
+
+            if line.indent > 2 {
+                return Err(AxParseError::UnexpectedIndentation { line: line.line });
+            }
+
+            if line.text.starts_with("title ") {
+                head.title = Some(self.parse_title()?);
+                continue;
+            }
+
+            if line.text.starts_with("meta ") {
+                head.metas.push(self.parse_head_tag("meta")?);
+                continue;
+            }
+
+            if line.text.starts_with("link ") {
+                head.links.push(self.parse_head_tag("link")?);
+                continue;
+            }
+
+            if line.text.starts_with("script ") {
+                head.scripts.push(self.parse_head_tag("script")?);
+                continue;
+            }
+
+            body.push(self.parse_statement(2)?);
+        }
 
         Ok(AxDocument {
+            head,
             page: AxPage::new(name, body),
         })
     }
@@ -216,6 +255,38 @@ impl Parser {
     fn peek(&self, offset: usize) -> Option<&AxLine> {
         self.lines.get(self.pos + offset)
     }
+
+    fn parse_title(&mut self) -> Result<AxExpr, AxParseError> {
+        let line = self.current().expect("line exists").clone();
+        let expr = line.text["title ".len()..].trim();
+        if expr.is_empty() {
+            return Err(AxParseError::InvalidTitle { line: line.line });
+        }
+
+        self.pos += 1;
+        parse_expr(expr, line.line)
+    }
+
+    fn parse_head_tag(&mut self, kind: &str) -> Result<AxHeadTag, AxParseError> {
+        let line = self.current().expect("line exists").clone();
+        let body = line.text[kind.len()..].trim();
+        let props = parse_named_props(body, line.line).map_err(|_| AxParseError::InvalidHeadTag {
+            line: line.line,
+            kind: kind.to_string(),
+        })?;
+
+        if props.is_empty() {
+            return Err(AxParseError::InvalidHeadTag {
+                line: line.line,
+                kind: kind.to_string(),
+            });
+        }
+
+        self.pos += 1;
+        Ok(AxHeadTag::new(
+            props.into_iter().map(|(name, value)| AxProp::new(name, value)),
+        ))
+    }
 }
 
 fn preprocess(input: &str) -> Result<Vec<AxLine>, AxParseError> {
@@ -257,15 +328,8 @@ fn parse_component_line(input: &str, line: usize) -> Result<AxComponent, AxParse
     let mut component = AxComponent::new(name);
 
     if !rest.trim().is_empty() {
-        for part in split_top_level(rest.trim(), ',') {
-            let Some((prop_name, value)) = part.split_once(':') else {
-                return Err(AxParseError::InvalidComponent { line });
-            };
-
-            let prop_name = prop_name.trim();
-            let value = parse_expr(value.trim(), line)?;
-
-            match prop_name {
+        for (prop_name, value) in parse_named_props(rest.trim(), line)? {
+            match prop_name.as_str() {
                 "recipe" => component = component.recipe(value),
                 "class" => component = component.class(value),
                 _ => component = component.prop(prop_name, value),
@@ -278,6 +342,28 @@ fn parse_component_line(input: &str, line: usize) -> Result<AxComponent, AxParse
     }
 
     Ok(component)
+}
+
+fn parse_named_props(input: &str, line: usize) -> Result<Vec<(String, AxExpr)>, AxParseError> {
+    if input.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut props = Vec::new();
+    for part in split_top_level(input, ',') {
+        let Some((name, value)) = part.split_once(':') else {
+            return Err(AxParseError::InvalidComponent { line });
+        };
+
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(AxParseError::InvalidComponent { line });
+        }
+
+        props.push((name.to_string(), parse_expr(value.trim(), line)?));
+    }
+
+    Ok(props)
 }
 
 fn is_component_name(name: &str) -> bool {
@@ -570,6 +656,27 @@ page Home
 
         assert_eq!(anchor.name, "a");
         assert_eq!(anchor.props.len(), 2);
+    }
+
+    #[test]
+    fn parses_document_head_metadata() {
+        let input = r#"
+page Home
+  title "Hello Axonyx"
+  meta name: "description", content: "A Rust-first site."
+  link rel: "icon", href: "/favicon.svg", type: "image/svg+xml"
+  script src: "/app.js", defer: true
+  section class: "hero-shell"
+    Copy -> "Body"
+"#;
+
+        let document = parse_ax(input).expect("document should parse");
+
+        assert_eq!(document.head.title, Some(AxExpr::string("Hello Axonyx")));
+        assert_eq!(document.head.metas.len(), 1);
+        assert_eq!(document.head.links.len(), 1);
+        assert_eq!(document.head.scripts.len(), 1);
+        assert_eq!(document.page.body.len(), 1);
     }
 
     #[test]

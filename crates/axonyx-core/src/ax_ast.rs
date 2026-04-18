@@ -2,12 +2,14 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxDocument {
+    pub head: AxHead,
     pub page: AxPage,
 }
 
 impl AxDocument {
     pub fn page(name: impl Into<String>, body: impl IntoIterator<Item = AxStatement>) -> Self {
         Self {
+            head: AxHead::default(),
             page: AxPage::new(name, body),
         }
     }
@@ -25,6 +27,63 @@ impl AxPage {
             name: name.into(),
             body: body.into_iter().collect(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AxHead {
+    pub title: Option<AxExpr>,
+    pub metas: Vec<AxHeadTag>,
+    pub links: Vec<AxHeadTag>,
+    pub scripts: Vec<AxHeadTag>,
+}
+
+impl AxHead {
+    pub fn with_title(mut self, value: impl Into<AxExpr>) -> Self {
+        self.title = Some(value.into());
+        self
+    }
+
+    pub fn meta(mut self, tag: AxHeadTag) -> Self {
+        self.metas.push(tag);
+        self
+    }
+
+    pub fn link(mut self, tag: AxHeadTag) -> Self {
+        self.links.push(tag);
+        self
+    }
+
+    pub fn script(mut self, tag: AxHeadTag) -> Self {
+        self.scripts.push(tag);
+        self
+    }
+
+    pub fn merge(&mut self, other: AxHead) {
+        if other.title.is_some() {
+            self.title = other.title;
+        }
+        self.metas.extend(other.metas);
+        self.links.extend(other.links);
+        self.scripts.extend(other.scripts);
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct AxHeadTag {
+    pub attrs: Vec<AxProp>,
+}
+
+impl AxHeadTag {
+    pub fn new(attrs: impl IntoIterator<Item = AxProp>) -> Self {
+        Self {
+            attrs: attrs.into_iter().collect(),
+        }
+    }
+
+    pub fn attr(mut self, name: impl Into<String>, value: impl Into<AxExpr>) -> Self {
+        self.attrs.push(AxProp::new(name, value));
+        self
     }
 }
 
@@ -300,6 +359,8 @@ pub mod prelude {
     pub use super::AxEachBlock;
     pub use super::AxEachStage;
     pub use super::AxExpr;
+    pub use super::AxHead;
+    pub use super::AxHeadTag;
     pub use super::AxPage;
     pub use super::AxPipeline;
     pub use super::AxPipelineStage;
