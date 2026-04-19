@@ -16,7 +16,9 @@ use axonyx_core::ax_backend_lowering_prelude::{
 use axonyx_core::ax_backend_parser::AxBackendParseError;
 use axonyx_core::ax_backend_parser_prelude::parse_backend_ax;
 use axonyx_core::ax_lowering::AxLowerError;
-use axonyx_core::ax_lowering_prelude::{lower_document_with_scope, AxValue};
+use axonyx_core::ax_lowering_prelude::{
+    lower_document_with_scope_and_imports, AxImportResolver, AxValue,
+};
 use axonyx_core::ax_parser_auto::AxAutoParseError;
 use axonyx_core::ax_parser_auto_prelude::parse_ax_auto;
 use axonyx_core::prelude::{Attribute, AxNode};
@@ -109,6 +111,13 @@ pub fn preview_ax_page(ax_source: &str) -> Result<String, PreviewError> {
     preview_ax_app(None, ax_source)
 }
 
+pub fn preview_ax_page_with_imports(
+    ax_source: &str,
+    import_resolver: &impl AxImportResolver,
+) -> Result<String, PreviewError> {
+    preview_ax_app_with_imports(None, ax_source, import_resolver)
+}
+
 pub fn preview_ax_app(
     layout_source: Option<&str>,
     page_source: &str,
@@ -117,11 +126,37 @@ pub fn preview_ax_app(
     preview_ax_route(&layout_sources, page_source)
 }
 
+pub fn preview_ax_app_with_imports(
+    layout_source: Option<&str>,
+    page_source: &str,
+    import_resolver: &impl AxImportResolver,
+) -> Result<String, PreviewError> {
+    let layout_sources = layout_source.into_iter().collect::<Vec<_>>();
+    preview_ax_route_with_imports(&layout_sources, page_source, import_resolver)
+}
+
 pub fn preview_ax_route(
     layout_sources: &[&str],
     page_source: &str,
 ) -> Result<String, PreviewError> {
     preview_ax_route_with_loaders(layout_sources, &[], page_source)
+}
+
+pub fn preview_ax_route_with_imports(
+    layout_sources: &[&str],
+    page_source: &str,
+    import_resolver: &impl AxImportResolver,
+) -> Result<String, PreviewError> {
+    let store = AxPreviewStore::default();
+    preview_ax_route_with_backend_and_imports(
+        layout_sources,
+        &[],
+        &[],
+        page_source,
+        "/",
+        &store,
+        import_resolver,
+    )
 }
 
 pub fn preview_ax_route_with_loaders(
@@ -223,6 +258,27 @@ pub fn preview_ax_route_with_backend(
     request_target: &str,
     store: &AxPreviewStore,
 ) -> Result<String, PreviewError> {
+    let import_resolver = |_: &str| None;
+    preview_ax_route_with_backend_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        request_target,
+        store,
+        &import_resolver,
+    )
+}
+
+pub fn preview_ax_route_with_backend_and_imports(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
+) -> Result<String, PreviewError> {
     let page_document = parse_ax_auto(page_source)?;
     let mut document = page_document;
 
@@ -261,7 +317,12 @@ pub fn preview_ax_route_with_backend(
         }
     };
 
-    let node = match lower_document_with_scope(&document, route_scope.clone(), &resolver) {
+    let node = match lower_document_with_scope_and_imports(
+        &document,
+        route_scope.clone(),
+        &resolver,
+        import_resolver,
+    ) {
         Ok(node) => node,
         Err(error) => {
             if let Some(runtime_error) = resolver_error.into_inner() {
@@ -286,6 +347,29 @@ pub fn preview_ax_route_with_request_context(
     request_target: &str,
     route_params: &BTreeMap<String, String>,
     store: &AxPreviewStore,
+) -> Result<String, PreviewError> {
+    let import_resolver = |_: &str| None;
+    preview_ax_route_with_request_context_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        request_target,
+        route_params,
+        store,
+        &import_resolver,
+    )
+}
+
+pub fn preview_ax_route_with_request_context_and_imports(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
 ) -> Result<String, PreviewError> {
     let page_document = parse_ax_auto(page_source)?;
     let mut document = page_document;
@@ -323,7 +407,12 @@ pub fn preview_ax_route_with_request_context(
         }
     };
 
-    let node = match lower_document_with_scope(&document, route_scope.clone(), &resolver) {
+    let node = match lower_document_with_scope_and_imports(
+        &document,
+        route_scope.clone(),
+        &resolver,
+        import_resolver,
+    ) {
         Ok(node) => node,
         Err(error) => {
             if let Some(runtime_error) = resolver_error.into_inner() {
@@ -1830,6 +1919,39 @@ page Home
         assert!(html.contains("data-import-source=\"@/ui\""));
         assert!(html.contains("data-import-name=\"Card\""));
         assert!(html.contains("data-import-local=\"SiteCard\""));
+    }
+
+    #[test]
+    fn previews_imported_component_from_resolved_source() {
+        let resolver = |source: &str| match source {
+            "@axonyx/ui/foundry/SectionCard.ax" => Some(
+                r#"
+page SectionCard
+<Card title={title}>
+  <Slot />
+</Card>
+"#
+                .to_string(),
+            ),
+            _ => None,
+        };
+
+        let html = preview_ax_page_with_imports(
+            r#"
+import { SectionCard } from "@axonyx/ui/foundry/SectionCard.ax"
+
+page Home
+<SectionCard title="Imported title">
+  <Copy>Imported body</Copy>
+</SectionCard>
+"#,
+            &resolver,
+        )
+        .expect("resolved imported component preview should render");
+
+        assert!(html.contains("Imported title"));
+        assert!(html.contains("Imported body"));
+        assert!(!html.contains("data-import-source"));
     }
 
     #[test]
