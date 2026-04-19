@@ -113,6 +113,7 @@ impl Parser {
         }
 
         Ok(AxDocument {
+            imports: Vec::new(),
             head,
             page: AxPage::new(name, body),
         })
@@ -427,7 +428,7 @@ fn split_first_token(input: &str) -> Option<(&str, &str)> {
     }
 }
 
-fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
+pub(crate) fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
     let input = input.trim();
     if input.is_empty() {
         return Err(AxParseError::InvalidExpression {

@@ -17,8 +17,8 @@ use axonyx_core::ax_backend_parser::AxBackendParseError;
 use axonyx_core::ax_backend_parser_prelude::parse_backend_ax;
 use axonyx_core::ax_lowering::AxLowerError;
 use axonyx_core::ax_lowering_prelude::{lower_document_with_scope, AxValue};
-use axonyx_core::ax_parser::AxParseError;
-use axonyx_core::ax_parser_prelude::parse_ax;
+use axonyx_core::ax_parser_auto::AxAutoParseError;
+use axonyx_core::ax_parser_auto_prelude::parse_ax_auto;
 use axonyx_core::prelude::{Attribute, AxNode};
 use axonyx_core::{AxonyxIr, SourceKind, TransformKind, ViewKind};
 use serde::{Deserialize, Serialize};
@@ -86,7 +86,7 @@ pub fn execute_json(ir_json: &str) -> Result<RenderPlan, serde_json::Error> {
 #[derive(Debug, Error)]
 pub enum PreviewError {
     #[error("failed to parse .ax file")]
-    Parse(#[from] AxParseError),
+    Parse(#[from] AxAutoParseError),
     #[error("failed to parse backend .ax file")]
     BackendParse(#[from] AxBackendParseError),
     #[error("failed to lower backend .ax file")]
@@ -223,11 +223,11 @@ pub fn preview_ax_route_with_backend(
     request_target: &str,
     store: &AxPreviewStore,
 ) -> Result<String, PreviewError> {
-    let page_document = parse_ax(page_source)?;
+    let page_document = parse_ax_auto(page_source)?;
     let mut document = page_document;
 
     for layout_source in layout_sources.iter().rev() {
-        let layout_document = parse_ax(layout_source)?;
+        let layout_document = parse_ax_auto(layout_source)?;
         document = compose_layout_with_page(layout_document, document);
     }
 
@@ -287,11 +287,11 @@ pub fn preview_ax_route_with_request_context(
     route_params: &BTreeMap<String, String>,
     store: &AxPreviewStore,
 ) -> Result<String, PreviewError> {
-    let page_document = parse_ax(page_source)?;
+    let page_document = parse_ax_auto(page_source)?;
     let mut document = page_document;
 
     for layout_source in layout_sources.iter().rev() {
-        let layout_document = parse_ax(layout_source)?;
+        let layout_document = parse_ax_auto(layout_source)?;
         document = compose_layout_with_page(layout_document, document);
     }
 
@@ -1224,6 +1224,7 @@ fn url_encode(value: &str) -> String {
 fn compose_layout_with_page(mut layout: AxDocument, page: AxDocument) -> AxDocument {
     let page_name = page.page.name;
     let page_head = page.head;
+    let page_imports = page.imports;
     let page_body = page.page.body;
 
     if !inject_slot_statements(&mut layout.page.body, &page_body) {
@@ -1231,6 +1232,7 @@ fn compose_layout_with_page(mut layout: AxDocument, page: AxDocument) -> AxDocum
     }
 
     layout.page.name = page_name;
+    layout.imports.extend(page_imports);
     layout.head.merge(page_head);
     layout
 }
@@ -1253,7 +1255,13 @@ fn inject_slot_statements(statements: &mut Vec<AxStatement>, page_body: &[AxStat
             }
             AxStatement::Each(mut each) => {
                 found_slot |= inject_slot_statements(&mut each.body, page_body);
+                found_slot |= inject_slot_statements(&mut each.empty_body, page_body);
                 composed.push(AxStatement::Each(each));
+            }
+            AxStatement::If(mut if_block) => {
+                found_slot |= inject_slot_statements(&mut if_block.body, page_body);
+                found_slot |= inject_slot_statements(&mut if_block.else_body, page_body);
+                composed.push(AxStatement::If(if_block));
             }
             AxStatement::Pipeline(mut pipeline) => {
                 found_slot |= inject_slot_pipeline(&mut pipeline, page_body);
@@ -1696,6 +1704,132 @@ page Home
         assert!(html.contains("Edit app/page.ax"));
         assert!(html.contains("class=\"ax-container\""));
         assert!(html.contains("class=\"ax-card__title\""));
+    }
+
+    #[test]
+    fn previews_jsx_like_ax_page_as_html_document() {
+        let html = preview_ax_page(
+            r#"
+page Home
+<Head>
+  <Title>{"Hello Axonyx"}</Title>
+  <Theme>silver</Theme>
+  <Meta name="description" content="Docs without bloat" />
+</Head>
+<Container max="xl">
+  <Card title="Runtime V2">
+    <Copy>Body from JSX-like .ax</Copy>
+  </Card>
+</Container>
+"#,
+        )
+        .expect("jsx-like preview should render");
+
+        assert!(html.contains("<title>Hello Axonyx</title>"));
+        assert!(html.contains("data-theme=\"silver\""));
+        assert!(html.contains("<meta name=\"description\" content=\"Docs without bloat\">"));
+        assert!(html.contains("Runtime V2"));
+        assert!(html.contains("Body from JSX-like .ax"));
+    }
+
+    #[test]
+    fn previews_jsx_like_mixed_children_and_fragment_without_wrapper() {
+        let html = preview_ax_page(
+            r#"
+page Home
+<>
+  <p>
+    Hello <strong>Axonyx</strong>
+  </p>
+</>
+"#,
+        )
+        .expect("mixed children preview should render");
+
+        assert!(html.contains("<p>Hello<strong>Axonyx</strong></p>"));
+        assert!(!html.contains("data-component=\"Fragment\""));
+    }
+
+    #[test]
+    fn previews_jsx_like_each_and_if_controls() {
+        let html = preview_ax_route_with_loaders(
+            &[],
+            &[r#"
+loader PostsList
+  data posts = Db.Stream("posts")
+    where status = "published"
+    order created_at desc
+    limit 2
+  return posts
+"#],
+            r#"
+page Posts
+<If when={false}>
+  <Copy>Hidden</Copy>
+</If>
+<Each item="post" in={load PostsList}>
+  <Card title={post.title}>
+    <Copy>{post.excerpt}</Copy>
+  </Card>
+</Each>
+"#,
+        )
+        .expect("jsx-like control preview should render");
+
+        assert!(!html.contains("Hidden"));
+        assert!(html.contains("Hello Axonyx"));
+        assert!(html.contains("Docs Without Bloat"));
+        assert!(!html.contains("Draft Preview"));
+    }
+
+    #[test]
+    fn previews_jsx_like_else_and_empty_controls() {
+        let html = preview_ax_route_with_loaders(
+            &[],
+            &[r#"
+loader EmptyPosts
+  data posts = Db.Stream("posts")
+    where status = "archived"
+  return posts
+"#],
+            r#"
+page Posts
+<If when={false}>
+  <Copy>Visible when true</Copy>
+  <Else>
+    <Copy>Else branch</Copy>
+  </Else>
+</If>
+<Each item="post" in={load EmptyPosts}>
+  <Card title={post.title} />
+  <Empty>
+    <Copy>No posts yet</Copy>
+  </Empty>
+</Each>
+"#,
+        )
+        .expect("jsx-like else and empty preview should render");
+
+        assert!(html.contains("Else branch"));
+        assert!(html.contains("No posts yet"));
+        assert!(!html.contains("Visible when true"));
+    }
+
+    #[test]
+    fn previews_imported_component_with_resolution_metadata() {
+        let html = preview_ax_page(
+            r#"
+import { Card as SiteCard } from "@/ui"
+
+page Home
+<SiteCard title="Hello import" />
+"#,
+        )
+        .expect("imported component preview should render");
+
+        assert!(html.contains("data-import-source=\"@/ui\""));
+        assert!(html.contains("data-import-name=\"Card\""));
+        assert!(html.contains("data-import-local=\"SiteCard\""));
     }
 
     #[test]

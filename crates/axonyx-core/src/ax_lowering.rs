@@ -102,7 +102,7 @@ pub fn lower_document_with_scope(
     resolver: &impl AxDataResolver,
 ) -> Result<AxNode, AxLowerError> {
     let mut scope = initial_scope;
-    let children = lower_statements(&document.page.body, &mut scope, resolver)?;
+    let children = lower_statements(&document.page.body, &document.imports, &mut scope, resolver)?;
 
     Ok(element_with_attrs(
         "main",
@@ -116,6 +116,7 @@ pub fn lower_document_with_scope(
 
 fn lower_statements(
     statements: &[AxStatement],
+    imports: &[AxImport],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
 ) -> Result<Vec<AxNode>, AxLowerError> {
@@ -133,17 +134,53 @@ fn lower_statements(
                     return Err(AxLowerError::EachRequiresList);
                 };
 
-                for item in items {
+                if items.is_empty() {
                     let mut nested = scope.clone();
-                    nested.insert(block.binding.clone(), item);
-                    nodes.extend(lower_statements(&block.body, &mut nested, resolver)?);
+                    nodes.extend(lower_statements(
+                        &block.empty_body,
+                        imports,
+                        &mut nested,
+                        resolver,
+                    )?);
+                } else {
+                    for item in items {
+                        let mut nested = scope.clone();
+                        nested.insert(block.binding.clone(), item);
+                        nodes.extend(lower_statements(
+                            &block.body,
+                            imports,
+                            &mut nested,
+                            resolver,
+                        )?);
+                    }
                 }
             }
+            AxStatement::If(block) => {
+                let condition = eval_expr(&block.condition, scope, resolver)?;
+                let body = if is_truthy(&condition) {
+                    &block.body
+                } else {
+                    &block.else_body
+                };
+                if !body.is_empty() {
+                    let mut nested = scope.clone();
+                    nodes.extend(lower_statements(body, imports, &mut nested, resolver)?);
+                }
+            }
+            AxStatement::Text(expr) => {
+                nodes.push(text(eval_expr(expr, scope, resolver)?.as_string()));
+            }
             AxStatement::Component(component) => {
-                nodes.push(lower_component(component, scope, resolver)?);
+                if component.name == "Fragment" {
+                    nodes.extend(lower_component_children(
+                        component, imports, scope, resolver,
+                    )?);
+                } else {
+                    nodes.push(lower_component(component, imports, scope, resolver)?);
+                }
             }
             AxStatement::Pipeline(pipeline) => {
-                nodes.push(lower_pipeline(pipeline, scope, resolver)?);
+                nodes.push(lower_pipeline(pipeline, imports, scope, resolver)?);
             }
         }
     }
@@ -153,22 +190,34 @@ fn lower_statements(
 
 fn lower_component(
     component: &AxComponent,
+    imports: &[AxImport],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
 ) -> Result<AxNode, AxLowerError> {
-    let children = match &component.body {
-        AxBody::Empty => Vec::new(),
-        AxBody::Inline(expr) => vec![text(eval_expr(expr, scope, resolver)?.as_string())],
-        AxBody::Block(body) => {
-            let mut nested = scope.clone();
-            lower_statements(body, &mut nested, resolver)?
-        }
-    };
+    let children = lower_component_children(component, imports, scope, resolver)?;
 
     let mut props = eval_props(component, scope, resolver)?;
     let mut attrs = style_attrs(&component.style, scope, resolver)?;
 
     let node = match component.name.as_str() {
+        name if resolve_import(imports, name).is_some() => {
+            let import_decl = resolve_import(imports, name).expect("checked above");
+            attrs.insert(0, attr("data-component", component.name.clone()));
+            attrs.push(attr_boxed(
+                "data-import-source".to_string(),
+                import_decl.source.to_string(),
+            ));
+            attrs.push(attr_boxed(
+                "data-import-name".to_string(),
+                import_decl.binding.imported.clone(),
+            ));
+            attrs.push(attr_boxed(
+                "data-import-local".to_string(),
+                import_decl.binding.local.clone(),
+            ));
+            push_remaining_props(&mut attrs, props);
+            element_with_attrs("div", attrs, children)
+        }
         "Container" => {
             prepend_class_attr(&mut attrs, "ax-container");
             attrs.insert(
@@ -242,8 +291,25 @@ fn lower_component(
     Ok(node)
 }
 
+fn lower_component_children(
+    component: &AxComponent,
+    imports: &[AxImport],
+    scope: &mut BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+) -> Result<Vec<AxNode>, AxLowerError> {
+    match &component.body {
+        AxBody::Empty => Ok(Vec::new()),
+        AxBody::Inline(expr) => Ok(vec![text(eval_expr(expr, scope, resolver)?.as_string())]),
+        AxBody::Block(body) => {
+            let mut nested = scope.clone();
+            lower_statements(body, imports, &mut nested, resolver)
+        }
+    }
+}
+
 fn lower_pipeline(
     pipeline: &AxPipeline,
+    imports: &[AxImport],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
 ) -> Result<AxNode, AxLowerError> {
@@ -270,7 +336,12 @@ fn lower_pipeline(
             }
             AxPipelineStage::Component(component) => {
                 let mut nested_scope = scope.clone();
-                children.push(lower_component(component, &mut nested_scope, resolver)?);
+                children.push(lower_component(
+                    component,
+                    imports,
+                    &mut nested_scope,
+                    resolver,
+                )?);
             }
         }
     }
@@ -373,6 +444,37 @@ fn prop_string(props: &mut BTreeMap<String, AxValue>, names: &[&str]) -> Option<
             return Some(value.as_string());
         }
     }
+    None
+}
+
+fn is_truthy(value: &AxValue) -> bool {
+    match value {
+        AxValue::Null => false,
+        AxValue::String(value) => !value.is_empty(),
+        AxValue::Number(value) => *value != 0,
+        AxValue::Bool(value) => *value,
+        AxValue::Record(fields) => !fields.is_empty(),
+        AxValue::List(items) => !items.is_empty(),
+    }
+}
+
+struct ResolvedImport<'a> {
+    binding: &'a AxImportBinding,
+    source: &'a str,
+}
+
+fn resolve_import<'a>(imports: &'a [AxImport], local_name: &str) -> Option<ResolvedImport<'a>> {
+    for import_decl in imports.iter().rev() {
+        for binding in import_decl.bindings.iter().rev() {
+            if binding.local == local_name {
+                return Some(ResolvedImport {
+                    binding,
+                    source: &import_decl.source,
+                });
+            }
+        }
+    }
+
     None
 }
 
@@ -657,5 +759,140 @@ page Home
         assert!(attrs
             .iter()
             .any(|attr| attr.name == "data-tone" && attr.value == "primary"));
+    }
+
+    #[test]
+    fn lowers_fragment_component_without_extra_wrapper() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::component(AxComponent::fragment([
+                AxStatement::text("Hello "),
+                AxStatement::component(AxComponent::new("strong").inline("Axonyx")),
+            ]))],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0], text("Hello "));
+        assert_eq!(
+            children[1],
+            element_with_attrs("strong", vec![], vec![text("Axonyx")])
+        );
+    }
+
+    #[test]
+    fn lowers_if_block_when_condition_is_truthy() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::if_block(
+                AxExpr::bool(true),
+                [AxStatement::component(
+                    AxComponent::new("Copy").inline("Visible"),
+                )],
+            )],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+
+        assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn lowers_if_block_else_when_condition_is_false() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::If(
+                AxIfBlock::new(
+                    AxExpr::bool(false),
+                    [AxStatement::component(
+                        AxComponent::new("Copy").inline("Hidden"),
+                    )],
+                )
+                .else_body([AxStatement::component(
+                    AxComponent::new("Copy").inline("Visible"),
+                )]),
+            )],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+
+        assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn lowers_each_empty_body_when_list_has_no_items() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::Each(
+                AxEachBlock::new("post", AxExpr::ident("posts"), []).empty([
+                    AxStatement::component(AxComponent::new("Copy").inline("No posts")),
+                ]),
+            )],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert("posts".to_string(), AxValue::list([]));
+
+        let node =
+            lower_document_with_scope(&document, scope, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+
+        assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn lowers_imported_component_with_resolution_metadata() {
+        let document = AxDocument {
+            imports: vec![AxImport::new(
+                [AxImportBinding::new("Card", "SiteCard")],
+                "@/ui",
+            )],
+            head: AxHead::default(),
+            page: AxPage::new(
+                "Home",
+                [AxStatement::component(
+                    AxComponent::new("SiteCard").prop("title", "Hello"),
+                )],
+            ),
+        };
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { attrs, .. } = &children[0] else {
+            panic!("expected imported component placeholder");
+        };
+
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-import-source" && attr.value == "@/ui"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-import-name" && attr.value == "Card"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-import-local" && attr.value == "SiteCard"));
     }
 }

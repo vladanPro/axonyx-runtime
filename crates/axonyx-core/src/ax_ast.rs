@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxDocument {
+    pub imports: Vec<AxImport>,
     pub head: AxHead,
     pub page: AxPage,
 }
@@ -9,8 +10,50 @@ pub struct AxDocument {
 impl AxDocument {
     pub fn page(name: impl Into<String>, body: impl IntoIterator<Item = AxStatement>) -> Self {
         Self {
+            imports: Vec::new(),
             head: AxHead::default(),
             page: AxPage::new(name, body),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxImport {
+    pub bindings: Vec<AxImportBinding>,
+    pub source: String,
+}
+
+impl AxImport {
+    pub fn new(
+        bindings: impl IntoIterator<Item = AxImportBinding>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            bindings: bindings.into_iter().collect(),
+            source: source.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxImportBinding {
+    pub imported: String,
+    pub local: String,
+}
+
+impl AxImportBinding {
+    pub fn new(imported: impl Into<String>, local: impl Into<String>) -> Self {
+        Self {
+            imported: imported.into(),
+            local: local.into(),
+        }
+    }
+
+    pub fn named(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            imported: name.clone(),
+            local: name,
         }
     }
 }
@@ -100,6 +143,8 @@ impl AxHeadTag {
 pub enum AxStatement {
     Data(AxDataBinding),
     Each(AxEachBlock),
+    If(AxIfBlock),
+    Text(AxExpr),
     Component(AxComponent),
     Pipeline(AxPipeline),
 }
@@ -115,6 +160,14 @@ impl AxStatement {
         body: impl IntoIterator<Item = AxStatement>,
     ) -> Self {
         Self::Each(AxEachBlock::new(binding, source, body))
+    }
+
+    pub fn if_block(condition: AxExpr, body: impl IntoIterator<Item = AxStatement>) -> Self {
+        Self::If(AxIfBlock::new(condition, body))
+    }
+
+    pub fn text(value: impl Into<AxExpr>) -> Self {
+        Self::Text(value.into())
     }
 
     pub fn component(component: AxComponent) -> Self {
@@ -146,6 +199,7 @@ pub struct AxEachBlock {
     pub binding: String,
     pub source: AxExpr,
     pub body: Vec<AxStatement>,
+    pub empty_body: Vec<AxStatement>,
 }
 
 impl AxEachBlock {
@@ -158,7 +212,13 @@ impl AxEachBlock {
             binding: binding.into(),
             source,
             body: body.into_iter().collect(),
+            empty_body: Vec::new(),
         }
+    }
+
+    pub fn empty(mut self, body: impl IntoIterator<Item = AxStatement>) -> Self {
+        self.empty_body = body.into_iter().collect();
+        self
     }
 }
 
@@ -218,8 +278,34 @@ impl AxComponent {
         self
     }
 
+    pub fn fragment(body: impl IntoIterator<Item = AxStatement>) -> Self {
+        Self::new("Fragment").block(body)
+    }
+
     pub fn block(mut self, body: impl IntoIterator<Item = AxStatement>) -> Self {
         self.body = AxBody::Block(body.into_iter().collect());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxIfBlock {
+    pub condition: AxExpr,
+    pub body: Vec<AxStatement>,
+    pub else_body: Vec<AxStatement>,
+}
+
+impl AxIfBlock {
+    pub fn new(condition: AxExpr, body: impl IntoIterator<Item = AxStatement>) -> Self {
+        Self {
+            condition,
+            body: body.into_iter().collect(),
+            else_body: Vec::new(),
+        }
+    }
+
+    pub fn else_body(mut self, body: impl IntoIterator<Item = AxStatement>) -> Self {
+        self.else_body = body.into_iter().collect();
         self
     }
 }
@@ -370,6 +456,9 @@ pub mod prelude {
     pub use super::AxExpr;
     pub use super::AxHead;
     pub use super::AxHeadTag;
+    pub use super::AxIfBlock;
+    pub use super::AxImport;
+    pub use super::AxImportBinding;
     pub use super::AxPage;
     pub use super::AxPipeline;
     pub use super::AxPipelineStage;
