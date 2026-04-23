@@ -227,8 +227,8 @@ fn convert_child(child: &AxNodeV2) -> Result<AxStatement, AxConvertV2Error> {
 }
 
 fn convert_each_statement(element: &AxElementNode) -> Result<AxStatement, AxConvertV2Error> {
-    let binding = control_binding_attr(element, &["item", "as"])?;
-    let source = control_expr_attr(element, &["in", "of"])?;
+    let binding = control_binding_attr(element, &["as", "item"])?;
+    let source = control_expr_attr(element, &["items", "in", "of"])?;
     let (body, empty_body) = split_each_children(element)?;
     Ok(AxStatement::Each(
         AxEachBlock::new(binding, source, body).empty(empty_body),
@@ -508,7 +508,7 @@ page Home
         let document = parse_ax_auto(
             r#"
 page Home
-<Each item="post" in={posts}>
+<Each items={posts} as="post">
   <If when={post.published}>
     <Card title={post.title} />
   </If>
@@ -548,7 +548,7 @@ page Home
     <Copy>Not ready</Copy>
   </Else>
 </If>
-<Each item="post" in={posts}>
+<Each items={posts} as="post">
   <Card title={post.title} />
   <Empty>
     <Copy>No posts</Copy>
@@ -579,5 +579,31 @@ page Home
             panic!("expected each block");
         };
         assert_eq!(each_block.empty_body.len(), 1);
+    }
+
+    #[test]
+    fn supports_each_items_and_as_authoring_shape() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+<Each items={posts} as="post">
+  <Card title={post.title} />
+</Each>
+"#,
+        )
+        .expect("each items/as syntax should parse");
+
+        let AxStatement::Component(fragment) = &document.page.body[0] else {
+            panic!("each should convert into fragment component");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("fragment should contain converted control statements");
+        };
+        let AxStatement::Each(each) = &body[0] else {
+            panic!("expected each block");
+        };
+
+        assert_eq!(each.binding, "post");
+        assert_eq!(each.source, AxExpr::ident("posts"));
     }
 }
