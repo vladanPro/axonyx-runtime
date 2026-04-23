@@ -263,9 +263,16 @@ fn lower_component_nodes(
         let Some(slot_context) = slot_context else {
             return Ok(Vec::new());
         };
+        let requested_slot = slot_name_expr(component, scope, resolver)?;
+        let selected_body = select_slot_statements(
+            slot_context.body,
+            requested_slot.as_deref(),
+            scope,
+            resolver,
+        )?;
         let mut nested = scope.clone();
         return lower_statements(
-            slot_context.body,
+            &selected_body,
             slot_context.imports,
             &mut nested,
             resolver,
@@ -672,6 +679,80 @@ fn component_children_to_statements(component: &AxComponent) -> Vec<AxStatement>
         AxBody::Empty => Vec::new(),
         AxBody::Inline(expr) => vec![AxStatement::text(expr.clone())],
         AxBody::Block(body) => body.clone(),
+    }
+}
+
+fn slot_name_expr(
+    component: &AxComponent,
+    scope: &BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+) -> Result<Option<String>, AxLowerError> {
+    for prop in &component.props {
+        if prop.name == "name" || prop.name == "slot" {
+            return Ok(Some(eval_expr(&prop.value, scope, resolver)?.as_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn select_slot_statements(
+    statements: &[AxStatement],
+    requested_slot: Option<&str>,
+    scope: &BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+) -> Result<Vec<AxStatement>, AxLowerError> {
+    let mut selected = Vec::new();
+
+    for statement in statements {
+        if slot_statement_matches(statement, requested_slot, scope, resolver)? {
+            selected.push(strip_slot_statement(statement));
+        }
+    }
+
+    Ok(selected)
+}
+
+fn slot_statement_matches(
+    statement: &AxStatement,
+    requested_slot: Option<&str>,
+    scope: &BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+) -> Result<bool, AxLowerError> {
+    let statement_slot = statement_slot_name(statement, scope, resolver)?;
+
+    Ok(match requested_slot {
+        Some(name) => statement_slot.as_deref() == Some(name),
+        None => statement_slot.is_none(),
+    })
+}
+
+fn statement_slot_name(
+    statement: &AxStatement,
+    scope: &BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+) -> Result<Option<String>, AxLowerError> {
+    let AxStatement::Component(component) = statement else {
+        return Ok(None);
+    };
+
+    for prop in &component.props {
+        if prop.name == "slot" {
+            return Ok(Some(eval_expr(&prop.value, scope, resolver)?.as_string()));
+        }
+    }
+
+    Ok(None)
+}
+
+fn strip_slot_statement(statement: &AxStatement) -> AxStatement {
+    match statement {
+        AxStatement::Component(component) => {
+            let mut component = component.clone();
+            component.props.retain(|prop| prop.name != "slot");
+            AxStatement::Component(component)
+        }
+        other => other.clone(),
     }
 }
 
@@ -1173,6 +1254,89 @@ page Frame
                             ),
                         ],
                     )],
+                )],
+            )
+        );
+    }
+
+    #[test]
+    fn lowers_imported_component_with_named_slots() {
+        let document = AxDocument {
+            imports: vec![AxImport::new(
+                [AxImportBinding::named("ShellCard")],
+                "@/components/shell-card.ax",
+            )],
+            head: AxHead::default(),
+            page: AxPage::new(
+                "Home",
+                [AxStatement::component(
+                    AxComponent::new("ShellCard").block([
+                        AxStatement::component(
+                            AxComponent::new("Copy")
+                                .prop("slot", "eyebrow")
+                                .inline("Framework"),
+                        ),
+                        AxStatement::component(AxComponent::new("Copy").inline("Default body")),
+                    ]),
+                )],
+            ),
+        };
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let import_resolver = |source: &str| -> Option<String> {
+            match source {
+                "@/components/shell-card.ax" => Some(
+                    r#"
+page ShellCard
+<Card title="Slot demo">
+  <Copy tone="lead">
+    <Slot name="eyebrow" />
+  </Copy>
+  <Slot />
+</Card>
+"#
+                    .to_string(),
+                ),
+                _ => None,
+            }
+        };
+
+        let node = lower_document_with_scope_and_imports(
+            &document,
+            BTreeMap::new(),
+            &resolver,
+            &import_resolver,
+        )
+        .expect("document should lower");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "article",
+                    vec![attr("class", "ax-card")],
+                    vec![
+                        element_with_attrs(
+                            "h2",
+                            vec![attr("class", "ax-card__title")],
+                            vec![text("Slot demo")],
+                        ),
+                        element_with_attrs(
+                            "p",
+                            vec![attr("class", "ax-copy"), attr("data-tone", "lead")],
+                            vec![element_with_attrs(
+                                "p",
+                                vec![attr("class", "ax-copy")],
+                                vec![text("Framework")],
+                            )],
+                        ),
+                        element_with_attrs(
+                            "p",
+                            vec![attr("class", "ax-copy")],
+                            vec![text("Default body")],
+                        ),
+                    ],
                 )],
             )
         );
