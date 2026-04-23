@@ -31,6 +31,8 @@ pub enum AxConvertV2Error {
     ControlBranchAttrsNotSupported { tag: String, branch: String },
     #[error("`<{tag}>` only allows one `<{branch}>` branch")]
     DuplicateControlBranch { tag: String, branch: String },
+    #[error("`<{branch}>` must be the final control branch inside `<{tag}>`")]
+    ControlBranchMustBeLast { tag: String, branch: String },
     #[error("`<{branch}>` is only valid inside `<{tag}>`")]
     UnexpectedControlBranch { tag: String, branch: String },
     #[error("`<Head>` only accepts element children")]
@@ -236,7 +238,7 @@ fn convert_each_statement(element: &AxElementNode) -> Result<AxStatement, AxConv
 }
 
 fn convert_if_statement(element: &AxElementNode) -> Result<AxStatement, AxConvertV2Error> {
-    let condition = control_expr_attr(element, &["when"])?;
+    let condition = control_expr_attr(element, &["when", "condition"])?;
     let (body, else_body) = split_if_children(element)?;
     Ok(AxStatement::If(
         AxIfBlock::new(condition, body).else_body(else_body),
@@ -326,31 +328,96 @@ fn split_each_children(
 fn split_if_children(
     element: &AxElementNode,
 ) -> Result<(Vec<AxStatement>, Vec<AxStatement>), AxConvertV2Error> {
-    let mut body = Vec::new();
-    let mut else_body = None;
+    split_if_children_from_slice(&element.name, &element.children)
+}
 
-    for child in &element.children {
-        match child {
+fn split_if_children_from_slice(
+    tag: &str,
+    children: &[AxNodeV2],
+) -> Result<(Vec<AxStatement>, Vec<AxStatement>), AxConvertV2Error> {
+    let mut body = Vec::new();
+    let mut index = 0;
+
+    while index < children.len() {
+        match &children[index] {
             AxNodeV2::Element(branch) if branch.name == "Else" => {
                 if !branch.attrs.is_empty() {
                     return Err(AxConvertV2Error::ControlBranchAttrsNotSupported {
-                        tag: element.name.clone(),
+                        tag: tag.to_string(),
                         branch: "Else".to_string(),
                     });
                 }
-                if else_body.is_some() {
-                    return Err(AxConvertV2Error::DuplicateControlBranch {
-                        tag: element.name.clone(),
+                if index + 1 != children.len() {
+                    return Err(AxConvertV2Error::ControlBranchMustBeLast {
+                        tag: tag.to_string(),
                         branch: "Else".to_string(),
                     });
                 }
-                else_body = Some(convert_children(&branch.children)?);
+                return Ok((body, convert_children(&branch.children)?));
             }
-            _ => body.push(convert_child(child)?),
+            AxNodeV2::Element(branch) if branch.name == "ElseIf" => {
+                let condition = control_expr_attr(branch, &["when", "condition"])?;
+                let nested_body = convert_children(&branch.children)?;
+                let nested_else_body = convert_if_tail(tag, &children[index + 1..])?;
+                return Ok((
+                    body,
+                    vec![AxStatement::If(
+                        AxIfBlock::new(condition, nested_body).else_body(nested_else_body),
+                    )],
+                ));
+            }
+            child => {
+                body.push(convert_child(child)?);
+                index += 1;
+            }
         }
     }
 
-    Ok((body, else_body.unwrap_or_default()))
+    Ok((body, Vec::new()))
+}
+
+fn convert_if_tail(tag: &str, tail: &[AxNodeV2]) -> Result<Vec<AxStatement>, AxConvertV2Error> {
+    let Some(first) = tail.first() else {
+        return Ok(Vec::new());
+    };
+
+    match first {
+        AxNodeV2::Element(branch) if branch.name == "Else" => {
+            if !branch.attrs.is_empty() {
+                return Err(AxConvertV2Error::ControlBranchAttrsNotSupported {
+                    tag: tag.to_string(),
+                    branch: "Else".to_string(),
+                });
+            }
+            if tail.len() > 1 {
+                return Err(AxConvertV2Error::ControlBranchMustBeLast {
+                    tag: tag.to_string(),
+                    branch: "Else".to_string(),
+                });
+            }
+            convert_children(&branch.children)
+        }
+        AxNodeV2::Element(branch) if branch.name == "ElseIf" => {
+            let condition = control_expr_attr(branch, &["when", "condition"])?;
+            let nested_body = convert_children(&branch.children)?;
+            let nested_else_body = convert_if_tail(tag, &tail[1..])?;
+            Ok(vec![AxStatement::If(
+                AxIfBlock::new(condition, nested_body).else_body(nested_else_body),
+            )])
+        }
+        AxNodeV2::Element(branch) if branch.name == "Empty" => {
+            Err(AxConvertV2Error::UnexpectedControlBranch {
+                tag: tag.to_string(),
+                branch: branch.name.clone(),
+            })
+        }
+        AxNodeV2::Element(_) | AxNodeV2::Text(_) | AxNodeV2::Expr(_) => {
+            Err(AxConvertV2Error::ControlBranchMustBeLast {
+                tag: tag.to_string(),
+                branch: "ElseIf".to_string(),
+            })
+        }
+    }
 }
 
 fn convert_prop(attr: &AxAttributeNode) -> Result<AxProp, AxConvertV2Error> {
@@ -579,6 +646,64 @@ page Home
             panic!("expected each block");
         };
         assert_eq!(each_block.empty_body.len(), 1);
+    }
+
+    #[test]
+    fn supports_if_condition_alias_and_else_if_chain() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+<If condition={is_ready}>
+  <Copy>Ready</Copy>
+  <ElseIf when={is_loading}>
+    <Copy>Loading</Copy>
+  </ElseIf>
+  <Else>
+    <Copy>Idle</Copy>
+  </Else>
+</If>
+"#,
+        )
+        .expect("if condition alias and else if should parse");
+
+        let AxStatement::Component(fragment) = &document.page.body[0] else {
+            panic!("if should convert into fragment component");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("fragment should contain converted if statement");
+        };
+        let AxStatement::If(if_block) = &body[0] else {
+            panic!("expected top-level if block");
+        };
+
+        assert_eq!(if_block.condition, AxExpr::ident("is_ready"));
+        let AxStatement::If(else_if) = &if_block.else_body[0] else {
+            panic!("expected else-if to lower into nested if");
+        };
+        assert_eq!(else_if.condition, AxExpr::ident("is_loading"));
+        assert_eq!(else_if.else_body.len(), 1);
+    }
+
+    #[test]
+    fn rejects_nodes_after_else_branch() {
+        let error = parse_ax_auto(
+            r#"
+page Home
+<If when={ready}>
+  <Copy>Ready</Copy>
+  <Else>
+    <Copy>Not ready</Copy>
+  </Else>
+  <Copy>Trailing</Copy>
+</If>
+"#,
+        )
+        .expect_err("trailing nodes after else should fail");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::ControlBranchMustBeLast { .. })
+        ));
     }
 
     #[test]
