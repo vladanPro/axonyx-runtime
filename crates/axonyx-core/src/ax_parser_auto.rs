@@ -88,6 +88,11 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
 
     Ok(AxDocument {
         imports: file.imports.iter().map(convert_import_decl).collect(),
+        components: file
+            .components
+            .iter()
+            .map(convert_component_decl)
+            .collect::<Result<Vec<_>, _>>()?,
         head,
         page: AxPage::new(file.page.name.clone(), body),
     })
@@ -100,6 +105,16 @@ fn convert_import_decl(import_decl: &crate::ax_ast_v2::AxImportDecl) -> AxImport
         }),
         import_decl.source.clone(),
     )
+}
+
+fn convert_component_decl(
+    component: &AxComponentDeclV2,
+) -> Result<AxComponentDef, AxConvertV2Error> {
+    Ok(AxComponentDef::new(
+        component.name.clone(),
+        component.params.clone(),
+        convert_children(&component.body)?,
+    ))
 }
 
 fn merge_head_element(head: &mut AxHead, element: &AxElementNode) -> Result<(), AxConvertV2Error> {
@@ -552,6 +567,30 @@ page Home
 
         assert_eq!(body.len(), 2);
         assert_eq!(body[0], AxStatement::text("Hello"));
+    }
+
+    #[test]
+    fn converts_local_component_declarations_into_runtime_defs() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+component FeatureCard(title) {
+  <Card title={title}>
+    <Slot />
+  </Card>
+}
+
+<FeatureCard title="Hello">Body</FeatureCard>
+"#,
+        )
+        .expect("local component declaration should convert");
+
+        assert_eq!(document.components.len(), 1);
+        assert_eq!(document.components[0].name, "FeatureCard");
+        assert_eq!(document.components[0].params, vec!["title"]);
+        assert_eq!(document.components[0].body.len(), 1);
+        assert_eq!(document.page.body.len(), 1);
     }
 
     #[test]

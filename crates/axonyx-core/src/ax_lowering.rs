@@ -134,6 +134,7 @@ pub fn lower_document_with_scope_and_imports(
     let children = lower_statements(
         &document.page.body,
         &document.imports,
+        &document.components,
         &mut scope,
         resolver,
         import_resolver,
@@ -153,12 +154,14 @@ pub fn lower_document_with_scope_and_imports(
 struct SlotContext<'a> {
     body: &'a [AxStatement],
     imports: &'a [AxImport],
+    components: &'a [AxComponentDef],
     parent: Option<&'a SlotContext<'a>>,
 }
 
 fn lower_statements(
     statements: &[AxStatement],
     imports: &[AxImport],
+    components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
@@ -183,6 +186,7 @@ fn lower_statements(
                     nodes.extend(lower_statements(
                         &block.empty_body,
                         imports,
+                        components,
                         &mut nested,
                         resolver,
                         import_resolver,
@@ -195,6 +199,7 @@ fn lower_statements(
                         nodes.extend(lower_statements(
                             &block.body,
                             imports,
+                            components,
                             &mut nested,
                             resolver,
                             import_resolver,
@@ -215,6 +220,7 @@ fn lower_statements(
                     nodes.extend(lower_statements(
                         body,
                         imports,
+                        components,
                         &mut nested,
                         resolver,
                         import_resolver,
@@ -229,6 +235,7 @@ fn lower_statements(
                 nodes.extend(lower_component_nodes(
                     component,
                     imports,
+                    components,
                     scope,
                     resolver,
                     import_resolver,
@@ -239,6 +246,7 @@ fn lower_statements(
                 nodes.push(lower_pipeline(
                     pipeline,
                     imports,
+                    components,
                     scope,
                     resolver,
                     import_resolver,
@@ -254,6 +262,7 @@ fn lower_statements(
 fn lower_component_nodes(
     component: &AxComponent,
     imports: &[AxImport],
+    components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
@@ -274,6 +283,7 @@ fn lower_component_nodes(
         return lower_statements(
             &selected_body,
             slot_context.imports,
+            slot_context.components,
             &mut nested,
             resolver,
             import_resolver,
@@ -285,6 +295,20 @@ fn lower_component_nodes(
         return lower_component_children(
             component,
             imports,
+            components,
+            scope,
+            resolver,
+            import_resolver,
+            slot_context,
+        );
+    }
+
+    if let Some(component_def) = resolve_component(components, &component.name) {
+        return lower_local_component_nodes(
+            component,
+            component_def,
+            imports,
+            components,
             scope,
             resolver,
             import_resolver,
@@ -298,6 +322,7 @@ fn lower_component_nodes(
                 component,
                 import_decl,
                 imports,
+                components,
                 scope,
                 resolver,
                 import_resolver,
@@ -310,6 +335,7 @@ fn lower_component_nodes(
     Ok(vec![lower_component_node(
         component,
         imports,
+        components,
         scope,
         resolver,
         import_resolver,
@@ -320,6 +346,7 @@ fn lower_component_nodes(
 fn lower_component_node(
     component: &AxComponent,
     imports: &[AxImport],
+    components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
@@ -328,6 +355,7 @@ fn lower_component_node(
     let children = lower_component_children(
         component,
         imports,
+        components,
         scope,
         resolver,
         import_resolver,
@@ -432,6 +460,7 @@ fn lower_component_node(
 fn lower_component_children(
     component: &AxComponent,
     imports: &[AxImport],
+    components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
@@ -445,6 +474,7 @@ fn lower_component_children(
             lower_statements(
                 body,
                 imports,
+                components,
                 &mut nested,
                 resolver,
                 import_resolver,
@@ -457,6 +487,7 @@ fn lower_component_children(
 fn lower_pipeline(
     pipeline: &AxPipeline,
     imports: &[AxImport],
+    components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
@@ -488,6 +519,7 @@ fn lower_pipeline(
                 children.extend(lower_component_nodes(
                     component,
                     imports,
+                    components,
                     &mut nested_scope,
                     resolver,
                     import_resolver,
@@ -629,10 +661,60 @@ fn resolve_import<'a>(imports: &'a [AxImport], local_name: &str) -> Option<Resol
     None
 }
 
+fn resolve_component<'a>(
+    components: &'a [AxComponentDef],
+    local_name: &str,
+) -> Option<&'a AxComponentDef> {
+    components
+        .iter()
+        .rev()
+        .find(|component| component.name == local_name)
+}
+
+fn lower_local_component_nodes(
+    component: &AxComponent,
+    component_def: &AxComponentDef,
+    imports: &[AxImport],
+    components: &[AxComponentDef],
+    scope: &mut BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+    import_resolver: &impl AxImportResolver,
+    slot_context: Option<&SlotContext<'_>>,
+) -> Result<Vec<AxNode>, AxLowerError> {
+    let props = eval_props(component, scope, resolver)?;
+    let mut component_scope = scope.clone();
+
+    for param in &component_def.params {
+        component_scope.insert(
+            param.clone(),
+            props.get(param).cloned().unwrap_or(AxValue::Null),
+        );
+    }
+
+    let slot_body = component_children_to_statements(component);
+    let slot_context = SlotContext {
+        body: &slot_body,
+        imports,
+        components,
+        parent: slot_context,
+    };
+
+    lower_statements(
+        &component_def.body,
+        imports,
+        components,
+        &mut component_scope,
+        resolver,
+        import_resolver,
+        Some(&slot_context),
+    )
+}
+
 fn lower_imported_component_nodes(
     component: &AxComponent,
     import_decl: ResolvedImport<'_>,
     imports: &[AxImport],
+    components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
@@ -661,12 +743,14 @@ fn lower_imported_component_nodes(
     let slot_context = SlotContext {
         body: &slot_body,
         imports,
+        components,
         parent: slot_context,
     };
 
     lower_statements(
         &document.page.body,
         &document.imports,
+        &document.components,
         &mut imported_scope,
         resolver,
         import_resolver,
@@ -1146,6 +1230,7 @@ page Home
                 [AxImportBinding::new("Card", "SiteCard")],
                 "@/ui",
             )],
+            components: Vec::new(),
             head: AxHead::default(),
             page: AxPage::new(
                 "Home",
@@ -1177,12 +1262,60 @@ page Home
     }
 
     #[test]
+    fn lowers_local_component_with_props_and_slot() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+component FeatureCard(title) {
+  <Card title={title}>
+    <Slot />
+  </Card>
+}
+
+<FeatureCard title="Hello">
+  <Copy>World</Copy>
+</FeatureCard>
+"#,
+        )
+        .expect("document should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "article",
+                    vec![attr("class", "ax-card")],
+                    vec![
+                        element_with_attrs(
+                            "h2",
+                            vec![attr("class", "ax-card__title")],
+                            vec![text("Hello")],
+                        ),
+                        element_with_attrs(
+                            "p",
+                            vec![attr("class", "ax-copy")],
+                            vec![text("World")],
+                        ),
+                    ],
+                )],
+            )
+        );
+    }
+
+    #[test]
     fn lowers_imported_component_from_resolved_source_with_slot_and_nested_imports() {
         let document = AxDocument {
             imports: vec![AxImport::new(
                 [AxImportBinding::named("SiteCard")],
                 "@/components/site-card.ax",
             )],
+            components: Vec::new(),
             head: AxHead::default(),
             page: AxPage::new(
                 "Home",
@@ -1266,6 +1399,7 @@ page Frame
                 [AxImportBinding::named("ShellCard")],
                 "@/components/shell-card.ax",
             )],
+            components: Vec::new(),
             head: AxHead::default(),
             page: AxPage::new(
                 "Home",

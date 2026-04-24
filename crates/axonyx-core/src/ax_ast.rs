@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxDocument {
     pub imports: Vec<AxImport>,
+    pub components: Vec<AxComponentDef>,
     pub head: AxHead,
     pub page: AxPage,
 }
@@ -11,6 +12,7 @@ impl AxDocument {
     pub fn page(name: impl Into<String>, body: impl IntoIterator<Item = AxStatement>) -> Self {
         Self {
             imports: Vec::new(),
+            components: Vec::new(),
             head: AxHead::default(),
             page: AxPage::new(name, body),
         }
@@ -54,6 +56,27 @@ impl AxImportBinding {
         Self {
             imported: name.clone(),
             local: name,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxComponentDef {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Vec<AxStatement>,
+}
+
+impl AxComponentDef {
+    pub fn new(
+        name: impl Into<String>,
+        params: impl IntoIterator<Item = impl Into<String>>,
+        body: impl IntoIterator<Item = AxStatement>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            params: params.into_iter().map(Into::into).collect(),
+            body: body.into_iter().collect(),
         }
     }
 }
@@ -449,6 +472,7 @@ impl From<bool> for AxExpr {
 pub mod prelude {
     pub use super::AxBody;
     pub use super::AxComponent;
+    pub use super::AxComponentDef;
     pub use super::AxDataBinding;
     pub use super::AxDocument;
     pub use super::AxEachBlock;

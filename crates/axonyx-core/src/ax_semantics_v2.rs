@@ -1,3 +1,5 @@
+use std::collections::BTreeSet;
+
 use thiserror::Error;
 
 use crate::ax_ast_v2::prelude::*;
@@ -6,6 +8,12 @@ use crate::ax_ast_v2::prelude::*;
 pub enum AxSemanticV2Error {
     #[error("import local name `{name}` is reserved by Axonyx built-ins; import it with an alias from `{import_source}`")]
     ReservedImportName { name: String, import_source: String },
+    #[error("component name `{name}` is reserved by Axonyx built-ins")]
+    ReservedComponentName { name: String },
+    #[error("duplicate component declaration `{name}`")]
+    DuplicateComponentName { name: String },
+    #[error("component name `{name}` conflicts with an imported local name")]
+    ComponentNameConflictsWithImport { name: String },
     #[error("`<{tag}>` is only valid inside `<Head>`")]
     HeadTagOutsideHead { tag: String },
     #[error("`<Head>` is only valid at the top level of a page")]
@@ -14,6 +22,13 @@ pub enum AxSemanticV2Error {
 
 pub fn validate_ax_v2_semantics(file: &AxFileV2) -> Result<(), AxSemanticV2Error> {
     validate_import_names(file)?;
+    validate_component_names(file)?;
+
+    for component in &file.components {
+        for node in &component.body {
+            validate_node(node, NodeContext::Body)?;
+        }
+    }
 
     for node in &file.body {
         validate_node(node, NodeContext::TopLevel)?;
@@ -31,6 +46,38 @@ fn validate_import_names(file: &AxFileV2) -> Result<(), AxSemanticV2Error> {
                     import_source: import.source.clone(),
                 });
             }
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_component_names(file: &AxFileV2) -> Result<(), AxSemanticV2Error> {
+    let mut import_names = BTreeSet::new();
+    for import in &file.imports {
+        for binding in &import.bindings {
+            import_names.insert(binding.local.as_str());
+        }
+    }
+
+    let mut component_names = BTreeSet::new();
+    for component in &file.components {
+        if is_reserved_import_name(&component.name) {
+            return Err(AxSemanticV2Error::ReservedComponentName {
+                name: component.name.clone(),
+            });
+        }
+
+        if import_names.contains(component.name.as_str()) {
+            return Err(AxSemanticV2Error::ComponentNameConflictsWithImport {
+                name: component.name.clone(),
+            });
+        }
+
+        if !component_names.insert(component.name.as_str()) {
+            return Err(AxSemanticV2Error::DuplicateComponentName {
+                name: component.name.clone(),
+            });
         }
     }
 
@@ -172,6 +219,56 @@ page Home
             error,
             AxSemanticV2Error::HeadTagOutsideHead {
                 tag: "Link".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_local_components_that_shadow_reserved_tags() {
+        let file = parse_ax_v2(
+            r#"
+page Home
+
+component Slot() {
+  <Copy>Body</Copy>
+}
+"#,
+        )
+        .expect("source should parse");
+
+        let error = validate_ax_v2_semantics(&file).expect_err("component name should fail");
+
+        assert_eq!(
+            error,
+            AxSemanticV2Error::ReservedComponentName {
+                name: "Slot".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_local_components() {
+        let file = parse_ax_v2(
+            r#"
+page Home
+
+component Feature() {
+  <Copy>One</Copy>
+}
+
+component Feature() {
+  <Copy>Two</Copy>
+}
+"#,
+        )
+        .expect("source should parse");
+
+        let error = validate_ax_v2_semantics(&file).expect_err("duplicate name should fail");
+
+        assert_eq!(
+            error,
+            AxSemanticV2Error::DuplicateComponentName {
+                name: "Feature".to_string()
             }
         );
     }

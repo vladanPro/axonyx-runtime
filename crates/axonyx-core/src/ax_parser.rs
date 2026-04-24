@@ -114,6 +114,7 @@ impl Parser {
 
         Ok(AxDocument {
             imports: Vec::new(),
+            components: Vec::new(),
             head,
             page: AxPage::new(name, body),
         })

@@ -14,6 +14,8 @@ pub enum AxParseV2Error {
     EmptyImportList { line: usize },
     #[error("expected `page <Name>` at line {line}")]
     InvalidPage { line: usize },
+    #[error("invalid component syntax at line {line}")]
+    InvalidComponent { line: usize },
     #[error("duplicate page declaration at line {line}")]
     DuplicatePage { line: usize },
     #[error("missing page declaration")]
@@ -76,11 +78,18 @@ impl<'a> Parser<'a> {
         let page = self.parse_page_decl()?;
         self.skip_layout_whitespace();
 
+        let mut components = Vec::new();
+        while self.starts_with_keyword("component") {
+            components.push(self.parse_component_decl()?);
+            self.skip_layout_whitespace();
+        }
+
         let body = self.parse_nodes(None)?;
 
         Ok(AxFileV2 {
             imports,
             page,
+            components,
             body,
         })
     }
@@ -167,6 +176,52 @@ impl<'a> Parser<'a> {
         Ok(AxPageDecl::new(name))
     }
 
+    fn parse_component_decl(&mut self) -> Result<AxComponentDeclV2, AxParseV2Error> {
+        let line = self.line;
+        self.expect_keyword("component")
+            .map_err(|_| AxParseV2Error::InvalidComponent { line })?;
+        self.skip_spaces();
+
+        let name = self.parse_identifier()?;
+        self.skip_spaces();
+
+        let mut params = Vec::new();
+        if self.peek_char() == Some('(') {
+            self.bump_char();
+            loop {
+                self.skip_spaces();
+                if self.peek_char() == Some(')') {
+                    self.bump_char();
+                    break;
+                }
+
+                params.push(self.parse_identifier()?);
+                self.skip_spaces();
+
+                match self.peek_char() {
+                    Some(',') => {
+                        self.bump_char();
+                    }
+                    Some(')') => {
+                        self.bump_char();
+                        break;
+                    }
+                    _ => return Err(AxParseV2Error::InvalidComponent { line }),
+                }
+            }
+        }
+
+        self.skip_layout_whitespace();
+        if self.peek_char() != Some('{') {
+            return Err(AxParseV2Error::InvalidComponent { line });
+        }
+        self.bump_char();
+        self.skip_layout_whitespace();
+        let body = self.parse_nodes_until_component_body_end()?;
+
+        Ok(AxComponentDeclV2::new(name, params, body))
+    }
+
     fn parse_nodes(&mut self, closing_tag: Option<&str>) -> Result<Vec<AxNodeV2>, AxParseV2Error> {
         let mut nodes = Vec::new();
 
@@ -225,6 +280,47 @@ impl<'a> Parser<'a> {
         }
 
         Ok(nodes)
+    }
+
+    fn parse_nodes_until_component_body_end(&mut self) -> Result<Vec<AxNodeV2>, AxParseV2Error> {
+        let mut nodes = Vec::new();
+
+        while !self.eof() {
+            if self.peek_char() == Some('}') {
+                self.bump_char();
+                return Ok(nodes);
+            }
+
+            if self.starts_with("</") {
+                let line = self.line;
+                self.bump_char();
+                self.bump_char();
+                let name = if self.peek_char() == Some('>') {
+                    "Fragment".to_string()
+                } else {
+                    self.parse_identifier()?
+                };
+                return Err(AxParseV2Error::UnexpectedClosingTag { line, name });
+            }
+
+            if self.peek_char() == Some('<') {
+                nodes.push(AxNodeV2::Element(self.parse_element()?));
+                continue;
+            }
+
+            if self.peek_char() == Some('{') {
+                nodes.push(AxNodeV2::Expr(AxExprNode::new(
+                    self.parse_expression_block()?,
+                )));
+                continue;
+            }
+
+            if let Some(text) = self.parse_text_node_until_component_body_end() {
+                nodes.push(AxNodeV2::Text(AxTextNode::new(text)));
+            }
+        }
+
+        Err(AxParseV2Error::InvalidComponent { line: self.line })
     }
 
     fn parse_element(&mut self) -> Result<AxElementNode, AxParseV2Error> {
@@ -307,6 +403,19 @@ impl<'a> Parser<'a> {
         let start = self.pos;
         while let Some(ch) = self.peek_char() {
             if ch == '<' || ch == '{' {
+                break;
+            }
+            self.bump_char();
+        }
+
+        let raw = &self.input[start..self.pos];
+        normalize_text(raw)
+    }
+
+    fn parse_text_node_until_component_body_end(&mut self) -> Option<String> {
+        let start = self.pos;
+        while let Some(ch) = self.peek_char() {
+            if ch == '<' || ch == '{' || ch == '}' {
                 break;
             }
             self.bump_char();
@@ -642,6 +751,47 @@ page Home
                 AxAttributeNode::string("gap", "lg"),
             ]
         );
+    }
+
+    #[test]
+    fn parses_local_component_declarations_before_page_body() {
+        let input = r#"
+page Home
+
+component FeatureCard(title, tone) {
+  <Card title={title}>
+    <Copy tone={tone}>
+      <Slot />
+    </Copy>
+  </Card>
+}
+
+<FeatureCard title="Hello" tone="lead">
+  World
+</FeatureCard>
+"#;
+
+        let file = parse_ax_v2(input).expect("component declaration should parse");
+
+        assert_eq!(file.components.len(), 1);
+        assert_eq!(file.components[0].name, "FeatureCard");
+        assert_eq!(file.components[0].params, vec!["title", "tone"]);
+        assert_eq!(file.components[0].body.len(), 1);
+        assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn rejects_unclosed_local_component_declarations() {
+        let input = r#"
+page Home
+
+component FeatureCard(title) {
+  <Card title={title} />
+"#;
+
+        let error = parse_ax_v2(input).expect_err("component declaration should be unclosed");
+
+        assert!(matches!(error, AxParseV2Error::InvalidComponent { .. }));
     }
 
     #[test]

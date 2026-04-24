@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct AxFileV2 {
     pub imports: Vec<AxImportDecl>,
     pub page: AxPageDecl,
+    pub components: Vec<AxComponentDeclV2>,
     pub body: Vec<AxNodeV2>,
 }
 
@@ -56,6 +57,27 @@ pub struct AxPageDecl {
 impl AxPageDecl {
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxComponentDeclV2 {
+    pub name: String,
+    pub params: Vec<String>,
+    pub body: Vec<AxNodeV2>,
+}
+
+impl AxComponentDeclV2 {
+    pub fn new(
+        name: impl Into<String>,
+        params: impl IntoIterator<Item = impl Into<String>>,
+        body: impl IntoIterator<Item = AxNodeV2>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            params: params.into_iter().map(Into::into).collect(),
+            body: body.into_iter().collect(),
+        }
     }
 }
 
@@ -157,6 +179,7 @@ impl AxExprNode {
 pub mod prelude {
     pub use super::AxAttributeNode;
     pub use super::AxAttributeValue;
+    pub use super::AxComponentDeclV2;
     pub use super::AxElementNode;
     pub use super::AxExprNode;
     pub use super::AxFileV2;
@@ -182,6 +205,7 @@ mod tests {
                 "@axonyx/ui",
             )],
             page: AxPageDecl::new("Home"),
+            components: Vec::new(),
             body: vec![AxNodeV2::Element(
                 AxElementNode::new("Card")
                     .attr(AxAttributeNode::string("title", "Hello"))
