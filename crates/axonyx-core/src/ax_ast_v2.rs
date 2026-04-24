@@ -79,20 +79,42 @@ impl AxLetDeclV2 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxComponentDeclV2 {
     pub name: String,
-    pub params: Vec<String>,
+    pub params: Vec<AxComponentParamDeclV2>,
     pub body: Vec<AxNodeV2>,
 }
 
 impl AxComponentDeclV2 {
     pub fn new(
         name: impl Into<String>,
-        params: impl IntoIterator<Item = impl Into<String>>,
+        params: impl IntoIterator<Item = AxComponentParamDeclV2>,
         body: impl IntoIterator<Item = AxNodeV2>,
     ) -> Self {
         Self {
             name: name.into(),
-            params: params.into_iter().map(Into::into).collect(),
+            params: params.into_iter().collect(),
             body: body.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxComponentParamDeclV2 {
+    pub name: String,
+    pub default: Option<String>,
+}
+
+impl AxComponentParamDeclV2 {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            default: None,
+        }
+    }
+
+    pub fn with_default(name: impl Into<String>, default: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            default: Some(default.into()),
         }
     }
 }
@@ -196,6 +218,7 @@ pub mod prelude {
     pub use super::AxAttributeNode;
     pub use super::AxAttributeValue;
     pub use super::AxComponentDeclV2;
+    pub use super::AxComponentParamDeclV2;
     pub use super::AxElementNode;
     pub use super::AxExprNode;
     pub use super::AxFileV2;

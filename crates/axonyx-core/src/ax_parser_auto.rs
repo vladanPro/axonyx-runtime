@@ -119,9 +119,24 @@ fn convert_component_decl(
 ) -> Result<AxComponentDef, AxConvertV2Error> {
     Ok(AxComponentDef::new(
         component.name.clone(),
-        component.params.clone(),
+        component
+            .params
+            .iter()
+            .map(convert_component_param_decl)
+            .collect::<Result<Vec<_>, _>>()?,
         convert_children(&component.body)?,
     ))
+}
+
+fn convert_component_param_decl(
+    param: &AxComponentParamDeclV2,
+) -> Result<AxComponentParamDef, AxConvertV2Error> {
+    Ok(match &param.default {
+        Some(default) => {
+            AxComponentParamDef::with_default(param.name.clone(), parse_v2_expr(default)?)
+        }
+        None => AxComponentParamDef::new(param.name.clone()),
+    })
 }
 
 fn merge_head_element(head: &mut AxHead, element: &AxElementNode) -> Result<(), AxConvertV2Error> {
@@ -595,9 +610,38 @@ component FeatureCard(title) {
 
         assert_eq!(document.components.len(), 1);
         assert_eq!(document.components[0].name, "FeatureCard");
-        assert_eq!(document.components[0].params, vec!["title"]);
+        assert_eq!(
+            document.components[0].params,
+            vec![AxComponentParamDef::new("title")]
+        );
         assert_eq!(document.components[0].body.len(), 1);
         assert_eq!(document.page.body.len(), 1);
+    }
+
+    #[test]
+    fn converts_local_component_param_defaults_into_runtime_exprs() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+component FeatureCard(title = "Hello") {
+  <Card title={title}>
+    <Slot />
+  </Card>
+}
+
+<FeatureCard />
+"#,
+        )
+        .expect("local component default should convert");
+
+        assert_eq!(
+            document.components[0].params,
+            vec![AxComponentParamDef::with_default(
+                "title",
+                AxExpr::string("Hello")
+            )]
+        );
     }
 
     #[test]

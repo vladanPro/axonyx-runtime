@@ -231,8 +231,7 @@ impl<'a> Parser<'a> {
                     break;
                 }
 
-                params.push(self.parse_identifier()?);
-                self.skip_spaces();
+                params.push(self.parse_component_param(line)?);
 
                 match self.peek_char() {
                     Some(',') => {
@@ -256,6 +255,28 @@ impl<'a> Parser<'a> {
         let body = self.parse_nodes_until_component_body_end()?;
 
         Ok(AxComponentDeclV2::new(name, params, body))
+    }
+
+    fn parse_component_param(
+        &mut self,
+        line: usize,
+    ) -> Result<AxComponentParamDeclV2, AxParseV2Error> {
+        let name = self.parse_identifier()?;
+        self.skip_spaces();
+
+        if self.peek_char() != Some('=') {
+            return Ok(AxComponentParamDeclV2::new(name));
+        }
+
+        self.bump_char();
+        self.skip_spaces();
+
+        let default = self.read_component_param_default().trim().to_string();
+        if default.is_empty() {
+            return Err(AxParseV2Error::InvalidComponent { line });
+        }
+
+        Ok(AxComponentParamDeclV2::with_default(name, default))
     }
 
     fn parse_nodes(&mut self, closing_tag: Option<&str>) -> Result<Vec<AxNodeV2>, AxParseV2Error> {
@@ -662,6 +683,44 @@ impl<'a> Parser<'a> {
         value
     }
 
+    fn read_component_param_default(&mut self) -> String {
+        let start = self.pos;
+        let mut string_quote = None;
+        let mut paren_depth = 0usize;
+
+        while let Some(ch) = self.peek_char() {
+            if let Some(quote) = string_quote {
+                self.bump_char();
+                if ch == quote {
+                    string_quote = None;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' | '\'' => {
+                    string_quote = Some(ch);
+                    self.bump_char();
+                }
+                '(' => {
+                    paren_depth += 1;
+                    self.bump_char();
+                }
+                ')' if paren_depth == 0 => break,
+                ')' => {
+                    paren_depth -= 1;
+                    self.bump_char();
+                }
+                ',' if paren_depth == 0 => break,
+                _ => {
+                    self.bump_char();
+                }
+            }
+        }
+
+        self.input[start..self.pos].to_string()
+    }
+
     fn skip_layout_whitespace(&mut self) {
         while let Some(ch) = self.peek_char() {
             if ch.is_whitespace() {
@@ -825,9 +884,41 @@ component FeatureCard(title, tone) {
 
         assert_eq!(file.components.len(), 1);
         assert_eq!(file.components[0].name, "FeatureCard");
-        assert_eq!(file.components[0].params, vec!["title", "tone"]);
+        assert_eq!(
+            file.components[0].params,
+            vec![
+                AxComponentParamDeclV2::new("title"),
+                AxComponentParamDeclV2::new("tone")
+            ]
+        );
         assert_eq!(file.components[0].body.len(), 1);
         assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn parses_local_component_param_defaults() {
+        let input = r#"
+page Home
+
+component FeatureCard(title = "Hello", tone = defaultTone, count = 2) {
+  <Card title={title}>
+    <Copy tone={tone}>{count}</Copy>
+  </Card>
+}
+
+<FeatureCard />
+"#;
+
+        let file = parse_ax_v2(input).expect("component defaults should parse");
+
+        assert_eq!(
+            file.components[0].params,
+            vec![
+                AxComponentParamDeclV2::with_default("title", "\"Hello\""),
+                AxComponentParamDeclV2::with_default("tone", "defaultTone"),
+                AxComponentParamDeclV2::with_default("count", "2")
+            ]
+        );
     }
 
     #[test]

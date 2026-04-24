@@ -63,20 +63,42 @@ impl AxImportBinding {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxComponentDef {
     pub name: String,
-    pub params: Vec<String>,
+    pub params: Vec<AxComponentParamDef>,
     pub body: Vec<AxStatement>,
 }
 
 impl AxComponentDef {
     pub fn new(
         name: impl Into<String>,
-        params: impl IntoIterator<Item = impl Into<String>>,
+        params: impl IntoIterator<Item = AxComponentParamDef>,
         body: impl IntoIterator<Item = AxStatement>,
     ) -> Self {
         Self {
             name: name.into(),
-            params: params.into_iter().map(Into::into).collect(),
+            params: params.into_iter().collect(),
             body: body.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxComponentParamDef {
+    pub name: String,
+    pub default: Option<AxExpr>,
+}
+
+impl AxComponentParamDef {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            default: None,
+        }
+    }
+
+    pub fn with_default(name: impl Into<String>, default: AxExpr) -> Self {
+        Self {
+            name: name.into(),
+            default: Some(default),
         }
     }
 }
@@ -473,6 +495,7 @@ pub mod prelude {
     pub use super::AxBody;
     pub use super::AxComponent;
     pub use super::AxComponentDef;
+    pub use super::AxComponentParamDef;
     pub use super::AxDataBinding;
     pub use super::AxDocument;
     pub use super::AxEachBlock;

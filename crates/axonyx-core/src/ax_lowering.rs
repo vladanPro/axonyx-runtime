@@ -685,10 +685,14 @@ fn lower_local_component_nodes(
     let mut component_scope = scope.clone();
 
     for param in &component_def.params {
-        component_scope.insert(
-            param.clone(),
-            props.get(param).cloned().unwrap_or(AxValue::Null),
-        );
+        let value = if let Some(value) = props.get(&param.name) {
+            value.clone()
+        } else if let Some(default) = &param.default {
+            eval_expr(default, &component_scope, resolver)?
+        } else {
+            AxValue::Null
+        };
+        component_scope.insert(param.name.clone(), value);
     }
 
     let slot_body = component_children_to_statements(component);
@@ -1344,6 +1348,53 @@ let heroTitle = "Hello Axonyx"
                             "p",
                             vec![attr("class", "ax-copy")],
                             vec![text("Hello Axonyx")],
+                        ),
+                    ],
+                )],
+            )
+        );
+    }
+
+    #[test]
+    fn lowers_local_component_default_params_when_props_are_missing() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+let defaultTitle = "Default title"
+
+component FeatureCard(title = defaultTitle, tone = "lead") {
+  <Card title={title}>
+    <Copy tone={tone}>Body</Copy>
+  </Card>
+}
+
+<FeatureCard />
+"#,
+        )
+        .expect("document should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "article",
+                    vec![attr("class", "ax-card")],
+                    vec![
+                        element_with_attrs(
+                            "h2",
+                            vec![attr("class", "ax-card__title")],
+                            vec![text("Default title")],
+                        ),
+                        element_with_attrs(
+                            "p",
+                            vec![attr("class", "ax-copy"), attr("data-tone", "lead")],
+                            vec![text("Body")],
                         ),
                     ],
                 )],
