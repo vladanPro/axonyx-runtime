@@ -1410,7 +1410,7 @@ fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
 }
 
 fn ax_behavior_script() -> &'static str {
-    r#"<script data-ax-runtime="behavior">
+    r##"<script data-ax-runtime="behavior">
 (() => {
   if (window.__axonyxBehaviorRuntime) return;
   window.__axonyxBehaviorRuntime = true;
@@ -1419,10 +1419,27 @@ fn ax_behavior_script() -> &'static str {
     trigger.setAttribute("aria-expanded", expanded ? "true" : "false");
   };
 
-  const toggleTarget = (trigger) => {
+  const targetFor = (trigger) => {
     const selector = trigger.getAttribute("data-ax-behavior-target");
-    if (!selector) return;
-    const target = document.querySelector(selector);
+    if (!selector) return null;
+    return document.querySelector(selector);
+  };
+
+  const initToggle = (trigger) => {
+    const selector = trigger.getAttribute("data-ax-behavior-target");
+    if (selector && selector.startsWith("#") && !trigger.hasAttribute("aria-controls")) {
+      trigger.setAttribute("aria-controls", selector.slice(1));
+    }
+    const target = targetFor(trigger);
+    if (target) setExpanded(trigger, !target.hidden);
+  };
+
+  const init = () => {
+    document.querySelectorAll('[data-ax-behavior="toggle"]').forEach(initToggle);
+  };
+
+  const toggleTarget = (trigger) => {
+    const target = targetFor(trigger);
     if (!target) return;
     const nextHidden = !target.hidden;
     target.hidden = nextHidden;
@@ -1437,8 +1454,14 @@ fn ax_behavior_script() -> &'static str {
       toggleTarget(trigger);
     }
   });
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init, { once: true });
+  } else {
+    init();
+  }
 })();
-</script>"#
+</script>"##
 }
 
 fn render_html_attrs(head: &AxHead) -> String {
@@ -1884,6 +1907,8 @@ page Home
         assert!(interactive_html.contains("data-ax-behavior-target=\"#menu\""));
         assert!(interactive_html.contains("data-ax-runtime=\"behavior\""));
         assert!(interactive_html.contains("window.__axonyxBehaviorRuntime"));
+        assert!(interactive_html.contains("aria-controls"));
+        assert!(interactive_html.contains("DOMContentLoaded"));
     }
 
     #[test]
