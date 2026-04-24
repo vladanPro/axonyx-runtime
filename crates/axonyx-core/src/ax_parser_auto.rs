@@ -73,6 +73,13 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
     let mut head = AxHead::default();
     let mut body = Vec::new();
 
+    for binding in &file.lets {
+        body.push(AxStatement::data(
+            binding.name.clone(),
+            parse_v2_expr(&binding.value)?,
+        ));
+    }
+
     for node in &file.body {
         match node {
             AxNodeV2::Element(element) if element.name == "Head" => {
@@ -591,6 +598,26 @@ component FeatureCard(title) {
         assert_eq!(document.components[0].params, vec!["title"]);
         assert_eq!(document.components[0].body.len(), 1);
         assert_eq!(document.page.body.len(), 1);
+    }
+
+    #[test]
+    fn converts_top_level_let_declarations_into_data_statements() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+let heroTitle = "Hello Axonyx"
+
+<Copy>{heroTitle}</Copy>
+"#,
+        )
+        .expect("let declaration should convert");
+
+        assert_eq!(document.page.body.len(), 2);
+        assert_eq!(
+            document.page.body[0],
+            AxStatement::data("heroTitle", AxExpr::string("Hello Axonyx"))
+        );
     }
 
     #[test]

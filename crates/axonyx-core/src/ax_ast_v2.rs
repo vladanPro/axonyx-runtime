@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct AxFileV2 {
     pub imports: Vec<AxImportDecl>,
     pub page: AxPageDecl,
+    pub lets: Vec<AxLetDeclV2>,
     pub components: Vec<AxComponentDeclV2>,
     pub body: Vec<AxNodeV2>,
 }
@@ -57,6 +58,21 @@ pub struct AxPageDecl {
 impl AxPageDecl {
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxLetDeclV2 {
+    pub name: String,
+    pub value: String,
+}
+
+impl AxLetDeclV2 {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
     }
 }
 
@@ -185,6 +201,7 @@ pub mod prelude {
     pub use super::AxFileV2;
     pub use super::AxImportBinding;
     pub use super::AxImportDecl;
+    pub use super::AxLetDeclV2;
     pub use super::AxNodeV2;
     pub use super::AxPageDecl;
     pub use super::AxTextNode;
@@ -205,6 +222,7 @@ mod tests {
                 "@axonyx/ui",
             )],
             page: AxPageDecl::new("Home"),
+            lets: Vec::new(),
             components: Vec::new(),
             body: vec![AxNodeV2::Element(
                 AxElementNode::new("Card")

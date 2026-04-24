@@ -14,6 +14,8 @@ pub enum AxParseV2Error {
     EmptyImportList { line: usize },
     #[error("expected `page <Name>` at line {line}")]
     InvalidPage { line: usize },
+    #[error("invalid let syntax at line {line}")]
+    InvalidLet { line: usize },
     #[error("invalid component syntax at line {line}")]
     InvalidComponent { line: usize },
     #[error("duplicate page declaration at line {line}")]
@@ -78,9 +80,14 @@ impl<'a> Parser<'a> {
         let page = self.parse_page_decl()?;
         self.skip_layout_whitespace();
 
+        let mut lets = Vec::new();
         let mut components = Vec::new();
-        while self.starts_with_keyword("component") {
-            components.push(self.parse_component_decl()?);
+        while self.starts_with_keyword("let") || self.starts_with_keyword("component") {
+            if self.starts_with_keyword("let") {
+                lets.push(self.parse_let_decl()?);
+            } else {
+                components.push(self.parse_component_decl()?);
+            }
             self.skip_layout_whitespace();
         }
 
@@ -89,6 +96,7 @@ impl<'a> Parser<'a> {
         Ok(AxFileV2 {
             imports,
             page,
+            lets,
             components,
             body,
         })
@@ -174,6 +182,34 @@ impl<'a> Parser<'a> {
         self.page_seen = true;
 
         Ok(AxPageDecl::new(name))
+    }
+
+    fn parse_let_decl(&mut self) -> Result<AxLetDeclV2, AxParseV2Error> {
+        let line = self.line;
+        self.expect_keyword("let")
+            .map_err(|_| AxParseV2Error::InvalidLet { line })?;
+        self.skip_spaces();
+
+        let name = self.parse_identifier()?;
+        self.skip_spaces();
+
+        if self.peek_char() != Some('=') {
+            return Err(AxParseV2Error::InvalidLet { line });
+        }
+        self.bump_char();
+        self.skip_spaces();
+
+        let value = self
+            .read_until_line_end()
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            return Err(AxParseV2Error::InvalidLet { line });
+        }
+
+        Ok(AxLetDeclV2::new(name, value))
     }
 
     fn parse_component_decl(&mut self) -> Result<AxComponentDeclV2, AxParseV2Error> {
@@ -612,6 +648,20 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn read_until_line_end(&mut self) -> String {
+        let start = self.pos;
+        while let Some(ch) = self.peek_char() {
+            if ch == '\n' || ch == '\r' {
+                break;
+            }
+            self.bump_char();
+        }
+
+        let value = self.input[start..self.pos].to_string();
+        self.consume_until_line_end();
+        value
+    }
+
     fn skip_layout_whitespace(&mut self) {
         while let Some(ch) = self.peek_char() {
             if ch.is_whitespace() {
@@ -778,6 +828,45 @@ component FeatureCard(title, tone) {
         assert_eq!(file.components[0].params, vec!["title", "tone"]);
         assert_eq!(file.components[0].body.len(), 1);
         assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn parses_top_level_let_declarations_before_page_body() {
+        let input = r#"
+page Home
+
+let heroTitle = "Hello Axonyx";
+let columns = 3
+
+<Grid cols={columns}>
+  <Copy>{heroTitle}</Copy>
+</Grid>
+"#;
+
+        let file = parse_ax_v2(input).expect("let declarations should parse");
+
+        assert_eq!(file.lets.len(), 2);
+        assert_eq!(
+            file.lets[0],
+            AxLetDeclV2::new("heroTitle", "\"Hello Axonyx\"")
+        );
+        assert_eq!(file.lets[1], AxLetDeclV2::new("columns", "3"));
+        assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn rejects_empty_top_level_let_declarations() {
+        let input = r#"
+page Home
+
+let title =
+
+<Copy>Body</Copy>
+"#;
+
+        let error = parse_ax_v2(input).expect_err("empty let should fail");
+
+        assert!(matches!(error, AxParseV2Error::InvalidLet { .. }));
     }
 
     #[test]

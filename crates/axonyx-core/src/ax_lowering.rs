@@ -1309,6 +1309,49 @@ component FeatureCard(title) {
     }
 
     #[test]
+    fn lowers_top_level_let_bindings_in_v2_documents() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+let heroTitle = "Hello Axonyx"
+
+<Card title={heroTitle}>
+  <Copy>{heroTitle}</Copy>
+</Card>
+"#,
+        )
+        .expect("document should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "article",
+                    vec![attr("class", "ax-card")],
+                    vec![
+                        element_with_attrs(
+                            "h2",
+                            vec![attr("class", "ax-card__title")],
+                            vec![text("Hello Axonyx")],
+                        ),
+                        element_with_attrs(
+                            "p",
+                            vec![attr("class", "ax-copy")],
+                            vec![text("Hello Axonyx")],
+                        ),
+                    ],
+                )],
+            )
+        );
+    }
+
+    #[test]
     fn lowers_imported_component_from_resolved_source_with_slot_and_nested_imports() {
         let document = AxDocument {
             imports: vec![AxImport::new(
