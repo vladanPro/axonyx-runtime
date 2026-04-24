@@ -400,6 +400,7 @@ fn lower_component_node(
                 "data-import-local".to_string(),
                 import_decl.binding.local.clone(),
             ));
+            push_behavior_props(&mut attrs, &mut props);
             push_remaining_props(&mut attrs, props);
             element_with_attrs("div", attrs, children)
         }
@@ -413,6 +414,7 @@ fn lower_component_node(
                         .unwrap_or_else(|| "xl".to_string()),
                 ),
             );
+            push_behavior_props(&mut attrs, &mut props);
             push_remaining_props(&mut attrs, props);
             element_with_attrs("div", attrs, children)
         }
@@ -432,12 +434,14 @@ fn lower_component_node(
                     prop_string(&mut props, &["gap"]).unwrap_or_else(|| "md".to_string()),
                 ),
             );
+            push_behavior_props(&mut attrs, &mut props);
             push_remaining_props(&mut attrs, props);
             element_with_attrs("div", attrs, children)
         }
         "Card" => {
             prepend_class_attr(&mut attrs, "ax-card");
             let title = prop_string(&mut props, &["title"]);
+            push_behavior_props(&mut attrs, &mut props);
             push_remaining_props(&mut attrs, props);
             let mut body = Vec::new();
             if let Some(title) = title {
@@ -453,21 +457,25 @@ fn lower_component_node(
         "Copy" => {
             prepend_class_attr(&mut attrs, "ax-copy");
             let tag = prop_string(&mut props, &["as", "tag"]).unwrap_or_else(|| "p".to_string());
+            push_behavior_props(&mut attrs, &mut props);
             push_remaining_props(&mut attrs, props);
             element_with_attrs(leak_tag(tag), attrs, children)
         }
         "Button" => {
             prepend_class_attr(&mut attrs, "ax-button");
             push_selected_native_props(&mut attrs, &mut props, &["type", "name", "value", "form"]);
+            push_behavior_props(&mut attrs, &mut props);
             push_remaining_props(&mut attrs, props);
             element_with_attrs("button", attrs, children)
         }
         tag if is_native_html_tag(tag) => {
+            push_behavior_props(&mut attrs, &mut props);
             push_native_props(&mut attrs, props);
             element_with_attrs(leak_tag(tag.to_string()), attrs, children)
         }
         other => {
             attrs.insert(0, attr("data-component", other.to_string()));
+            push_behavior_props(&mut attrs, &mut props);
             push_remaining_props(&mut attrs, props);
             element_with_attrs("div", attrs, children)
         }
@@ -941,6 +949,24 @@ fn push_remaining_props(attrs: &mut Vec<Attribute>, props: BTreeMap<String, AxVa
     }
 }
 
+fn push_behavior_props(attrs: &mut Vec<Attribute>, props: &mut BTreeMap<String, AxValue>) {
+    let mappings = [
+        ("behavior", "data-ax-behavior"),
+        ("behavior_target", "data-ax-behavior-target"),
+        ("behaviorTarget", "data-ax-behavior-target"),
+        ("behavior_action", "data-ax-behavior-action"),
+        ("behaviorAction", "data-ax-behavior-action"),
+        ("behavior_value", "data-ax-behavior-value"),
+        ("behaviorValue", "data-ax-behavior-value"),
+    ];
+
+    for (prop_name, attr_name) in mappings {
+        if let Some(value) = props.remove(prop_name) {
+            attrs.push(attr_boxed(attr_name.to_string(), value.as_string()));
+        }
+    }
+}
+
 fn push_selected_native_props(
     attrs: &mut Vec<Attribute>,
     props: &mut BTreeMap<String, AxValue>,
@@ -1218,6 +1244,88 @@ page Home
         assert!(attrs
             .iter()
             .any(|attr| attr.name == "data-tone" && attr.value == "primary"));
+    }
+
+    #[test]
+    fn component_behavior_props_emit_ax_behavior_attributes() {
+        let document = parse_ax_auto(
+            r##"
+page Home
+
+<Button
+  behavior="toggle"
+  behaviorTarget="#menu"
+  behaviorAction="open"
+  behaviorValue="expanded"
+  tone="primary"
+>
+  Menu
+</Button>
+"##,
+        )
+        .expect("document should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { attrs, .. } = &children[0] else {
+            panic!("expected button");
+        };
+
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-ax-behavior" && attr.value == "toggle"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-ax-behavior-target" && attr.value == "#menu"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-ax-behavior-action" && attr.value == "open"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-ax-behavior-value" && attr.value == "expanded"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-tone" && attr.value == "primary"));
+        assert!(!attrs.iter().any(|attr| attr.name == "data-behavior"));
+    }
+
+    #[test]
+    fn native_behavior_props_emit_ax_behavior_attributes() {
+        let document = parse_ax_auto(
+            r##"
+page Home
+
+<button behavior="dialog" behavior_target="#modal" type="button">
+  Open
+</button>
+"##,
+        )
+        .expect("document should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { attrs, .. } = &children[0] else {
+            panic!("expected native button");
+        };
+
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-ax-behavior" && attr.value == "dialog"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-ax-behavior-target" && attr.value == "#modal"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "type" && attr.value == "button"));
+        assert!(!attrs.iter().any(|attr| attr.name == "behavior"));
     }
 
     #[test]
