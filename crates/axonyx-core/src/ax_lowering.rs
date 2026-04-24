@@ -133,6 +133,7 @@ pub fn lower_document_with_scope_and_imports(
     let mut scope = initial_scope;
     let children = lower_statements(
         &document.page.body,
+        &document.functions,
         &document.imports,
         &document.components,
         &mut scope,
@@ -153,6 +154,7 @@ pub fn lower_document_with_scope_and_imports(
 
 struct SlotContext<'a> {
     body: &'a [AxStatement],
+    functions: &'a [AxFunctionDef],
     imports: &'a [AxImport],
     components: &'a [AxComponentDef],
     parent: Option<&'a SlotContext<'a>>,
@@ -160,6 +162,7 @@ struct SlotContext<'a> {
 
 fn lower_statements(
     statements: &[AxStatement],
+    functions: &[AxFunctionDef],
     imports: &[AxImport],
     components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
@@ -172,11 +175,11 @@ fn lower_statements(
     for statement in statements {
         match statement {
             AxStatement::Data(binding) => {
-                let value = eval_expr(&binding.value, scope, resolver)?;
+                let value = eval_expr(&binding.value, functions, scope, resolver)?;
                 scope.insert(binding.name.clone(), value);
             }
             AxStatement::Each(block) => {
-                let source = eval_expr(&block.source, scope, resolver)?;
+                let source = eval_expr(&block.source, functions, scope, resolver)?;
                 let AxValue::List(items) = source else {
                     return Err(AxLowerError::EachRequiresList);
                 };
@@ -185,6 +188,7 @@ fn lower_statements(
                     let mut nested = scope.clone();
                     nodes.extend(lower_statements(
                         &block.empty_body,
+                        functions,
                         imports,
                         components,
                         &mut nested,
@@ -198,6 +202,7 @@ fn lower_statements(
                         nested.insert(block.binding.clone(), item);
                         nodes.extend(lower_statements(
                             &block.body,
+                            functions,
                             imports,
                             components,
                             &mut nested,
@@ -209,7 +214,7 @@ fn lower_statements(
                 }
             }
             AxStatement::If(block) => {
-                let condition = eval_expr(&block.condition, scope, resolver)?;
+                let condition = eval_expr(&block.condition, functions, scope, resolver)?;
                 let body = if is_truthy(&condition) {
                     &block.body
                 } else {
@@ -219,6 +224,7 @@ fn lower_statements(
                     let mut nested = scope.clone();
                     nodes.extend(lower_statements(
                         body,
+                        functions,
                         imports,
                         components,
                         &mut nested,
@@ -229,11 +235,14 @@ fn lower_statements(
                 }
             }
             AxStatement::Text(expr) => {
-                nodes.push(text(eval_expr(expr, scope, resolver)?.as_string()));
+                nodes.push(text(
+                    eval_expr(expr, functions, scope, resolver)?.as_string(),
+                ));
             }
             AxStatement::Component(component) => {
                 nodes.extend(lower_component_nodes(
                     component,
+                    functions,
                     imports,
                     components,
                     scope,
@@ -245,6 +254,7 @@ fn lower_statements(
             AxStatement::Pipeline(pipeline) => {
                 nodes.push(lower_pipeline(
                     pipeline,
+                    functions,
                     imports,
                     components,
                     scope,
@@ -261,6 +271,7 @@ fn lower_statements(
 
 fn lower_component_nodes(
     component: &AxComponent,
+    functions: &[AxFunctionDef],
     imports: &[AxImport],
     components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
@@ -272,16 +283,18 @@ fn lower_component_nodes(
         let Some(slot_context) = slot_context else {
             return Ok(Vec::new());
         };
-        let requested_slot = slot_name_expr(component, scope, resolver)?;
+        let requested_slot = slot_name_expr(component, slot_context.functions, scope, resolver)?;
         let selected_body = select_slot_statements(
             slot_context.body,
             requested_slot.as_deref(),
+            slot_context.functions,
             scope,
             resolver,
         )?;
         let mut nested = scope.clone();
         return lower_statements(
             &selected_body,
+            slot_context.functions,
             slot_context.imports,
             slot_context.components,
             &mut nested,
@@ -294,6 +307,7 @@ fn lower_component_nodes(
     if component.name == "Fragment" {
         return lower_component_children(
             component,
+            functions,
             imports,
             components,
             scope,
@@ -307,6 +321,7 @@ fn lower_component_nodes(
         return lower_local_component_nodes(
             component,
             component_def,
+            functions,
             imports,
             components,
             scope,
@@ -321,6 +336,7 @@ fn lower_component_nodes(
             return lower_imported_component_nodes(
                 component,
                 import_decl,
+                functions,
                 imports,
                 components,
                 scope,
@@ -334,6 +350,7 @@ fn lower_component_nodes(
 
     Ok(vec![lower_component_node(
         component,
+        functions,
         imports,
         components,
         scope,
@@ -345,6 +362,7 @@ fn lower_component_nodes(
 
 fn lower_component_node(
     component: &AxComponent,
+    functions: &[AxFunctionDef],
     imports: &[AxImport],
     components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
@@ -354,6 +372,7 @@ fn lower_component_node(
 ) -> Result<AxNode, AxLowerError> {
     let children = lower_component_children(
         component,
+        functions,
         imports,
         components,
         scope,
@@ -362,8 +381,8 @@ fn lower_component_node(
         slot_context,
     )?;
 
-    let mut props = eval_props(component, scope, resolver)?;
-    let mut attrs = style_attrs(&component.style, scope, resolver)?;
+    let mut props = eval_props(component, functions, scope, resolver)?;
+    let mut attrs = style_attrs(&component.style, functions, scope, resolver)?;
 
     let node = match component.name.as_str() {
         name if resolve_import(imports, name).is_some() => {
@@ -459,6 +478,7 @@ fn lower_component_node(
 
 fn lower_component_children(
     component: &AxComponent,
+    functions: &[AxFunctionDef],
     imports: &[AxImport],
     components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
@@ -468,11 +488,14 @@ fn lower_component_children(
 ) -> Result<Vec<AxNode>, AxLowerError> {
     match &component.body {
         AxBody::Empty => Ok(Vec::new()),
-        AxBody::Inline(expr) => Ok(vec![text(eval_expr(expr, scope, resolver)?.as_string())]),
+        AxBody::Inline(expr) => Ok(vec![text(
+            eval_expr(expr, functions, scope, resolver)?.as_string(),
+        )]),
         AxBody::Block(body) => {
             let mut nested = scope.clone();
             lower_statements(
                 body,
+                functions,
                 imports,
                 components,
                 &mut nested,
@@ -486,6 +509,7 @@ fn lower_component_children(
 
 fn lower_pipeline(
     pipeline: &AxPipeline,
+    functions: &[AxFunctionDef],
     imports: &[AxImport],
     components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
@@ -493,7 +517,7 @@ fn lower_pipeline(
     import_resolver: &impl AxImportResolver,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<AxNode, AxLowerError> {
-    let source = eval_expr(&pipeline.source, scope, resolver)?;
+    let source = eval_expr(&pipeline.source, functions, scope, resolver)?;
     let source_text = source.as_string();
 
     let mut attrs = vec![attr("data-ax-pipeline", "true")];
@@ -518,6 +542,7 @@ fn lower_pipeline(
                 let mut nested_scope = scope.clone();
                 children.extend(lower_component_nodes(
                     component,
+                    functions,
                     imports,
                     components,
                     &mut nested_scope,
@@ -534,18 +559,23 @@ fn lower_pipeline(
 
 fn eval_props(
     component: &AxComponent,
+    functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
 ) -> Result<BTreeMap<String, AxValue>, AxLowerError> {
     let mut props = BTreeMap::new();
     for prop in &component.props {
-        props.insert(prop.name.clone(), eval_expr(&prop.value, scope, resolver)?);
+        props.insert(
+            prop.name.clone(),
+            eval_expr(&prop.value, functions, scope, resolver)?,
+        );
     }
     Ok(props)
 }
 
 fn style_attrs(
     style: &AxStyle,
+    functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
 ) -> Result<Vec<Attribute>, AxLowerError> {
@@ -553,13 +583,13 @@ fn style_attrs(
     if let Some(recipe) = &style.recipe {
         attrs.push(attr(
             "data-recipe",
-            eval_expr(recipe, scope, resolver)?.as_string(),
+            eval_expr(recipe, functions, scope, resolver)?.as_string(),
         ));
     }
     if let Some(class) = &style.class {
         attrs.push(attr(
             "class",
-            eval_expr(class, scope, resolver)?.as_string(),
+            eval_expr(class, functions, scope, resolver)?.as_string(),
         ));
     }
     Ok(attrs)
@@ -580,6 +610,7 @@ fn prepend_class_attr(attrs: &mut Vec<Attribute>, class_name: &str) {
 
 fn eval_expr(
     expr: &AxExpr,
+    functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
 ) -> Result<AxValue, AxLowerError> {
@@ -592,7 +623,7 @@ fn eval_expr(
             .cloned()
             .ok_or_else(|| AxLowerError::UnknownIdentifier { name: name.clone() }),
         AxExpr::Member { object, property } => {
-            let value = eval_expr(object, scope, resolver)?;
+            let value = eval_expr(object, functions, scope, resolver)?;
             match value {
                 AxValue::Record(fields) => {
                     fields
@@ -610,8 +641,11 @@ fn eval_expr(
         AxExpr::Call { path, args } => {
             let args = args
                 .iter()
-                .map(|arg| eval_expr(arg, scope, resolver))
+                .map(|arg| eval_expr(arg, functions, scope, resolver))
                 .collect::<Result<Vec<_>, _>>()?;
+            if let Some(function) = resolve_function(functions, path) {
+                return eval_function_call(function, &args, functions, scope, resolver);
+            }
             resolver
                 .resolve_call(path, &args)
                 .ok_or_else(|| AxLowerError::UnsupportedCall {
@@ -619,6 +653,43 @@ fn eval_expr(
                 })
         }
     }
+}
+
+fn resolve_function<'a>(
+    functions: &'a [AxFunctionDef],
+    path: &[String],
+) -> Option<&'a AxFunctionDef> {
+    let [name] = path else {
+        return None;
+    };
+
+    functions
+        .iter()
+        .rev()
+        .find(|function| function.name == *name)
+}
+
+fn eval_function_call(
+    function: &AxFunctionDef,
+    args: &[AxValue],
+    functions: &[AxFunctionDef],
+    scope: &BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+) -> Result<AxValue, AxLowerError> {
+    let mut function_scope = scope.clone();
+
+    for (index, param) in function.params.iter().enumerate() {
+        let value = if let Some(value) = args.get(index) {
+            value.clone()
+        } else if let Some(default) = &param.default {
+            eval_expr(default, functions, &function_scope, resolver)?
+        } else {
+            AxValue::Null
+        };
+        function_scope.insert(param.name.clone(), value);
+    }
+
+    eval_expr(&function.body, functions, &function_scope, resolver)
 }
 
 fn prop_string(props: &mut BTreeMap<String, AxValue>, names: &[&str]) -> Option<String> {
@@ -674,6 +745,7 @@ fn resolve_component<'a>(
 fn lower_local_component_nodes(
     component: &AxComponent,
     component_def: &AxComponentDef,
+    functions: &[AxFunctionDef],
     imports: &[AxImport],
     components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
@@ -681,14 +753,14 @@ fn lower_local_component_nodes(
     import_resolver: &impl AxImportResolver,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
-    let props = eval_props(component, scope, resolver)?;
+    let props = eval_props(component, functions, scope, resolver)?;
     let mut component_scope = scope.clone();
 
     for param in &component_def.params {
         let value = if let Some(value) = props.get(&param.name) {
             value.clone()
         } else if let Some(default) = &param.default {
-            eval_expr(default, &component_scope, resolver)?
+            eval_expr(default, functions, &component_scope, resolver)?
         } else {
             AxValue::Null
         };
@@ -698,6 +770,7 @@ fn lower_local_component_nodes(
     let slot_body = component_children_to_statements(component);
     let slot_context = SlotContext {
         body: &slot_body,
+        functions,
         imports,
         components,
         parent: slot_context,
@@ -705,6 +778,7 @@ fn lower_local_component_nodes(
 
     lower_statements(
         &component_def.body,
+        functions,
         imports,
         components,
         &mut component_scope,
@@ -717,6 +791,7 @@ fn lower_local_component_nodes(
 fn lower_imported_component_nodes(
     component: &AxComponent,
     import_decl: ResolvedImport<'_>,
+    functions: &[AxFunctionDef],
     imports: &[AxImport],
     components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
@@ -732,20 +807,27 @@ fn lower_imported_component_nodes(
         })?;
 
     let mut imported_scope = scope.clone();
-    for (name, value) in eval_props(component, scope, resolver)? {
+    for (name, value) in eval_props(component, functions, scope, resolver)? {
         imported_scope.insert(name, value);
     }
 
     if let Some(class) = &component.style.class {
-        imported_scope.insert("class".to_string(), eval_expr(class, scope, resolver)?);
+        imported_scope.insert(
+            "class".to_string(),
+            eval_expr(class, functions, scope, resolver)?,
+        );
     }
     if let Some(recipe) = &component.style.recipe {
-        imported_scope.insert("recipe".to_string(), eval_expr(recipe, scope, resolver)?);
+        imported_scope.insert(
+            "recipe".to_string(),
+            eval_expr(recipe, functions, scope, resolver)?,
+        );
     }
 
     let slot_body = component_children_to_statements(component);
     let slot_context = SlotContext {
         body: &slot_body,
+        functions,
         imports,
         components,
         parent: slot_context,
@@ -753,6 +835,7 @@ fn lower_imported_component_nodes(
 
     lower_statements(
         &document.page.body,
+        &document.functions,
         &document.imports,
         &document.components,
         &mut imported_scope,
@@ -772,12 +855,15 @@ fn component_children_to_statements(component: &AxComponent) -> Vec<AxStatement>
 
 fn slot_name_expr(
     component: &AxComponent,
+    functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
 ) -> Result<Option<String>, AxLowerError> {
     for prop in &component.props {
         if prop.name == "name" || prop.name == "slot" {
-            return Ok(Some(eval_expr(&prop.value, scope, resolver)?.as_string()));
+            return Ok(Some(
+                eval_expr(&prop.value, functions, scope, resolver)?.as_string(),
+            ));
         }
     }
 
@@ -787,13 +873,14 @@ fn slot_name_expr(
 fn select_slot_statements(
     statements: &[AxStatement],
     requested_slot: Option<&str>,
+    functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
 ) -> Result<Vec<AxStatement>, AxLowerError> {
     let mut selected = Vec::new();
 
     for statement in statements {
-        if slot_statement_matches(statement, requested_slot, scope, resolver)? {
+        if slot_statement_matches(statement, requested_slot, functions, scope, resolver)? {
             selected.push(strip_slot_statement(statement));
         }
     }
@@ -804,10 +891,11 @@ fn select_slot_statements(
 fn slot_statement_matches(
     statement: &AxStatement,
     requested_slot: Option<&str>,
+    functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
 ) -> Result<bool, AxLowerError> {
-    let statement_slot = statement_slot_name(statement, scope, resolver)?;
+    let statement_slot = statement_slot_name(statement, functions, scope, resolver)?;
 
     Ok(match requested_slot {
         Some(name) => statement_slot.as_deref() == Some(name),
@@ -817,6 +905,7 @@ fn slot_statement_matches(
 
 fn statement_slot_name(
     statement: &AxStatement,
+    functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
 ) -> Result<Option<String>, AxLowerError> {
@@ -826,7 +915,9 @@ fn statement_slot_name(
 
     for prop in &component.props {
         if prop.name == "slot" {
-            return Ok(Some(eval_expr(&prop.value, scope, resolver)?.as_string()));
+            return Ok(Some(
+                eval_expr(&prop.value, functions, scope, resolver)?.as_string(),
+            ));
         }
     }
 
@@ -1234,6 +1325,7 @@ page Home
                 [AxImportBinding::new("Card", "SiteCard")],
                 "@/ui",
             )],
+            functions: Vec::new(),
             components: Vec::new(),
             head: AxHead::default(),
             page: AxPage::new(
@@ -1356,6 +1448,49 @@ let heroTitle = "Hello Axonyx"
     }
 
     #[test]
+    fn lowers_top_level_function_calls_in_v2_documents() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+fn heroTitle(title = "Hello Axonyx") = title
+
+<Card title={heroTitle()}>
+  <Copy>{heroTitle("Custom title")}</Copy>
+</Card>
+"#,
+        )
+        .expect("document should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "article",
+                    vec![attr("class", "ax-card")],
+                    vec![
+                        element_with_attrs(
+                            "h2",
+                            vec![attr("class", "ax-card__title")],
+                            vec![text("Hello Axonyx")],
+                        ),
+                        element_with_attrs(
+                            "p",
+                            vec![attr("class", "ax-copy")],
+                            vec![text("Custom title")],
+                        ),
+                    ],
+                )],
+            )
+        );
+    }
+
+    #[test]
     fn lowers_local_component_default_params_when_props_are_missing() {
         let document = parse_ax_auto(
             r#"
@@ -1409,6 +1544,7 @@ component FeatureCard(title = defaultTitle, tone = "lead") {
                 [AxImportBinding::named("SiteCard")],
                 "@/components/site-card.ax",
             )],
+            functions: Vec::new(),
             components: Vec::new(),
             head: AxHead::default(),
             page: AxPage::new(
@@ -1493,6 +1629,7 @@ page Frame
                 [AxImportBinding::named("ShellCard")],
                 "@/components/shell-card.ax",
             )],
+            functions: Vec::new(),
             components: Vec::new(),
             head: AxHead::default(),
             page: AxPage::new(

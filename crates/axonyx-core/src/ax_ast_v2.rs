@@ -5,6 +5,7 @@ pub struct AxFileV2 {
     pub imports: Vec<AxImportDecl>,
     pub page: AxPageDecl,
     pub lets: Vec<AxLetDeclV2>,
+    pub functions: Vec<AxFunctionDeclV2>,
     pub components: Vec<AxComponentDeclV2>,
     pub body: Vec<AxNodeV2>,
 }
@@ -72,6 +73,27 @@ impl AxLetDeclV2 {
         Self {
             name: name.into(),
             value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxFunctionDeclV2 {
+    pub name: String,
+    pub params: Vec<AxComponentParamDeclV2>,
+    pub body: String,
+}
+
+impl AxFunctionDeclV2 {
+    pub fn new(
+        name: impl Into<String>,
+        params: impl IntoIterator<Item = AxComponentParamDeclV2>,
+        body: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            params: params.into_iter().collect(),
+            body: body.into(),
         }
     }
 }
@@ -222,6 +244,7 @@ pub mod prelude {
     pub use super::AxElementNode;
     pub use super::AxExprNode;
     pub use super::AxFileV2;
+    pub use super::AxFunctionDeclV2;
     pub use super::AxImportBinding;
     pub use super::AxImportDecl;
     pub use super::AxLetDeclV2;
@@ -246,6 +269,7 @@ mod tests {
             )],
             page: AxPageDecl::new("Home"),
             lets: Vec::new(),
+            functions: Vec::new(),
             components: Vec::new(),
             body: vec![AxNodeV2::Element(
                 AxElementNode::new("Card")

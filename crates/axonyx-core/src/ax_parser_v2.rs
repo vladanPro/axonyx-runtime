@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::ax_ast_v2::prelude::*;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum AxParseV2Error {
     #[error("document is empty")]
     EmptyDocument,
@@ -16,6 +16,8 @@ pub enum AxParseV2Error {
     InvalidPage { line: usize },
     #[error("invalid let syntax at line {line}")]
     InvalidLet { line: usize },
+    #[error("invalid function syntax at line {line}")]
+    InvalidFunction { line: usize },
     #[error("invalid component syntax at line {line}")]
     InvalidComponent { line: usize },
     #[error("duplicate page declaration at line {line}")]
@@ -81,10 +83,16 @@ impl<'a> Parser<'a> {
         self.skip_layout_whitespace();
 
         let mut lets = Vec::new();
+        let mut functions = Vec::new();
         let mut components = Vec::new();
-        while self.starts_with_keyword("let") || self.starts_with_keyword("component") {
+        while self.starts_with_keyword("let")
+            || self.starts_with_keyword("fn")
+            || self.starts_with_keyword("component")
+        {
             if self.starts_with_keyword("let") {
                 lets.push(self.parse_let_decl()?);
+            } else if self.starts_with_keyword("fn") {
+                functions.push(self.parse_function_decl()?);
             } else {
                 components.push(self.parse_component_decl()?);
             }
@@ -97,6 +105,7 @@ impl<'a> Parser<'a> {
             imports,
             page,
             lets,
+            functions,
             components,
             body,
         })
@@ -212,6 +221,40 @@ impl<'a> Parser<'a> {
         Ok(AxLetDeclV2::new(name, value))
     }
 
+    fn parse_function_decl(&mut self) -> Result<AxFunctionDeclV2, AxParseV2Error> {
+        let line = self.line;
+        self.expect_keyword("fn")
+            .map_err(|_| AxParseV2Error::InvalidFunction { line })?;
+        self.skip_spaces();
+
+        let name = self.parse_identifier()?;
+        self.skip_spaces();
+
+        if self.peek_char() != Some('(') {
+            return Err(AxParseV2Error::InvalidFunction { line });
+        }
+        let params = self.parse_param_list(line, AxParseV2Error::InvalidFunction { line })?;
+        self.skip_spaces();
+
+        if self.peek_char() != Some('=') {
+            return Err(AxParseV2Error::InvalidFunction { line });
+        }
+        self.bump_char();
+        self.skip_spaces();
+
+        let body = self
+            .read_until_line_end()
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        if body.is_empty() {
+            return Err(AxParseV2Error::InvalidFunction { line });
+        }
+
+        Ok(AxFunctionDeclV2::new(name, params, body))
+    }
+
     fn parse_component_decl(&mut self) -> Result<AxComponentDeclV2, AxParseV2Error> {
         let line = self.line;
         self.expect_keyword("component")
@@ -223,27 +266,7 @@ impl<'a> Parser<'a> {
 
         let mut params = Vec::new();
         if self.peek_char() == Some('(') {
-            self.bump_char();
-            loop {
-                self.skip_spaces();
-                if self.peek_char() == Some(')') {
-                    self.bump_char();
-                    break;
-                }
-
-                params.push(self.parse_component_param(line)?);
-
-                match self.peek_char() {
-                    Some(',') => {
-                        self.bump_char();
-                    }
-                    Some(')') => {
-                        self.bump_char();
-                        break;
-                    }
-                    _ => return Err(AxParseV2Error::InvalidComponent { line }),
-                }
-            }
+            params = self.parse_param_list(line, AxParseV2Error::InvalidComponent { line })?;
         }
 
         self.skip_layout_whitespace();
@@ -255,6 +278,37 @@ impl<'a> Parser<'a> {
         let body = self.parse_nodes_until_component_body_end()?;
 
         Ok(AxComponentDeclV2::new(name, params, body))
+    }
+
+    fn parse_param_list(
+        &mut self,
+        line: usize,
+        error: AxParseV2Error,
+    ) -> Result<Vec<AxComponentParamDeclV2>, AxParseV2Error> {
+        let mut params = Vec::new();
+        self.bump_char();
+        loop {
+            self.skip_spaces();
+            if self.peek_char() == Some(')') {
+                self.bump_char();
+                break;
+            }
+
+            params.push(self.parse_component_param(line)?);
+
+            match self.peek_char() {
+                Some(',') => {
+                    self.bump_char();
+                }
+                Some(')') => {
+                    self.bump_char();
+                    break;
+                }
+                _ => return Err(error.clone()),
+            }
+        }
+
+        Ok(params)
     }
 
     fn parse_component_param(
@@ -942,6 +996,28 @@ let columns = 3
             AxLetDeclV2::new("heroTitle", "\"Hello Axonyx\"")
         );
         assert_eq!(file.lets[1], AxLetDeclV2::new("columns", "3"));
+        assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn parses_top_level_function_declarations_before_page_body() {
+        let input = r#"
+page Home
+
+fn heroTitle(title = "Hello") = title
+
+<Copy>{heroTitle()}</Copy>
+"#;
+
+        let file = parse_ax_v2(input).expect("function declaration should parse");
+
+        assert_eq!(file.functions.len(), 1);
+        assert_eq!(file.functions[0].name, "heroTitle");
+        assert_eq!(
+            file.functions[0].params,
+            vec![AxComponentParamDeclV2::with_default("title", "\"Hello\"")]
+        );
+        assert_eq!(file.functions[0].body, "title");
         assert_eq!(file.body.len(), 1);
     }
 

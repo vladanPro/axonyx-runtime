@@ -95,6 +95,11 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
 
     Ok(AxDocument {
         imports: file.imports.iter().map(convert_import_decl).collect(),
+        functions: file
+            .functions
+            .iter()
+            .map(convert_function_decl)
+            .collect::<Result<Vec<_>, _>>()?,
         components: file
             .components
             .iter()
@@ -112,6 +117,18 @@ fn convert_import_decl(import_decl: &crate::ax_ast_v2::AxImportDecl) -> AxImport
         }),
         import_decl.source.clone(),
     )
+}
+
+fn convert_function_decl(function: &AxFunctionDeclV2) -> Result<AxFunctionDef, AxConvertV2Error> {
+    Ok(AxFunctionDef::new(
+        function.name.clone(),
+        function
+            .params
+            .iter()
+            .map(convert_component_param_decl)
+            .collect::<Result<Vec<_>, _>>()?,
+        parse_v2_expr(&function.body)?,
+    ))
 }
 
 fn convert_component_decl(
@@ -662,6 +679,31 @@ let heroTitle = "Hello Axonyx"
             document.page.body[0],
             AxStatement::data("heroTitle", AxExpr::string("Hello Axonyx"))
         );
+    }
+
+    #[test]
+    fn converts_top_level_function_declarations_into_runtime_defs() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+fn heroTitle(title = "Hello") = title
+
+<Copy>{heroTitle()}</Copy>
+"#,
+        )
+        .expect("function declaration should convert");
+
+        assert_eq!(document.functions.len(), 1);
+        assert_eq!(document.functions[0].name, "heroTitle");
+        assert_eq!(
+            document.functions[0].params,
+            vec![AxComponentParamDef::with_default(
+                "title",
+                AxExpr::string("Hello")
+            )]
+        );
+        assert_eq!(document.functions[0].body, AxExpr::ident("title"));
     }
 
     #[test]
