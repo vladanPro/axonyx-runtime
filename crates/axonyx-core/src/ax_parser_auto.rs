@@ -4,6 +4,7 @@ use crate::ax_ast::prelude::*;
 use crate::ax_ast_v2::prelude::*;
 use crate::ax_parser::{parse_ax, parse_expr, AxParseError};
 use crate::ax_parser_v2::{parse_ax_v2, AxParseV2Error};
+use crate::ax_semantics_v2::{validate_ax_v2_semantics, AxSemanticV2Error};
 
 #[derive(Debug, Error)]
 pub enum AxAutoParseError {
@@ -11,6 +12,8 @@ pub enum AxAutoParseError {
     V1(#[from] AxParseError),
     #[error("failed to parse JSX-like .ax file")]
     V2(#[from] AxParseV2Error),
+    #[error("failed to validate JSX-like .ax file")]
+    Semantic(#[from] AxSemanticV2Error),
     #[error("failed to lower JSX-like .ax file into runtime document")]
     Convert(#[from] AxConvertV2Error),
 }
@@ -59,6 +62,7 @@ pub fn looks_like_ax_v2(input: &str) -> bool {
 pub fn parse_ax_auto(input: &str) -> Result<AxDocument, AxAutoParseError> {
     if looks_like_ax_v2(input) {
         let file = parse_ax_v2(input)?;
+        validate_ax_v2_semantics(&file)?;
         Ok(convert_ax_v2_file(&file)?)
     } else {
         Ok(parse_ax(input)?)
