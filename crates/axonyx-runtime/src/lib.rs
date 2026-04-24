@@ -1393,14 +1393,52 @@ fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
     render_node(root, &mut body);
     let head = render_head_html(&document.head);
     let html_attrs = render_html_attrs(&document.head);
+    let behavior_script = if body.contains("data-ax-behavior=") {
+        ax_behavior_script()
+    } else {
+        ""
+    };
 
     format!(
-        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>{}</head><body>{}</body></html>",
+        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>{}</head><body>{}{}</body></html>",
         html_attrs,
         preview_styles(),
         head,
-        body
+        body,
+        behavior_script
     )
+}
+
+fn ax_behavior_script() -> &'static str {
+    r#"<script data-ax-runtime="behavior">
+(() => {
+  if (window.__axonyxBehaviorRuntime) return;
+  window.__axonyxBehaviorRuntime = true;
+
+  const setExpanded = (trigger, expanded) => {
+    trigger.setAttribute("aria-expanded", expanded ? "true" : "false");
+  };
+
+  const toggleTarget = (trigger) => {
+    const selector = trigger.getAttribute("data-ax-behavior-target");
+    if (!selector) return;
+    const target = document.querySelector(selector);
+    if (!target) return;
+    const nextHidden = !target.hidden;
+    target.hidden = nextHidden;
+    setExpanded(trigger, !nextHidden);
+  };
+
+  document.addEventListener("click", (event) => {
+    const trigger = event.target.closest("[data-ax-behavior]");
+    if (!trigger) return;
+    const behavior = trigger.getAttribute("data-ax-behavior");
+    if (behavior === "toggle") {
+      toggleTarget(trigger);
+    }
+  });
+})();
+</script>"#
 }
 
 fn render_html_attrs(head: &AxHead) -> String {
@@ -1819,6 +1857,33 @@ page Home
         assert!(html.contains("<meta name=\"description\" content=\"Docs without bloat\">"));
         assert!(html.contains("Runtime V2"));
         assert!(html.contains("Body from JSX-like .ax"));
+    }
+
+    #[test]
+    fn preview_injects_behavior_runtime_only_when_behavior_hooks_exist() {
+        let static_html = preview_ax_page(
+            r#"
+page Home
+<Button>Plain</Button>
+"#,
+        )
+        .expect("static preview should render");
+
+        assert!(!static_html.contains("data-ax-runtime=\"behavior\""));
+
+        let interactive_html = preview_ax_page(
+            r##"
+page Home
+<Button behavior="toggle" behaviorTarget="#menu">Menu</Button>
+<nav id="menu" hidden="true">Links</nav>
+"##,
+        )
+        .expect("interactive preview should render");
+
+        assert!(interactive_html.contains("data-ax-behavior=\"toggle\""));
+        assert!(interactive_html.contains("data-ax-behavior-target=\"#menu\""));
+        assert!(interactive_html.contains("data-ax-runtime=\"behavior\""));
+        assert!(interactive_html.contains("window.__axonyxBehaviorRuntime"));
     }
 
     #[test]
