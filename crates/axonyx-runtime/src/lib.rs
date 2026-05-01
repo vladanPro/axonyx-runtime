@@ -1434,8 +1434,25 @@ fn ax_behavior_script() -> &'static str {
     if (target) setExpanded(trigger, !target.hidden);
   };
 
+  const allowedThemes = new Set(["silver", "bronze", "gold"]);
+
+  const applyTheme = (theme) => {
+    const next = allowedThemes.has(theme) ? theme : "silver";
+    document.documentElement.setAttribute("data-theme", next);
+    return next;
+  };
+
+  const initTheme = (control) => {
+    const storageKey = control.getAttribute("data-ax-theme-storage-key") || "axonyx-theme";
+    const stored = window.localStorage ? window.localStorage.getItem(storageKey) : null;
+    const current = document.documentElement.getAttribute("data-theme");
+    const initial = applyTheme(stored || current || control.value || "silver");
+    control.value = initial;
+  };
+
   const init = () => {
     document.querySelectorAll('[data-ax-behavior="toggle"]').forEach(initToggle);
+    document.querySelectorAll('[data-ax-behavior="theme"]').forEach(initTheme);
   };
 
   const toggleTarget = (trigger) => {
@@ -1453,6 +1470,14 @@ fn ax_behavior_script() -> &'static str {
     if (behavior === "toggle") {
       toggleTarget(trigger);
     }
+  });
+
+  document.addEventListener("change", (event) => {
+    const control = event.target.closest('[data-ax-behavior="theme"]');
+    if (!control) return;
+    const storageKey = control.getAttribute("data-ax-theme-storage-key") || "axonyx-theme";
+    const next = applyTheme(control.value);
+    if (window.localStorage) window.localStorage.setItem(storageKey, next);
   });
 
   if (document.readyState === "loading") {
@@ -1909,6 +1934,23 @@ page Home
         assert!(interactive_html.contains("window.__axonyxBehaviorRuntime"));
         assert!(interactive_html.contains("aria-controls"));
         assert!(interactive_html.contains("DOMContentLoaded"));
+
+        let themed_html = preview_ax_page(
+            r##"
+page Home
+<select data-ax-behavior="theme" data-ax-theme-storage-key="demo-theme">
+  <option value="silver">Silver</option>
+  <option value="bronze">Bronze</option>
+  <option value="gold">Gold</option>
+</select>
+"##,
+        )
+        .expect("theme behavior preview should render");
+
+        assert!(themed_html.contains("data-ax-behavior=\"theme\""));
+        assert!(themed_html.contains("data-ax-theme-storage-key=\"demo-theme\""));
+        assert!(themed_html.contains("allowedThemes"));
+        assert!(themed_html.contains("localStorage.setItem"));
     }
 
     #[test]
