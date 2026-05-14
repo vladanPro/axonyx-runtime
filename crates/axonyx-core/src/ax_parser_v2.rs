@@ -16,6 +16,8 @@ pub enum AxParseV2Error {
     InvalidPage { line: usize },
     #[error("invalid let syntax at line {line}")]
     InvalidLet { line: usize },
+    #[error("invalid type syntax at line {line}")]
+    InvalidType { line: usize },
     #[error("invalid function syntax at line {line}")]
     InvalidFunction { line: usize },
     #[error("invalid component syntax at line {line}")]
@@ -82,14 +84,18 @@ impl<'a> Parser<'a> {
         let page = self.parse_page_decl()?;
         self.skip_layout_whitespace();
 
+        let mut types = Vec::new();
         let mut lets = Vec::new();
         let mut functions = Vec::new();
         let mut components = Vec::new();
-        while self.starts_with_keyword("let")
+        while self.starts_with_keyword("type")
+            || self.starts_with_keyword("let")
             || self.starts_with_keyword("fn")
             || self.starts_with_keyword("component")
         {
-            if self.starts_with_keyword("let") {
+            if self.starts_with_keyword("type") {
+                types.push(self.parse_type_decl()?);
+            } else if self.starts_with_keyword("let") {
                 lets.push(self.parse_let_decl()?);
             } else if self.starts_with_keyword("fn") {
                 functions.push(self.parse_function_decl()?);
@@ -104,6 +110,7 @@ impl<'a> Parser<'a> {
         Ok(AxFileV2 {
             imports,
             page,
+            types,
             lets,
             functions,
             components,
@@ -235,6 +242,56 @@ impl<'a> Parser<'a> {
             Some(ty) => AxLetDeclV2::typed(name, ty, value),
             None => AxLetDeclV2::new(name, value),
         })
+    }
+
+    fn parse_type_decl(&mut self) -> Result<AxTypeDeclV2, AxParseV2Error> {
+        let line = self.line;
+        self.expect_keyword("type")
+            .map_err(|_| AxParseV2Error::InvalidType { line })?;
+        self.skip_spaces();
+
+        let name = self.parse_identifier()?;
+        self.skip_layout_whitespace();
+        if self.peek_char() != Some('{') {
+            return Err(AxParseV2Error::InvalidType { line });
+        }
+        self.bump_char();
+        self.skip_layout_whitespace();
+
+        let mut fields = Vec::new();
+        while !self.eof() && self.peek_char() != Some('}') {
+            let field_line = self.line;
+            let field_name = self
+                .parse_identifier()
+                .map_err(|_| AxParseV2Error::InvalidType { line: field_line })?;
+            self.skip_spaces();
+            if self.peek_char() != Some(':') {
+                return Err(AxParseV2Error::InvalidType { line: field_line });
+            }
+            self.bump_char();
+            self.skip_spaces();
+
+            let ty = self
+                .read_until_line_end()
+                .trim()
+                .trim_end_matches(',')
+                .trim_end_matches(';')
+                .trim()
+                .to_string();
+            if ty.is_empty() {
+                return Err(AxParseV2Error::InvalidType { line: field_line });
+            }
+            fields.push(AxTypeFieldDeclV2::new(field_name, ty));
+            self.skip_layout_whitespace();
+        }
+
+        if self.peek_char() != Some('}') {
+            return Err(AxParseV2Error::InvalidType { line });
+        }
+        self.bump_char();
+        self.consume_until_line_end();
+
+        Ok(AxTypeDeclV2::new(name, fields))
     }
 
     fn parse_function_decl(&mut self) -> Result<AxFunctionDeclV2, AxParseV2Error> {
@@ -1081,6 +1138,39 @@ let posts: List<Post> = load PostsList
         assert_eq!(
             file.lets[0],
             AxLetDeclV2::typed("posts", "List<Post>", "load PostsList")
+        );
+    }
+
+    #[test]
+    fn parses_top_level_type_declarations() {
+        let input = r#"
+page Blog
+
+type Post {
+  title: String
+  slug: String
+  published: Bool
+}
+
+let posts: List<Post> = load PostsList
+
+<Each items={posts} as="post">
+  <Card title={post.title} />
+</Each>
+"#;
+
+        let file = parse_ax_v2(input).expect("type declaration should parse");
+
+        assert_eq!(
+            file.types,
+            vec![AxTypeDeclV2::new(
+                "Post",
+                [
+                    AxTypeFieldDeclV2::new("title", "String"),
+                    AxTypeFieldDeclV2::new("slug", "String"),
+                    AxTypeFieldDeclV2::new("published", "Bool"),
+                ]
+            )]
         );
     }
 

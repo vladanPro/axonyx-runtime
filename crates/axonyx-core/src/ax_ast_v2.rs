@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub struct AxFileV2 {
     pub imports: Vec<AxImportDecl>,
     pub page: AxPageDecl,
+    pub types: Vec<AxTypeDeclV2>,
     pub lets: Vec<AxLetDeclV2>,
     pub functions: Vec<AxFunctionDeclV2>,
     pub components: Vec<AxComponentDeclV2>,
@@ -59,6 +60,39 @@ pub struct AxPageDecl {
 impl AxPageDecl {
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxTypeDeclV2 {
+    pub name: String,
+    pub fields: Vec<AxTypeFieldDeclV2>,
+}
+
+impl AxTypeDeclV2 {
+    pub fn new(
+        name: impl Into<String>,
+        fields: impl IntoIterator<Item = AxTypeFieldDeclV2>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            fields: fields.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxTypeFieldDeclV2 {
+    pub name: String,
+    pub ty: String,
+}
+
+impl AxTypeFieldDeclV2 {
+    pub fn new(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+        }
     }
 }
 
@@ -261,6 +295,8 @@ pub mod prelude {
     pub use super::AxNodeV2;
     pub use super::AxPageDecl;
     pub use super::AxTextNode;
+    pub use super::AxTypeDeclV2;
+    pub use super::AxTypeFieldDeclV2;
 }
 
 #[cfg(test)]
@@ -278,6 +314,7 @@ mod tests {
                 "@axonyx/ui",
             )],
             page: AxPageDecl::new("Home"),
+            types: Vec::new(),
             lets: Vec::new(),
             functions: Vec::new(),
             components: Vec::new(),

@@ -113,6 +113,15 @@ impl AxDataContext {
 
     pub fn from_v2_let_types(file: &AxFileV2) -> Result<Self, AxTypeParseError> {
         let mut context = Self::new();
+        for record in &file.types {
+            let mut record_type = AxRecordType::new(record.name.clone());
+            for field in &record.fields {
+                record_type =
+                    record_type.field(field.name.clone(), AxType::parse_annotation(&field.ty)?);
+            }
+            context = context.with_record(record_type);
+        }
+
         for binding in &file.lets {
             let Some(ty) = &binding.ty else {
                 continue;
@@ -365,6 +374,7 @@ impl AxTypeChecker {
     fn check_statement(&mut self, statement: &AxStatement, location: &str) {
         match statement {
             AxStatement::Data(binding) => match self.context.resolve_expr_type(&binding.value) {
+                Ok(AxType::Unknown) if self.context.binding(&binding.name).is_some() => {}
                 Ok(ty) => self.context.bind(binding.name.clone(), ty),
                 Err(error) => self.push_error(format!("{location}.data.{}", binding.name), error),
             },
@@ -549,6 +559,11 @@ mod tests {
             r#"
 page Blog
 
+type Post {
+  title: String
+  slug: String
+}
+
 let posts: List<Post> = load PostsList
 let title = "Blog"
 
@@ -562,6 +577,14 @@ let title = "Blog"
         assert_eq!(
             context.binding("posts"),
             Some(&AxType::list(AxType::record("Post")))
+        );
+        assert_eq!(
+            context.record("Post"),
+            Some(
+                &AxRecordType::new("Post")
+                    .field("title", AxType::String)
+                    .field("slug", AxType::String)
+            )
         );
         assert_eq!(context.binding("title"), None);
     }
