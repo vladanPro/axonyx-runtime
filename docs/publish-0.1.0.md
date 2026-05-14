@@ -73,7 +73,7 @@ cargo run
 
 Expected result:
 
-- the app resolves `axonyx-runtime = "0.1.0"` from crates.io
+- the app resolves `axonyx-runtime = "0.1.1"` from crates.io
 - the generated app compiles without switching back to `git` or `path`
 
 ## 5. Tag The Release
