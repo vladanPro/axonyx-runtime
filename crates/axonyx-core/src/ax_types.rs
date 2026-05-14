@@ -619,6 +619,37 @@ mod tests {
     }
 
     #[test]
+    fn optional_type_field_allows_regular_member_access() {
+        let file = parse_ax_v2(
+            r#"
+page Blog
+
+type Post {
+  title: String
+  summary?: String
+}
+
+let posts: List<Post> = load PostsList
+
+<Each items={posts} as="post">
+  <Card title={post.summary} />
+</Each>
+"#,
+        )
+        .expect("source should parse");
+        let context = AxDataContext::from_v2_let_types(&file).expect("context should build");
+        let each_context = context
+            .bind_each_item("post", &AxExpr::ident("posts"))
+            .expect("posts should be iterable");
+
+        let ty = each_context
+            .resolve_expr_type(&AxExpr::ident("post").member("summary"))
+            .expect("optional type field should resolve");
+
+        assert_eq!(ty, AxType::optional(AxType::String));
+    }
+
+    #[test]
     fn reports_non_list_each_source() {
         let context = AxDataContext::new().with_binding("post", AxType::record("Post"));
         let error = context

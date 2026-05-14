@@ -265,6 +265,13 @@ impl<'a> Parser<'a> {
                 .parse_identifier()
                 .map_err(|_| AxParseV2Error::InvalidType { line: field_line })?;
             self.skip_spaces();
+            let optional = if self.peek_char() == Some('?') {
+                self.bump_char();
+                self.skip_spaces();
+                true
+            } else {
+                false
+            };
             if self.peek_char() != Some(':') {
                 return Err(AxParseV2Error::InvalidType { line: field_line });
             }
@@ -281,6 +288,11 @@ impl<'a> Parser<'a> {
             if ty.is_empty() {
                 return Err(AxParseV2Error::InvalidType { line: field_line });
             }
+            let ty = if optional {
+                format!("Optional<{ty}>")
+            } else {
+                ty
+            };
             fields.push(AxTypeFieldDeclV2::new(field_name, ty));
             self.skip_layout_whitespace();
         }
@@ -1149,6 +1161,7 @@ page Blog
 type Post {
   title: String
   slug: String
+  excerpt?: String
   published: Bool
 }
 
@@ -1168,6 +1181,7 @@ let posts: List<Post> = load PostsList
                 [
                     AxTypeFieldDeclV2::new("title", "String"),
                     AxTypeFieldDeclV2::new("slug", "String"),
+                    AxTypeFieldDeclV2::new("excerpt", "Optional<String>"),
                     AxTypeFieldDeclV2::new("published", "Bool"),
                 ]
             )]
