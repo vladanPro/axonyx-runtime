@@ -156,6 +156,16 @@ impl AxDataContext {
                 let object_type = self.resolve_expr_type(object)?;
                 self.resolve_member_type(&object_type, property)
             }
+            AxExpr::OptionalMember { object, property } => {
+                let object_type = self.resolve_expr_type(object)?;
+                match self.resolve_member_type(&object_type, property) {
+                    Ok(ty) => Ok(AxType::optional(ty)),
+                    Err(
+                        AxTypeError::UnknownField { .. } | AxTypeError::CannotAccessField { .. },
+                    ) => Ok(AxType::Unknown),
+                    Err(error) => Err(error),
+                }
+            }
             AxExpr::Call { .. } => Ok(AxType::Unknown),
         }
     }
@@ -508,6 +518,9 @@ fn format_expr(expr: &AxExpr) -> String {
         AxExpr::Bool(value) => value.to_string(),
         AxExpr::Identifier(name) => name.clone(),
         AxExpr::Member { object, property } => format!("{}.{}", format_expr(object), property),
+        AxExpr::OptionalMember { object, property } => {
+            format!("{}?.{}", format_expr(object), property)
+        }
         AxExpr::Call { path, args } => {
             let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
             format!("{}({args})", path.join("."))
@@ -575,6 +588,34 @@ mod tests {
                 field: "summary".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn optional_member_allows_missing_record_field() {
+        let context = post_context();
+        let each_context = context
+            .bind_each_item("post", &AxExpr::ident("posts"))
+            .expect("posts should be iterable");
+
+        let ty = each_context
+            .resolve_expr_type(&AxExpr::ident("post").optional_member("summary"))
+            .expect("optional member should not fail on missing field");
+
+        assert_eq!(ty, AxType::Unknown);
+    }
+
+    #[test]
+    fn optional_member_wraps_existing_field_type() {
+        let context = post_context();
+        let each_context = context
+            .bind_each_item("post", &AxExpr::ident("posts"))
+            .expect("posts should be iterable");
+
+        let ty = each_context
+            .resolve_expr_type(&AxExpr::ident("post").optional_member("title"))
+            .expect("optional member should resolve existing field");
+
+        assert_eq!(ty, AxType::optional(AxType::String));
     }
 
     #[test]

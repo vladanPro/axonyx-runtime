@@ -646,6 +646,21 @@ fn eval_expr(
                 }),
             }
         }
+        AxExpr::OptionalMember { object, property } => {
+            let value = match eval_expr(object, functions, scope, resolver) {
+                Ok(value) => value,
+                Err(AxLowerError::UnknownIdentifier { .. })
+                | Err(AxLowerError::UnknownMember { .. }) => return Ok(AxValue::Null),
+                Err(error) => return Err(error),
+            };
+            match value {
+                AxValue::Record(fields) => {
+                    Ok(fields.get(property).cloned().unwrap_or(AxValue::Null))
+                }
+                AxValue::Null => Ok(AxValue::Null),
+                _ => Ok(AxValue::Null),
+            }
+        }
         AxExpr::Call { path, args } => {
             let args = args
                 .iter()
@@ -1424,6 +1439,34 @@ page Home
         };
 
         assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn optional_member_lowers_missing_field_to_empty_text() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::component(AxComponent::new("Copy").inline(
+                AxExpr::ident("post").optional_member("summary"),
+            ))],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert(
+            "post".to_string(),
+            AxValue::record([("title", AxValue::from("Hello"))]),
+        );
+
+        let node =
+            lower_document_with_scope(&document, scope, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { children, .. } = &children[0] else {
+            panic!("expected copy element");
+        };
+
+        assert_eq!(children, &[text("")]);
     }
 
     #[test]

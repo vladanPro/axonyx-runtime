@@ -384,6 +384,9 @@ fn render_expr(expr: &AxExpr) -> String {
         AxExpr::Bool(value) => value.to_string(),
         AxExpr::Identifier(name) => name.clone(),
         AxExpr::Member { object, property } => format!("{}.{}", render_expr(object), property),
+        AxExpr::OptionalMember { object, property } => {
+            format!("{}.{}", render_expr(object), property)
+        }
         AxExpr::Call { path, args } => {
             let fn_name = path.join("::");
             let args = args.iter().map(render_expr).collect::<Vec<_>>().join(", ");
@@ -410,6 +413,11 @@ fn expr_member_path(expr: &AxExpr) -> Option<Vec<String>> {
     match expr {
         AxExpr::Identifier(name) => Some(vec![name.clone()]),
         AxExpr::Member { object, property } => {
+            let mut path = expr_member_path(object)?;
+            path.push(property.clone());
+            Some(path)
+        }
+        AxExpr::OptionalMember { object, property } => {
             let mut path = expr_member_path(object)?;
             path.push(property.clone());
             Some(path)

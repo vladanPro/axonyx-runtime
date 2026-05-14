@@ -1566,6 +1566,9 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
         AxExpr::Member { object, property } => {
             format!("{}.{}", head_expr_to_string(object), property)
         }
+        AxExpr::OptionalMember { object, property } => {
+            format!("{}?.{}", head_expr_to_string(object), property)
+        }
         AxExpr::Call { path, args } => {
             let args = args
                 .iter()

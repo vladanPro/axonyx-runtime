@@ -449,6 +449,10 @@ pub enum AxExpr {
         object: Box<AxExpr>,
         property: String,
     },
+    OptionalMember {
+        object: Box<AxExpr>,
+        property: String,
+    },
     Call {
         path: Vec<String>,
         args: Vec<AxExpr>,
@@ -474,6 +478,13 @@ impl AxExpr {
 
     pub fn member(self, property: impl Into<String>) -> Self {
         Self::Member {
+            object: Box::new(self),
+            property: property.into(),
+        }
+    }
+
+    pub fn optional_member(self, property: impl Into<String>) -> Self {
+        Self::OptionalMember {
             object: Box::new(self),
             property: property.into(),
         }

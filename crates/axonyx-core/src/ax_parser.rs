@@ -521,30 +521,64 @@ pub(crate) fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseErro
         }
     }
 
-    if input.contains('.') {
-        let mut parts = input.split('.').map(str::trim);
-        let first = parts.next().unwrap_or_default();
-        if first.is_empty() {
+    if input.contains('.') || input.contains("?.") {
+        return parse_member_expr(input, line);
+    }
+
+    Ok(AxExpr::ident(input))
+}
+
+fn parse_member_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
+    let mut cursor = input.trim();
+    let first_end = cursor
+        .find(['.', '?'])
+        .ok_or_else(|| AxParseError::InvalidExpression {
+            line,
+            message: format!("invalid member expression `{input}`"),
+        })?;
+    let first = cursor[..first_end].trim();
+    if first.is_empty() {
+        return Err(AxParseError::InvalidExpression {
+            line,
+            message: format!("invalid member expression `{input}`"),
+        });
+    }
+
+    let mut expr = AxExpr::ident(first);
+    cursor = &cursor[first_end..];
+
+    while !cursor.is_empty() {
+        let optional = if let Some(rest) = cursor.strip_prefix("?.") {
+            cursor = rest;
+            true
+        } else if let Some(rest) = cursor.strip_prefix('.') {
+            cursor = rest;
+            false
+        } else {
+            return Err(AxParseError::InvalidExpression {
+                line,
+                message: format!("invalid member expression `{input}`"),
+            });
+        };
+
+        let next_separator = cursor.find(['.', '?']).unwrap_or(cursor.len());
+        let property = cursor[..next_separator].trim();
+        if property.is_empty() {
             return Err(AxParseError::InvalidExpression {
                 line,
                 message: format!("invalid member expression `{input}`"),
             });
         }
 
-        let mut expr = AxExpr::ident(first);
-        for property in parts {
-            if property.is_empty() {
-                return Err(AxParseError::InvalidExpression {
-                    line,
-                    message: format!("invalid member expression `{input}`"),
-                });
-            }
-            expr = expr.member(property);
-        }
-        return Ok(expr);
+        expr = if optional {
+            expr.optional_member(property)
+        } else {
+            expr.member(property)
+        };
+        cursor = &cursor[next_separator..];
     }
 
-    Ok(AxExpr::ident(input))
+    Ok(expr)
 }
 
 fn find_call_open(input: &str) -> Option<usize> {
@@ -778,6 +812,24 @@ page Posts
                 args: vec![AxExpr::string("PostsList")],
             }
         );
+    }
+
+    #[test]
+    fn parses_optional_member_expression() {
+        let input = r#"
+page Home
+  Copy -> post?.summary
+"#;
+
+        let document = parse_ax(input).expect("document should parse");
+        let AxStatement::Component(copy) = &document.page.body[0] else {
+            panic!("expected copy component");
+        };
+        let AxBody::Inline(expr) = &copy.body else {
+            panic!("expected inline expression");
+        };
+
+        assert_eq!(expr, &AxExpr::ident("post").optional_member("summary"));
     }
 
     #[test]
