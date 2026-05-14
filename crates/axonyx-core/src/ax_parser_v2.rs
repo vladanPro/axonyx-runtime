@@ -202,6 +202,19 @@ impl<'a> Parser<'a> {
         let name = self.parse_identifier()?;
         self.skip_spaces();
 
+        let ty = if self.peek_char() == Some(':') {
+            self.bump_char();
+            self.skip_spaces();
+            let ty = self.read_until_top_level_equals().trim().to_string();
+            if ty.is_empty() {
+                return Err(AxParseV2Error::InvalidLet { line });
+            }
+            self.skip_spaces();
+            Some(ty)
+        } else {
+            None
+        };
+
         if self.peek_char() != Some('=') {
             return Err(AxParseV2Error::InvalidLet { line });
         }
@@ -218,7 +231,10 @@ impl<'a> Parser<'a> {
             return Err(AxParseV2Error::InvalidLet { line });
         }
 
-        Ok(AxLetDeclV2::new(name, value))
+        Ok(match ty {
+            Some(ty) => AxLetDeclV2::typed(name, ty, value),
+            None => AxLetDeclV2::new(name, value),
+        })
     }
 
     fn parse_function_decl(&mut self) -> Result<AxFunctionDeclV2, AxParseV2Error> {
@@ -737,6 +753,55 @@ impl<'a> Parser<'a> {
         value
     }
 
+    fn read_until_top_level_equals(&mut self) -> String {
+        let start = self.pos;
+        let mut string_quote = None;
+        let mut angle_depth = 0usize;
+        let mut paren_depth = 0usize;
+
+        while let Some(ch) = self.peek_char() {
+            if let Some(quote) = string_quote {
+                self.bump_char();
+                if ch == '\\' {
+                    self.bump_char();
+                } else if ch == quote {
+                    string_quote = None;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' | '\'' => {
+                    string_quote = Some(ch);
+                    self.bump_char();
+                }
+                '<' => {
+                    angle_depth += 1;
+                    self.bump_char();
+                }
+                '>' => {
+                    angle_depth = angle_depth.saturating_sub(1);
+                    self.bump_char();
+                }
+                '(' => {
+                    paren_depth += 1;
+                    self.bump_char();
+                }
+                ')' => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    self.bump_char();
+                }
+                '=' if angle_depth == 0 && paren_depth == 0 => break,
+                '\n' | '\r' => break,
+                _ => {
+                    self.bump_char();
+                }
+            }
+        }
+
+        self.input[start..self.pos].to_string()
+    }
+
     fn read_component_param_default(&mut self) -> String {
         let start = self.pos;
         let mut string_quote = None;
@@ -997,6 +1062,26 @@ let columns = 3
         );
         assert_eq!(file.lets[1], AxLetDeclV2::new("columns", "3"));
         assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn parses_typed_top_level_let_declarations() {
+        let input = r#"
+page Blog
+
+let posts: List<Post> = load PostsList
+
+<Each items={posts} as="post">
+  <Card title={post.title} />
+</Each>
+"#;
+
+        let file = parse_ax_v2(input).expect("typed let declaration should parse");
+
+        assert_eq!(
+            file.lets[0],
+            AxLetDeclV2::typed("posts", "List<Post>", "load PostsList")
+        );
     }
 
     #[test]

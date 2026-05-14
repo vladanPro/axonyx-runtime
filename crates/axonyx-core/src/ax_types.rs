@@ -6,6 +6,7 @@ use thiserror::Error;
 use crate::ax_ast::prelude::{
     AxBody, AxComponent, AxDocument, AxExpr, AxPipelineStage, AxStatement,
 };
+use crate::ax_ast_v2::prelude::AxFileV2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxType {
@@ -50,6 +51,10 @@ impl AxType {
             Self::List(item) => Some(item),
             _ => None,
         }
+    }
+
+    pub fn parse_annotation(input: &str) -> Result<Self, AxTypeParseError> {
+        parse_type_annotation(input)
     }
 }
 
@@ -104,6 +109,17 @@ impl AxDataContext {
 
     pub fn binding(&self, name: &str) -> Option<&AxType> {
         self.bindings.get(name)
+    }
+
+    pub fn from_v2_let_types(file: &AxFileV2) -> Result<Self, AxTypeParseError> {
+        let mut context = Self::new();
+        for binding in &file.lets {
+            let Some(ty) = &binding.ty else {
+                continue;
+            };
+            context.bind(binding.name.clone(), AxType::parse_annotation(ty)?);
+        }
+        Ok(context)
     }
 
     pub fn resolve_expr_type(&self, expr: &AxExpr) -> Result<AxType, AxTypeError> {
@@ -171,6 +187,97 @@ impl AxDataContext {
             }),
         }
     }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum AxTypeParseError {
+    #[error("empty type annotation")]
+    Empty,
+    #[error("invalid type annotation `{raw}`")]
+    Invalid { raw: String },
+}
+
+fn parse_type_annotation(input: &str) -> Result<AxType, AxTypeParseError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(AxTypeParseError::Empty);
+    }
+
+    if let Some(inner) = parse_wrapped_type(input, "List")? {
+        return Ok(AxType::list(parse_type_annotation(inner)?));
+    }
+
+    if let Some(inner) = parse_wrapped_type(input, "Optional")? {
+        return Ok(AxType::optional(parse_type_annotation(inner)?));
+    }
+
+    Ok(match input {
+        "String" => AxType::String,
+        "Number" => AxType::Number,
+        "Bool" => AxType::Bool,
+        "DateTime" => AxType::DateTime,
+        "Unknown" => AxType::Unknown,
+        name if is_type_identifier(name) => AxType::record(name),
+        source => {
+            return Err(AxTypeParseError::Invalid {
+                raw: source.to_string(),
+            })
+        }
+    })
+}
+
+fn parse_wrapped_type<'a>(
+    input: &'a str,
+    wrapper: &str,
+) -> Result<Option<&'a str>, AxTypeParseError> {
+    let Some(rest) = input.strip_prefix(wrapper) else {
+        return Ok(None);
+    };
+
+    let rest = rest.trim_start();
+    if !rest.starts_with('<') {
+        return Ok(None);
+    }
+    if !rest.ends_with('>') {
+        return Err(AxTypeParseError::Invalid {
+            raw: input.to_string(),
+        });
+    }
+
+    let inner = &rest[1..rest.len() - 1];
+    if !has_balanced_angle_brackets(inner) {
+        return Err(AxTypeParseError::Invalid {
+            raw: input.to_string(),
+        });
+    }
+
+    Ok(Some(inner.trim()))
+}
+
+fn has_balanced_angle_brackets(input: &str) -> bool {
+    let mut depth = 0usize;
+    for ch in input.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => {
+                let Some(next) = depth.checked_sub(1) else {
+                    return false;
+                };
+                depth = next;
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+
+fn is_type_identifier(input: &str) -> bool {
+    let mut chars = input.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -358,12 +465,14 @@ pub mod prelude {
     pub use super::AxTypeCheckError;
     pub use super::AxTypeCheckReport;
     pub use super::AxTypeError;
+    pub use super::AxTypeParseError;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ax_ast::prelude::AxEachBlock;
+    use crate::ax_parser_v2::parse_ax_v2;
 
     fn post_context() -> AxDataContext {
         AxDataContext::new()
@@ -423,6 +532,38 @@ mod tests {
                 found: "Post".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn parses_type_annotations() {
+        assert_eq!(AxType::parse_annotation("String"), Ok(AxType::String));
+        assert_eq!(
+            AxType::parse_annotation("List<Optional<Post>>"),
+            Ok(AxType::list(AxType::optional(AxType::record("Post"))))
+        );
+    }
+
+    #[test]
+    fn builds_context_from_v2_typed_lets() {
+        let file = parse_ax_v2(
+            r#"
+page Blog
+
+let posts: List<Post> = load PostsList
+let title = "Blog"
+
+<Copy>{title}</Copy>
+"#,
+        )
+        .expect("source should parse");
+
+        let context = AxDataContext::from_v2_let_types(&file).expect("typed lets should resolve");
+
+        assert_eq!(
+            context.binding("posts"),
+            Some(&AxType::list(AxType::record("Post")))
+        );
+        assert_eq!(context.binding("title"), None);
     }
 
     #[test]

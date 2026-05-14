@@ -65,6 +65,7 @@ impl AxPageDecl {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxLetDeclV2 {
     pub name: String,
+    pub ty: Option<String>,
     pub value: String,
 }
 
@@ -72,6 +73,15 @@ impl AxLetDeclV2 {
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            ty: None,
+            value: value.into(),
+        }
+    }
+
+    pub fn typed(name: impl Into<String>, ty: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: Some(ty.into()),
             value: value.into(),
         }
     }
