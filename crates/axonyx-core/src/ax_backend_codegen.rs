@@ -224,6 +224,9 @@ fn render_query_plan(query: &AxQueryPlan) -> String {
 
     let source = match &query.source {
         AxQuerySourcePlan::Stream { collection } => format!("{collection:?}.to_string()"),
+        AxQuerySourcePlan::ContentCollection { collection } => {
+            format!("{collection:?}.to_string()")
+        }
     };
 
     format!(

@@ -46,6 +46,7 @@ impl AxQuerySpec {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxQuerySource {
     Stream { collection: String },
+    ContentCollection { collection: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -137,5 +138,21 @@ mod tests {
                 offset: Some(40),
             }
         );
+    }
+
+    #[test]
+    fn query_spec_can_model_content_collections() {
+        let query = AxQuerySpec::new(AxQuerySource::ContentCollection {
+            collection: "docs".to_string(),
+        })
+        .order(AxQueryOrder::new("slug", AxQueryOrderDirection::Asc));
+
+        assert_eq!(
+            query.source,
+            AxQuerySource::ContentCollection {
+                collection: "docs".to_string()
+            }
+        );
+        assert_eq!(query.orders.len(), 1);
     }
 }

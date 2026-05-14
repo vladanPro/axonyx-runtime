@@ -573,6 +573,16 @@ fn query_source_from_expr(expr: AxExpr, line: usize) -> Result<AxQuerySource, Ax
                 _ => Err(AxBackendParseError::InvalidQuerySource { line }),
             }
         }
+        AxExpr::Call { path, args }
+            if path == vec!["Content".to_string(), "Collection".to_string()] && args.len() == 1 =>
+        {
+            match &args[0] {
+                AxExpr::String(collection) => Ok(AxQuerySource::ContentCollection {
+                    collection: collection.clone(),
+                }),
+                _ => Err(AxBackendParseError::InvalidQuerySource { line }),
+            }
+        }
         _ => Err(AxBackendParseError::InvalidQuerySource { line }),
     }
 }
@@ -798,6 +808,35 @@ loader PostsList
             AxBackendValue::Query(AxQuerySpec::new(AxQuerySource::Stream {
                 collection: "posts".to_string(),
             }))
+        );
+    }
+
+    #[test]
+    fn parses_content_collection_binding_as_query() {
+        let input = r#"
+loader DocsList
+  data docs = Content.Collection("docs")
+    order slug asc
+  return docs
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected loader block");
+        };
+        let AxBackendStmt::Data(docs) = &loader.body[0] else {
+            panic!("expected data statement");
+        };
+
+        assert_eq!(
+            docs.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::ContentCollection {
+                    collection: "docs".to_string(),
+                })
+                .order(AxQueryOrder::new("slug", AxQueryOrderDirection::Asc))
+            )
         );
     }
 

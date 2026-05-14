@@ -98,6 +98,7 @@ pub struct AxQueryPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxQuerySourcePlan {
     Stream { collection: String },
+    ContentCollection { collection: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -341,6 +342,11 @@ fn lower_query(query: &AxQuerySpec) -> AxQueryPlan {
             AxQuerySource::Stream { collection } => AxQuerySourcePlan::Stream {
                 collection: collection.clone(),
             },
+            AxQuerySource::ContentCollection { collection } => {
+                AxQuerySourcePlan::ContentCollection {
+                    collection: collection.clone(),
+                }
+            }
         },
         filters: query
             .filters

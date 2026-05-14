@@ -196,6 +196,11 @@ impl Default for AxPreviewStore {
 }
 
 impl AxPreviewStore {
+    pub fn with_collection(mut self, collection: impl Into<String>, items: Vec<AxValue>) -> Self {
+        self.collections.insert(collection.into(), items);
+        self
+    }
+
     pub fn collection_items(&self, collection: &str) -> Vec<AxValue> {
         self.collections
             .get(collection)
@@ -575,6 +580,16 @@ fn preview_resolve_call(
         return Ok(Some(AxValue::List(store.collection_items(collection))));
     }
 
+    if path == ["Content".to_string(), "Collection".to_string()] {
+        let [AxValue::String(collection)] = args else {
+            return Err(PreviewError::Runtime {
+                message: "Content.Collection(...) expects a collection name".to_string(),
+            });
+        };
+
+        return Ok(Some(AxValue::List(store.collection_items(collection))));
+    }
+
     Ok(None)
 }
 
@@ -777,7 +792,10 @@ fn eval_preview_query(
     env: &backend::AxEnv,
     store: &AxPreviewStore,
 ) -> Result<AxValue, PreviewError> {
-    let AxQuerySourcePlan::Stream { collection } = &query.source;
+    let collection = match &query.source {
+        AxQuerySourcePlan::Stream { collection } => collection,
+        AxQuerySourcePlan::ContentCollection { collection } => collection,
+    };
     let mut items = store.collection_items(collection);
 
     for filter in &query.filters {
@@ -2192,6 +2210,41 @@ page Posts
         assert!(html.contains("Hello Axonyx"));
         assert!(html.contains("Docs Without Bloat"));
         assert!(!html.contains("Draft Preview"));
+    }
+
+    #[test]
+    fn previews_content_collection_loader_data_inside_page() {
+        let store = AxPreviewStore::default().with_collection(
+            "docs",
+            vec![AxValue::record([
+                ("slug", AxValue::from("getting-started")),
+                ("path", AxValue::from("content/docs/getting-started.md")),
+                ("title", AxValue::from("Getting Started")),
+            ])],
+        );
+        let html = preview_ax_route_with_backend(
+            &[],
+            &[r#"
+loader DocsList
+  data docs = Content.Collection("docs")
+    order slug asc
+  return docs
+"#],
+            &[],
+            r#"
+page Docs
+  data docs = load DocsList
+  each doc in docs
+    Card title: doc.title
+      Copy -> doc.path
+"#,
+            "/docs",
+            &store,
+        )
+        .expect("content collection preview should render");
+
+        assert!(html.contains("Getting Started"));
+        assert!(html.contains("content/docs/getting-started.md"));
     }
 
     #[test]

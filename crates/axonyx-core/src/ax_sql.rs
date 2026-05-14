@@ -71,6 +71,7 @@ pub fn compile_query_plan_to_sql(
 ) -> Result<AxSqlQuery, AxSqlCompileError> {
     let collection = match &query.source {
         AxQuerySourcePlan::Stream { collection } => collection,
+        AxQuerySourcePlan::ContentCollection { collection } => collection,
     };
     validate_ident(collection)?;
 
