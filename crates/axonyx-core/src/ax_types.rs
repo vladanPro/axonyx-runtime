@@ -114,8 +114,19 @@ impl AxDataContext {
     pub fn from_v2_let_types(file: &AxFileV2) -> Result<Self, AxTypeParseError> {
         let mut context = Self::new();
         for record in &file.types {
+            if context.records.contains_key(&record.name) {
+                return Err(AxTypeParseError::DuplicateRecord {
+                    name: record.name.clone(),
+                });
+            }
             let mut record_type = AxRecordType::new(record.name.clone());
             for field in &record.fields {
+                if record_type.fields.contains_key(&field.name) {
+                    return Err(AxTypeParseError::DuplicateField {
+                        record: record.name.clone(),
+                        field: field.name.clone(),
+                    });
+                }
                 record_type =
                     record_type.field(field.name.clone(), AxType::parse_annotation(&field.ty)?);
             }
@@ -204,6 +215,10 @@ pub enum AxTypeParseError {
     Empty,
     #[error("invalid type annotation `{raw}`")]
     Invalid { raw: String },
+    #[error("duplicate type declaration `{name}`")]
+    DuplicateRecord { name: String },
+    #[error("duplicate field `{field}` in type `{record}`")]
+    DuplicateField { record: String, field: String },
 }
 
 fn parse_type_annotation(input: &str) -> Result<AxType, AxTypeParseError> {
@@ -325,13 +340,15 @@ impl AxTypeCheckReport {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxTypeCheckError {
     pub location: String,
+    pub expression: Option<String>,
     pub message: String,
 }
 
 impl AxTypeCheckError {
-    fn new(location: impl Into<String>, error: AxTypeError) -> Self {
+    fn new(location: impl Into<String>, expression: Option<String>, error: AxTypeError) -> Self {
         Self {
             location: location.into(),
+            expression,
             message: error.to_string(),
         }
     }
@@ -376,7 +393,11 @@ impl AxTypeChecker {
             AxStatement::Data(binding) => match self.context.resolve_expr_type(&binding.value) {
                 Ok(AxType::Unknown) if self.context.binding(&binding.name).is_some() => {}
                 Ok(ty) => self.context.bind(binding.name.clone(), ty),
-                Err(error) => self.push_error(format!("{location}.data.{}", binding.name), error),
+                Err(error) => self.push_expr_error(
+                    format!("{location}.data.{}", binding.name),
+                    &binding.value,
+                    error,
+                ),
             },
             AxStatement::Each(block) => {
                 match self.context.bind_each_item(&block.binding, &block.source) {
@@ -390,7 +411,11 @@ impl AxTypeChecker {
                             .check_statements(&block.empty_body, &format!("{location}.empty"));
                         self.errors.extend(empty_checker.errors);
                     }
-                    Err(error) => self.push_error(format!("{location}.each.source"), error),
+                    Err(error) => self.push_expr_error(
+                        format!("{location}.each.source"),
+                        &block.source,
+                        error,
+                    ),
                 }
             }
             AxStatement::If(block) => {
@@ -458,12 +483,35 @@ impl AxTypeChecker {
 
     fn check_expr(&mut self, expr: &AxExpr, location: String) {
         if let Err(error) = self.context.resolve_expr_type(expr) {
-            self.push_error(location, error);
+            self.push_expr_error(location, expr, error);
         }
     }
 
     fn push_error(&mut self, location: impl Into<String>, error: AxTypeError) {
-        self.errors.push(AxTypeCheckError::new(location, error));
+        self.errors
+            .push(AxTypeCheckError::new(location, None, error));
+    }
+
+    fn push_expr_error(&mut self, location: impl Into<String>, expr: &AxExpr, error: AxTypeError) {
+        self.errors.push(AxTypeCheckError::new(
+            location,
+            Some(format_expr(expr)),
+            error,
+        ));
+    }
+}
+
+fn format_expr(expr: &AxExpr) -> String {
+    match expr {
+        AxExpr::String(value) => format!("{value:?}"),
+        AxExpr::Number(value) => value.to_string(),
+        AxExpr::Bool(value) => value.to_string(),
+        AxExpr::Identifier(name) => name.clone(),
+        AxExpr::Member { object, property } => format!("{}.{}", format_expr(object), property),
+        AxExpr::Call { path, args } => {
+            let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            format!("{}({args})", path.join("."))
+        }
     }
 }
 
@@ -590,6 +638,64 @@ let title = "Blog"
     }
 
     #[test]
+    fn rejects_duplicate_v2_type_fields() {
+        let file = parse_ax_v2(
+            r#"
+page Blog
+
+type Post {
+  title: String
+  title: String
+}
+
+<Copy>Blog</Copy>
+"#,
+        )
+        .expect("source should parse");
+
+        let error =
+            AxDataContext::from_v2_let_types(&file).expect_err("duplicate field should fail");
+
+        assert_eq!(
+            error,
+            AxTypeParseError::DuplicateField {
+                record: "Post".to_string(),
+                field: "title".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_v2_type_declarations() {
+        let file = parse_ax_v2(
+            r#"
+page Blog
+
+type Post {
+  title: String
+}
+
+type Post {
+  slug: String
+}
+
+<Copy>Blog</Copy>
+"#,
+        )
+        .expect("source should parse");
+
+        let error =
+            AxDataContext::from_v2_let_types(&file).expect_err("duplicate type should fail");
+
+        assert_eq!(
+            error,
+            AxTypeParseError::DuplicateRecord {
+                name: "Post".to_string(),
+            }
+        );
+    }
+
+    #[test]
     fn checks_document_each_item_members() {
         let document = AxDocument::page(
             "Blog",
@@ -631,6 +737,7 @@ let title = "Blog"
             report.errors,
             vec![AxTypeCheckError {
                 location: "page[0].each[0].Card.prop.title".to_string(),
+                expression: Some("post.summary".to_string()),
                 message: "unknown field `summary` on Post".to_string(),
             }]
         );
@@ -655,6 +762,7 @@ let title = "Blog"
             report.errors,
             vec![AxTypeCheckError {
                 location: "page[0].empty[0].Copy.body".to_string(),
+                expression: Some("post.title".to_string()),
                 message: "unknown binding `post`".to_string(),
             }]
         );
