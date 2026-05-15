@@ -88,6 +88,42 @@ pub struct AxSendRequest {
     pub payload: Value,
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxLoaderContext {
+    pub params: BTreeMap<String, String>,
+    pub query: BTreeMap<String, String>,
+}
+
+impl AxLoaderContext {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_param(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.params.insert(name.into(), value.into());
+        self
+    }
+
+    pub fn with_query(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.query.insert(name.into(), value.into());
+        self
+    }
+
+    pub fn param(&self, name: &str) -> AxRuntimeResult<String> {
+        self.params
+            .get(name)
+            .cloned()
+            .ok_or_else(|| AxRuntimeError::message(format!("missing route param `{name}`")))
+    }
+
+    pub fn query(&self, name: &str) -> AxRuntimeResult<String> {
+        self.query
+            .get(name)
+            .cloned()
+            .ok_or_else(|| AxRuntimeError::message(format!("missing query param `{name}`")))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AxDirectSqlPlan {
     pub dialect: String,
@@ -1126,6 +1162,7 @@ pub mod prelude {
     pub use super::AxDeleteRequest;
     pub use super::AxEnv;
     pub use super::AxInsertRequest;
+    pub use super::AxLoaderContext;
     pub use super::AxMessenger;
     pub use super::AxMutationExecutor;
     pub use super::AxQueryExecutor;

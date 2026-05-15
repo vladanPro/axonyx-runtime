@@ -104,6 +104,10 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
             handler.rust_fn,
             action_input_struct_name(&handler.rust_fn)
         ),
+        AxHandlerKind::Loader => format!(
+            "pub fn {}(runtime: &impl AxBackendRuntime, context: &AxLoaderContext) -> AxRuntimeResult<Value>",
+            handler.rust_fn
+        ),
         _ => format!(
             "pub fn {}(runtime: &impl AxBackendRuntime) -> AxRuntimeResult<Value>",
             handler.rust_fn
@@ -278,7 +282,20 @@ fn render_query_filters(filters: &[AxQueryFilterPlan]) -> String {
 }
 
 fn render_borrowed_expr(expr: &AxRustExpr) -> String {
-    format!("&{}", expr.code)
+    if let Some(context_expr) = render_context_lookup(&expr.code) {
+        context_expr
+    } else {
+        format!("&{}", expr.code)
+    }
+}
+
+fn render_context_lookup(code: &str) -> Option<String> {
+    let (source, field) = code.split_once('.')?;
+    match source {
+        "params" => Some(format!("&context.param({field:?})?")),
+        "query" => Some(format!("&context.query({field:?})?")),
+        _ => None,
+    }
 }
 
 fn render_filter_op(op: AxQueryFilterOpPlan) -> &'static str {
@@ -377,7 +394,9 @@ mod tests {
         let module = generate_backend_module(&plan).expect("module should generate");
 
         assert!(module.contains("use axonyx_runtime::backend_prelude::*;"));
-        assert!(module.contains("pub fn loader_posts_list(runtime: &impl AxBackendRuntime)"));
+        assert!(module.contains(
+            "pub fn loader_posts_list(runtime: &impl AxBackendRuntime, context: &AxLoaderContext)"
+        ));
         assert!(module.contains("runtime.load(&AxQueryRequest"));
         assert!(module.contains("pub struct ActionCreatePostInput"));
         assert!(module.contains("pub fn action_create_post(runtime: &impl AxBackendRuntime, input: &ActionCreatePostInput)"));
@@ -398,9 +417,32 @@ loader PostsList
         )
         .expect("source should compile");
 
-        assert!(module.contains("pub fn loader_posts_list(runtime: &impl AxBackendRuntime)"));
+        assert!(module.contains(
+            "pub fn loader_posts_list(runtime: &impl AxBackendRuntime, context: &AxLoaderContext)"
+        ));
         assert!(module.contains("field: \"status\".to_string()"));
         assert!(module.contains("limit: Some(12)"));
+    }
+
+    #[test]
+    fn compiles_loader_params_and_query_into_context_lookups() {
+        let module = compile_backend_ax_to_module(
+            r#"
+loader PostDetail
+  data posts = Db.Stream("posts")
+    where slug = params.slug
+    where status = query.status
+    limit 1
+  return posts
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains(
+            "pub fn loader_post_detail(runtime: &impl AxBackendRuntime, context: &AxLoaderContext)"
+        ));
+        assert!(module.contains(r#"value: json!(&context.param("slug")?)"#));
+        assert!(module.contains(r#"value: json!(&context.query("status")?)"#));
     }
 
     #[test]
@@ -441,7 +483,9 @@ route GET "/api/posts"
         ])
         .expect("sources should compile");
 
-        assert!(module.contains("pub fn loader_posts_list(runtime: &impl AxBackendRuntime)"));
+        assert!(module.contains(
+            "pub fn loader_posts_list(runtime: &impl AxBackendRuntime, context: &AxLoaderContext)"
+        ));
         assert!(module.contains("pub fn route_get_api_posts(runtime: &impl AxBackendRuntime)"));
     }
 
