@@ -461,6 +461,22 @@ fn lower_component_node(
             push_remaining_props(&mut attrs, props);
             element_with_attrs(leak_tag(tag), attrs, children)
         }
+        "Html" => {
+            prepend_class_attr(&mut attrs, "ax-html");
+            let content = prop_string(&mut props, &["content", "html"]).unwrap_or_else(|| {
+                children
+                    .iter()
+                    .map(|child| match child {
+                        AxNode::Text(value) | AxNode::RawHtml(value) => value.clone(),
+                        AxNode::Element { .. } => String::new(),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("")
+            });
+            push_behavior_props(&mut attrs, &mut props);
+            push_remaining_props(&mut attrs, props);
+            element_with_attrs("div", attrs, vec![raw_html(content)])
+        }
         "Button" => {
             prepend_class_attr(&mut attrs, "ax-button");
             push_selected_native_props(&mut attrs, &mut props, &["type", "name", "value", "form"]);

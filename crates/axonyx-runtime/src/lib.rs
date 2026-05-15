@@ -1601,6 +1601,7 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
 fn render_node(node: &AxNode, out: &mut String) {
     match node {
         AxNode::Text(text) => out.push_str(&escape_html(text)),
+        AxNode::RawHtml(html) => out.push_str(html),
         AxNode::Element {
             tag,
             attrs,
@@ -1990,6 +1991,23 @@ page Home
 
         assert!(html.contains("<p>Hello<strong>Axonyx</strong></p>"));
         assert!(!html.contains("data-component=\"Fragment\""));
+    }
+
+    #[test]
+    fn previews_html_primitive_as_raw_content() {
+        let html = preview_ax_page(
+            r#"
+page Home
+
+<Html content={"<h2>Rendered markdown</h2><p>Safe build output</p>"} />
+"#,
+        )
+        .expect("html primitive should render");
+
+        assert!(html.contains(
+            "<div class=\"ax-html\"><h2>Rendered markdown</h2><p>Safe build output</p></div>"
+        ));
+        assert!(!html.contains("&lt;h2&gt;Rendered markdown&lt;/h2&gt;"));
     }
 
     #[test]

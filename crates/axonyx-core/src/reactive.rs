@@ -133,10 +133,15 @@ pub enum AxNode {
         children: Vec<AxNode>,
     },
     Text(String),
+    RawHtml(String),
 }
 
 pub fn text(content: impl Into<String>) -> AxNode {
     AxNode::Text(content.into())
+}
+
+pub fn raw_html(content: impl Into<String>) -> AxNode {
+    AxNode::RawHtml(content.into())
 }
 
 pub fn children(nodes: impl IntoIterator<Item = AxNode>) -> Children {
@@ -180,6 +185,7 @@ pub mod prelude {
     pub use super::element;
     pub use super::element_with_attrs;
     pub use super::mem;
+    pub use super::raw_html;
     pub use super::render_component;
     pub use super::resource;
     pub use super::signal;
