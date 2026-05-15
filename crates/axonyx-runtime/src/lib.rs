@@ -1416,13 +1416,19 @@ fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
     } else {
         ""
     };
+    let state_bridge_script = if body.contains("data-ax-signal=") {
+        ax_state_bridge_script()
+    } else {
+        ""
+    };
 
     format!(
-        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>{}</head><body>{}{}</body></html>",
+        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>{}</head><body>{}{}{}</body></html>",
         html_attrs,
         preview_styles(),
         head,
         body,
+        state_bridge_script,
         behavior_script
     )
 }
@@ -1497,6 +1503,103 @@ fn ax_behavior_script() -> &'static str {
     const next = applyTheme(control.value);
     if (window.localStorage) window.localStorage.setItem(storageKey, next);
   });
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init, { once: true });
+  } else {
+    init();
+  }
+})();
+</script>"##
+}
+
+fn ax_state_bridge_script() -> &'static str {
+    r##"<script data-ax-runtime="state-bridge">
+(() => {
+  if (window.__axonyxStateBridge) return;
+
+  const state = new Map();
+  const bindings = new Map();
+
+  const readValue = (node, target) => {
+    if (target === "checked") return !!node.checked;
+    if (target === "text") return node.textContent || "";
+    return node.value ?? node.getAttribute("value") ?? "";
+  };
+
+  const castValue = (value, type) => {
+    if (type === "Bool") {
+      return value === true || value === "true" || value === "on";
+    }
+    if (type === "Number") {
+      const next = Number(value);
+      return Number.isFinite(next) ? next : value;
+    }
+    return value == null ? "" : String(value);
+  };
+
+  const writeValue = (node, target, value) => {
+    const next = value == null ? "" : String(value);
+    if (target === "checked") {
+      node.checked = value === true || value === "true" || value === "on";
+      return;
+    }
+    if (target === "text") {
+      node.textContent = next;
+      return;
+    }
+    if ("value" in node) node.value = next;
+    else node.setAttribute("value", next);
+  };
+
+  const emitPatch = (signal, value, source) => {
+    const detail = { signal, value, source };
+    window.dispatchEvent(new CustomEvent("axonyx:state-patch", { detail }));
+  };
+
+  const register = (node) => {
+    const signal = node.getAttribute("data-ax-signal");
+    if (!signal) return;
+    const target = node.getAttribute("data-ax-bind") || "value";
+    const type = node.getAttribute("data-ax-state-type") || "String";
+    const initial = castValue(readValue(node, target), type);
+    if (!state.has(signal)) state.set(signal, initial);
+    writeValue(node, target, state.get(signal));
+    if (!bindings.has(signal)) bindings.set(signal, []);
+    bindings.get(signal).push({ node, target, type });
+  };
+
+  const setSignal = (signal, value, source = "client") => {
+    state.set(signal, value);
+    (bindings.get(signal) || []).forEach(({ node, target }) => {
+      writeValue(node, target, value);
+    });
+    emitPatch(signal, value, source);
+  };
+
+  const init = () => {
+    document.querySelectorAll("[data-ax-signal]").forEach(register);
+  };
+
+  document.addEventListener("input", (event) => {
+    const node = event.target.closest("[data-ax-signal]");
+    if (!node) return;
+    const type = node.getAttribute("data-ax-state-type") || "String";
+    setSignal(node.getAttribute("data-ax-signal"), castValue(readValue(node, node.getAttribute("data-ax-bind") || "value"), type));
+  });
+
+  document.addEventListener("change", (event) => {
+    const node = event.target.closest("[data-ax-signal]");
+    if (!node) return;
+    const type = node.getAttribute("data-ax-state-type") || "String";
+    setSignal(node.getAttribute("data-ax-signal"), castValue(readValue(node, node.getAttribute("data-ax-bind") || "value"), type));
+  });
+
+  window.__axonyxStateBridge = {
+    get: (signal) => state.get(signal),
+    set: setSignal,
+    snapshot: () => Object.fromEntries(state.entries()),
+  };
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init, { once: true });
@@ -1973,6 +2076,62 @@ page Home
         assert!(themed_html.contains("data-ax-theme-storage-key=\"demo-theme\""));
         assert!(themed_html.contains("allowedThemes"));
         assert!(themed_html.contains("localStorage.setItem"));
+    }
+
+    #[test]
+    fn preview_injects_state_bridge_only_when_signal_hooks_exist() {
+        let static_html = preview_ax_page(
+            r#"
+page Home
+<input value="silver" />
+"#,
+        )
+        .expect("static preview should render");
+
+        assert!(!static_html.contains("data-ax-runtime=\"state-bridge\""));
+
+        let state_html = preview_ax_page(
+            r#"
+page Home
+<input data-ax-signal="root:theme:1" data-ax-bind="value" value="silver" />
+<span data-ax-signal="root:theme:1" data-ax-bind="text">silver</span>
+"#,
+        )
+        .expect("state bridge preview should render");
+
+        assert!(state_html.contains("data-ax-signal=\"root:theme:1\""));
+        assert!(state_html.contains("data-ax-bind=\"value\""));
+        assert!(state_html.contains("data-ax-runtime=\"state-bridge\""));
+        assert!(state_html.contains("axonyx:state-patch"));
+        assert!(state_html.contains("window.__axonyxStateBridge"));
+    }
+
+    #[test]
+    fn preview_lowers_state_signal_syntax_into_bridge_metadata() {
+        let html = preview_ax_page(
+            r#"
+page Home
+
+state theme = "silver"
+state count: Number = 0
+
+<input bind:value={theme} />
+<span bind:text={theme}>{theme}</span>
+<input bind:value={count} />
+"#,
+        )
+        .expect("state syntax preview should render");
+
+        assert!(html.contains("data-ax-signal=\"root:theme:1\""));
+        assert!(html.contains("data-ax-bind=\"value\""));
+        assert!(html.contains("data-ax-state-type=\"String\""));
+        assert!(html.contains("value=\"silver\""));
+        assert!(html.contains("data-ax-bind=\"text\""));
+        assert!(html.contains(">silver</span>"));
+        assert!(html.contains("data-ax-state-type=\"Number\""));
+        assert!(html.contains("value=\"0\""));
+        assert!(html.contains("data-ax-runtime=\"state-bridge\""));
+        assert!(html.contains("castValue"));
     }
 
     #[test]

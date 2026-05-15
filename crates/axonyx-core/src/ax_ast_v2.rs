@@ -6,6 +6,7 @@ pub struct AxFileV2 {
     pub page: AxPageDecl,
     pub types: Vec<AxTypeDeclV2>,
     pub lets: Vec<AxLetDeclV2>,
+    pub states: Vec<AxStateDeclV2>,
     pub functions: Vec<AxFunctionDeclV2>,
     pub components: Vec<AxComponentDeclV2>,
     pub body: Vec<AxNodeV2>,
@@ -104,6 +105,31 @@ pub struct AxLetDeclV2 {
 }
 
 impl AxLetDeclV2 {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: None,
+            value: value.into(),
+        }
+    }
+
+    pub fn typed(name: impl Into<String>, ty: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: Some(ty.into()),
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxStateDeclV2 {
+    pub name: String,
+    pub ty: Option<String>,
+    pub value: String,
+}
+
+impl AxStateDeclV2 {
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
             name: name.into(),
@@ -294,6 +320,7 @@ pub mod prelude {
     pub use super::AxLetDeclV2;
     pub use super::AxNodeV2;
     pub use super::AxPageDecl;
+    pub use super::AxStateDeclV2;
     pub use super::AxTextNode;
     pub use super::AxTypeDeclV2;
     pub use super::AxTypeFieldDeclV2;
@@ -316,6 +343,7 @@ mod tests {
             page: AxPageDecl::new("Home"),
             types: Vec::new(),
             lets: Vec::new(),
+            states: Vec::new(),
             functions: Vec::new(),
             components: Vec::new(),
             body: vec![AxNodeV2::Element(

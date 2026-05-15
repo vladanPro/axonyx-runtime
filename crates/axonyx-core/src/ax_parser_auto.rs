@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use thiserror::Error;
 
 use crate::ax_ast::prelude::*;
@@ -50,6 +51,14 @@ pub enum AxConvertV2Error {
     HeadValueInvalidChild { tag: String },
     #[error("`<{tag}>` inside `<Head>` only supports attributes for now")]
     HeadTagChildrenNotSupported { tag: String },
+    #[error(
+        "invalid state initializer `{expr_source}`; expected a literal value or `signal(...)`"
+    )]
+    InvalidStateInitializer { expr_source: String },
+    #[error("`{attr}` must bind to a declared `state` signal")]
+    UnknownStateBinding { attr: String },
+    #[error("`{attr}` only supports expression bindings such as `{{theme}}`")]
+    InvalidStateBinding { attr: String },
 }
 
 pub fn looks_like_ax_v2(input: &str) -> bool {
@@ -72,11 +81,19 @@ pub fn parse_ax_auto(input: &str) -> Result<AxDocument, AxAutoParseError> {
 pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Error> {
     let mut head = AxHead::default();
     let mut body = Vec::new();
+    let state_bindings = collect_state_bindings(file)?;
 
     for binding in &file.lets {
         body.push(AxStatement::data(
             binding.name.clone(),
             parse_v2_expr(&binding.value)?,
+        ));
+    }
+
+    for binding in &file.states {
+        body.push(AxStatement::data(
+            binding.name.clone(),
+            parse_state_initializer(&binding.value)?.value,
         ));
     }
 
@@ -86,7 +103,10 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
                 merge_head_element(&mut head, element)?
             }
             AxNodeV2::Element(element) => {
-                body.push(AxStatement::component(convert_element(element)?));
+                body.push(AxStatement::component(convert_element(
+                    element,
+                    &state_bindings,
+                )?));
             }
             AxNodeV2::Text(text) => body.push(AxStatement::text(text.value.clone())),
             AxNodeV2::Expr(expr) => body.push(AxStatement::text(parse_v2_expr(&expr.source)?)),
@@ -103,7 +123,7 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
         components: file
             .components
             .iter()
-            .map(convert_component_decl)
+            .map(|component| convert_component_decl(component, &state_bindings))
             .collect::<Result<Vec<_>, _>>()?,
         head,
         page: AxPage::new(file.page.name.clone(), body),
@@ -133,6 +153,7 @@ fn convert_function_decl(function: &AxFunctionDeclV2) -> Result<AxFunctionDef, A
 
 fn convert_component_decl(
     component: &AxComponentDeclV2,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
 ) -> Result<AxComponentDef, AxConvertV2Error> {
     Ok(AxComponentDef::new(
         component.name.clone(),
@@ -141,7 +162,7 @@ fn convert_component_decl(
             .iter()
             .map(convert_component_param_decl)
             .collect::<Result<Vec<_>, _>>()?,
-        convert_children(&component.body)?,
+        convert_children(&component.body, state_bindings)?,
     ))
 }
 
@@ -217,22 +238,27 @@ fn convert_head_tag(element: &AxElementNode) -> Result<AxHeadTag, AxConvertV2Err
     Ok(AxHeadTag::new(attrs))
 }
 
-fn convert_element(element: &AxElementNode) -> Result<AxComponent, AxConvertV2Error> {
+fn convert_element(
+    element: &AxElementNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<AxComponent, AxConvertV2Error> {
     if element.name == "Each" {
-        return convert_each_element(element);
+        return convert_each_element(element, state_bindings);
     }
     if element.name == "If" {
-        return convert_if_element(element);
+        return convert_if_element(element, state_bindings);
     }
 
     let mut component = AxComponent::new(element.name.clone());
 
     for attr in &element.attrs {
-        let value = convert_attr_value(&attr.value)?;
         match attr.name.as_str() {
-            "class" => component = component.class(value),
-            "recipe" => component = component.recipe(value),
-            _ => component = component.prop(attr.name.clone(), value),
+            name if name.starts_with("bind:") => {
+                component = apply_state_binding_attr(component, attr, state_bindings)?;
+            }
+            "class" => component = component.class(convert_attr_value(&attr.value)?),
+            "recipe" => component = component.recipe(convert_attr_value(&attr.value)?),
+            _ => component = component.prop(attr.name.clone(), convert_attr_value(&attr.value)?),
         }
     }
 
@@ -248,7 +274,7 @@ fn convert_element(element: &AxElementNode) -> Result<AxComponent, AxConvertV2Er
         let body = element
             .children
             .iter()
-            .map(convert_child)
+            .map(|child| convert_child(child, state_bindings))
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(component.block(body));
     }
@@ -257,58 +283,92 @@ fn convert_element(element: &AxElementNode) -> Result<AxComponent, AxConvertV2Er
         return match &element.children[0] {
             AxNodeV2::Text(text) => Ok(component.inline(AxExpr::string(text.value.clone()))),
             AxNodeV2::Expr(expr) => Ok(component.inline(parse_v2_expr(&expr.source)?)),
-            AxNodeV2::Element(child) => {
-                Ok(component.block([AxStatement::component(convert_element(child)?)]))
-            }
+            AxNodeV2::Element(child) => Ok(component.block([AxStatement::component(
+                convert_element(child, state_bindings)?,
+            )])),
         };
     }
 
-    Ok(component.block(convert_children(&element.children)?))
+    Ok(component.block(convert_children(&element.children, state_bindings)?))
 }
 
-fn convert_children(children: &[AxNodeV2]) -> Result<Vec<AxStatement>, AxConvertV2Error> {
-    children.iter().map(convert_child).collect()
+fn convert_children(
+    children: &[AxNodeV2],
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<Vec<AxStatement>, AxConvertV2Error> {
+    children
+        .iter()
+        .map(|child| convert_child(child, state_bindings))
+        .collect()
 }
 
-fn convert_child(child: &AxNodeV2) -> Result<AxStatement, AxConvertV2Error> {
+fn convert_child(
+    child: &AxNodeV2,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<AxStatement, AxConvertV2Error> {
     match child {
-        AxNodeV2::Element(element) if element.name == "Each" => convert_each_statement(element),
-        AxNodeV2::Element(element) if element.name == "If" => convert_if_statement(element),
+        AxNodeV2::Element(element) if element.name == "Each" => {
+            convert_each_statement(element, state_bindings)
+        }
+        AxNodeV2::Element(element) if element.name == "If" => {
+            convert_if_statement(element, state_bindings)
+        }
         AxNodeV2::Element(element) if element.name == "Else" || element.name == "Empty" => {
             Err(AxConvertV2Error::UnexpectedControlBranch {
                 tag: "control-flow".to_string(),
                 branch: element.name.clone(),
             })
         }
-        AxNodeV2::Element(element) => Ok(AxStatement::component(convert_element(element)?)),
+        AxNodeV2::Element(element) => Ok(AxStatement::component(convert_element(
+            element,
+            state_bindings,
+        )?)),
         AxNodeV2::Text(text) => Ok(AxStatement::text(text.value.clone())),
         AxNodeV2::Expr(expr) => Ok(AxStatement::text(parse_v2_expr(&expr.source)?)),
     }
 }
 
-fn convert_each_statement(element: &AxElementNode) -> Result<AxStatement, AxConvertV2Error> {
+fn convert_each_statement(
+    element: &AxElementNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<AxStatement, AxConvertV2Error> {
     let binding = control_binding_attr(element, &["as", "item"])?;
     let source = control_expr_attr(element, &["items", "in", "of"])?;
-    let (body, empty_body) = split_each_children(element)?;
+    let (body, empty_body) = split_each_children(element, state_bindings)?;
     Ok(AxStatement::Each(
         AxEachBlock::new(binding, source, body).empty(empty_body),
     ))
 }
 
-fn convert_if_statement(element: &AxElementNode) -> Result<AxStatement, AxConvertV2Error> {
+fn convert_if_statement(
+    element: &AxElementNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<AxStatement, AxConvertV2Error> {
     let condition = control_expr_attr(element, &["when", "condition"])?;
-    let (body, else_body) = split_if_children(element)?;
+    let (body, else_body) = split_if_children(element, state_bindings)?;
     Ok(AxStatement::If(
         AxIfBlock::new(condition, body).else_body(else_body),
     ))
 }
 
-fn convert_each_element(element: &AxElementNode) -> Result<AxComponent, AxConvertV2Error> {
-    Ok(AxComponent::fragment([convert_each_statement(element)?]))
+fn convert_each_element(
+    element: &AxElementNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<AxComponent, AxConvertV2Error> {
+    Ok(AxComponent::fragment([convert_each_statement(
+        element,
+        state_bindings,
+    )?]))
 }
 
-fn convert_if_element(element: &AxElementNode) -> Result<AxComponent, AxConvertV2Error> {
-    Ok(AxComponent::fragment([convert_if_statement(element)?]))
+fn convert_if_element(
+    element: &AxElementNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<AxComponent, AxConvertV2Error> {
+    Ok(AxComponent::fragment([convert_if_statement(
+        element,
+        state_bindings,
+    )?]))
 }
 
 fn control_expr_attr(element: &AxElementNode, names: &[&str]) -> Result<AxExpr, AxConvertV2Error> {
@@ -355,6 +415,7 @@ fn control_binding_attr(
 
 fn split_each_children(
     element: &AxElementNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
 ) -> Result<(Vec<AxStatement>, Vec<AxStatement>), AxConvertV2Error> {
     let mut body = Vec::new();
     let mut empty_body = None;
@@ -374,9 +435,9 @@ fn split_each_children(
                         branch: "Empty".to_string(),
                     });
                 }
-                empty_body = Some(convert_children(&branch.children)?);
+                empty_body = Some(convert_children(&branch.children, state_bindings)?);
             }
-            _ => body.push(convert_child(child)?),
+            _ => body.push(convert_child(child, state_bindings)?),
         }
     }
 
@@ -385,13 +446,15 @@ fn split_each_children(
 
 fn split_if_children(
     element: &AxElementNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
 ) -> Result<(Vec<AxStatement>, Vec<AxStatement>), AxConvertV2Error> {
-    split_if_children_from_slice(&element.name, &element.children)
+    split_if_children_from_slice(&element.name, &element.children, state_bindings)
 }
 
 fn split_if_children_from_slice(
     tag: &str,
     children: &[AxNodeV2],
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
 ) -> Result<(Vec<AxStatement>, Vec<AxStatement>), AxConvertV2Error> {
     let mut body = Vec::new();
     let mut index = 0;
@@ -411,12 +474,13 @@ fn split_if_children_from_slice(
                         branch: "Else".to_string(),
                     });
                 }
-                return Ok((body, convert_children(&branch.children)?));
+                return Ok((body, convert_children(&branch.children, state_bindings)?));
             }
             AxNodeV2::Element(branch) if branch.name == "ElseIf" => {
                 let condition = control_expr_attr(branch, &["when", "condition"])?;
-                let nested_body = convert_children(&branch.children)?;
-                let nested_else_body = convert_if_tail(tag, &children[index + 1..])?;
+                let nested_body = convert_children(&branch.children, state_bindings)?;
+                let nested_else_body =
+                    convert_if_tail_with_state(tag, &children[index + 1..], state_bindings)?;
                 return Ok((
                     body,
                     vec![AxStatement::If(
@@ -425,7 +489,7 @@ fn split_if_children_from_slice(
                 ));
             }
             child => {
-                body.push(convert_child(child)?);
+                body.push(convert_child(child, state_bindings)?);
                 index += 1;
             }
         }
@@ -434,7 +498,11 @@ fn split_if_children_from_slice(
     Ok((body, Vec::new()))
 }
 
-fn convert_if_tail(tag: &str, tail: &[AxNodeV2]) -> Result<Vec<AxStatement>, AxConvertV2Error> {
+fn convert_if_tail_with_state(
+    tag: &str,
+    tail: &[AxNodeV2],
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<Vec<AxStatement>, AxConvertV2Error> {
     let Some(first) = tail.first() else {
         return Ok(Vec::new());
     };
@@ -453,12 +521,12 @@ fn convert_if_tail(tag: &str, tail: &[AxNodeV2]) -> Result<Vec<AxStatement>, AxC
                     branch: "Else".to_string(),
                 });
             }
-            convert_children(&branch.children)
+            convert_children(&branch.children, state_bindings)
         }
         AxNodeV2::Element(branch) if branch.name == "ElseIf" => {
             let condition = control_expr_attr(branch, &["when", "condition"])?;
-            let nested_body = convert_children(&branch.children)?;
-            let nested_else_body = convert_if_tail(tag, &tail[1..])?;
+            let nested_body = convert_children(&branch.children, state_bindings)?;
+            let nested_else_body = convert_if_tail_with_state(tag, &tail[1..], state_bindings)?;
             Ok(vec![AxStatement::If(
                 AxIfBlock::new(condition, nested_body).else_body(nested_else_body),
             )])
@@ -476,6 +544,113 @@ fn convert_if_tail(tag: &str, tail: &[AxNodeV2]) -> Result<Vec<AxStatement>, AxC
             })
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateBindingPlan {
+    signal_id: String,
+    ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateInitializerPlan {
+    value: AxExpr,
+    ty: String,
+}
+
+fn collect_state_bindings(
+    file: &AxFileV2,
+) -> Result<BTreeMap<String, StateBindingPlan>, AxConvertV2Error> {
+    let mut bindings = BTreeMap::new();
+    for (index, state) in file.states.iter().enumerate() {
+        let initializer = parse_state_initializer(&state.value)?;
+        let ty = state.ty.clone().unwrap_or_else(|| initializer.ty.clone());
+        bindings.insert(
+            state.name.clone(),
+            StateBindingPlan {
+                signal_id: format!("root:{}:{}", state.name, index + 1),
+                ty,
+            },
+        );
+    }
+    Ok(bindings)
+}
+
+fn parse_state_initializer(source: &str) -> Result<StateInitializerPlan, AxConvertV2Error> {
+    let expr = parse_v2_expr(source)?;
+
+    let value = match expr {
+        AxExpr::Call { path, args } if path.as_slice() == ["signal"] && args.len() == 1 => {
+            args[0].clone()
+        }
+        AxExpr::Call { .. } => {
+            return Err(AxConvertV2Error::InvalidStateInitializer {
+                expr_source: source.to_string(),
+            });
+        }
+        other => other,
+    };
+
+    Ok(StateInitializerPlan {
+        ty: infer_state_type(&value).to_string(),
+        value,
+    })
+}
+
+fn infer_state_type(value: &AxExpr) -> &'static str {
+    match value {
+        AxExpr::String(_) => "String",
+        AxExpr::Bool(_) => "Bool",
+        AxExpr::Number(_) => "Number",
+        _ => "Unknown",
+    }
+}
+
+fn apply_state_binding_attr(
+    mut component: AxComponent,
+    attr: &AxAttributeNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<AxComponent, AxConvertV2Error> {
+    let bind_target = attr.name.trim_start_matches("bind:");
+    if bind_target.is_empty() {
+        return Err(AxConvertV2Error::InvalidStateBinding {
+            attr: attr.name.clone(),
+        });
+    }
+    if !matches!(bind_target, "value" | "checked" | "text") {
+        return Err(AxConvertV2Error::InvalidStateBinding {
+            attr: attr.name.clone(),
+        });
+    }
+
+    let AxAttributeValue::Expr(source) = &attr.value else {
+        return Err(AxConvertV2Error::InvalidStateBinding {
+            attr: attr.name.clone(),
+        });
+    };
+    let AxExpr::Identifier(name) = parse_v2_expr(source)? else {
+        return Err(AxConvertV2Error::InvalidStateBinding {
+            attr: attr.name.clone(),
+        });
+    };
+    let Some(binding) = state_bindings.get(&name) else {
+        return Err(AxConvertV2Error::UnknownStateBinding {
+            attr: attr.name.clone(),
+        });
+    };
+
+    component = component
+        .prop("data-ax-signal", AxExpr::string(binding.signal_id.clone()))
+        .prop("data-ax-bind", AxExpr::string(bind_target.to_string()))
+        .prop("data-ax-state-type", AxExpr::string(binding.ty.clone()));
+
+    if matches!(bind_target, "value" | "checked")
+        && !component.props.iter().any(|prop| prop.name == bind_target)
+    {
+        component = component.prop(bind_target.to_string(), AxExpr::ident(name));
+    }
+
+    Ok(component)
 }
 
 fn convert_prop(attr: &AxAttributeNode) -> Result<AxProp, AxConvertV2Error> {
@@ -679,6 +854,99 @@ let heroTitle = "Hello Axonyx"
             document.page.body[0],
             AxStatement::data("heroTitle", AxExpr::string("Hello Axonyx"))
         );
+    }
+
+    #[test]
+    fn converts_state_signal_binding_into_bridge_metadata() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+state theme = "silver"
+state count: Number = 0
+
+<input bind:value={theme} />
+<span bind:text={theme}>{theme}</span>
+<input bind:value={count} />
+"#,
+        )
+        .expect("state binding should convert");
+
+        assert_eq!(document.page.body.len(), 5);
+        assert_eq!(
+            document.page.body[0],
+            AxStatement::data("theme", AxExpr::string("silver"))
+        );
+        assert_eq!(
+            document.page.body[1],
+            AxStatement::data("count", AxExpr::number(0))
+        );
+
+        let AxStatement::Component(input) = &document.page.body[2] else {
+            panic!("input should convert into component");
+        };
+        assert!(input.props.contains(&AxProp::new(
+            "data-ax-signal",
+            AxExpr::string("root:theme:1")
+        )));
+        assert!(input
+            .props
+            .contains(&AxProp::new("data-ax-bind", AxExpr::string("value"))));
+        assert!(input
+            .props
+            .contains(&AxProp::new("data-ax-state-type", AxExpr::string("String"))));
+        assert!(input
+            .props
+            .contains(&AxProp::new("value", AxExpr::ident("theme"))));
+
+        let AxStatement::Component(span) = &document.page.body[3] else {
+            panic!("span should convert into component");
+        };
+        assert!(span
+            .props
+            .contains(&AxProp::new("data-ax-bind", AxExpr::string("text"))));
+        assert!(!span.props.iter().any(|prop| prop.name == "text"));
+
+        let AxStatement::Component(count_input) = &document.page.body[4] else {
+            panic!("count input should convert into component");
+        };
+        assert!(count_input
+            .props
+            .contains(&AxProp::new("data-ax-state-type", AxExpr::string("Number"))));
+    }
+
+    #[test]
+    fn rejects_bind_to_undeclared_state() {
+        let error = parse_ax_auto(
+            r#"
+page Home
+<input bind:value={theme} />
+"#,
+        )
+        .expect_err("undeclared state binding should fail");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::UnknownStateBinding { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_state_bind_target() {
+        let error = parse_ax_auto(
+            r#"
+page Home
+
+state theme = "silver"
+<input bind:theme={theme} />
+"#,
+        )
+        .expect_err("unknown state bind target should fail");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::InvalidStateBinding { .. })
+        ));
     }
 
     #[test]

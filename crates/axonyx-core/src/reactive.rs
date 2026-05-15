@@ -2,6 +2,8 @@ use std::cell::RefCell;
 use std::future::Future;
 use std::rc::Rc;
 
+use crate::state::{AxBindTarget, AxSignalId, AxStateBinding};
+
 pub trait Props: Clone + 'static {}
 
 impl<T> Props for T where T: Clone + 'static {}
@@ -155,6 +157,23 @@ pub fn attr(name: &'static str, value: impl Into<String>) -> Attribute {
     }
 }
 
+pub fn signal_attr(signal: &AxSignalId) -> Attribute {
+    attr("data-ax-signal", signal.stable_key())
+}
+
+pub fn bind_attr(target: AxBindTarget) -> Attribute {
+    let value = match target {
+        AxBindTarget::Value => "value",
+        AxBindTarget::Checked => "checked",
+        AxBindTarget::Text => "text",
+    };
+    attr("data-ax-bind", value)
+}
+
+pub fn state_binding_attrs(binding: &AxStateBinding) -> Attributes {
+    vec![signal_attr(&binding.signal), bind_attr(binding.target)]
+}
+
 pub fn element(tag: &'static str, children: Vec<AxNode>) -> AxNode {
     element_with_attrs(tag, vec![], children)
 }
@@ -180,6 +199,7 @@ where
 
 pub mod prelude {
     pub use super::attr;
+    pub use super::bind_attr;
     pub use super::children;
     pub use super::effect;
     pub use super::element;
@@ -189,6 +209,8 @@ pub mod prelude {
     pub use super::render_component;
     pub use super::resource;
     pub use super::signal;
+    pub use super::signal_attr;
+    pub use super::state_binding_attrs;
     pub use super::text;
     pub use super::view;
     pub use super::Attribute;
@@ -278,6 +300,25 @@ mod tests {
                 name: "class",
                 value: "primary".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn state_binding_attrs_build_bridge_metadata() {
+        let attrs = state_binding_attrs(&AxStateBinding::value(AxSignalId::root("theme", 1)));
+
+        assert_eq!(
+            attrs,
+            vec![
+                Attribute {
+                    name: "data-ax-signal",
+                    value: "root:theme:1".to_string(),
+                },
+                Attribute {
+                    name: "data-ax-bind",
+                    value: "value".to_string(),
+                },
+            ]
         );
     }
 }

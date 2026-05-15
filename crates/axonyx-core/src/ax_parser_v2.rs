@@ -16,6 +16,8 @@ pub enum AxParseV2Error {
     InvalidPage { line: usize },
     #[error("invalid let syntax at line {line}")]
     InvalidLet { line: usize },
+    #[error("invalid state syntax at line {line}")]
+    InvalidState { line: usize },
     #[error("invalid type syntax at line {line}")]
     InvalidType { line: usize },
     #[error("invalid function syntax at line {line}")]
@@ -86,10 +88,12 @@ impl<'a> Parser<'a> {
 
         let mut types = Vec::new();
         let mut lets = Vec::new();
+        let mut states = Vec::new();
         let mut functions = Vec::new();
         let mut components = Vec::new();
         while self.starts_with_keyword("type")
             || self.starts_with_keyword("let")
+            || self.starts_with_keyword("state")
             || self.starts_with_keyword("fn")
             || self.starts_with_keyword("component")
         {
@@ -97,6 +101,8 @@ impl<'a> Parser<'a> {
                 types.push(self.parse_type_decl()?);
             } else if self.starts_with_keyword("let") {
                 lets.push(self.parse_let_decl()?);
+            } else if self.starts_with_keyword("state") {
+                states.push(self.parse_state_decl()?);
             } else if self.starts_with_keyword("fn") {
                 functions.push(self.parse_function_decl()?);
             } else {
@@ -112,6 +118,7 @@ impl<'a> Parser<'a> {
             page,
             types,
             lets,
+            states,
             functions,
             components,
             body,
@@ -241,6 +248,50 @@ impl<'a> Parser<'a> {
         Ok(match ty {
             Some(ty) => AxLetDeclV2::typed(name, ty, value),
             None => AxLetDeclV2::new(name, value),
+        })
+    }
+
+    fn parse_state_decl(&mut self) -> Result<AxStateDeclV2, AxParseV2Error> {
+        let line = self.line;
+        self.expect_keyword("state")
+            .map_err(|_| AxParseV2Error::InvalidState { line })?;
+        self.skip_spaces();
+
+        let name = self.parse_identifier()?;
+        self.skip_spaces();
+
+        let ty = if self.peek_char() == Some(':') {
+            self.bump_char();
+            self.skip_spaces();
+            let ty = self.read_until_top_level_equals().trim().to_string();
+            if ty.is_empty() {
+                return Err(AxParseV2Error::InvalidState { line });
+            }
+            self.skip_spaces();
+            Some(ty)
+        } else {
+            None
+        };
+
+        if self.peek_char() != Some('=') {
+            return Err(AxParseV2Error::InvalidState { line });
+        }
+        self.bump_char();
+        self.skip_spaces();
+
+        let value = self
+            .read_until_line_end()
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            return Err(AxParseV2Error::InvalidState { line });
+        }
+
+        Ok(match ty {
+            Some(ty) => AxStateDeclV2::typed(name, ty, value),
+            None => AxStateDeclV2::new(name, value),
         })
     }
 
@@ -570,7 +621,7 @@ impl<'a> Parser<'a> {
 
     fn parse_attribute(&mut self) -> Result<AxAttributeNode, AxParseV2Error> {
         let line = self.line;
-        let name = self.parse_name_like(true)?;
+        let name = self.parse_attribute_name()?;
         if name.is_empty() {
             return Err(AxParseV2Error::InvalidTag { line });
         }
@@ -745,6 +796,25 @@ impl<'a> Parser<'a> {
         if name.is_empty() {
             return Err(AxParseV2Error::InvalidTag { line });
         }
+        Ok(name)
+    }
+
+    fn parse_attribute_name(&mut self) -> Result<String, AxParseV2Error> {
+        let mut name = self.parse_name_like(true)?;
+        if name.is_empty() {
+            return Ok(name);
+        }
+
+        if self.peek_char() == Some(':') {
+            self.bump_char();
+            let suffix = self.parse_name_like(true)?;
+            if suffix.is_empty() {
+                return Ok(String::new());
+            }
+            name.push(':');
+            name.push_str(&suffix);
+        }
+
         Ok(name)
     }
 
@@ -1131,6 +1201,32 @@ let columns = 3
         );
         assert_eq!(file.lets[1], AxLetDeclV2::new("columns", "3"));
         assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn parses_top_level_state_declarations_and_bind_attrs() {
+        let input = r#"
+page Home
+
+state theme = "silver"
+state count: Number = 0
+
+<input bind:value={theme} />
+"#;
+
+        let file = parse_ax_v2(input).expect("state declaration should parse");
+
+        assert_eq!(
+            file.states,
+            vec![
+                AxStateDeclV2::new("theme", r#""silver""#),
+                AxStateDeclV2::typed("count", "Number", "0")
+            ]
+        );
+        let AxNodeV2::Element(input) = &file.body[0] else {
+            panic!("expected input element");
+        };
+        assert_eq!(input.attrs[0], AxAttributeNode::expr("bind:value", "theme"));
     }
 
     #[test]
