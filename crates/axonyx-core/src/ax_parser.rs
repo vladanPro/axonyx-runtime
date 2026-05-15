@@ -473,10 +473,8 @@ pub(crate) fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseErro
         });
     }
 
-    if (input.starts_with('"') && input.ends_with('"'))
-        || (input.starts_with('\'') && input.ends_with('\''))
-    {
-        return Ok(AxExpr::string(input[1..input.len() - 1].to_string()));
+    if let Some(value) = parse_quoted_string(input, line)? {
+        return Ok(AxExpr::string(value));
     }
 
     if input == "true" {
@@ -579,6 +577,52 @@ fn parse_member_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
     }
 
     Ok(expr)
+}
+
+fn parse_quoted_string(input: &str, line: usize) -> Result<Option<String>, AxParseError> {
+    let mut chars = input.chars();
+    let Some(quote) = chars.next() else {
+        return Ok(None);
+    };
+    if quote != '"' && quote != '\'' {
+        return Ok(None);
+    }
+    if !input.ends_with(quote) || input.len() < 2 {
+        return Err(AxParseError::InvalidExpression {
+            line,
+            message: "unterminated string literal".to_string(),
+        });
+    }
+
+    let mut value = String::new();
+    let mut escaped = false;
+    for ch in input[1..input.len() - quote.len_utf8()].chars() {
+        if escaped {
+            value.push(match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '\\' => '\\',
+                '"' => '"',
+                '\'' => '\'',
+                other => other,
+            });
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else {
+            value.push(ch);
+        }
+    }
+
+    if escaped {
+        return Err(AxParseError::InvalidExpression {
+            line,
+            message: "unterminated string escape".to_string(),
+        });
+    }
+
+    Ok(Some(value))
 }
 
 fn find_call_open(input: &str) -> Option<usize> {
@@ -830,6 +874,24 @@ page Home
         };
 
         assert_eq!(expr, &AxExpr::ident("post").optional_member("summary"));
+    }
+
+    #[test]
+    fn parses_escaped_string_literals() {
+        let input = r#"
+page Home
+  pre class: "docs-code" -> "line one\nline two"
+"#;
+
+        let document = parse_ax(input).expect("document should parse");
+        let AxStatement::Component(pre) = &document.page.body[0] else {
+            panic!("expected pre component");
+        };
+        let AxBody::Inline(expr) = &pre.body else {
+            panic!("expected inline string");
+        };
+
+        assert_eq!(expr, &AxExpr::string("line one\nline two"));
     }
 
     #[test]
