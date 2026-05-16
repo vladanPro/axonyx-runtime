@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod server;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -28,6 +29,7 @@ use serde_json::json;
 use thiserror::Error;
 
 pub use backend::prelude as backend_prelude;
+pub use server::prelude as server_prelude;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RenderPlan {
