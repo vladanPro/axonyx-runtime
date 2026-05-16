@@ -75,7 +75,11 @@ impl AxHttpResponse {
     }
 
     pub fn text(status: u16, body: impl Into<String>) -> Self {
-        Self::new(status, "text/plain; charset=utf-8", body.into().into_bytes())
+        Self::new(
+            status,
+            "text/plain; charset=utf-8",
+            body.into().into_bytes(),
+        )
     }
 
     pub fn bytes(status: u16, content_type: impl Into<String>, body: Vec<u8>) -> Self {
@@ -121,8 +125,8 @@ mod tests {
 
     #[test]
     fn response_helpers_preserve_headers_and_body() {
-        let response = AxHttpResponse::html(200, "<h1>Hello</h1>")
-            .with_header("Cache-Control", "no-store");
+        let response =
+            AxHttpResponse::html(200, "<h1>Hello</h1>").with_header("Cache-Control", "no-store");
 
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "text/html; charset=utf-8");
