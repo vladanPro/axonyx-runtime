@@ -99,6 +99,35 @@ impl AxHttpResponse {
         self.headers.insert(name.into(), value.into());
         self
     }
+
+    pub fn with_no_store(self) -> Self {
+        self.with_header("Cache-Control", "no-store")
+    }
+
+    pub fn status_line(&self) -> String {
+        format!("{} {}", self.status, status_reason(self.status))
+    }
+
+    pub fn header_value(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+}
+
+pub fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "OK",
+        204 => "No Content",
+        303 => "See Other",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        415 => "Unsupported Media Type",
+        500 => "Internal Server Error",
+        _ => "OK",
+    }
 }
 
 pub trait AxServer {
@@ -107,7 +136,9 @@ pub trait AxServer {
 }
 
 pub mod prelude {
-    pub use super::{AxHttpRequest, AxHttpResponse, AxServer, AxServerConfig, AxServerMode};
+    pub use super::{
+        status_reason, AxHttpRequest, AxHttpResponse, AxServer, AxServerConfig, AxServerMode,
+    };
 }
 
 #[cfg(test)]
@@ -135,5 +166,16 @@ mod tests {
             response.headers.get("Cache-Control").map(String::as_str),
             Some("no-store")
         );
+    }
+
+    #[test]
+    fn response_knows_status_line_and_case_insensitive_headers() {
+        let response = AxHttpResponse::text(303, "")
+            .with_header("location", "/next")
+            .with_no_store();
+
+        assert_eq!(response.status_line(), "303 See Other");
+        assert_eq!(response.header_value("Location"), Some("/next"));
+        assert_eq!(response.header_value("cache-control"), Some("no-store"));
     }
 }
