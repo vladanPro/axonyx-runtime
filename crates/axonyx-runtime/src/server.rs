@@ -66,7 +66,7 @@ pub struct AxHttpResponse {
     pub status: u16,
     pub content_type: String,
     pub headers: BTreeMap<String, String>,
-    pub body: Vec<u8>,
+    pub body: AxBody,
 }
 
 impl AxHttpResponse {
@@ -91,7 +91,20 @@ impl AxHttpResponse {
             status,
             content_type: content_type.into(),
             headers: BTreeMap::new(),
-            body,
+            body: AxBody::fixed(body),
+        }
+    }
+
+    pub fn stream_chunks(
+        status: u16,
+        content_type: impl Into<String>,
+        chunks: Vec<Vec<u8>>,
+    ) -> Self {
+        Self {
+            status,
+            content_type: content_type.into(),
+            headers: BTreeMap::new(),
+            body: AxBody::chunks(chunks),
         }
     }
 
@@ -113,6 +126,60 @@ impl AxHttpResponse {
             .iter()
             .find(|(header, _)| header.eq_ignore_ascii_case(name))
             .map(|(_, value)| value.as_str())
+    }
+
+    pub fn body_len(&self) -> usize {
+        self.body.len()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AxBody {
+    Fixed(Vec<u8>),
+    Chunks(Vec<Vec<u8>>),
+}
+
+impl AxBody {
+    pub fn fixed(body: Vec<u8>) -> Self {
+        Self::Fixed(body)
+    }
+
+    pub fn chunks(chunks: Vec<Vec<u8>>) -> Self {
+        Self::Chunks(chunks)
+    }
+
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Fixed(body) => body.len(),
+            Self::Chunks(chunks) => chunks.iter().map(Vec::len).sum(),
+        }
+    }
+
+    pub fn is_streaming(&self) -> bool {
+        matches!(self, Self::Chunks(_))
+    }
+
+    pub fn chunks_iter(&self) -> AxBodyChunks<'_> {
+        match self {
+            Self::Fixed(body) => AxBodyChunks::Fixed(std::iter::once(body.as_slice())),
+            Self::Chunks(chunks) => AxBodyChunks::Chunks(chunks.iter().map(Vec::as_slice)),
+        }
+    }
+}
+
+pub enum AxBodyChunks<'a> {
+    Fixed(std::iter::Once<&'a [u8]>),
+    Chunks(std::iter::Map<std::slice::Iter<'a, Vec<u8>>, fn(&'a Vec<u8>) -> &'a [u8]>),
+}
+
+impl<'a> Iterator for AxBodyChunks<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Fixed(iter) => iter.next(),
+            Self::Chunks(iter) => iter.next(),
+        }
     }
 }
 
@@ -137,7 +204,8 @@ pub trait AxServer {
 
 pub mod prelude {
     pub use super::{
-        status_reason, AxHttpRequest, AxHttpResponse, AxServer, AxServerConfig, AxServerMode,
+        status_reason, AxBody, AxBodyChunks, AxHttpRequest, AxHttpResponse, AxServer,
+        AxServerConfig, AxServerMode,
     };
 }
 
@@ -161,7 +229,11 @@ mod tests {
 
         assert_eq!(response.status, 200);
         assert_eq!(response.content_type, "text/html; charset=utf-8");
-        assert_eq!(response.body, b"<h1>Hello</h1>");
+        assert_eq!(response.body_len(), "<h1>Hello</h1>".len());
+        assert_eq!(
+            response.body.chunks_iter().collect::<Vec<_>>(),
+            vec![b"<h1>Hello</h1>".as_slice()]
+        );
         assert_eq!(
             response.headers.get("Cache-Control").map(String::as_str),
             Some("no-store")
@@ -177,5 +249,25 @@ mod tests {
         assert_eq!(response.status_line(), "303 See Other");
         assert_eq!(response.header_value("Location"), Some("/next"));
         assert_eq!(response.header_value("cache-control"), Some("no-store"));
+    }
+
+    #[test]
+    fn response_can_describe_streaming_chunks_without_transport() {
+        let response = AxHttpResponse::stream_chunks(
+            200,
+            "text/html; charset=utf-8",
+            vec![b"<main>".to_vec(), b"Hello".to_vec(), b"</main>".to_vec()],
+        );
+
+        assert!(response.body.is_streaming());
+        assert_eq!(response.body_len(), "<main>Hello</main>".len());
+        assert_eq!(
+            response.body.chunks_iter().collect::<Vec<_>>(),
+            vec![
+                b"<main>".as_slice(),
+                b"Hello".as_slice(),
+                b"</main>".as_slice()
+            ]
+        );
     }
 }
