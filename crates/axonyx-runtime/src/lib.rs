@@ -1522,6 +1522,8 @@ fn ax_state_bridge_script() -> &'static str {
 
   const state = new Map();
   const bindings = new Map();
+  const types = new Map();
+  const subscribers = new Map();
 
   const readValue = (node, target) => {
     if (target === "checked") return !!node.checked;
@@ -1555,8 +1557,14 @@ fn ax_state_bridge_script() -> &'static str {
   };
 
   const emitPatch = (signal, value, source) => {
-    const detail = { signal, value, source };
+    const detail = { op: "set", signal, value, source };
     window.dispatchEvent(new CustomEvent("axonyx:state-patch", { detail }));
+  };
+
+  const notifySubscribers = (signal, value, source) => {
+    const detail = { signal, value, source };
+    window.dispatchEvent(new CustomEvent("axonyx:state-change", { detail }));
+    (subscribers.get(signal) || []).forEach((listener) => listener(value, detail));
   };
 
   const register = (node) => {
@@ -1565,18 +1573,41 @@ fn ax_state_bridge_script() -> &'static str {
     const target = node.getAttribute("data-ax-bind") || "value";
     const type = node.getAttribute("data-ax-state-type") || "String";
     const initial = castValue(readValue(node, target), type);
+    if (!types.has(signal)) types.set(signal, type);
     if (!state.has(signal)) state.set(signal, initial);
     writeValue(node, target, state.get(signal));
     if (!bindings.has(signal)) bindings.set(signal, []);
     bindings.get(signal).push({ node, target, type });
   };
 
-  const setSignal = (signal, value, source = "client") => {
-    state.set(signal, value);
+  const writeSignal = (signal, value, source = "client", emit = true) => {
+    const type = types.get(signal) || "String";
+    const nextValue = castValue(value, type);
+    state.set(signal, nextValue);
     (bindings.get(signal) || []).forEach(({ node, target }) => {
-      writeValue(node, target, value);
+      writeValue(node, target, nextValue);
     });
-    emitPatch(signal, value, source);
+    notifySubscribers(signal, nextValue, source);
+    if (emit) emitPatch(signal, nextValue, source);
+    return nextValue;
+  };
+
+  const setSignal = (signal, value, source = "client") => {
+    return writeSignal(signal, value, source, true);
+  };
+
+  const applyPatch = (patch) => {
+    if (!patch || !patch.signal) return undefined;
+    const op = patch.op || "set";
+    if (op !== "set") return undefined;
+    return writeSignal(patch.signal, patch.value, patch.source || "patch", false);
+  };
+
+  const subscribe = (signal, listener) => {
+    if (typeof listener !== "function") return () => {};
+    if (!subscribers.has(signal)) subscribers.set(signal, new Set());
+    subscribers.get(signal).add(listener);
+    return () => subscribers.get(signal)?.delete(listener);
   };
 
   const init = () => {
@@ -1597,11 +1628,17 @@ fn ax_state_bridge_script() -> &'static str {
     setSignal(node.getAttribute("data-ax-signal"), castValue(readValue(node, node.getAttribute("data-ax-bind") || "value"), type));
   });
 
-  window.__axonyxStateBridge = {
+  window.__axonyx = window.__axonyx || {};
+  window.__axonyx.state = {
+    version: 1,
     get: (signal) => state.get(signal),
     set: setSignal,
+    subscribe,
+    applyPatch,
     snapshot: () => Object.fromEntries(state.entries()),
   };
+  window.__axonyx.applyPatch = applyPatch;
+  window.__axonyxStateBridge = window.__axonyx.state;
 
   if (document.readyState === "loading") {
     document.addEventListener("DOMContentLoaded", init, { once: true });
@@ -2105,6 +2142,10 @@ page Home
         assert!(state_html.contains("data-ax-bind=\"value\""));
         assert!(state_html.contains("data-ax-runtime=\"state-bridge\""));
         assert!(state_html.contains("axonyx:state-patch"));
+        assert!(state_html.contains("axonyx:state-change"));
+        assert!(state_html.contains("window.__axonyx.state"));
+        assert!(state_html.contains("applyPatch"));
+        assert!(state_html.contains("subscribe"));
         assert!(state_html.contains("window.__axonyxStateBridge"));
     }
 
