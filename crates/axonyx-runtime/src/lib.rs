@@ -1454,14 +1454,20 @@ fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
     } else {
         ""
     };
+    let action_script = if body.contains("/__axonyx/action?") {
+        ax_action_script()
+    } else {
+        ""
+    };
 
     format!(
-        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>{}</head><body>{}{}{}</body></html>",
+        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>{}</head><body>{}{}{}{}</body></html>",
         html_attrs,
         preview_styles(),
         head,
         body,
         state_bridge_script,
+        action_script,
         behavior_script
     )
 }
@@ -1542,6 +1548,70 @@ fn ax_behavior_script() -> &'static str {
   } else {
     init();
   }
+})();
+</script>"##
+}
+
+fn ax_action_script() -> &'static str {
+    r##"<script data-ax-runtime="actions">
+(() => {
+  if (window.__axonyxActionRuntime) return;
+  window.__axonyxActionRuntime = true;
+
+  const isAxonyxActionForm = (form) => {
+    if (!form || !form.action) return false;
+    try {
+      return new URL(form.action, window.location.href).pathname === "/__axonyx/action";
+    } catch (_error) {
+      return form.getAttribute("action")?.startsWith("/__axonyx/action");
+    }
+  };
+
+  const applyPatchResponse = (payload, form) => {
+    const patches = Array.isArray(payload?.patches) ? payload.patches : [];
+    patches.forEach((patch) => window.__axonyx?.state?.applyPatch?.(patch));
+    window.dispatchEvent(new CustomEvent("axonyx:action-complete", {
+      detail: { form, payload, patches },
+    }));
+    if (patches.length === 0 && payload?.redirect) {
+      window.location.assign(payload.redirect);
+    }
+  };
+
+  document.addEventListener("submit", async (event) => {
+    const form = event.target;
+    if (!(form instanceof HTMLFormElement) || !isAxonyxActionForm(form)) return;
+    event.preventDefault();
+
+    const body = new FormData(form);
+    if (!body.has("__ax_patch")) body.append("__ax_patch", "1");
+    form.setAttribute("data-ax-action-state", "pending");
+
+    try {
+      const response = await fetch(form.action, {
+        method: form.method || "POST",
+        headers: { Accept: "application/ax-patch+json" },
+        body,
+        cache: "no-store",
+      });
+      const contentType = response.headers.get("content-type") || "";
+      if (contentType.includes("application/ax-patch+json")) {
+        applyPatchResponse(await response.json(), form);
+        form.setAttribute("data-ax-action-state", "complete");
+        return;
+      }
+      if (response.redirected) {
+        window.location.assign(response.url);
+        return;
+      }
+      window.location.reload();
+    } catch (error) {
+      form.setAttribute("data-ax-action-state", "error");
+      window.dispatchEvent(new CustomEvent("axonyx:action-error", {
+        detail: { form, error },
+      }));
+    }
+  });
 })();
 </script>"##
 }
@@ -2533,6 +2603,9 @@ page Posts
 
         assert!(html.contains("/__axonyx/action?path=%2Fposts&amp;name=CreatePost"));
         assert!(html.contains("type=\"submit\""));
+        assert!(html.contains("data-ax-runtime=\"actions\""));
+        assert!(html.contains("application/ax-patch+json"));
+        assert!(html.contains("__ax_patch"));
     }
 
     #[test]
