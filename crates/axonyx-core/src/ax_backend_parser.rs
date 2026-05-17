@@ -892,7 +892,7 @@ action SetTheme
   input:
     theme: string
 
-  patch "root:theme:1" = input.theme
+  patch theme = input.theme
   return ok
 "#;
 
@@ -905,7 +905,7 @@ action SetTheme
             panic!("expected patch statement");
         };
 
-        assert_eq!(patch.signal, AxExpr::string("root:theme:1"));
+        assert_eq!(patch.signal, AxExpr::ident("theme"));
         assert_eq!(patch.value, AxExpr::ident("input").member("theme"));
     }
 

@@ -309,7 +309,7 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
             target: lower_expr(expr),
         },
         AxBackendStmt::Patch(patch) => AxStepPlan::Patch {
-            signal: lower_expr(&patch.signal),
+            signal: lower_patch_signal(&patch.signal),
             value: lower_expr(&patch.value),
         },
         AxBackendStmt::Return(value) => AxStepPlan::Return(lower_return(value)),
@@ -385,6 +385,16 @@ fn lower_query(query: &AxQuerySpec) -> AxQueryPlan {
 
 fn lower_expr(expr: &AxExpr) -> AxRustExpr {
     AxRustExpr::new(render_expr(expr))
+}
+
+fn lower_patch_signal(expr: &AxExpr) -> AxRustExpr {
+    match expr {
+        AxExpr::Identifier(name) => {
+            let signal = format!("root:{name}:1");
+            AxRustExpr::new(format!("{signal:?}.to_string()"))
+        }
+        _ => lower_expr(expr),
+    }
 }
 
 fn render_expr(expr: &AxExpr) -> String {
@@ -641,7 +651,7 @@ action SetTheme
   input:
     theme: string
 
-  patch "root:theme:1" = input.theme
+  patch theme = input.theme
   return ok
 "#,
         )
@@ -654,6 +664,32 @@ action SetTheme
             handler.steps[0],
             AxStepPlan::Patch {
                 signal: AxRustExpr::new(r#""root:theme:1".to_string()"#),
+                value: AxRustExpr::new("input.theme"),
+            }
+        );
+    }
+
+    #[test]
+    fn keeps_explicit_patch_signal_strings() {
+        let document = parse_backend_ax(
+            r#"
+action SetTheme
+  input:
+    theme: string
+
+  patch "root:theme:2" = input.theme
+  return ok
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+        let handler = &plan.handlers[0];
+
+        assert_eq!(
+            handler.steps[0],
+            AxStepPlan::Patch {
+                signal: AxRustExpr::new(r#""root:theme:2".to_string()"#),
                 value: AxRustExpr::new("input.theme"),
             }
         );
