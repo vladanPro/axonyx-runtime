@@ -61,6 +61,10 @@ pub enum AxStepPlan {
     Revalidate {
         target: AxRustExpr,
     },
+    Patch {
+        signal: AxRustExpr,
+        value: AxRustExpr,
+    },
     Return(AxReturnPlan),
     Send {
         target: String,
@@ -303,6 +307,10 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
         },
         AxBackendStmt::Revalidate(expr) => AxStepPlan::Revalidate {
             target: lower_expr(expr),
+        },
+        AxBackendStmt::Patch(patch) => AxStepPlan::Patch {
+            signal: lower_expr(&patch.signal),
+            value: lower_expr(&patch.value),
         },
         AxBackendStmt::Return(value) => AxStepPlan::Return(lower_return(value)),
         AxBackendStmt::Send(send) => AxStepPlan::Send {
@@ -623,6 +631,32 @@ action CreatePost
             }
         );
         assert_eq!(handler.steps[2], AxStepPlan::Return(AxReturnPlan::Ok));
+    }
+
+    #[test]
+    fn lowers_action_patch_step_into_plan() {
+        let document = parse_backend_ax(
+            r#"
+action SetTheme
+  input:
+    theme: string
+
+  patch "root:theme:1" = input.theme
+  return ok
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+        let handler = &plan.handlers[0];
+
+        assert_eq!(
+            handler.steps[0],
+            AxStepPlan::Patch {
+                signal: AxRustExpr::new(r#""root:theme:1".to_string()"#),
+                value: AxRustExpr::new("input.theme"),
+            }
+        );
     }
 
     #[test]

@@ -170,6 +170,9 @@ fn render_step(step: &AxStepPlan) -> String {
         AxStepPlan::Revalidate { target } => {
             format!("    runtime.revalidate({})?;\n", render_borrowed_expr(target))
         }
+        AxStepPlan::Patch { signal, value } => {
+            format!("    // patch {} = {}\n", signal.code, value.code)
+        }
         AxStepPlan::Return(value) => match value {
             AxReturnPlan::Expr(expr) => format!("    Ok(json!({}))\n", render_borrowed_expr(expr)),
             AxReturnPlan::Ok => "    Ok(ok_payload())\n".to_string(),

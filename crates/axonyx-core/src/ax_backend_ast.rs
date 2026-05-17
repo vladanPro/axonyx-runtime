@@ -108,6 +108,7 @@ pub enum AxBackendStmt {
     Insert(AxMutation),
     Update(AxMutation),
     Delete(AxMutation),
+    Patch(AxPatch),
     Revalidate(AxExpr),
     Return(AxReturn),
     Send(AxSend),
@@ -138,6 +139,10 @@ impl AxBackendStmt {
 
     pub fn revalidate(value: impl Into<AxExpr>) -> Self {
         Self::Revalidate(value.into())
+    }
+
+    pub fn patch(signal: impl Into<AxExpr>, value: impl Into<AxExpr>) -> Self {
+        Self::Patch(AxPatch::new(signal, value))
     }
 
     pub fn r#return(value: impl Into<AxReturn>) -> Self {
@@ -238,6 +243,21 @@ impl AxField {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxPatch {
+    pub signal: AxExpr,
+    pub value: AxExpr,
+}
+
+impl AxPatch {
+    pub fn new(signal: impl Into<AxExpr>, value: impl Into<AxExpr>) -> Self {
+        Self {
+            signal: signal.into(),
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxReturn {
     Expr(AxExpr),
     Ok,
@@ -286,6 +306,7 @@ pub mod prelude {
     pub use super::AxJob;
     pub use super::AxLoader;
     pub use super::AxMutation;
+    pub use super::AxPatch;
     pub use super::AxReturn;
     pub use super::AxRoute;
     pub use super::AxSend;

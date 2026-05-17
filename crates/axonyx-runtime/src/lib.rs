@@ -228,6 +228,26 @@ impl AxPreviewStore {
 pub struct AxPreviewActionResult {
     pub redirect_to: Option<String>,
     pub value: AxValue,
+    pub patches: Vec<AxPreviewStatePatch>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxPreviewStatePatch {
+    pub op: String,
+    pub signal: String,
+    pub value: AxValue,
+    pub source: Option<String>,
+}
+
+impl AxPreviewStatePatch {
+    pub fn set(signal: impl Into<String>, value: AxValue) -> Self {
+        Self {
+            op: "set".to_string(),
+            signal: signal.into(),
+            value,
+            source: Some("action".to_string()),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -614,6 +634,7 @@ fn execute_preview_loader(
             | AxStepPlan::Update { .. }
             | AxStepPlan::Delete { .. }
             | AxStepPlan::Revalidate { .. }
+            | AxStepPlan::Patch { .. }
             | AxStepPlan::Send { .. } => {}
         }
     }
@@ -648,6 +669,7 @@ fn execute_preview_action(
 
     let mut redirect_to = None;
     let mut value = AxValue::record([("ok", AxValue::Bool(true))]);
+    let mut patches = Vec::new();
 
     for step in &action.steps {
         match step {
@@ -690,6 +712,11 @@ fn execute_preview_action(
             AxStepPlan::Revalidate { target } => {
                 redirect_to = Some(eval_preview_expr(target, &scope, env)?.as_string());
             }
+            AxStepPlan::Patch { signal, value } => {
+                let signal = eval_preview_expr(signal, &scope, env)?.as_string();
+                let value = eval_preview_expr(value, &scope, env)?;
+                patches.push(AxPreviewStatePatch::set(signal, value));
+            }
             AxStepPlan::Return(result) => {
                 value = eval_preview_return(result, &scope, env)?;
             }
@@ -697,7 +724,11 @@ fn execute_preview_action(
         }
     }
 
-    Ok(AxPreviewActionResult { redirect_to, value })
+    Ok(AxPreviewActionResult {
+        redirect_to,
+        value,
+        patches,
+    })
 }
 
 fn execute_preview_route(
@@ -758,7 +789,7 @@ fn execute_preview_route(
             AxStepPlan::Return(result) => {
                 value = eval_preview_return(result, &scope, env)?;
             }
-            AxStepPlan::Revalidate { .. } | AxStepPlan::Send { .. } => {}
+            AxStepPlan::Revalidate { .. } | AxStepPlan::Patch { .. } | AxStepPlan::Send { .. } => {}
         }
     }
 
@@ -2567,6 +2598,32 @@ page Posts
         .expect("page should render with mutated store");
 
         assert!(html.contains("Axonyx Forms"));
+    }
+
+    #[test]
+    fn preview_action_collects_state_patches() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action SetTheme
+  input:
+    theme: string
+
+  patch "root:theme:1" = input.theme
+  return ok
+"#],
+            "SetTheme",
+            &BTreeMap::from([("theme".to_string(), "gold".to_string())]),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert_eq!(result.redirect_to, None);
+        assert_eq!(result.patches.len(), 1);
+        assert_eq!(result.patches[0].op, "set");
+        assert_eq!(result.patches[0].signal, "root:theme:1");
+        assert_eq!(result.patches[0].value, AxValue::String("gold".to_string()));
+        assert_eq!(result.patches[0].source.as_deref(), Some("action"));
     }
 
     #[test]

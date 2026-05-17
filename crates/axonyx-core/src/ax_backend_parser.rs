@@ -246,6 +246,24 @@ impl Parser {
             )?));
         }
 
+        if let Some(rest) = text.strip_prefix("patch ") {
+            let Some((signal, value)) = rest.split_once('=') else {
+                return Err(AxBackendParseError::InvalidAssignment { line: line.line });
+            };
+
+            let signal = signal.trim();
+            let value = value.trim();
+            if signal.is_empty() || value.is_empty() {
+                return Err(AxBackendParseError::InvalidAssignment { line: line.line });
+            }
+
+            self.pos += 1;
+            return Ok(AxBackendStmt::patch(
+                parse_expr(signal, line.line)?,
+                parse_expr(value, line.line)?,
+            ));
+        }
+
         if let Some(value) = text.strip_prefix("return ") {
             self.pos += 1;
             let value = value.trim();
@@ -865,6 +883,30 @@ action CreatePost
         assert_eq!(action.name, "CreatePost");
         assert_eq!(action.input.len(), 2);
         assert_eq!(action.body.len(), 3);
+    }
+
+    #[test]
+    fn parses_action_patch_step() {
+        let input = r#"
+action SetTheme
+  input:
+    theme: string
+
+  patch "root:theme:1" = input.theme
+  return ok
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+        let AxBackendStmt::Patch(patch) = &action.body[0] else {
+            panic!("expected patch statement");
+        };
+
+        assert_eq!(patch.signal, AxExpr::string("root:theme:1"));
+        assert_eq!(patch.value, AxExpr::ident("input").member("theme"));
     }
 
     #[test]
