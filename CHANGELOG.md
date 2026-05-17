@@ -4,6 +4,15 @@ All notable changes to the Axonyx runtime workspace will be documented in this f
 
 The format is intentionally simple while the project is still early-stage.
 
+## 0.1.7 - 2026-05-17
+
+### Added
+
+- release for `axonyx-core` and `axonyx-runtime`; `axonyx-macros` remains `0.1.0`
+- server runtime contract with `AxServerConfig`, `AxServerMode`, `AxServer`, `AxHttpRequest`, and `AxHttpResponse`
+- streaming-ready `AxBody` with fixed bytes and chunk collections
+- response helpers for status lines, case-insensitive header lookup, no-store responses, and streaming chunk iteration
+
 ## 0.1.0 - Unreleased
 
 ### Added
