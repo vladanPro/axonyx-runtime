@@ -1569,11 +1569,13 @@ fn ax_action_script() -> &'static str {
 
   const applyPatchResponse = (payload, form) => {
     const patches = Array.isArray(payload?.patches) ? payload.patches : [];
-    patches.forEach((patch) => window.__axonyx?.state?.applyPatch?.(patch));
+    const applyPatch = window.__axonyx?.state?.applyPatch;
+    const canApplyPatches = typeof applyPatch === "function";
+    if (canApplyPatches) patches.forEach((patch) => applyPatch(patch));
     window.dispatchEvent(new CustomEvent("axonyx:action-complete", {
       detail: { form, payload, patches },
     }));
-    if (patches.length === 0 && payload?.redirect) {
+    if ((patches.length === 0 || !canApplyPatches) && payload?.redirect) {
       window.location.assign(payload.redirect);
     }
   };
