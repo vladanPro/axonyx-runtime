@@ -518,6 +518,15 @@ fn lower_component_node(
             body.extend(children);
             element_with_attrs("form", attrs, body)
         }
+        "ActionStatus" => {
+            prepend_class_attr(&mut attrs, "ax-action-status");
+            let state = prop_string(&mut props, &["state", "when"])
+                .unwrap_or_else(|| "pending".to_string());
+            attrs.push(attr("data-state", state));
+            push_behavior_props(&mut attrs, &mut props);
+            push_remaining_props(&mut attrs, props);
+            element_with_attrs("p", attrs, children)
+        }
         tag if is_native_html_tag(tag) => {
             push_behavior_props(&mut attrs, &mut props);
             push_native_props(&mut attrs, props);

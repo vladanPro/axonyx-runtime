@@ -2632,6 +2632,9 @@ page Home
     <option value="silver">Silver</option>
     <option value="gold">Gold</option>
   </select>
+  <ActionStatus state="pending">Saving theme...</ActionStatus>
+  <ActionStatus state="complete">Theme saved.</ActionStatus>
+  <ActionStatus state="error">Theme could not be saved.</ActionStatus>
   <Button type="submit">Apply</Button>
 </ActionForm>
 "#,
@@ -2646,6 +2649,9 @@ page Home
         assert!(html.contains("/__axonyx/action?path=%2F&amp;name=SetTheme"));
         assert!(html.contains("name=\"__ax_patch\""));
         assert!(html.contains("value=\"1\""));
+        assert!(html.contains("class=\"ax-action-status\""));
+        assert!(html.contains("data-state=\"pending\""));
+        assert!(html.contains("Saving theme..."));
         assert!(html.contains("data-ax-runtime=\"actions\""));
     }
 
