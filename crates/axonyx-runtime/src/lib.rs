@@ -664,7 +664,7 @@ fn execute_preview_action(
     let mut scope = BTreeMap::new();
     scope.insert(
         "input".to_string(),
-        build_preview_input_record(input, input_fields),
+        build_preview_input_record(input, input_fields)?,
     );
 
     let mut redirect_to = None;
@@ -1068,28 +1068,49 @@ fn eval_preview_filters(
 fn build_preview_input_record(
     fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
     input_fields: &BTreeMap<String, String>,
-) -> AxValue {
-    AxValue::record(fields.iter().map(|field| {
+) -> Result<AxValue, PreviewError> {
+    let mut record = BTreeMap::new();
+    for field in fields {
         let value = input_fields.get(&field.name).cloned().unwrap_or_default();
-        (
+        record.insert(
             field.name.clone(),
-            coerce_preview_input_value(&field.rust_ty, value),
-        )
-    }))
+            coerce_preview_input_value(&field.name, &field.rust_ty, value)?,
+        );
+    }
+    Ok(AxValue::Record(record))
 }
 
-fn coerce_preview_input_value(rust_ty: &str, value: String) -> AxValue {
+fn coerce_preview_input_value(
+    field_name: &str,
+    rust_ty: &str,
+    value: String,
+) -> Result<AxValue, PreviewError> {
     match rust_ty {
-        "bool" => AxValue::Bool(matches!(
+        "bool" => Ok(AxValue::Bool(matches!(
             value.trim().to_ascii_lowercase().as_str(),
             "true" | "1" | "on" | "yes"
-        )),
+        ))),
         "i64" => value
             .trim()
             .parse::<i64>()
             .map(AxValue::Number)
-            .unwrap_or_else(|_| AxValue::String(value)),
-        _ => AxValue::String(value),
+            .map_err(|_| PreviewError::Runtime {
+                message: format!("input `{field_name}` expected i64 but received `{value}`"),
+            }),
+        "u64" => {
+            let parsed = value
+                .trim()
+                .parse::<u64>()
+                .map_err(|_| PreviewError::Runtime {
+                    message: format!("input `{field_name}` expected u64 but received `{value}`"),
+                })?;
+            i64::try_from(parsed)
+                .map(AxValue::Number)
+                .map_err(|_| PreviewError::Runtime {
+                    message: format!("input `{field_name}` exceeded Axonyx preview number range"),
+                })
+        }
+        _ => Ok(AxValue::String(value)),
     }
 }
 
@@ -2744,6 +2765,62 @@ action SetTheme
         assert_eq!(result.patches[0].signal, "root:theme:1");
         assert_eq!(result.patches[0].value, AxValue::String("gold".to_string()));
         assert_eq!(result.patches[0].source.as_deref(), Some("action"));
+    }
+
+    #[test]
+    fn preview_action_coerces_multiple_typed_inputs() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action UpdatePreferences
+  input:
+    displayName: string
+    count: i64
+    newsletter: bool
+
+  return input
+"#],
+            "UpdatePreferences",
+            &BTreeMap::from([
+                ("displayName".to_string(), "Vladan".to_string()),
+                ("count".to_string(), "42".to_string()),
+                ("newsletter".to_string(), "on".to_string()),
+            ]),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        let AxValue::Record(fields) = result.value else {
+            panic!("expected input record");
+        };
+        assert_eq!(
+            fields.get("displayName"),
+            Some(&AxValue::String("Vladan".to_string()))
+        );
+        assert_eq!(fields.get("count"), Some(&AxValue::Number(42)));
+        assert_eq!(fields.get("newsletter"), Some(&AxValue::Bool(true)));
+    }
+
+    #[test]
+    fn preview_action_rejects_invalid_integer_input() {
+        let mut store = AxPreviewStore::default();
+        let error = execute_preview_action_sources(
+            &[r#"
+action UpdateCount
+  input:
+    count: i64
+
+  return input
+"#],
+            "UpdateCount",
+            &BTreeMap::from([("count".to_string(), "many".to_string())]),
+            &mut store,
+        )
+        .expect_err("invalid integer should fail");
+
+        assert!(error
+            .to_string()
+            .contains("input `count` expected i64 but received `many`"));
     }
 
     #[test]
