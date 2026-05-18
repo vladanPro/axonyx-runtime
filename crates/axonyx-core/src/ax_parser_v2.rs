@@ -93,7 +93,7 @@ impl<'a> Parser<'a> {
         let mut components = Vec::new();
         while self.starts_with_keyword("type")
             || self.starts_with_keyword("let")
-            || self.starts_with_keyword("state")
+            || self.is_state_decl_start()
             || self.starts_with_keyword("fn")
             || self.starts_with_keyword("component")
         {
@@ -101,7 +101,7 @@ impl<'a> Parser<'a> {
                 types.push(self.parse_type_decl()?);
             } else if self.starts_with_keyword("let") {
                 lets.push(self.parse_let_decl()?);
-            } else if self.starts_with_keyword("state") {
+            } else if self.is_state_decl_start() {
                 states.push(self.parse_state_decl()?);
             } else if self.starts_with_keyword("fn") {
                 functions.push(self.parse_function_decl()?);
@@ -253,6 +253,19 @@ impl<'a> Parser<'a> {
 
     fn parse_state_decl(&mut self) -> Result<AxStateDeclV2, AxParseV2Error> {
         let line = self.line;
+        let scope = if self.starts_with_keyword("app")
+            || self.starts_with_keyword("layout")
+            || self.starts_with_keyword("page")
+        {
+            let scope = self
+                .parse_identifier()
+                .map_err(|_| AxParseV2Error::InvalidState { line })?;
+            self.skip_spaces();
+            Some(scope)
+        } else {
+            None
+        };
+
         self.expect_keyword("state")
             .map_err(|_| AxParseV2Error::InvalidState { line })?;
         self.skip_spaces();
@@ -289,9 +302,11 @@ impl<'a> Parser<'a> {
             return Err(AxParseV2Error::InvalidState { line });
         }
 
-        Ok(match ty {
-            Some(ty) => AxStateDeclV2::typed(name, ty, value),
-            None => AxStateDeclV2::new(name, value),
+        Ok(match (scope, ty) {
+            (Some(scope), Some(ty)) => AxStateDeclV2::typed_scoped(scope, name, ty, value),
+            (Some(scope), None) => AxStateDeclV2::scoped(scope, name, value),
+            (None, Some(ty)) => AxStateDeclV2::typed(name, ty, value),
+            (None, None) => AxStateDeclV2::new(name, value),
         })
     }
 
@@ -858,6 +873,27 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn is_state_decl_start(&self) -> bool {
+        self.starts_with_keyword("state")
+            || self.starts_with_scoped_state_keyword("app")
+            || self.starts_with_scoped_state_keyword("layout")
+            || self.starts_with_scoped_state_keyword("page")
+    }
+
+    fn starts_with_scoped_state_keyword(&self, keyword: &str) -> bool {
+        if !self.starts_with_keyword(keyword) {
+            return false;
+        }
+
+        let rest = &self.input[self.pos + keyword.len()..];
+        let trimmed = rest.trim_start_matches([' ', '\t']);
+        trimmed.starts_with("state")
+            && trimmed["state".len()..]
+                .chars()
+                .next()
+                .is_some_and(|ch| ch.is_whitespace())
+    }
+
     fn expect_keyword(&mut self, keyword: &str) -> Result<(), ()> {
         if !self.starts_with_keyword(keyword) {
             return Err(());
@@ -1227,6 +1263,30 @@ state count: Number = 0
             panic!("expected input element");
         };
         assert_eq!(input.attrs[0], AxAttributeNode::expr("bind:value", "theme"));
+    }
+
+    #[test]
+    fn parses_scoped_state_declarations_before_page_body() {
+        let input = r#"
+page Home
+
+app state language: String = "sr"
+layout state sidebarOpen: Bool = false
+page state filter = signal("")
+
+<Copy>Body</Copy>
+"#;
+
+        let file = parse_ax_v2(input).expect("scoped state declarations should parse");
+
+        assert_eq!(
+            file.states,
+            vec![
+                AxStateDeclV2::typed_scoped("app", "language", "String", r#""sr""#),
+                AxStateDeclV2::typed_scoped("layout", "sidebarOpen", "Bool", "false"),
+                AxStateDeclV2::scoped("page", "filter", r#"signal("")"#),
+            ]
+        );
     }
 
     #[test]

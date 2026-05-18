@@ -1,5 +1,5 @@
 use crate::ax_ast::AxExpr;
-use crate::ax_ast_v2::AxFileV2;
+use crate::ax_ast_v2::{AxFileV2, AxStateDeclV2};
 use crate::ax_parser::parse_expr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -230,6 +230,19 @@ pub fn build_state_manifest_with_scope(
     file: &AxFileV2,
     scope: impl AsRef<str>,
 ) -> Result<AxStateManifest, AxStateManifestError> {
+    build_state_manifest_with_scope_mapper(file, scope, |state, default_scope| {
+        state.scope.as_deref().unwrap_or(default_scope).to_string()
+    })
+}
+
+pub fn build_state_manifest_with_scope_mapper<F>(
+    file: &AxFileV2,
+    scope: impl AsRef<str>,
+    resolve_scope: F,
+) -> Result<AxStateManifest, AxStateManifestError>
+where
+    F: Fn(&AxStateDeclV2, &str) -> String,
+{
     let mut manifest = AxStateManifest::new();
     let scope = scope.as_ref();
 
@@ -239,8 +252,9 @@ pub fn build_state_manifest_with_scope(
             .ty
             .clone()
             .unwrap_or_else(|| initial.type_name().to_string());
+        let signal_scope = resolve_scope(state, scope);
         manifest = manifest.with_signal(AxStateManifestSignal::new(
-            AxSignalId::new(scope, &state.name, index as u32 + 1),
+            AxSignalId::new(signal_scope, &state.name, index as u32 + 1),
             ty,
             initial,
         ));
@@ -312,6 +326,7 @@ impl AxStatePatch {
 pub mod prelude {
     pub use super::build_state_manifest;
     pub use super::build_state_manifest_with_scope;
+    pub use super::build_state_manifest_with_scope_mapper;
     pub use super::AxBindTarget;
     pub use super::AxSignalId;
     pub use super::AxSignalState;
@@ -434,6 +449,27 @@ state language: String = "sr"
 
         let manifest =
             build_state_manifest_with_scope(&file, "app").expect("manifest should build");
+
+        assert_eq!(manifest.signals.len(), 1);
+        assert_eq!(manifest.signals[0].scope, "app");
+        assert_eq!(manifest.signals[0].key, "app:language:1");
+    }
+
+    #[test]
+    fn scoped_state_declaration_overrides_default_scope() {
+        let file = crate::ax_parser_v2::parse_ax_v2(
+            r#"
+page RootLayout
+
+app state language: String = "sr"
+
+<Slot />
+"#,
+        )
+        .expect("v2 file should parse");
+
+        let manifest =
+            build_state_manifest_with_scope(&file, "page:root").expect("manifest should build");
 
         assert_eq!(manifest.signals.len(), 1);
         assert_eq!(manifest.signals[0].scope, "app");

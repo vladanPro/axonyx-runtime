@@ -124,6 +124,7 @@ impl AxLetDeclV2 {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxStateDeclV2 {
+    pub scope: Option<String>,
     pub name: String,
     pub ty: Option<String>,
     pub value: String,
@@ -132,6 +133,7 @@ pub struct AxStateDeclV2 {
 impl AxStateDeclV2 {
     pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
+            scope: None,
             name: name.into(),
             ty: None,
             value: value.into(),
@@ -140,6 +142,34 @@ impl AxStateDeclV2 {
 
     pub fn typed(name: impl Into<String>, ty: impl Into<String>, value: impl Into<String>) -> Self {
         Self {
+            scope: None,
+            name: name.into(),
+            ty: Some(ty.into()),
+            value: value.into(),
+        }
+    }
+
+    pub fn scoped(
+        scope: impl Into<String>,
+        name: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        Self {
+            scope: Some(scope.into()),
+            name: name.into(),
+            ty: None,
+            value: value.into(),
+        }
+    }
+
+    pub fn typed_scoped(
+        scope: impl Into<String>,
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        Self {
+            scope: Some(scope.into()),
             name: name.into(),
             ty: Some(ty.into()),
             value: value.into(),
