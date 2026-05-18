@@ -223,7 +223,15 @@ impl AxStateManifestSignal {
 }
 
 pub fn build_state_manifest(file: &AxFileV2) -> Result<AxStateManifest, AxStateManifestError> {
+    build_state_manifest_with_scope(file, "root")
+}
+
+pub fn build_state_manifest_with_scope(
+    file: &AxFileV2,
+    scope: impl AsRef<str>,
+) -> Result<AxStateManifest, AxStateManifestError> {
     let mut manifest = AxStateManifest::new();
+    let scope = scope.as_ref();
 
     for (index, state) in file.states.iter().enumerate() {
         let initial = parse_state_manifest_value(&state.name, &state.value)?;
@@ -232,7 +240,7 @@ pub fn build_state_manifest(file: &AxFileV2) -> Result<AxStateManifest, AxStateM
             .clone()
             .unwrap_or_else(|| initial.type_name().to_string());
         manifest = manifest.with_signal(AxStateManifestSignal::new(
-            AxSignalId::root(&state.name, index as u32 + 1),
+            AxSignalId::new(scope, &state.name, index as u32 + 1),
             ty,
             initial,
         ));
@@ -303,6 +311,7 @@ impl AxStatePatch {
 
 pub mod prelude {
     pub use super::build_state_manifest;
+    pub use super::build_state_manifest_with_scope;
     pub use super::AxBindTarget;
     pub use super::AxSignalId;
     pub use super::AxSignalState;
@@ -408,5 +417,26 @@ state theme = Runtime.Env.public.THEME
                     .to_string(),
             }
         );
+    }
+
+    #[test]
+    fn builds_state_manifest_with_custom_scope() {
+        let file = crate::ax_parser_v2::parse_ax_v2(
+            r#"
+page RootLayout
+
+state language: String = "sr"
+
+<Slot />
+"#,
+        )
+        .expect("v2 file should parse");
+
+        let manifest =
+            build_state_manifest_with_scope(&file, "app").expect("manifest should build");
+
+        assert_eq!(manifest.signals.len(), 1);
+        assert_eq!(manifest.signals[0].scope, "app");
+        assert_eq!(manifest.signals[0].key, "app:language:1");
     }
 }
