@@ -484,6 +484,40 @@ fn lower_component_node(
             push_remaining_props(&mut attrs, props);
             element_with_attrs("button", attrs, children)
         }
+        "ActionForm" => {
+            prepend_class_attr(&mut attrs, "ax-form");
+            let method = prop_string(&mut props, &["method"]).unwrap_or_else(|| "post".to_string());
+            let action = prop_string(&mut props, &["action"]).or_else(|| {
+                prop_string(&mut props, &["name", "actionName"]).and_then(|name| {
+                    resolver
+                        .resolve_call(&["action".to_string()], &[AxValue::String(name)])
+                        .map(|value| value.as_string())
+                })
+            });
+            let patch = prop_bool(&mut props, &["patch"]).unwrap_or(true);
+
+            attrs.push(attr("method", method));
+            if let Some(action) = action {
+                attrs.push(attr("action", action));
+            }
+            push_behavior_props(&mut attrs, &mut props);
+            push_remaining_props(&mut attrs, props);
+
+            let mut body = Vec::new();
+            if patch {
+                body.push(element_with_attrs(
+                    "input",
+                    vec![
+                        attr("type", "hidden"),
+                        attr("name", "__ax_patch"),
+                        attr("value", "1"),
+                    ],
+                    vec![],
+                ));
+            }
+            body.extend(children);
+            element_with_attrs("form", attrs, body)
+        }
         tag if is_native_html_tag(tag) => {
             push_behavior_props(&mut attrs, &mut props);
             push_native_props(&mut attrs, props);
@@ -730,6 +764,22 @@ fn prop_string(props: &mut BTreeMap<String, AxValue>, names: &[&str]) -> Option<
     for name in names {
         if let Some(value) = props.remove(*name) {
             return Some(value.as_string());
+        }
+    }
+    None
+}
+
+fn prop_bool(props: &mut BTreeMap<String, AxValue>, names: &[&str]) -> Option<bool> {
+    for name in names {
+        if let Some(value) = props.remove(*name) {
+            return Some(match value {
+                AxValue::Bool(value) => value,
+                AxValue::String(value) => matches!(value.as_str(), "true" | "1" | "yes" | "on"),
+                AxValue::Number(value) => value != 0,
+                AxValue::Null => false,
+                AxValue::Record(fields) => !fields.is_empty(),
+                AxValue::List(items) => !items.is_empty(),
+            });
         }
     }
     None

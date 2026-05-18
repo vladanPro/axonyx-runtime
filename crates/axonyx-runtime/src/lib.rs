@@ -2611,6 +2611,45 @@ page Posts
     }
 
     #[test]
+    fn previews_jsx_action_form_with_patch_hidden_input() {
+        let store = AxPreviewStore::default();
+        let html = preview_ax_route_with_backend(
+            &[],
+            &[],
+            &[r#"
+action SetTheme
+  input:
+    theme: string
+
+  patch theme = input.theme
+  return ok
+"#],
+            r#"
+page Home
+
+<ActionForm name="SetTheme">
+  <select name="theme">
+    <option value="silver">Silver</option>
+    <option value="gold">Gold</option>
+  </select>
+  <Button type="submit">Apply</Button>
+</ActionForm>
+"#,
+            "/",
+            &store,
+        )
+        .expect("jsx action form should render");
+
+        assert!(html.contains("<form"));
+        assert!(html.contains("class=\"ax-form\""));
+        assert!(html.contains("method=\"post\""));
+        assert!(html.contains("/__axonyx/action?path=%2F&amp;name=SetTheme"));
+        assert!(html.contains("name=\"__ax_patch\""));
+        assert!(html.contains("value=\"1\""));
+        assert!(html.contains("data-ax-runtime=\"actions\""));
+    }
+
+    #[test]
     fn preview_action_mutates_store_and_redirects() {
         let mut store = AxPreviewStore::default();
         let result = execute_preview_action_sources(
