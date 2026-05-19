@@ -182,15 +182,25 @@ impl Parser {
             let raw_name = name.trim();
             let optional = raw_name.ends_with('?');
             let name = raw_name.trim_end_matches('?').trim();
-            let ty = ty.trim();
+            let (ty, default) = match ty.split_once('=') {
+                Some((ty, default)) => {
+                    let default = default.trim();
+                    if default.is_empty() {
+                        return Err(AxBackendParseError::InvalidField { line: line.line });
+                    }
+                    (ty.trim(), Some(parse_expr(default, line.line)?))
+                }
+                None => (ty.trim(), None),
+            };
             if name.is_empty() || ty.is_empty() {
                 return Err(AxBackendParseError::InvalidField { line: line.line });
             }
 
-            fields.push(if optional {
-                AxField::optional(name, ty)
-            } else {
-                AxField::new(name, ty)
+            fields.push(match (optional, default) {
+                (true, Some(default)) => AxField::optional_with_default(name, ty, default),
+                (true, None) => AxField::optional(name, ty),
+                (false, Some(default)) => AxField::with_default(name, ty, default),
+                (false, None) => AxField::new(name, ty),
             });
             self.pos += 1;
         }
@@ -910,6 +920,33 @@ action CreatePost
 
         assert_eq!(action.input[0], AxField::new("title", "string"));
         assert_eq!(action.input[1], AxField::optional("summary", "string"));
+    }
+
+    #[test]
+    fn parses_action_input_default_values() {
+        let input = r#"
+action SetLanguage
+  input:
+    language?: string = "sr"
+    count: i64 = 0
+
+  return input
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(
+            action.input[0],
+            AxField::optional_with_default("language", "string", AxExpr::string("sr"))
+        );
+        assert_eq!(
+            action.input[1],
+            AxField::with_default("count", "i64", AxExpr::number(0))
+        );
     }
 
     #[test]

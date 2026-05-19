@@ -232,6 +232,7 @@ pub struct AxField {
     pub name: String,
     pub ty: String,
     pub optional: bool,
+    pub default: Option<AxExpr>,
 }
 
 impl AxField {
@@ -240,6 +241,7 @@ impl AxField {
             name: name.into(),
             ty: ty.into(),
             optional: false,
+            default: None,
         }
     }
 
@@ -248,6 +250,33 @@ impl AxField {
             name: name.into(),
             ty: ty.into(),
             optional: true,
+            default: None,
+        }
+    }
+
+    pub fn with_default(
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        default: impl Into<AxExpr>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            optional: false,
+            default: Some(default.into()),
+        }
+    }
+
+    pub fn optional_with_default(
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        default: impl Into<AxExpr>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            optional: true,
+            default: Some(default.into()),
         }
     }
 }

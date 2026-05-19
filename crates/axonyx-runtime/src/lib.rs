@@ -1072,6 +1072,13 @@ fn build_preview_input_record(
     let mut record = BTreeMap::new();
     for field in fields {
         let Some(value) = input_fields.get(&field.name).cloned() else {
+            if let Some(default) = &field.default {
+                record.insert(
+                    field.name.clone(),
+                    coerce_preview_default_input_value(&field.name, &field.rust_ty, default)?,
+                );
+                continue;
+            }
             if field.optional {
                 record.insert(field.name.clone(), AxValue::Null);
                 continue;
@@ -1090,6 +1097,28 @@ fn build_preview_input_record(
         );
     }
     Ok(AxValue::Record(record))
+}
+
+fn coerce_preview_default_input_value(
+    field_name: &str,
+    rust_ty: &str,
+    default: &AxRustExpr,
+) -> Result<AxValue, PreviewError> {
+    let empty_scope = BTreeMap::new();
+    let env = backend::AxEnv::from_env();
+    let value = eval_preview_expr(default, &empty_scope, &env)?;
+    match (rust_ty, value) {
+        ("bool", AxValue::Bool(value)) => Ok(AxValue::Bool(value)),
+        ("i64" | "u64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        ("String", AxValue::String(value)) => Ok(AxValue::String(value)),
+        ("String", value) => Ok(AxValue::String(value.as_string())),
+        (_, value) => Err(PreviewError::Runtime {
+            message: format!(
+                "default value for input `{field_name}` does not match expected {rust_ty}: got {}",
+                preview_value_type_name(&value)
+            ),
+        }),
+    }
 }
 
 fn coerce_preview_input_value(
@@ -1123,6 +1152,17 @@ fn coerce_preview_input_value(
                 })
         }
         _ => Ok(AxValue::String(value)),
+    }
+}
+
+fn preview_value_type_name(value: &AxValue) -> &'static str {
+    match value {
+        AxValue::Null => "Null",
+        AxValue::String(_) => "String",
+        AxValue::Number(_) => "Number",
+        AxValue::Bool(_) => "Bool",
+        AxValue::Record(_) => "Record",
+        AxValue::List(_) => "List",
     }
 }
 
@@ -2881,6 +2921,58 @@ action CreatePost
         .expect_err("missing required input should fail");
 
         assert!(error.to_string().contains("missing required input `title`"));
+    }
+
+    #[test]
+    fn preview_action_uses_default_input_values() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action SetLanguage
+  input:
+    language?: string = "sr"
+    count: i64 = 0
+    newsletter: bool = true
+
+  return input
+"#],
+            "SetLanguage",
+            &BTreeMap::new(),
+            &mut store,
+        )
+        .expect("default inputs should execute");
+
+        let AxValue::Record(fields) = result.value else {
+            panic!("expected input record");
+        };
+        assert_eq!(
+            fields.get("language"),
+            Some(&AxValue::String("sr".to_string()))
+        );
+        assert_eq!(fields.get("count"), Some(&AxValue::Number(0)));
+        assert_eq!(fields.get("newsletter"), Some(&AxValue::Bool(true)));
+    }
+
+    #[test]
+    fn preview_action_rejects_default_input_type_mismatch() {
+        let mut store = AxPreviewStore::default();
+        let error = execute_preview_action_sources(
+            &[r#"
+action SetCount
+  input:
+    count: i64 = "many"
+
+  return input
+"#],
+            "SetCount",
+            &BTreeMap::new(),
+            &mut store,
+        )
+        .expect_err("mismatched default should fail");
+
+        assert!(error
+            .to_string()
+            .contains("default value for input `count` does not match expected i64"));
     }
 
     #[test]

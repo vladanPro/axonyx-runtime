@@ -38,6 +38,7 @@ pub struct AxFieldPlan {
     pub name: String,
     pub rust_ty: String,
     pub optional: bool,
+    pub default: Option<AxRustExpr>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,6 +262,7 @@ fn lower_input_field(field: &AxField) -> Result<AxFieldPlan, AxBackendLowerError
         name: field.name.clone(),
         rust_ty: map_input_type(&field.ty),
         optional: field.optional,
+        default: field.default.as_ref().map(lower_expr),
     })
 }
 
@@ -613,11 +615,13 @@ action CreatePost
                         name: "title".to_string(),
                         rust_ty: "String".to_string(),
                         optional: false,
+                        default: None,
                     },
                     AxFieldPlan {
                         name: "featured".to_string(),
                         rust_ty: "bool".to_string(),
                         optional: false,
+                        default: None,
                     },
                 ],
             }
