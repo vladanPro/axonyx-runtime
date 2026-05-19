@@ -4,6 +4,15 @@ All notable changes to the Axonyx runtime workspace will be documented in this f
 
 The format is intentionally simple while the project is still early-stage.
 
+## 0.1.8 - 2026-05-19
+
+### Added
+
+- scoped action/state patch support for app/layout/page state ownership
+- `ActionForm` and `ActionStatus` lowering/runtime helpers
+- typed, optional, and defaulted action input coercion for preview actions
+- stronger state/action bridge contract for `cargo ax run dev`
+
 ## 0.1.7 - 2026-05-17
 
 ### Added
