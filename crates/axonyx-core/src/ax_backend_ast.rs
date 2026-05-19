@@ -231,6 +231,7 @@ impl AxAssignment {
 pub struct AxField {
     pub name: String,
     pub ty: String,
+    pub optional: bool,
 }
 
 impl AxField {
@@ -238,6 +239,15 @@ impl AxField {
         Self {
             name: name.into(),
             ty: ty.into(),
+            optional: false,
+        }
+    }
+
+    pub fn optional(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            optional: true,
         }
     }
 }

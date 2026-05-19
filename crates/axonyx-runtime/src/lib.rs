@@ -1071,7 +1071,19 @@ fn build_preview_input_record(
 ) -> Result<AxValue, PreviewError> {
     let mut record = BTreeMap::new();
     for field in fields {
-        let value = input_fields.get(&field.name).cloned().unwrap_or_default();
+        let Some(value) = input_fields.get(&field.name).cloned() else {
+            if field.optional {
+                record.insert(field.name.clone(), AxValue::Null);
+                continue;
+            }
+            if field.rust_ty == "bool" {
+                record.insert(field.name.clone(), AxValue::Bool(false));
+                continue;
+            }
+            return Err(PreviewError::Runtime {
+                message: format!("missing required input `{}`", field.name),
+            });
+        };
         record.insert(
             field.name.clone(),
             coerce_preview_input_value(&field.name, &field.rust_ty, value)?,
@@ -2821,6 +2833,54 @@ action UpdateCount
         assert!(error
             .to_string()
             .contains("input `count` expected i64 but received `many`"));
+    }
+
+    #[test]
+    fn preview_action_allows_missing_optional_input() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action CreatePost
+  input:
+    title: string
+    summary?: string
+
+  return input
+"#],
+            "CreatePost",
+            &BTreeMap::from([("title".to_string(), "Hello".to_string())]),
+            &mut store,
+        )
+        .expect("optional input can be missing");
+
+        let AxValue::Record(fields) = result.value else {
+            panic!("expected input record");
+        };
+        assert_eq!(
+            fields.get("title"),
+            Some(&AxValue::String("Hello".to_string()))
+        );
+        assert_eq!(fields.get("summary"), Some(&AxValue::Null));
+    }
+
+    #[test]
+    fn preview_action_rejects_missing_required_input() {
+        let mut store = AxPreviewStore::default();
+        let error = execute_preview_action_sources(
+            &[r#"
+action CreatePost
+  input:
+    title: string
+
+  return input
+"#],
+            "CreatePost",
+            &BTreeMap::new(),
+            &mut store,
+        )
+        .expect_err("missing required input should fail");
+
+        assert!(error.to_string().contains("missing required input `title`"));
     }
 
     #[test]

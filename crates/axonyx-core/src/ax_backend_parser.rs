@@ -179,13 +179,19 @@ impl Parser {
                 return Err(AxBackendParseError::InvalidField { line: line.line });
             };
 
-            let name = name.trim();
+            let raw_name = name.trim();
+            let optional = raw_name.ends_with('?');
+            let name = raw_name.trim_end_matches('?').trim();
             let ty = ty.trim();
             if name.is_empty() || ty.is_empty() {
                 return Err(AxBackendParseError::InvalidField { line: line.line });
             }
 
-            fields.push(AxField::new(name, ty));
+            fields.push(if optional {
+                AxField::optional(name, ty)
+            } else {
+                AxField::new(name, ty)
+            });
             self.pos += 1;
         }
 
@@ -883,6 +889,27 @@ action CreatePost
         assert_eq!(action.name, "CreatePost");
         assert_eq!(action.input.len(), 2);
         assert_eq!(action.body.len(), 3);
+    }
+
+    #[test]
+    fn parses_optional_action_input_fields() {
+        let input = r#"
+action CreatePost
+  input:
+    title: string
+    summary?: string
+
+  return input
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(action.input[0], AxField::new("title", "string"));
+        assert_eq!(action.input[1], AxField::optional("summary", "string"));
     }
 
     #[test]
