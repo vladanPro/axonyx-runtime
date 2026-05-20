@@ -108,6 +108,19 @@ impl AxHttpResponse {
         }
     }
 
+    pub fn sse_events(events: impl IntoIterator<Item = AxSseEvent>) -> Self {
+        Self::stream_chunks(
+            200,
+            "text/event-stream; charset=utf-8",
+            events
+                .into_iter()
+                .map(|event| event.render().into_bytes())
+                .collect::<Vec<_>>(),
+        )
+        .with_header("X-Accel-Buffering", "no")
+        .with_no_store()
+    }
+
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.insert(name.into(), value.into());
         self
@@ -131,6 +144,74 @@ impl AxHttpResponse {
     pub fn body_len(&self) -> usize {
         self.body.len()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxSseEvent {
+    pub event: Option<String>,
+    pub data: String,
+    pub id: Option<String>,
+    pub retry_ms: Option<u64>,
+}
+
+impl AxSseEvent {
+    pub fn data(data: impl Into<String>) -> Self {
+        Self {
+            event: None,
+            data: data.into(),
+            id: None,
+            retry_ms: None,
+        }
+    }
+
+    pub fn named(event: impl Into<String>, data: impl Into<String>) -> Self {
+        Self::data(data).with_event(event)
+    }
+
+    pub fn with_event(mut self, event: impl Into<String>) -> Self {
+        self.event = Some(event.into());
+        self
+    }
+
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = Some(id.into());
+        self
+    }
+
+    pub fn with_retry(mut self, retry_ms: u64) -> Self {
+        self.retry_ms = Some(retry_ms);
+        self
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        if let Some(id) = &self.id {
+            push_sse_field(&mut out, "id", id);
+        }
+        if let Some(event) = &self.event {
+            push_sse_field(&mut out, "event", event);
+        }
+        if let Some(retry_ms) = self.retry_ms {
+            out.push_str("retry: ");
+            out.push_str(&retry_ms.to_string());
+            out.push('\n');
+        }
+        for line in self.data.lines() {
+            push_sse_field(&mut out, "data", line);
+        }
+        if self.data.ends_with('\n') {
+            push_sse_field(&mut out, "data", "");
+        }
+        out.push('\n');
+        out
+    }
+}
+
+fn push_sse_field(out: &mut String, name: &str, value: &str) {
+    out.push_str(name);
+    out.push_str(": ");
+    out.push_str(value);
+    out.push('\n');
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -206,6 +287,7 @@ pub mod prelude {
     pub use super::{
         status_reason, AxBody, AxBodyChunks, AxHttpRequest, AxHttpResponse, AxServer,
         AxServerConfig, AxServerMode,
+        AxSseEvent,
     };
 }
 
@@ -269,5 +351,30 @@ mod tests {
                 b"</main>".as_slice()
             ]
         );
+    }
+
+    #[test]
+    fn sse_events_render_as_event_stream_chunks() {
+        let response = AxHttpResponse::sse_events([
+            AxSseEvent::named("state", r#"{"ready":true}"#)
+                .with_id("1")
+                .with_retry(1500),
+            AxSseEvent::data("line one\nline two"),
+        ]);
+
+        assert_eq!(response.content_type, "text/event-stream; charset=utf-8");
+        assert!(response.body.is_streaming());
+        assert_eq!(response.header_value("Cache-Control"), Some("no-store"));
+        assert_eq!(response.header_value("X-Accel-Buffering"), Some("no"));
+        let body = response
+            .body
+            .chunks_iter()
+            .map(|chunk| String::from_utf8_lossy(chunk).into_owned())
+            .collect::<String>();
+        assert!(body.contains("id: 1\n"));
+        assert!(body.contains("event: state\n"));
+        assert!(body.contains("retry: 1500\n"));
+        assert!(body.contains("data: {\"ready\":true}\n\n"));
+        assert!(body.contains("data: line one\ndata: line two\n\n"));
     }
 }
