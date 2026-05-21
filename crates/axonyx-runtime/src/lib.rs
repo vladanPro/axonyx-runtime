@@ -255,6 +255,7 @@ pub struct AxPreviewHttpResponse {
     pub status: u16,
     pub content_type: String,
     pub headers: BTreeMap<String, String>,
+    pub set_cookies: Vec<String>,
     pub body: Vec<u8>,
 }
 
@@ -636,6 +637,9 @@ fn execute_preview_loader(
             | AxStepPlan::Delete { .. }
             | AxStepPlan::Revalidate { .. }
             | AxStepPlan::Patch { .. }
+            | AxStepPlan::Header { .. }
+            | AxStepPlan::Cookie { .. }
+            | AxStepPlan::ClearCookie { .. }
             | AxStepPlan::Send { .. } => {}
         }
     }
@@ -721,7 +725,10 @@ fn execute_preview_action(
             AxStepPlan::Return(result) => {
                 value = eval_preview_return(result, &scope, env)?;
             }
-            AxStepPlan::Send { .. } => {}
+            AxStepPlan::Header { .. }
+            | AxStepPlan::Cookie { .. }
+            | AxStepPlan::ClearCookie { .. }
+            | AxStepPlan::Send { .. } => {}
         }
     }
 
@@ -747,6 +754,8 @@ fn execute_preview_route(
     let mut scope = BTreeMap::new();
     scope.insert("params".to_string(), AxValue::Record(route_match.params));
     scope.insert("query".to_string(), build_preview_query_record(query));
+    let mut headers = BTreeMap::new();
+    let mut set_cookies = Vec::new();
     for step in &route_match.handler.steps {
         match step {
             AxStepPlan::Let {
@@ -785,12 +794,42 @@ fn execute_preview_route(
                     .ensure_collection(collection)
                     .retain(|item| !preview_record_matches_all(item, &filters));
             }
-            AxStepPlan::Return(result) => return render_preview_route_return(result, &scope, env),
+            AxStepPlan::Header { name, value } => {
+                headers.insert(
+                    eval_preview_expr(name, &scope, env)?.as_string(),
+                    eval_preview_expr(value, &scope, env)?.as_string(),
+                );
+            }
+            AxStepPlan::Cookie { name, value } => {
+                set_cookies.push(
+                    server::AxCookie::new(
+                        eval_preview_expr(name, &scope, env)?.as_string(),
+                        eval_preview_expr(value, &scope, env)?.as_string(),
+                    )
+                    .with_path("/")
+                    .render(),
+                );
+            }
+            AxStepPlan::ClearCookie { name } => {
+                set_cookies.push(
+                    server::AxCookie::new(eval_preview_expr(name, &scope, env)?.as_string(), "")
+                        .with_path("/")
+                        .with_max_age(0)
+                        .render(),
+                );
+            }
+            AxStepPlan::Return(result) => {
+                return render_preview_route_return(result, &scope, env, headers, set_cookies)
+            }
             AxStepPlan::Revalidate { .. } | AxStepPlan::Patch { .. } | AxStepPlan::Send { .. } => {}
         }
     }
 
-    Ok(Some(render_preview_json_response(&AxValue::Null)?))
+    Ok(Some(apply_preview_response_metadata(
+        render_preview_json_response(&AxValue::Null)?,
+        headers,
+        set_cookies,
+    )))
 }
 
 fn eval_preview_value(
@@ -824,6 +863,8 @@ fn render_preview_route_return(
     value: &AxReturnPlan,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
+    headers: BTreeMap<String, String>,
+    set_cookies: Vec<String>,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
     let response = match value {
         AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => {
@@ -835,6 +876,7 @@ fn render_preview_route_return(
                 status: status.unwrap_or(303),
                 content_type: "text/plain; charset=utf-8".to_string(),
                 headers: BTreeMap::from([("Location".to_string(), target)]),
+                set_cookies: Vec::new(),
                 body: Vec::new(),
             }
         }
@@ -842,6 +884,7 @@ fn render_preview_route_return(
             status: 204,
             content_type: "text/plain; charset=utf-8".to_string(),
             headers: BTreeMap::new(),
+            set_cookies: Vec::new(),
             body: Vec::new(),
         },
         AxReturnPlan::Ok => {
@@ -849,7 +892,23 @@ fn render_preview_route_return(
         }
     };
 
-    Ok(Some(response))
+    Ok(Some(apply_preview_response_metadata(
+        response,
+        headers,
+        set_cookies,
+    )))
+}
+
+fn apply_preview_response_metadata(
+    mut response: AxPreviewHttpResponse,
+    headers: BTreeMap<String, String>,
+    set_cookies: Vec<String>,
+) -> AxPreviewHttpResponse {
+    for (name, value) in headers {
+        response.headers.insert(name, value);
+    }
+    response.set_cookies.extend(set_cookies);
+    response
 }
 
 fn eval_preview_query(
@@ -1396,6 +1455,7 @@ fn render_preview_json_response(value: &AxValue) -> Result<AxPreviewHttpResponse
         status: 200,
         content_type: "application/json; charset=utf-8".to_string(),
         headers: BTreeMap::new(),
+        set_cookies: Vec::new(),
         body,
     })
 }
@@ -3088,6 +3148,38 @@ route DELETE "/api/posts"
 
         assert_eq!(response.status, 204);
         assert!(response.body.is_empty());
+    }
+
+    #[test]
+    fn preview_route_sources_apply_headers_and_cookies() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_sources(
+            &[r#"
+route GET "/api/session"
+  header "Cache-Control" = "no-store"
+  cookie "theme" = query.theme
+  clearCookie "flash"
+  return json("ok")
+"#],
+            "GET",
+            "/api/session?theme=gold",
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(
+            response.headers.get("Cache-Control").map(String::as_str),
+            Some("no-store")
+        );
+        assert!(response
+            .set_cookies
+            .iter()
+            .any(|cookie| cookie == "theme=gold; Path=/"));
+        assert!(response
+            .set_cookies
+            .iter()
+            .any(|cookie| cookie == "flash=; Path=/; Max-Age=0"));
     }
 
     #[test]

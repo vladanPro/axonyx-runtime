@@ -109,6 +109,9 @@ pub enum AxBackendStmt {
     Update(AxMutation),
     Delete(AxMutation),
     Patch(AxPatch),
+    Header(AxResponseHeader),
+    Cookie(AxResponseCookie),
+    ClearCookie(AxExpr),
     Revalidate(AxExpr),
     Return(AxReturn),
     Send(AxSend),
@@ -143,6 +146,18 @@ impl AxBackendStmt {
 
     pub fn patch(signal: impl Into<AxExpr>, value: impl Into<AxExpr>) -> Self {
         Self::Patch(AxPatch::new(signal, value))
+    }
+
+    pub fn header(name: impl Into<AxExpr>, value: impl Into<AxExpr>) -> Self {
+        Self::Header(AxResponseHeader::new(name, value))
+    }
+
+    pub fn cookie(name: impl Into<AxExpr>, value: impl Into<AxExpr>) -> Self {
+        Self::Cookie(AxResponseCookie::new(name, value))
+    }
+
+    pub fn clear_cookie(name: impl Into<AxExpr>) -> Self {
+        Self::ClearCookie(name.into())
     }
 
     pub fn r#return(value: impl Into<AxReturn>) -> Self {
@@ -297,6 +312,36 @@ impl AxPatch {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxResponseHeader {
+    pub name: AxExpr,
+    pub value: AxExpr,
+}
+
+impl AxResponseHeader {
+    pub fn new(name: impl Into<AxExpr>, value: impl Into<AxExpr>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxResponseCookie {
+    pub name: AxExpr,
+    pub value: AxExpr,
+}
+
+impl AxResponseCookie {
+    pub fn new(name: impl Into<AxExpr>, value: impl Into<AxExpr>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxReturn {
     Expr(AxExpr),
     Ok,
@@ -346,6 +391,8 @@ pub mod prelude {
     pub use super::AxLoader;
     pub use super::AxMutation;
     pub use super::AxPatch;
+    pub use super::AxResponseCookie;
+    pub use super::AxResponseHeader;
     pub use super::AxReturn;
     pub use super::AxRoute;
     pub use super::AxSend;

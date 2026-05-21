@@ -67,6 +67,17 @@ pub enum AxStepPlan {
         signal: AxRustExpr,
         value: AxRustExpr,
     },
+    Header {
+        name: AxRustExpr,
+        value: AxRustExpr,
+    },
+    Cookie {
+        name: AxRustExpr,
+        value: AxRustExpr,
+    },
+    ClearCookie {
+        name: AxRustExpr,
+    },
     Return(AxReturnPlan),
     Send {
         target: String,
@@ -321,6 +332,17 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
         AxBackendStmt::Patch(patch) => AxStepPlan::Patch {
             signal: lower_patch_signal(&patch.signal),
             value: lower_expr(&patch.value),
+        },
+        AxBackendStmt::Header(header) => AxStepPlan::Header {
+            name: lower_expr(&header.name),
+            value: lower_expr(&header.value),
+        },
+        AxBackendStmt::Cookie(cookie) => AxStepPlan::Cookie {
+            name: lower_expr(&cookie.name),
+            value: lower_expr(&cookie.value),
+        },
+        AxBackendStmt::ClearCookie(name) => AxStepPlan::ClearCookie {
+            name: lower_expr(name),
         },
         AxBackendStmt::Return(value) => AxStepPlan::Return(lower_return(value)),
         AxBackendStmt::Send(send) => AxStepPlan::Send {
@@ -892,6 +914,44 @@ route DELETE "/api/posts"
         assert_eq!(
             plan.handlers[2].steps[0],
             AxStepPlan::Return(AxReturnPlan::NoContent)
+        );
+    }
+
+    #[test]
+    fn lowers_route_response_metadata_steps() {
+        let document = parse_backend_ax(
+            r#"
+route GET "/api/session"
+  header "Cache-Control" = "no-store"
+  cookie "theme" = query.theme
+  clearCookie "flash"
+  return json("ok")
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+        let handler = &plan.handlers[0];
+
+        assert_eq!(
+            handler.steps[0],
+            AxStepPlan::Header {
+                name: AxRustExpr::new(r#""Cache-Control".to_string()"#),
+                value: AxRustExpr::new(r#""no-store".to_string()"#),
+            }
+        );
+        assert_eq!(
+            handler.steps[1],
+            AxStepPlan::Cookie {
+                name: AxRustExpr::new(r#""theme".to_string()"#),
+                value: AxRustExpr::new("query.theme"),
+            }
+        );
+        assert_eq!(
+            handler.steps[2],
+            AxStepPlan::ClearCookie {
+                name: AxRustExpr::new(r#""flash".to_string()"#),
+            }
         );
     }
 }

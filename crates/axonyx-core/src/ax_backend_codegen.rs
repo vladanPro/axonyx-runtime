@@ -37,6 +37,15 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("use axonyx_runtime::backend_prelude::*;\n");
     out.push_str("use axonyx_runtime::server_prelude::*;\n");
     out.push_str("use serde_json::{json, Value};\n\n");
+    out.push_str("fn __ax_finalize_response(mut response: AxHttpResponse, headers: BTreeMap<String, String>, cookies: Vec<AxCookie>) -> AxHttpResponse {\n");
+    out.push_str("    for (name, value) in headers {\n");
+    out.push_str("        response = response.with_header(name, value);\n");
+    out.push_str("    }\n");
+    out.push_str("    for cookie in cookies {\n");
+    out.push_str("        response = response.with_cookie(cookie);\n");
+    out.push_str("    }\n");
+    out.push_str("    response\n");
+    out.push_str("}\n\n");
 
     for handler in &plan.handlers {
         if let AxHandlerKind::Action { input } = &handler.kind {
@@ -132,6 +141,10 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
     }
 
     let route_response = matches!(&handler.kind, AxHandlerKind::Route { .. });
+    if route_response {
+        out.push_str("    let mut __ax_headers: BTreeMap<String, String> = BTreeMap::new();\n");
+        out.push_str("    let mut __ax_cookies: Vec<AxCookie> = Vec::new();\n");
+    }
     for step in &handler.steps {
         out.push_str(&render_step(step, route_response));
     }
@@ -142,7 +155,7 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
         .any(|step| matches!(step, AxStepPlan::Return(_)))
     {
         if route_response {
-            out.push_str("    Ok(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?)\n");
+            out.push_str("    Ok(__ax_finalize_response(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies))\n");
         } else {
             out.push_str("    Ok(ok_payload())\n");
         }
@@ -183,6 +196,27 @@ fn render_step(step: &AxStepPlan, route_response: bool) -> String {
         AxStepPlan::Patch { signal, value } => {
             format!("    // patch {} = {}\n", signal.code, value.code)
         }
+        AxStepPlan::Header { name, value } if route_response => format!(
+            "    __ax_headers.insert({}, {});\n",
+            render_string_expr(name),
+            render_string_expr(value)
+        ),
+        AxStepPlan::Header { name, value } => {
+            format!("    // header {} = {}\n", name.code, value.code)
+        }
+        AxStepPlan::Cookie { name, value } if route_response => format!(
+            "    __ax_cookies.push(AxCookie::new({}, {}).with_path(\"/\"));\n",
+            render_string_expr(name),
+            render_string_expr(value)
+        ),
+        AxStepPlan::Cookie { name, value } => {
+            format!("    // cookie {} = {}\n", name.code, value.code)
+        }
+        AxStepPlan::ClearCookie { name } if route_response => format!(
+            "    __ax_cookies.push(AxCookie::new({}, \"\").with_path(\"/\").with_max_age(0));\n",
+            render_string_expr(name)
+        ),
+        AxStepPlan::ClearCookie { name } => format!("    // clearCookie {}\n", name.code),
         AxStepPlan::Return(value) => render_return_step(value, route_response),
         AxStepPlan::Send { target, payload } => format!(
             "    runtime.send(&AxSendRequest {{\n        target: {:?}.to_string(),\n        payload: json!({}),\n    }})?;\n",
@@ -306,26 +340,32 @@ fn render_owned_expr(expr: &AxRustExpr) -> String {
         .unwrap_or_else(|| expr.code.clone())
 }
 
+fn render_string_expr(expr: &AxRustExpr) -> String {
+    format!("({}).to_string()", render_owned_expr(expr))
+}
+
 fn render_return_step(value: &AxReturnPlan, route_response: bool) -> String {
     if route_response {
         return match value {
             AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => format!(
-                "    Ok(AxHttpResponse::json(200, &json!({})).map_err(|error| AxRuntimeError::message(error.to_string()))?)\n",
+                "    Ok(__ax_finalize_response(AxHttpResponse::json(200, &json!({})).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies))\n",
                 render_borrowed_expr(expr)
             ),
             AxReturnPlan::Redirect { target, status } => match status {
                 Some(status) => format!(
-                    "    Ok(AxHttpResponse::redirect_with_status({status}, {}))\n",
+                    "    Ok(__ax_finalize_response(AxHttpResponse::redirect_with_status({status}, {}), __ax_headers, __ax_cookies))\n",
                     render_owned_expr(target)
                 ),
                 None => format!(
-                    "    Ok(AxHttpResponse::redirect({}))\n",
+                    "    Ok(__ax_finalize_response(AxHttpResponse::redirect({}), __ax_headers, __ax_cookies))\n",
                     render_owned_expr(target)
                 ),
             },
-            AxReturnPlan::NoContent => "    Ok(AxHttpResponse::no_content())\n".to_string(),
+            AxReturnPlan::NoContent => {
+                "    Ok(__ax_finalize_response(AxHttpResponse::no_content(), __ax_headers, __ax_cookies))\n".to_string()
+            }
             AxReturnPlan::Ok => {
-                "    Ok(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?)\n".to_string()
+                "    Ok(__ax_finalize_response(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies))\n".to_string()
             }
         };
     }
@@ -564,6 +604,26 @@ route DELETE "/api/posts"
         assert!(module.contains("AxHttpResponse::json(200, &json!(&posts))"));
         assert!(module.contains(r#"AxHttpResponse::redirect("/next".to_string())"#));
         assert!(module.contains("AxHttpResponse::no_content()"));
+    }
+
+    #[test]
+    fn compiles_route_response_metadata_into_response_finalizer() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route GET "/api/session"
+  header "Cache-Control" = "no-store"
+  cookie "theme" = "gold"
+  clearCookie "flash"
+  return json("ok")
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("let mut __ax_headers: BTreeMap<String, String>"));
+        assert!(module.contains("__ax_headers.insert((\"Cache-Control\".to_string()).to_string(), (\"no-store\".to_string()).to_string());"));
+        assert!(module.contains("__ax_cookies.push(AxCookie::new((\"theme\".to_string()).to_string(), (\"gold\".to_string()).to_string()).with_path(\"/\"));"));
+        assert!(module.contains("__ax_cookies.push(AxCookie::new((\"flash\".to_string()).to_string(), \"\").with_path(\"/\").with_max_age(0));"));
+        assert!(module.contains("__ax_finalize_response(AxHttpResponse::json"));
     }
 
     #[test]

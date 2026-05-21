@@ -26,6 +26,10 @@ pub enum AxBackendParseError {
     InvalidMutation { line: usize },
     #[error("invalid assignment at line {line}")]
     InvalidAssignment { line: usize },
+    #[error("invalid response header at line {line}")]
+    InvalidHeader { line: usize },
+    #[error("invalid response cookie at line {line}")]
+    InvalidCookie { line: usize },
     #[error("invalid return statement at line {line}")]
     InvalidReturn { line: usize },
     #[error("invalid send statement at line {line}")]
@@ -278,6 +282,52 @@ impl Parser {
                 parse_expr(signal, line.line)?,
                 parse_expr(value, line.line)?,
             ));
+        }
+
+        if let Some(rest) = text.strip_prefix("header ") {
+            let Some((name, value)) = rest.split_once('=') else {
+                return Err(AxBackendParseError::InvalidHeader { line: line.line });
+            };
+
+            let name = name.trim();
+            let value = value.trim();
+            if name.is_empty() || value.is_empty() {
+                return Err(AxBackendParseError::InvalidHeader { line: line.line });
+            }
+
+            self.pos += 1;
+            return Ok(AxBackendStmt::header(
+                parse_expr(name, line.line)?,
+                parse_expr(value, line.line)?,
+            ));
+        }
+
+        if let Some(rest) = text.strip_prefix("cookie ") {
+            let Some((name, value)) = rest.split_once('=') else {
+                return Err(AxBackendParseError::InvalidCookie { line: line.line });
+            };
+
+            let name = name.trim();
+            let value = value.trim();
+            if name.is_empty() || value.is_empty() {
+                return Err(AxBackendParseError::InvalidCookie { line: line.line });
+            }
+
+            self.pos += 1;
+            return Ok(AxBackendStmt::cookie(
+                parse_expr(name, line.line)?,
+                parse_expr(value, line.line)?,
+            ));
+        }
+
+        if let Some(name) = text.strip_prefix("clearCookie ") {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(AxBackendParseError::InvalidCookie { line: line.line });
+            }
+
+            self.pos += 1;
+            return Ok(AxBackendStmt::clear_cookie(parse_expr(name, line.line)?));
         }
 
         if let Some(value) = text.strip_prefix("return ") {
@@ -971,6 +1021,39 @@ action SetTheme
 
         assert_eq!(patch.signal, AxExpr::ident("theme"));
         assert_eq!(patch.value, AxExpr::ident("input").member("theme"));
+    }
+
+    #[test]
+    fn parses_route_response_metadata_steps() {
+        let input = r#"
+route GET "/api/session"
+  header "Cache-Control" = "no-store"
+  cookie "theme" = query.theme
+  clearCookie "flash"
+  return json("ok")
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Route(route) = &document.blocks[0] else {
+            panic!("expected route block");
+        };
+
+        assert_eq!(
+            route.body[0],
+            AxBackendStmt::header(AxExpr::string("Cache-Control"), AxExpr::string("no-store"))
+        );
+        assert_eq!(
+            route.body[1],
+            AxBackendStmt::cookie(
+                AxExpr::string("theme"),
+                AxExpr::ident("query").member("theme")
+            )
+        );
+        assert_eq!(
+            route.body[2],
+            AxBackendStmt::clear_cookie(AxExpr::string("flash"))
+        );
     }
 
     #[test]
