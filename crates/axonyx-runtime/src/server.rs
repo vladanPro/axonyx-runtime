@@ -50,6 +50,18 @@ pub struct AxHttpRequest {
     pub body: Vec<u8>,
 }
 
+pub struct AxAuth;
+
+impl AxAuth {
+    pub fn bearer<'a>(request: &'a AxHttpRequest) -> Option<&'a str> {
+        request.bearer_token()
+    }
+
+    pub fn session<'a>(request: &'a AxHttpRequest) -> Option<&'a str> {
+        request.cookie_value("session")
+    }
+}
+
 impl AxHttpRequest {
     pub fn new(method: impl Into<String>, target: impl Into<String>) -> Self {
         Self {
@@ -523,8 +535,8 @@ pub trait AxServer {
 
 pub mod prelude {
     pub use super::{
-        status_reason, AxBody, AxBodyChunks, AxCookie, AxHttpRequest, AxHttpResponse, AxServer,
-        AxServerConfig, AxServerMode, AxSseEvent,
+        status_reason, AxAuth, AxBody, AxBodyChunks, AxCookie, AxHttpRequest, AxHttpResponse,
+        AxServer, AxServerConfig, AxServerMode, AxSseEvent,
     };
 }
 
@@ -588,6 +600,10 @@ mod tests {
 
         let auth = AxHttpRequest::new("GET", "/admin").with_header("Authorization", "Bearer abc");
         assert_eq!(auth.bearer_token(), Some("abc"));
+        assert_eq!(AxAuth::bearer(&auth), Some("abc"));
+
+        let session = AxHttpRequest::new("GET", "/admin").with_header("Cookie", "session=s123");
+        assert_eq!(AxAuth::session(&session), Some("s123"));
     }
 
     #[test]

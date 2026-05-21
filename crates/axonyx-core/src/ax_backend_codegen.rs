@@ -420,8 +420,8 @@ fn render_context_lookup(code: &str) -> Option<String> {
 
 fn render_auth_lookup(field: &str) -> Option<String> {
     match field {
-        "bearer" => Some("&request.bearer_token().unwrap_or_default()".to_string()),
-        "session" => Some("&request.cookie_value(\"session\").unwrap_or_default()".to_string()),
+        "bearer" => Some("&AxAuth::bearer(request).unwrap_or_default()".to_string()),
+        "session" => Some("&AxAuth::session(request).unwrap_or_default()".to_string()),
         _ => None,
     }
 }
@@ -735,8 +735,8 @@ route POST "/api/session"
         assert!(module.contains("request.body_text_lossy()"));
         assert!(module.contains("request.form_value(\"title\").unwrap_or_default()"));
         assert!(module.contains("request.json_field_string(\"slug\").unwrap_or_default()"));
-        assert!(module.contains("request.bearer_token().unwrap_or_default()"));
-        assert!(module.contains("request.cookie_value(\"session\").unwrap_or_default()"));
+        assert!(module.contains("AxAuth::bearer(request).unwrap_or_default()"));
+        assert!(module.contains("AxAuth::session(request).unwrap_or_default()"));
     }
 
     #[test]

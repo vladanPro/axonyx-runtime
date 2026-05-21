@@ -1435,13 +1435,16 @@ fn build_preview_auth_record(request: &server::AxHttpRequest) -> AxValue {
     AxValue::Record(BTreeMap::from([
         (
             "bearer".to_string(),
-            AxValue::String(request.bearer_token().unwrap_or_default().to_string()),
+            AxValue::String(
+                server::AxAuth::bearer(request)
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
         ),
         (
             "session".to_string(),
             AxValue::String(
-                request
-                    .cookie_value("session")
+                server::AxAuth::session(request)
                     .unwrap_or_default()
                     .to_string(),
             ),
