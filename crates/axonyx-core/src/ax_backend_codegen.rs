@@ -217,6 +217,11 @@ fn render_step(step: &AxStepPlan, route_response: bool) -> String {
             render_string_expr(name)
         ),
         AxStepPlan::ClearCookie { name } => format!("    // clearCookie {}\n", name.code),
+        AxStepPlan::Require { value } if route_response => format!(
+            "    if {}.is_empty() {{\n        return Ok(__ax_finalize_response(AxHttpResponse::json(401, &json!({{\"error\":\"unauthorized\"}})).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies));\n    }}\n",
+            render_string_expr(value)
+        ),
+        AxStepPlan::Require { value } => format!("    // require {}\n", value.code),
         AxStepPlan::Return(value) => render_return_step(value, route_response),
         AxStepPlan::Send { target, payload } => format!(
             "    runtime.send(&AxSendRequest {{\n        target: {:?}.to_string(),\n        payload: json!({}),\n    }})?;\n",
@@ -641,6 +646,7 @@ route DELETE "/api/posts"
         let module = compile_backend_ax_to_module(
             r#"
 route GET "/api/session"
+  require request.cookies.session
   header "Cache-Control" = "no-store"
   cookie "theme" = "gold"
   clearCookie "flash"
@@ -650,6 +656,9 @@ route GET "/api/session"
         .expect("source should compile");
 
         assert!(module.contains("let mut __ax_headers: BTreeMap<String, String>"));
+        assert!(module.contains(
+            "if (request.cookie_value(\"session\").unwrap_or_default()).to_string().is_empty()"
+        ));
         assert!(module.contains("__ax_headers.insert((\"Cache-Control\".to_string()).to_string(), (\"no-store\".to_string()).to_string());"));
         assert!(module.contains("__ax_cookies.push(AxCookie::new((\"theme\".to_string()).to_string(), (\"gold\".to_string()).to_string()).with_path(\"/\"));"));
         assert!(module.contains("__ax_cookies.push(AxCookie::new((\"flash\".to_string()).to_string(), \"\").with_path(\"/\").with_max_age(0));"));

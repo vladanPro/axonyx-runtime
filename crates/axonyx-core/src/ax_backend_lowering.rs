@@ -78,6 +78,9 @@ pub enum AxStepPlan {
     ClearCookie {
         name: AxRustExpr,
     },
+    Require {
+        value: AxRustExpr,
+    },
     Return(AxReturnPlan),
     Send {
         target: String,
@@ -343,6 +346,9 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
         },
         AxBackendStmt::ClearCookie(name) => AxStepPlan::ClearCookie {
             name: lower_expr(name),
+        },
+        AxBackendStmt::Require(value) => AxStepPlan::Require {
+            value: lower_expr(value),
         },
         AxBackendStmt::Return(value) => AxStepPlan::Return(lower_return(value)),
         AxBackendStmt::Send(send) => AxStepPlan::Send {
@@ -922,6 +928,7 @@ route DELETE "/api/posts"
         let document = parse_backend_ax(
             r#"
 route GET "/api/session"
+  require request.cookies.session
   header "Cache-Control" = "no-store"
   cookie "theme" = query.theme
   clearCookie "flash"
@@ -935,20 +942,26 @@ route GET "/api/session"
 
         assert_eq!(
             handler.steps[0],
+            AxStepPlan::Require {
+                value: AxRustExpr::new("request.cookies.session"),
+            }
+        );
+        assert_eq!(
+            handler.steps[1],
             AxStepPlan::Header {
                 name: AxRustExpr::new(r#""Cache-Control".to_string()"#),
                 value: AxRustExpr::new(r#""no-store".to_string()"#),
             }
         );
         assert_eq!(
-            handler.steps[1],
+            handler.steps[2],
             AxStepPlan::Cookie {
                 name: AxRustExpr::new(r#""theme".to_string()"#),
                 value: AxRustExpr::new("query.theme"),
             }
         );
         assert_eq!(
-            handler.steps[2],
+            handler.steps[3],
             AxStepPlan::ClearCookie {
                 name: AxRustExpr::new(r#""flash".to_string()"#),
             }

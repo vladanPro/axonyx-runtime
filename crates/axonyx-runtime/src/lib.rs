@@ -656,6 +656,7 @@ fn execute_preview_loader(
             | AxStepPlan::Header { .. }
             | AxStepPlan::Cookie { .. }
             | AxStepPlan::ClearCookie { .. }
+            | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {}
         }
     }
@@ -744,6 +745,7 @@ fn execute_preview_action(
             AxStepPlan::Header { .. }
             | AxStepPlan::Cookie { .. }
             | AxStepPlan::ClearCookie { .. }
+            | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {}
         }
     }
@@ -835,6 +837,23 @@ fn execute_preview_route(
                         .render(),
                 );
             }
+            AxStepPlan::Require { value } => {
+                if eval_preview_require_expr(value, &scope, env)?
+                    .as_string()
+                    .is_empty()
+                {
+                    let mut response = render_preview_json_response(&AxValue::record([(
+                        "error",
+                        AxValue::String("unauthorized".to_string()),
+                    )]))?;
+                    response.status = 401;
+                    return Ok(Some(apply_preview_response_metadata(
+                        response,
+                        headers,
+                        set_cookies,
+                    )));
+                }
+            }
             AxStepPlan::Return(result) => {
                 return render_preview_route_return(result, &scope, env, headers, set_cookies)
             }
@@ -847,6 +866,20 @@ fn execute_preview_route(
         headers,
         set_cookies,
     )))
+}
+
+fn eval_preview_require_expr(
+    expr: &AxRustExpr,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+) -> Result<AxValue, PreviewError> {
+    match eval_preview_expr(expr, scope, env) {
+        Ok(value) => Ok(value),
+        Err(error) if expr.code.trim().starts_with("request.") => {
+            Ok(AxValue::String(String::new()))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn eval_preview_value(
@@ -3318,6 +3351,34 @@ route POST "/api/session"
 
         let body = String::from_utf8(response.body).expect("json response should be utf-8");
         assert_eq!(body, "\"gold\"");
+    }
+
+    #[test]
+    fn preview_route_sources_can_require_request_values() {
+        let mut store = AxPreviewStore::default();
+        let source = r#"
+route GET "/api/admin"
+  require request.cookies.session
+  return json("ok")
+"#;
+        let request = server::AxHttpRequest::new("GET", "/api/admin");
+        let response = execute_preview_route_request_sources(&[source], &request, &mut store)
+            .expect("route should execute")
+            .expect("route should match");
+
+        assert_eq!(response.status, 401);
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert!(body.contains("unauthorized"));
+
+        let request =
+            server::AxHttpRequest::new("GET", "/api/admin").with_header("Cookie", "session=abc123");
+        let response = execute_preview_route_request_sources(&[source], &request, &mut store)
+            .expect("route should execute")
+            .expect("route should match");
+
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert_eq!(body, "\"ok\"");
     }
 
     #[test]

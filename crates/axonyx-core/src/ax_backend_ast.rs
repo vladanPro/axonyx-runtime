@@ -112,6 +112,7 @@ pub enum AxBackendStmt {
     Header(AxResponseHeader),
     Cookie(AxResponseCookie),
     ClearCookie(AxExpr),
+    Require(AxExpr),
     Revalidate(AxExpr),
     Return(AxReturn),
     Send(AxSend),
@@ -158,6 +159,10 @@ impl AxBackendStmt {
 
     pub fn clear_cookie(name: impl Into<AxExpr>) -> Self {
         Self::ClearCookie(name.into())
+    }
+
+    pub fn require(value: impl Into<AxExpr>) -> Self {
+        Self::Require(value.into())
     }
 
     pub fn r#return(value: impl Into<AxReturn>) -> Self {

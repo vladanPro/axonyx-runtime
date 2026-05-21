@@ -30,6 +30,8 @@ pub enum AxBackendParseError {
     InvalidHeader { line: usize },
     #[error("invalid response cookie at line {line}")]
     InvalidCookie { line: usize },
+    #[error("invalid requirement at line {line}")]
+    InvalidRequirement { line: usize },
     #[error("invalid return statement at line {line}")]
     InvalidReturn { line: usize },
     #[error("invalid send statement at line {line}")]
@@ -328,6 +330,16 @@ impl Parser {
 
             self.pos += 1;
             return Ok(AxBackendStmt::clear_cookie(parse_expr(name, line.line)?));
+        }
+
+        if let Some(value) = text.strip_prefix("require ") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(AxBackendParseError::InvalidRequirement { line: line.line });
+            }
+
+            self.pos += 1;
+            return Ok(AxBackendStmt::require(parse_expr(value, line.line)?));
         }
 
         if let Some(value) = text.strip_prefix("return ") {
@@ -1027,6 +1039,7 @@ action SetTheme
     fn parses_route_response_metadata_steps() {
         let input = r#"
 route GET "/api/session"
+  require request.cookies.session
   header "Cache-Control" = "no-store"
   cookie "theme" = query.theme
   clearCookie "flash"
@@ -1041,17 +1054,21 @@ route GET "/api/session"
 
         assert_eq!(
             route.body[0],
-            AxBackendStmt::header(AxExpr::string("Cache-Control"), AxExpr::string("no-store"))
+            AxBackendStmt::require(AxExpr::ident("request").member("cookies").member("session"))
         );
         assert_eq!(
             route.body[1],
+            AxBackendStmt::header(AxExpr::string("Cache-Control"), AxExpr::string("no-store"))
+        );
+        assert_eq!(
+            route.body[2],
             AxBackendStmt::cookie(
                 AxExpr::string("theme"),
                 AxExpr::ident("query").member("theme")
             )
         );
         assert_eq!(
-            route.body[2],
+            route.body[3],
             AxBackendStmt::clear_cookie(AxExpr::string("flash"))
         );
     }
