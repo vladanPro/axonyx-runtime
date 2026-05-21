@@ -59,6 +59,32 @@ impl AxHttpRequest {
             body: Vec::new(),
         }
     }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.headers.insert(name.into(), value.into());
+        self
+    }
+
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    pub fn header_value(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(header, _)| header.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    pub fn cookie_value(&self, name: &str) -> Option<&str> {
+        self.header_value("Cookie").and_then(|cookies| {
+            cookies.split(';').find_map(|pair| {
+                let (key, value) = pair.trim().split_once('=')?;
+                (key == name).then_some(value)
+            })
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -66,6 +92,7 @@ pub struct AxHttpResponse {
     pub status: u16,
     pub content_type: String,
     pub headers: BTreeMap<String, String>,
+    pub set_cookies: Vec<String>,
     pub body: AxBody,
 }
 
@@ -86,11 +113,32 @@ impl AxHttpResponse {
         Self::new(status, content_type, body)
     }
 
+    pub fn json(status: u16, value: &impl Serialize) -> Result<Self, serde_json::Error> {
+        Ok(Self::bytes(
+            status,
+            "application/json; charset=utf-8",
+            serde_json::to_vec(value)?,
+        ))
+    }
+
+    pub fn no_content() -> Self {
+        Self::new(204, "text/plain; charset=utf-8", Vec::new())
+    }
+
+    pub fn redirect(location: impl Into<String>) -> Self {
+        Self::redirect_with_status(303, location)
+    }
+
+    pub fn redirect_with_status(status: u16, location: impl Into<String>) -> Self {
+        Self::text(status, "").with_header("Location", location)
+    }
+
     pub fn new(status: u16, content_type: impl Into<String>, body: Vec<u8>) -> Self {
         Self {
             status,
             content_type: content_type.into(),
             headers: BTreeMap::new(),
+            set_cookies: Vec::new(),
             body: AxBody::fixed(body),
         }
     }
@@ -104,6 +152,7 @@ impl AxHttpResponse {
             status,
             content_type: content_type.into(),
             headers: BTreeMap::new(),
+            set_cookies: Vec::new(),
             body: AxBody::chunks(chunks),
         }
     }
@@ -130,6 +179,21 @@ impl AxHttpResponse {
         self.with_header("Cache-Control", "no-store")
     }
 
+    pub fn with_cookie(mut self, cookie: AxCookie) -> Self {
+        self.set_cookies.push(cookie.render());
+        self
+    }
+
+    pub fn without_cookie(self, name: impl Into<String>) -> Self {
+        self.with_cookie(
+            AxCookie::new(name, "")
+                .with_path("/")
+                .with_max_age(0)
+                .http_only()
+                .same_site("Lax"),
+        )
+    }
+
     pub fn status_line(&self) -> String {
         format!("{} {}", self.status, status_reason(self.status))
     }
@@ -144,6 +208,97 @@ impl AxHttpResponse {
     pub fn body_len(&self) -> usize {
         self.body.len()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxCookie {
+    pub name: String,
+    pub value: String,
+    pub path: Option<String>,
+    pub domain: Option<String>,
+    pub max_age: Option<i64>,
+    pub http_only: bool,
+    pub secure: bool,
+    pub same_site: Option<String>,
+}
+
+impl AxCookie {
+    pub fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: value.into(),
+            path: None,
+            domain: None,
+            max_age: None,
+            http_only: false,
+            secure: false,
+            same_site: None,
+        }
+    }
+
+    pub fn with_path(mut self, path: impl Into<String>) -> Self {
+        self.path = Some(path.into());
+        self
+    }
+
+    pub fn with_domain(mut self, domain: impl Into<String>) -> Self {
+        self.domain = Some(domain.into());
+        self
+    }
+
+    pub fn with_max_age(mut self, max_age: i64) -> Self {
+        self.max_age = Some(max_age);
+        self
+    }
+
+    pub fn http_only(mut self) -> Self {
+        self.http_only = true;
+        self
+    }
+
+    pub fn secure(mut self) -> Self {
+        self.secure = true;
+        self
+    }
+
+    pub fn same_site(mut self, same_site: impl Into<String>) -> Self {
+        self.same_site = Some(same_site.into());
+        self
+    }
+
+    pub fn render(&self) -> String {
+        let mut parts = vec![format!(
+            "{}={}",
+            sanitize_cookie_part(&self.name),
+            sanitize_cookie_part(&self.value)
+        )];
+        if let Some(path) = &self.path {
+            parts.push(format!("Path={}", sanitize_cookie_part(path)));
+        }
+        if let Some(domain) = &self.domain {
+            parts.push(format!("Domain={}", sanitize_cookie_part(domain)));
+        }
+        if let Some(max_age) = self.max_age {
+            parts.push(format!("Max-Age={max_age}"));
+        }
+        if self.http_only {
+            parts.push("HttpOnly".to_string());
+        }
+        if self.secure {
+            parts.push("Secure".to_string());
+        }
+        if let Some(same_site) = &self.same_site {
+            parts.push(format!("SameSite={}", sanitize_cookie_part(same_site)));
+        }
+        parts.join("; ")
+    }
+}
+
+fn sanitize_cookie_part(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| !matches!(ch, '\r' | '\n' | ';'))
+        .collect()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -267,12 +422,19 @@ impl<'a> Iterator for AxBodyChunks<'a> {
 pub fn status_reason(status: u16) -> &'static str {
     match status {
         200 => "OK",
+        201 => "Created",
         204 => "No Content",
+        301 => "Moved Permanently",
+        302 => "Found",
         303 => "See Other",
         400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
         404 => "Not Found",
         405 => "Method Not Allowed",
+        409 => "Conflict",
         415 => "Unsupported Media Type",
+        422 => "Unprocessable Entity",
         500 => "Internal Server Error",
         _ => "OK",
     }
@@ -285,7 +447,7 @@ pub trait AxServer {
 
 pub mod prelude {
     pub use super::{
-        status_reason, AxBody, AxBodyChunks, AxHttpRequest, AxHttpResponse, AxServer,
+        status_reason, AxBody, AxBodyChunks, AxCookie, AxHttpRequest, AxHttpResponse, AxServer,
         AxServerConfig, AxServerMode, AxSseEvent,
     };
 }
@@ -318,6 +480,63 @@ mod tests {
         assert_eq!(
             response.headers.get("Cache-Control").map(String::as_str),
             Some("no-store")
+        );
+    }
+
+    #[test]
+    fn request_helpers_read_headers_and_cookies() {
+        let request = AxHttpRequest::new("GET", "/settings")
+            .with_header("cookie", "theme=gold; session=abc123")
+            .with_body(b"body".to_vec());
+
+        assert_eq!(
+            request.header_value("Cookie"),
+            Some("theme=gold; session=abc123")
+        );
+        assert_eq!(request.cookie_value("theme"), Some("gold"));
+        assert_eq!(request.cookie_value("session"), Some("abc123"));
+        assert_eq!(request.cookie_value("missing"), None);
+        assert_eq!(request.body, b"body".to_vec());
+    }
+
+    #[test]
+    fn response_json_redirect_and_no_content_helpers() {
+        let json = AxHttpResponse::json(201, &serde_json::json!({ "ok": true }))
+            .expect("json response should serialize");
+        assert_eq!(json.status_line(), "201 Created");
+        assert_eq!(json.content_type, "application/json; charset=utf-8");
+        assert_eq!(
+            json.body.chunks_iter().collect::<Vec<_>>(),
+            vec![br#"{"ok":true}"#.as_slice()]
+        );
+
+        let redirect = AxHttpResponse::redirect("/next");
+        assert_eq!(redirect.status_line(), "303 See Other");
+        assert_eq!(redirect.header_value("Location"), Some("/next"));
+
+        let empty = AxHttpResponse::no_content();
+        assert_eq!(empty.status_line(), "204 No Content");
+        assert_eq!(empty.body_len(), 0);
+    }
+
+    #[test]
+    fn response_cookie_helpers_render_set_cookie_headers() {
+        let response = AxHttpResponse::text(200, "ok")
+            .with_cookie(
+                AxCookie::new("session", "abc123")
+                    .with_path("/")
+                    .http_only()
+                    .secure()
+                    .same_site("Lax"),
+            )
+            .without_cookie("flash");
+
+        assert_eq!(
+            response.set_cookies,
+            vec![
+                "session=abc123; Path=/; HttpOnly; Secure; SameSite=Lax".to_string(),
+                "flash=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax".to_string(),
+            ]
         );
     }
 
