@@ -89,6 +89,12 @@ pub struct AxAssignmentPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxReturnPlan {
     Expr(AxRustExpr),
+    Json(AxRustExpr),
+    Redirect {
+        target: AxRustExpr,
+        status: Option<u16>,
+    },
+    NoContent,
     Ok,
 }
 
@@ -343,8 +349,38 @@ fn lower_assignments(fields: &[AxAssignment]) -> Vec<AxAssignmentPlan> {
 
 fn lower_return(value: &AxReturn) -> AxReturnPlan {
     match value {
-        AxReturn::Expr(expr) => AxReturnPlan::Expr(lower_expr(expr)),
+        AxReturn::Expr(expr) => lower_return_expr(expr),
         AxReturn::Ok => AxReturnPlan::Ok,
+    }
+}
+
+fn lower_return_expr(expr: &AxExpr) -> AxReturnPlan {
+    let AxExpr::Call { path, args } = expr else {
+        return AxReturnPlan::Expr(lower_expr(expr));
+    };
+
+    let Some(name) = path.last().map(String::as_str) else {
+        return AxReturnPlan::Expr(lower_expr(expr));
+    };
+
+    match name {
+        "json" if args.len() == 1 => AxReturnPlan::Json(lower_expr(&args[0])),
+        "redirect" if args.len() == 1 => AxReturnPlan::Redirect {
+            target: lower_expr(&args[0]),
+            status: None,
+        },
+        "redirect" if args.len() == 2 => {
+            let status = match &args[0] {
+                AxExpr::Number(value) => u16::try_from(*value).ok(),
+                _ => None,
+            };
+            AxReturnPlan::Redirect {
+                target: lower_expr(&args[1]),
+                status,
+            }
+        }
+        "noContent" | "no_content" if args.is_empty() => AxReturnPlan::NoContent,
+        _ => AxReturnPlan::Expr(lower_expr(expr)),
     }
 }
 
@@ -820,6 +856,42 @@ loader PostsList
                 binding: "app_name".to_string(),
                 value: AxValuePlan::Expr(AxRustExpr::new(r#"runtime.env().public("app_name")?"#,)),
             }
+        );
+    }
+
+    #[test]
+    fn lowers_route_http_return_helpers() {
+        let document = parse_backend_ax(
+            r#"
+route GET "/api/posts"
+  data posts = Db.Stream("posts")
+  return json(posts)
+
+route GET "/go"
+  return redirect("/next")
+
+route DELETE "/api/posts"
+  return noContent()
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert_eq!(
+            plan.handlers[0].steps[1],
+            AxStepPlan::Return(AxReturnPlan::Json(AxRustExpr::new("posts")))
+        );
+        assert_eq!(
+            plan.handlers[1].steps[0],
+            AxStepPlan::Return(AxReturnPlan::Redirect {
+                target: AxRustExpr::new(r#""/next".to_string()"#),
+                status: None,
+            })
+        );
+        assert_eq!(
+            plan.handlers[2].steps[0],
+            AxStepPlan::Return(AxReturnPlan::NoContent)
         );
     }
 }

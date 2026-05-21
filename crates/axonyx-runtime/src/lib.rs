@@ -254,6 +254,7 @@ impl AxPreviewStatePatch {
 pub struct AxPreviewHttpResponse {
     pub status: u16,
     pub content_type: String,
+    pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
 }
 
@@ -746,8 +747,6 @@ fn execute_preview_route(
     let mut scope = BTreeMap::new();
     scope.insert("params".to_string(), AxValue::Record(route_match.params));
     scope.insert("query".to_string(), build_preview_query_record(query));
-    let mut value = AxValue::Null;
-
     for step in &route_match.handler.steps {
         match step {
             AxStepPlan::Let {
@@ -786,14 +785,12 @@ fn execute_preview_route(
                     .ensure_collection(collection)
                     .retain(|item| !preview_record_matches_all(item, &filters));
             }
-            AxStepPlan::Return(result) => {
-                value = eval_preview_return(result, &scope, env)?;
-            }
+            AxStepPlan::Return(result) => return render_preview_route_return(result, &scope, env),
             AxStepPlan::Revalidate { .. } | AxStepPlan::Patch { .. } | AxStepPlan::Send { .. } => {}
         }
     }
 
-    Ok(Some(render_preview_json_response(&value)?))
+    Ok(Some(render_preview_json_response(&AxValue::Null)?))
 }
 
 fn eval_preview_value(
@@ -815,8 +812,44 @@ fn eval_preview_return(
 ) -> Result<AxValue, PreviewError> {
     match value {
         AxReturnPlan::Expr(expr) => eval_preview_expr(expr, scope, env),
+        AxReturnPlan::Json(expr) => eval_preview_expr(expr, scope, env),
+        AxReturnPlan::Redirect { .. } | AxReturnPlan::NoContent => Err(PreviewError::Runtime {
+            message: "HTTP response helpers are only supported in route blocks".to_string(),
+        }),
         AxReturnPlan::Ok => Ok(AxValue::record([("ok", AxValue::Bool(true))])),
     }
+}
+
+fn render_preview_route_return(
+    value: &AxReturnPlan,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    let response = match value {
+        AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => {
+            render_preview_json_response(&eval_preview_expr(expr, scope, env)?)?
+        }
+        AxReturnPlan::Redirect { target, status } => {
+            let target = eval_preview_expr(target, scope, env)?.as_string();
+            AxPreviewHttpResponse {
+                status: status.unwrap_or(303),
+                content_type: "text/plain; charset=utf-8".to_string(),
+                headers: BTreeMap::from([("Location".to_string(), target)]),
+                body: Vec::new(),
+            }
+        }
+        AxReturnPlan::NoContent => AxPreviewHttpResponse {
+            status: 204,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            headers: BTreeMap::new(),
+            body: Vec::new(),
+        },
+        AxReturnPlan::Ok => {
+            render_preview_json_response(&AxValue::record([("ok", AxValue::Bool(true))]))?
+        }
+    };
+
+    Ok(Some(response))
 }
 
 fn eval_preview_query(
@@ -1362,6 +1395,7 @@ fn render_preview_json_response(value: &AxValue) -> Result<AxPreviewHttpResponse
     Ok(AxPreviewHttpResponse {
         status: 200,
         content_type: "application/json; charset=utf-8".to_string(),
+        headers: BTreeMap::new(),
         body,
     })
 }
@@ -3001,6 +3035,59 @@ route GET "/api/posts"
         assert!(body.contains("Hello Axonyx"));
         assert!(body.contains("Docs Without Bloat"));
         assert!(!body.contains("Draft Preview"));
+    }
+
+    #[test]
+    fn preview_route_sources_support_http_return_helpers() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_sources(
+            &[r#"
+route GET "/api/posts"
+  data posts = Db.Stream("posts")
+  return json(posts)
+"#],
+            "GET",
+            "/api/posts",
+            &mut store,
+        )
+        .expect("json route should execute")
+        .expect("json route should match");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "application/json; charset=utf-8");
+
+        let response = execute_preview_route_sources(
+            &[r#"
+route GET "/go"
+  return redirect("/next")
+"#],
+            "GET",
+            "/go",
+            &mut store,
+        )
+        .expect("redirect route should execute")
+        .expect("redirect route should match");
+
+        assert_eq!(response.status, 303);
+        assert_eq!(
+            response.headers.get("Location").map(String::as_str),
+            Some("/next")
+        );
+
+        let response = execute_preview_route_sources(
+            &[r#"
+route DELETE "/api/posts"
+  return noContent()
+"#],
+            "DELETE",
+            "/api/posts",
+            &mut store,
+        )
+        .expect("no content route should execute")
+        .expect("no content route should match");
+
+        assert_eq!(response.status, 204);
+        assert!(response.body.is_empty());
     }
 
     #[test]

@@ -35,6 +35,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("#![allow(dead_code, unused_variables)]\n\n");
     out.push_str("use std::collections::BTreeMap;\n\n");
     out.push_str("use axonyx_runtime::backend_prelude::*;\n");
+    out.push_str("use axonyx_runtime::server_prelude::*;\n");
     out.push_str("use serde_json::{json, Value};\n\n");
 
     for handler in &plan.handlers {
@@ -109,7 +110,11 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
             "pub fn {}(runtime: &impl AxBackendRuntime, context: &AxLoaderContext) -> AxRuntimeResult<Value>",
             handler.rust_fn
         ),
-        _ => format!(
+        AxHandlerKind::Route { .. } => format!(
+            "pub fn {}(runtime: &impl AxBackendRuntime) -> AxRuntimeResult<AxHttpResponse>",
+            handler.rust_fn
+        ),
+        AxHandlerKind::Job => format!(
             "pub fn {}(runtime: &impl AxBackendRuntime) -> AxRuntimeResult<Value>",
             handler.rust_fn
         ),
@@ -126,8 +131,9 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
         out.push_str(&format!("    // route {method} {path}\n"));
     }
 
+    let route_response = matches!(&handler.kind, AxHandlerKind::Route { .. });
     for step in &handler.steps {
-        out.push_str(&render_step(step));
+        out.push_str(&render_step(step, route_response));
     }
 
     if !handler
@@ -135,14 +141,18 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
         .iter()
         .any(|step| matches!(step, AxStepPlan::Return(_)))
     {
-        out.push_str("    Ok(ok_payload())\n");
+        if route_response {
+            out.push_str("    Ok(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?)\n");
+        } else {
+            out.push_str("    Ok(ok_payload())\n");
+        }
     }
 
     out.push_str("}\n");
     Ok(out)
 }
 
-fn render_step(step: &AxStepPlan) -> String {
+fn render_step(step: &AxStepPlan, route_response: bool) -> String {
     match step {
         AxStepPlan::Let { binding, value } => {
             format!("    let {binding} = {};\n", render_value_plan(value))
@@ -173,10 +183,7 @@ fn render_step(step: &AxStepPlan) -> String {
         AxStepPlan::Patch { signal, value } => {
             format!("    // patch {} = {}\n", signal.code, value.code)
         }
-        AxStepPlan::Return(value) => match value {
-            AxReturnPlan::Expr(expr) => format!("    Ok(json!({}))\n", render_borrowed_expr(expr)),
-            AxReturnPlan::Ok => "    Ok(ok_payload())\n".to_string(),
-        },
+        AxStepPlan::Return(value) => render_return_step(value, route_response),
         AxStepPlan::Send { target, payload } => format!(
             "    runtime.send(&AxSendRequest {{\n        target: {:?}.to_string(),\n        payload: json!({}),\n    }})?;\n",
             target,
@@ -293,6 +300,46 @@ fn render_borrowed_expr(expr: &AxRustExpr) -> String {
     }
 }
 
+fn render_owned_expr(expr: &AxRustExpr) -> String {
+    render_context_lookup(&expr.code)
+        .map(|value| value.trim_start_matches('&').to_string())
+        .unwrap_or_else(|| expr.code.clone())
+}
+
+fn render_return_step(value: &AxReturnPlan, route_response: bool) -> String {
+    if route_response {
+        return match value {
+            AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => format!(
+                "    Ok(AxHttpResponse::json(200, &json!({})).map_err(|error| AxRuntimeError::message(error.to_string()))?)\n",
+                render_borrowed_expr(expr)
+            ),
+            AxReturnPlan::Redirect { target, status } => match status {
+                Some(status) => format!(
+                    "    Ok(AxHttpResponse::redirect_with_status({status}, {}))\n",
+                    render_owned_expr(target)
+                ),
+                None => format!(
+                    "    Ok(AxHttpResponse::redirect({}))\n",
+                    render_owned_expr(target)
+                ),
+            },
+            AxReturnPlan::NoContent => "    Ok(AxHttpResponse::no_content())\n".to_string(),
+            AxReturnPlan::Ok => {
+                "    Ok(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?)\n".to_string()
+            }
+        };
+    }
+
+    match value {
+        AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => {
+            format!("    Ok(json!({}))\n", render_borrowed_expr(expr))
+        }
+        AxReturnPlan::Ok | AxReturnPlan::NoContent | AxReturnPlan::Redirect { .. } => {
+            "    Ok(ok_payload())\n".to_string()
+        }
+    }
+}
+
 fn render_context_lookup(code: &str) -> Option<String> {
     let (source, field) = code.split_once('.')?;
     match source {
@@ -398,6 +445,7 @@ mod tests {
         let module = generate_backend_module(&plan).expect("module should generate");
 
         assert!(module.contains("use axonyx_runtime::backend_prelude::*;"));
+        assert!(module.contains("use axonyx_runtime::server_prelude::*;"));
         assert!(module.contains("#![allow(dead_code, unused_variables)]"));
         assert!(module.contains(
             "pub fn loader_posts_list(runtime: &impl AxBackendRuntime, context: &AxLoaderContext)"
@@ -491,7 +539,31 @@ route GET "/api/posts"
         assert!(module.contains(
             "pub fn loader_posts_list(runtime: &impl AxBackendRuntime, context: &AxLoaderContext)"
         ));
-        assert!(module.contains("pub fn route_get_api_posts(runtime: &impl AxBackendRuntime)"));
+        assert!(module
+            .contains("pub fn route_get_api_posts(runtime: &impl AxBackendRuntime) -> AxRuntimeResult<AxHttpResponse>"));
+    }
+
+    #[test]
+    fn compiles_route_http_return_helpers_into_responses() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route GET "/api/posts"
+  data posts = Db.Stream("posts")
+  return json(posts)
+
+route GET "/go"
+  return redirect("/next")
+
+route DELETE "/api/posts"
+  return noContent()
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("AxRuntimeResult<AxHttpResponse>"));
+        assert!(module.contains("AxHttpResponse::json(200, &json!(&posts))"));
+        assert!(module.contains(r#"AxHttpResponse::redirect("/next".to_string())"#));
+        assert!(module.contains("AxHttpResponse::no_content()"));
     }
 
     #[test]
