@@ -201,10 +201,17 @@ impl<'a> Parser<'a> {
             .map_err(|_| AxParseV2Error::InvalidPage { line })?;
         self.skip_spaces();
         let name = self.parse_identifier()?;
+        self.skip_spaces();
+
+        let mut params = Vec::new();
+        if self.peek_char() == Some('(') {
+            params = self.parse_param_list(line, AxParseV2Error::InvalidPage { line })?;
+        }
+
         self.consume_until_line_end();
         self.page_seen = true;
 
-        Ok(AxPageDecl::new(name))
+        Ok(AxPageDecl::with_params(name, params))
     }
 
     fn parse_let_decl(&mut self) -> Result<AxLetDeclV2, AxParseV2Error> {
@@ -1122,6 +1129,7 @@ page Home
         assert_eq!(file.body.len(), 2);
         assert_eq!(file.imports[1].bindings[0].imported, "SiteHeader");
         assert_eq!(file.imports[1].bindings[0].local, "Header");
+        assert!(file.page.params.is_empty());
 
         let AxNodeV2::Element(card) = &file.body[1] else {
             panic!("expected card element");
@@ -1130,6 +1138,26 @@ page Home
         assert_eq!(card.attrs.len(), 1);
         assert!(!card.self_closing);
         assert_eq!(card.children.len(), 2);
+    }
+
+    #[test]
+    fn parses_page_param_defaults_for_package_components() {
+        let input = r#"
+page Card(title = "Untitled", tone = "surface")
+
+<article>{title}</article>
+"#;
+
+        let file = parse_ax_v2(input).expect("page params should parse");
+
+        assert_eq!(file.page.name, "Card");
+        assert_eq!(
+            file.page.params,
+            vec![
+                AxComponentParamDeclV2::with_default("title", "\"Untitled\""),
+                AxComponentParamDeclV2::with_default("tone", "\"surface\"")
+            ]
+        );
     }
 
     #[test]

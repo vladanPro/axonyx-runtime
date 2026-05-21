@@ -131,6 +131,12 @@ pub fn lower_document_with_scope_and_imports(
     import_resolver: &impl AxImportResolver,
 ) -> Result<AxNode, AxLowerError> {
     let mut scope = initial_scope;
+    apply_params_to_scope(
+        &document.page.params,
+        &mut scope,
+        &document.functions,
+        resolver,
+    )?;
     let children = lower_statements(
         &document.page.body,
         &document.functions,
@@ -900,6 +906,12 @@ fn lower_imported_component_nodes(
         })?;
 
     let mut imported_scope = scope.clone();
+    apply_params_to_scope(
+        &document.page.params,
+        &mut imported_scope,
+        functions,
+        resolver,
+    )?;
     for (name, value) in eval_props(component, functions, scope, resolver)? {
         imported_scope.insert(name, value);
     }
@@ -936,6 +948,28 @@ fn lower_imported_component_nodes(
         import_resolver,
         Some(&slot_context),
     )
+}
+
+fn apply_params_to_scope(
+    params: &[AxComponentParamDef],
+    scope: &mut BTreeMap<String, AxValue>,
+    functions: &[AxFunctionDef],
+    resolver: &impl AxDataResolver,
+) -> Result<(), AxLowerError> {
+    for param in params {
+        if scope.contains_key(&param.name) {
+            continue;
+        }
+
+        let value = if let Some(default) = &param.default {
+            eval_expr(default, functions, scope, resolver)?
+        } else {
+            AxValue::Null
+        };
+        scope.insert(param.name.clone(), value);
+    }
+
+    Ok(())
 }
 
 fn component_children_to_statements(component: &AxComponent) -> Vec<AxStatement> {
@@ -1952,6 +1986,60 @@ page ShellCard
                         ),
                     ],
                 )],
+            )
+        );
+    }
+
+    #[test]
+    fn lowers_imported_page_params_with_defaults_and_overrides() {
+        let document = AxDocument {
+            imports: vec![AxImport::new(
+                [AxImportBinding::named("SiteBadge")],
+                "@/components/site-badge.ax",
+            )],
+            functions: Vec::new(),
+            components: Vec::new(),
+            head: AxHead::default(),
+            page: AxPage::new(
+                "Home",
+                [
+                    AxStatement::component(AxComponent::new("SiteBadge")),
+                    AxStatement::component(AxComponent::new("SiteBadge").prop("label", "Stable")),
+                ],
+            ),
+        };
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let import_resolver = |source: &str| -> Option<String> {
+            match source {
+                "@/components/site-badge.ax" => Some(
+                    r#"
+page SiteBadge(label = "Beta")
+
+<span class="badge">{label}</span>
+"#
+                    .to_string(),
+                ),
+                _ => None,
+            }
+        };
+
+        let node = lower_document_with_scope_and_imports(
+            &document,
+            BTreeMap::new(),
+            &resolver,
+            &import_resolver,
+        )
+        .expect("imported page params should lower");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![
+                    element_with_attrs("span", vec![attr("class", "badge")], vec![text("Beta")]),
+                    element_with_attrs("span", vec![attr("class", "badge")], vec![text("Stable")],),
+                ],
             )
         );
     }

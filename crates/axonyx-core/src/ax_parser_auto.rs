@@ -126,7 +126,15 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
             .map(|component| convert_component_decl(component, &state_bindings))
             .collect::<Result<Vec<_>, _>>()?,
         head,
-        page: AxPage::new(file.page.name.clone(), body),
+        page: AxPage::with_params(
+            file.page.name.clone(),
+            file.page
+                .params
+                .iter()
+                .map(convert_component_param_decl)
+                .collect::<Result<Vec<_>, _>>()?,
+            body,
+        ),
     })
 }
 
@@ -713,6 +721,27 @@ page Home
 
         assert_eq!(container.name, "Container");
         assert_eq!(container.props, vec![AxProp::new("max", "xl")]);
+    }
+
+    #[test]
+    fn converts_page_param_defaults_into_runtime_page_params() {
+        let document = parse_ax_auto(
+            r#"
+page Card(title = "Untitled")
+
+<article>{title}</article>
+"#,
+        )
+        .expect("auto parse should support page params");
+
+        assert_eq!(document.page.name, "Card");
+        assert_eq!(
+            document.page.params,
+            vec![AxComponentParamDef::with_default(
+                "title",
+                AxExpr::string("Untitled")
+            )]
+        );
     }
 
     #[test]

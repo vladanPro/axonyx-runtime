@@ -56,11 +56,25 @@ impl AxImportBinding {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxPageDecl {
     pub name: String,
+    pub params: Vec<AxComponentParamDeclV2>,
 }
 
 impl AxPageDecl {
     pub fn new(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+        Self {
+            name: name.into(),
+            params: Vec::new(),
+        }
+    }
+
+    pub fn with_params(
+        name: impl Into<String>,
+        params: impl IntoIterator<Item = AxComponentParamDeclV2>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            params: params.into_iter().collect(),
+        }
     }
 }
 

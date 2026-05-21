@@ -286,8 +286,7 @@ pub trait AxServer {
 pub mod prelude {
     pub use super::{
         status_reason, AxBody, AxBodyChunks, AxHttpRequest, AxHttpResponse, AxServer,
-        AxServerConfig, AxServerMode,
-        AxSseEvent,
+        AxServerConfig, AxServerMode, AxSseEvent,
     };
 }
 

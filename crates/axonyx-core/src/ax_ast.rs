@@ -129,6 +129,7 @@ impl AxComponentParamDef {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxPage {
     pub name: String,
+    pub params: Vec<AxComponentParamDef>,
     pub body: Vec<AxStatement>,
 }
 
@@ -136,6 +137,19 @@ impl AxPage {
     pub fn new(name: impl Into<String>, body: impl IntoIterator<Item = AxStatement>) -> Self {
         Self {
             name: name.into(),
+            params: Vec::new(),
+            body: body.into_iter().collect(),
+        }
+    }
+
+    pub fn with_params(
+        name: impl Into<String>,
+        params: impl IntoIterator<Item = AxComponentParamDef>,
+        body: impl IntoIterator<Item = AxStatement>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            params: params.into_iter().collect(),
             body: body.into_iter().collect(),
         }
     }
