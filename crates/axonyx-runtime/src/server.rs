@@ -85,6 +85,10 @@ impl AxHttpRequest {
             })
         })
     }
+
+    pub fn body_text_lossy(&self) -> String {
+        String::from_utf8_lossy(&self.body).to_string()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -497,6 +501,7 @@ mod tests {
         assert_eq!(request.cookie_value("session"), Some("abc123"));
         assert_eq!(request.cookie_value("missing"), None);
         assert_eq!(request.body, b"body".to_vec());
+        assert_eq!(request.body_text_lossy(), "body");
     }
 
     #[test]

@@ -475,11 +475,27 @@ pub fn execute_preview_route_sources(
     request_target: &str,
     store: &mut AxPreviewStore,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    let request = server::AxHttpRequest::new(method, request_target);
+    execute_preview_route_request_sources(route_sources, &request, store)
+}
+
+pub fn execute_preview_route_request_sources(
+    route_sources: &[&str],
+    request: &server::AxHttpRequest,
+    store: &mut AxPreviewStore,
+) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
     let handlers = collect_preview_handlers(&[], &[], route_sources)?;
     let env = backend::AxEnv::from_env();
-    let request_path = normalize_preview_request_path(request_target)?;
-    let query = parse_preview_query_fields(request_target);
-    execute_preview_route(&handlers.routes, method, &request_path, &query, &env, store)
+    let request_path = normalize_preview_request_path(&request.target)?;
+    let query = parse_preview_query_fields(&request.target);
+    execute_preview_route(
+        &handlers.routes,
+        request,
+        &request_path,
+        &query,
+        &env,
+        store,
+    )
 }
 
 pub fn preview_action_endpoint_path(request_path: &str, action_name: &str) -> String {
@@ -741,19 +757,20 @@ fn execute_preview_action(
 
 fn execute_preview_route(
     routes: &[AxHandlerPlan],
-    method: &str,
+    request: &server::AxHttpRequest,
     request_path: &str,
     query: &BTreeMap<String, String>,
     env: &backend::AxEnv,
     store: &mut AxPreviewStore,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
-    let Some(route_match) = match_preview_route(routes, method, request_path) else {
+    let Some(route_match) = match_preview_route(routes, &request.method, request_path) else {
         return Ok(None);
     };
 
     let mut scope = BTreeMap::new();
     scope.insert("params".to_string(), AxValue::Record(route_match.params));
     scope.insert("query".to_string(), build_preview_query_record(query));
+    scope.insert("request".to_string(), build_preview_request_record(request));
     let mut headers = BTreeMap::new();
     let mut set_cookies = Vec::new();
     for step in &route_match.handler.steps {
@@ -1292,6 +1309,61 @@ fn build_preview_query_record(query: &BTreeMap<String, String>) -> AxValue {
             .map(|(key, value)| (key.clone(), AxValue::String(value.clone())))
             .collect(),
     )
+}
+
+fn build_preview_request_record(request: &server::AxHttpRequest) -> AxValue {
+    let headers = request
+        .headers
+        .iter()
+        .map(|(key, value)| {
+            (
+                normalize_preview_header_key(key),
+                AxValue::String(value.clone()),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
+    let cookies = request
+        .header_value("Cookie")
+        .map(parse_preview_cookie_fields)
+        .unwrap_or_default();
+
+    AxValue::Record(BTreeMap::from([
+        (
+            "method".to_string(),
+            AxValue::String(request.method.clone()),
+        ),
+        (
+            "target".to_string(),
+            AxValue::String(request.target.clone()),
+        ),
+        (
+            "body".to_string(),
+            AxValue::String(request.body_text_lossy()),
+        ),
+        ("headers".to_string(), AxValue::Record(headers)),
+        ("cookies".to_string(), AxValue::Record(cookies)),
+    ]))
+}
+
+fn parse_preview_cookie_fields(cookies: &str) -> BTreeMap<String, AxValue> {
+    cookies
+        .split(';')
+        .filter_map(|pair| {
+            let (key, value) = pair.trim().split_once('=')?;
+            Some((
+                key.trim().to_string(),
+                AxValue::String(value.trim().to_string()),
+            ))
+        })
+        .collect()
+}
+
+fn normalize_preview_header_key(key: &str) -> String {
+    key.trim()
+        .to_ascii_lowercase()
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect()
 }
 
 fn build_preview_route_scope(
@@ -3180,6 +3252,32 @@ route GET "/api/session"
             .set_cookies
             .iter()
             .any(|cookie| cookie == "flash=; Path=/; Max-Age=0"));
+    }
+
+    #[test]
+    fn preview_route_sources_can_read_request_context() {
+        let mut store = AxPreviewStore::default();
+        let request = server::AxHttpRequest::new("POST", "/api/session?source=form")
+            .with_header("Cookie", "theme=gold; session=abc123")
+            .with_header("User-Agent", "AxonyxTest")
+            .with_body(b"name=Axonyx".to_vec());
+        let response = execute_preview_route_request_sources(
+            &[r#"
+route POST "/api/session"
+  data theme = request.cookies.theme
+  data session = request.cookies.session
+  data agent = request.headers.user_agent
+  data body = request.body
+  return json(theme)
+"#],
+            &request,
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert_eq!(body, "\"gold\"");
     }
 
     #[test]

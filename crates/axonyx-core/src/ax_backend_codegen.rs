@@ -120,7 +120,7 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
             handler.rust_fn
         ),
         AxHandlerKind::Route { .. } => format!(
-            "pub fn {}(runtime: &impl AxBackendRuntime) -> AxRuntimeResult<AxHttpResponse>",
+            "pub fn {}(runtime: &impl AxBackendRuntime, request: &AxHttpRequest) -> AxRuntimeResult<AxHttpResponse>",
             handler.rust_fn
         ),
         AxHandlerKind::Job => format!(
@@ -385,8 +385,34 @@ fn render_context_lookup(code: &str) -> Option<String> {
     match source {
         "params" => Some(format!("&context.param({field:?})?")),
         "query" => Some(format!("&context.query({field:?})?")),
+        "request" => render_request_lookup(field),
         _ => None,
     }
+}
+
+fn render_request_lookup(field: &str) -> Option<String> {
+    match field {
+        "method" => Some("&request.method".to_string()),
+        "target" => Some("&request.target".to_string()),
+        "body" => Some("&request.body_text_lossy()".to_string()),
+        _ => {
+            let (group, key) = field.split_once('.')?;
+            match group {
+                "cookies" => Some(format!(
+                    "&request.cookie_value({key:?}).unwrap_or_default()"
+                )),
+                "headers" => Some(format!(
+                    "&request.header_value({:?}).unwrap_or_default()",
+                    denormalize_header_key(key)
+                )),
+                _ => None,
+            }
+        }
+    }
+}
+
+fn denormalize_header_key(key: &str) -> String {
+    key.replace('_', "-")
 }
 
 fn render_filter_op(op: AxQueryFilterOpPlan) -> &'static str {
@@ -580,7 +606,7 @@ route GET "/api/posts"
             "pub fn loader_posts_list(runtime: &impl AxBackendRuntime, context: &AxLoaderContext)"
         ));
         assert!(module
-            .contains("pub fn route_get_api_posts(runtime: &impl AxBackendRuntime) -> AxRuntimeResult<AxHttpResponse>"));
+            .contains("pub fn route_get_api_posts(runtime: &impl AxBackendRuntime, request: &AxHttpRequest) -> AxRuntimeResult<AxHttpResponse>"));
     }
 
     #[test]
@@ -624,6 +650,24 @@ route GET "/api/session"
         assert!(module.contains("__ax_cookies.push(AxCookie::new((\"theme\".to_string()).to_string(), (\"gold\".to_string()).to_string()).with_path(\"/\"));"));
         assert!(module.contains("__ax_cookies.push(AxCookie::new((\"flash\".to_string()).to_string(), \"\").with_path(\"/\").with_max_age(0));"));
         assert!(module.contains("__ax_finalize_response(AxHttpResponse::json"));
+    }
+
+    #[test]
+    fn compiles_route_request_context_into_request_helpers() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route POST "/api/session"
+  data theme = request.cookies.theme
+  data agent = request.headers.user_agent
+  data body = request.body
+  return json(theme)
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("request.cookie_value(\"theme\").unwrap_or_default()"));
+        assert!(module.contains("request.header_value(\"user-agent\").unwrap_or_default()"));
+        assert!(module.contains("request.body_text_lossy()"));
     }
 
     #[test]
