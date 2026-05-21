@@ -89,6 +89,69 @@ impl AxHttpRequest {
     pub fn body_text_lossy(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
+
+    pub fn form_value(&self, name: &str) -> Option<String> {
+        parse_urlencoded_fields(&self.body_text_lossy()).remove(name)
+    }
+
+    pub fn json_field_value(&self, name: &str) -> Option<serde_json::Value> {
+        let value = serde_json::from_slice::<serde_json::Value>(&self.body).ok()?;
+        value.as_object()?.get(name).cloned()
+    }
+
+    pub fn json_field_string(&self, name: &str) -> Option<String> {
+        self.json_field_value(name).map(|value| match value {
+            serde_json::Value::Null => String::new(),
+            serde_json::Value::Bool(value) => value.to_string(),
+            serde_json::Value::Number(value) => value.to_string(),
+            serde_json::Value::String(value) => value,
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => value.to_string(),
+        })
+    }
+}
+
+fn parse_urlencoded_fields(body: &str) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
+    for pair in body.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        fields.insert(url_decode(key), url_decode(value));
+    }
+    fields
+}
+
+fn url_decode(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = String::with_capacity(value.len());
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            b'+' => {
+                out.push(' ');
+                index += 1;
+            }
+            b'%' if index + 2 < bytes.len() => {
+                let hex = &value[index + 1..index + 3];
+                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
+                    out.push(decoded as char);
+                    index += 3;
+                } else {
+                    out.push('%');
+                    index += 1;
+                }
+            }
+            byte => {
+                out.push(byte as char);
+                index += 1;
+            }
+        }
+    }
+
+    out
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -502,6 +565,17 @@ mod tests {
         assert_eq!(request.cookie_value("missing"), None);
         assert_eq!(request.body, b"body".to_vec());
         assert_eq!(request.body_text_lossy(), "body");
+
+        let form = AxHttpRequest::new("POST", "/form")
+            .with_body(b"title=Hello+Axonyx&excerpt=Fast%20forms".to_vec());
+        assert_eq!(form.form_value("title"), Some("Hello Axonyx".to_string()));
+        assert_eq!(form.form_value("excerpt"), Some("Fast forms".to_string()));
+        assert_eq!(form.form_value("missing"), None);
+
+        let json = AxHttpRequest::new("POST", "/json")
+            .with_body(br#"{"title":"Hello","count":3}"#.to_vec());
+        assert_eq!(json.json_field_string("title"), Some("Hello".to_string()));
+        assert_eq!(json.json_field_string("count"), Some("3".to_string()));
     }
 
     #[test]

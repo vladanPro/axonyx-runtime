@@ -1326,6 +1326,11 @@ fn build_preview_request_record(request: &server::AxHttpRequest) -> AxValue {
         .header_value("Cookie")
         .map(parse_preview_cookie_fields)
         .unwrap_or_default();
+    let form = parse_preview_form_fields(&request.body_text_lossy());
+    let json = serde_json::from_slice::<serde_json::Value>(&request.body)
+        .ok()
+        .map(preview_json_to_value)
+        .unwrap_or(AxValue::Null);
 
     AxValue::Record(BTreeMap::from([
         (
@@ -1342,6 +1347,8 @@ fn build_preview_request_record(request: &server::AxHttpRequest) -> AxValue {
         ),
         ("headers".to_string(), AxValue::Record(headers)),
         ("cookies".to_string(), AxValue::Record(cookies)),
+        ("form".to_string(), AxValue::Record(form)),
+        ("json".to_string(), json),
     ]))
 }
 
@@ -1358,12 +1365,45 @@ fn parse_preview_cookie_fields(cookies: &str) -> BTreeMap<String, AxValue> {
         .collect()
 }
 
+fn parse_preview_form_fields(body: &str) -> BTreeMap<String, AxValue> {
+    body.split('&')
+        .filter_map(|pair| {
+            if pair.is_empty() {
+                return None;
+            }
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            Some((url_decode(key), AxValue::String(url_decode(value))))
+        })
+        .collect()
+}
+
 fn normalize_preview_header_key(key: &str) -> String {
     key.trim()
         .to_ascii_lowercase()
         .chars()
         .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
         .collect()
+}
+
+fn preview_json_to_value(value: serde_json::Value) -> AxValue {
+    match value {
+        serde_json::Value::Null => AxValue::Null,
+        serde_json::Value::Bool(value) => AxValue::Bool(value),
+        serde_json::Value::Number(value) => value
+            .as_i64()
+            .map(AxValue::Number)
+            .unwrap_or_else(|| AxValue::String(value.to_string())),
+        serde_json::Value::String(value) => AxValue::String(value),
+        serde_json::Value::Array(items) => {
+            AxValue::List(items.into_iter().map(preview_json_to_value).collect())
+        }
+        serde_json::Value::Object(fields) => AxValue::Record(
+            fields
+                .into_iter()
+                .map(|(key, value)| (key, preview_json_to_value(value)))
+                .collect(),
+        ),
+    }
 }
 
 fn build_preview_route_scope(
@@ -3278,6 +3318,45 @@ route POST "/api/session"
 
         let body = String::from_utf8(response.body).expect("json response should be utf-8");
         assert_eq!(body, "\"gold\"");
+    }
+
+    #[test]
+    fn preview_route_sources_can_read_structured_request_body() {
+        let mut store = AxPreviewStore::default();
+        let request = server::AxHttpRequest::new("POST", "/api/form")
+            .with_body(b"title=Hello+Axonyx&excerpt=Fast%20forms".to_vec());
+        let response = execute_preview_route_request_sources(
+            &[r#"
+route POST "/api/form"
+  data title = request.form.title
+  return json(title)
+"#],
+            &request,
+            &mut store,
+        )
+        .expect("form route should execute")
+        .expect("form route should match");
+
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert_eq!(body, "\"Hello Axonyx\"");
+
+        let request = server::AxHttpRequest::new("POST", "/api/json")
+            .with_body(br#"{"title":"Hello JSON","count":3}"#.to_vec());
+        let response = execute_preview_route_request_sources(
+            &[r#"
+route POST "/api/json"
+  data title = request.json.title
+  data count = request.json.count
+  return json(count)
+"#],
+            &request,
+            &mut store,
+        )
+        .expect("json route should execute")
+        .expect("json route should match");
+
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert_eq!(body, "3");
     }
 
     #[test]

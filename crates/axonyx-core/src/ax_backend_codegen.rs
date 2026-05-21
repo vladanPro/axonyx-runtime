@@ -405,6 +405,10 @@ fn render_request_lookup(field: &str) -> Option<String> {
                     "&request.header_value({:?}).unwrap_or_default()",
                     denormalize_header_key(key)
                 )),
+                "form" => Some(format!("&request.form_value({key:?}).unwrap_or_default()")),
+                "json" => Some(format!(
+                    "&request.json_field_string({key:?}).unwrap_or_default()"
+                )),
                 _ => None,
             }
         }
@@ -660,6 +664,8 @@ route POST "/api/session"
   data theme = request.cookies.theme
   data agent = request.headers.user_agent
   data body = request.body
+  data title = request.form.title
+  data slug = request.json.slug
   return json(theme)
 "#,
         )
@@ -668,6 +674,8 @@ route POST "/api/session"
         assert!(module.contains("request.cookie_value(\"theme\").unwrap_or_default()"));
         assert!(module.contains("request.header_value(\"user-agent\").unwrap_or_default()"));
         assert!(module.contains("request.body_text_lossy()"));
+        assert!(module.contains("request.form_value(\"title\").unwrap_or_default()"));
+        assert!(module.contains("request.json_field_string(\"slug\").unwrap_or_default()"));
     }
 
     #[test]
