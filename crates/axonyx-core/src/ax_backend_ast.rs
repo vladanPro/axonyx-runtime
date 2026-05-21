@@ -112,7 +112,7 @@ pub enum AxBackendStmt {
     Header(AxResponseHeader),
     Cookie(AxResponseCookie),
     ClearCookie(AxExpr),
-    Require(AxExpr),
+    Require(AxRequirement),
     Revalidate(AxExpr),
     Return(AxReturn),
     Send(AxSend),
@@ -162,7 +162,11 @@ impl AxBackendStmt {
     }
 
     pub fn require(value: impl Into<AxExpr>) -> Self {
-        Self::Require(value.into())
+        Self::Require(AxRequirement::new(value))
+    }
+
+    pub fn require_with_fallback(value: impl Into<AxExpr>, fallback: impl Into<AxReturn>) -> Self {
+        Self::Require(AxRequirement::new(value).fallback(fallback))
     }
 
     pub fn r#return(value: impl Into<AxReturn>) -> Self {
@@ -347,6 +351,26 @@ impl AxResponseCookie {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxRequirement {
+    pub value: AxExpr,
+    pub fallback: Option<AxReturn>,
+}
+
+impl AxRequirement {
+    pub fn new(value: impl Into<AxExpr>) -> Self {
+        Self {
+            value: value.into(),
+            fallback: None,
+        }
+    }
+
+    pub fn fallback(mut self, fallback: impl Into<AxReturn>) -> Self {
+        self.fallback = Some(fallback.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxReturn {
     Expr(AxExpr),
     Ok,
@@ -396,6 +420,7 @@ pub mod prelude {
     pub use super::AxLoader;
     pub use super::AxMutation;
     pub use super::AxPatch;
+    pub use super::AxRequirement;
     pub use super::AxResponseCookie;
     pub use super::AxResponseHeader;
     pub use super::AxReturn;

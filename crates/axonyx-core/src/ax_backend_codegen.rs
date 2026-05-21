@@ -217,11 +217,12 @@ fn render_step(step: &AxStepPlan, route_response: bool) -> String {
             render_string_expr(name)
         ),
         AxStepPlan::ClearCookie { name } => format!("    // clearCookie {}\n", name.code),
-        AxStepPlan::Require { value } if route_response => format!(
-            "    if {}.is_empty() {{\n        return Ok(__ax_finalize_response(AxHttpResponse::json(401, &json!({{\"error\":\"unauthorized\"}})).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies));\n    }}\n",
-            render_string_expr(value)
+        AxStepPlan::Require { value, fallback } if route_response => format!(
+            "    if {}.is_empty() {{\n{}    }}\n",
+            render_string_expr(value),
+            render_require_fallback(fallback.as_ref())
         ),
-        AxStepPlan::Require { value } => format!("    // require {}\n", value.code),
+        AxStepPlan::Require { value, .. } => format!("    // require {}\n", value.code),
         AxStepPlan::Return(value) => render_return_step(value, route_response),
         AxStepPlan::Send { target, payload } => format!(
             "    runtime.send(&AxSendRequest {{\n        target: {:?}.to_string(),\n        payload: json!({}),\n    }})?;\n",
@@ -383,6 +384,27 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool) -> String {
             "    Ok(ok_payload())\n".to_string()
         }
     }
+}
+
+fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
+    let response = match fallback {
+        Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => format!(
+            "AxHttpResponse::json(401, &json!({})).map_err(|error| AxRuntimeError::message(error.to_string()))?",
+            render_borrowed_expr(expr)
+        ),
+        Some(AxReturnPlan::Redirect { target, status }) => match status {
+            Some(status) => format!(
+                "AxHttpResponse::redirect_with_status({status}, {})",
+                render_owned_expr(target)
+            ),
+            None => format!("AxHttpResponse::redirect({})", render_owned_expr(target)),
+        },
+        Some(AxReturnPlan::NoContent) => "AxHttpResponse::no_content()".to_string(),
+        Some(AxReturnPlan::Ok) => "AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?".to_string(),
+        None => "AxHttpResponse::json(401, &json!({\"error\":\"unauthorized\"})).map_err(|error| AxRuntimeError::message(error.to_string()))?".to_string(),
+    };
+
+    format!("        return Ok(__ax_finalize_response({response}, __ax_headers, __ax_cookies));\n")
 }
 
 fn render_context_lookup(code: &str) -> Option<String> {
@@ -663,6 +685,23 @@ route GET "/api/session"
         assert!(module.contains("__ax_cookies.push(AxCookie::new((\"theme\".to_string()).to_string(), (\"gold\".to_string()).to_string()).with_path(\"/\"));"));
         assert!(module.contains("__ax_cookies.push(AxCookie::new((\"flash\".to_string()).to_string(), \"\").with_path(\"/\").with_max_age(0));"));
         assert!(module.contains("__ax_finalize_response(AxHttpResponse::json"));
+    }
+
+    #[test]
+    fn compiles_require_fallback_into_route_response() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route GET "/api/admin"
+  require request.cookies.session else redirect("/login")
+  return json("ok")
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains(
+            "if (request.cookie_value(\"session\").unwrap_or_default()).to_string().is_empty()"
+        ));
+        assert!(module.contains(r#"AxHttpResponse::redirect("/login".to_string())"#));
     }
 
     #[test]

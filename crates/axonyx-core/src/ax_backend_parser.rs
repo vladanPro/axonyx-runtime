@@ -333,13 +333,26 @@ impl Parser {
         }
 
         if let Some(value) = text.strip_prefix("require ") {
-            let value = value.trim();
+            let (value, fallback) = match value.split_once(" else ") {
+                Some((value, fallback)) => (value.trim(), Some(fallback.trim())),
+                None => (value.trim(), None),
+            };
             if value.is_empty() {
+                return Err(AxBackendParseError::InvalidRequirement { line: line.line });
+            }
+            if matches!(fallback, Some("")) {
                 return Err(AxBackendParseError::InvalidRequirement { line: line.line });
             }
 
             self.pos += 1;
-            return Ok(AxBackendStmt::require(parse_expr(value, line.line)?));
+            let value = parse_expr(value, line.line)?;
+            return match fallback {
+                Some(fallback) => Ok(AxBackendStmt::require_with_fallback(
+                    value,
+                    parse_expr(fallback, line.line)?,
+                )),
+                None => Ok(AxBackendStmt::require(value)),
+            };
         }
 
         if let Some(value) = text.strip_prefix("return ") {
@@ -1070,6 +1083,29 @@ route GET "/api/session"
         assert_eq!(
             route.body[3],
             AxBackendStmt::clear_cookie(AxExpr::string("flash"))
+        );
+    }
+
+    #[test]
+    fn parses_require_fallback_step() {
+        let input = r#"
+route GET "/api/admin"
+  require request.cookies.session else redirect("/login")
+  return json("ok")
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Route(route) = &document.blocks[0] else {
+            panic!("expected route block");
+        };
+
+        assert_eq!(
+            route.body[0],
+            AxBackendStmt::require_with_fallback(
+                AxExpr::ident("request").member("cookies").member("session"),
+                AxExpr::call(["redirect"], [AxExpr::string("/login")])
+            )
         );
     }
 

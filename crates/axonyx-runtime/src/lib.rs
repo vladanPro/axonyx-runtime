@@ -837,16 +837,12 @@ fn execute_preview_route(
                         .render(),
                 );
             }
-            AxStepPlan::Require { value } => {
+            AxStepPlan::Require { value, fallback } => {
                 if eval_preview_require_expr(value, &scope, env)?
                     .as_string()
                     .is_empty()
                 {
-                    let mut response = render_preview_json_response(&AxValue::record([(
-                        "error",
-                        AxValue::String("unauthorized".to_string()),
-                    )]))?;
-                    response.status = 401;
+                    let response = render_preview_require_fallback(fallback.as_ref(), &scope, env)?;
                     return Ok(Some(apply_preview_response_metadata(
                         response,
                         headers,
@@ -866,6 +862,55 @@ fn execute_preview_route(
         headers,
         set_cookies,
     )))
+}
+
+fn render_preview_require_fallback(
+    fallback: Option<&AxReturnPlan>,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+) -> Result<AxPreviewHttpResponse, PreviewError> {
+    let mut response = match fallback {
+        Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
+            render_preview_json_response(&eval_preview_expr(expr, scope, env)?)?
+        }
+        Some(AxReturnPlan::Redirect { target, status }) => {
+            let target = eval_preview_expr(target, scope, env)?.as_string();
+            AxPreviewHttpResponse {
+                status: status.unwrap_or(303),
+                content_type: "text/plain; charset=utf-8".to_string(),
+                headers: BTreeMap::from([("Location".to_string(), target)]),
+                set_cookies: Vec::new(),
+                body: Vec::new(),
+            }
+        }
+        Some(AxReturnPlan::NoContent) => AxPreviewHttpResponse {
+            status: 204,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            headers: BTreeMap::new(),
+            set_cookies: Vec::new(),
+            body: Vec::new(),
+        },
+        Some(AxReturnPlan::Ok) => {
+            render_preview_json_response(&AxValue::record([("ok", AxValue::Bool(true))]))?
+        }
+        None => {
+            let mut response = render_preview_json_response(&AxValue::record([(
+                "error",
+                AxValue::String("unauthorized".to_string()),
+            )]))?;
+            response.status = 401;
+            response
+        }
+    };
+
+    if matches!(
+        fallback,
+        Some(AxReturnPlan::Expr(_)) | Some(AxReturnPlan::Json(_))
+    ) {
+        response.status = 401;
+    }
+
+    Ok(response)
 }
 
 fn eval_preview_require_expr(
@@ -3379,6 +3424,28 @@ route GET "/api/admin"
         assert_eq!(response.status, 200);
         let body = String::from_utf8(response.body).expect("json response should be utf-8");
         assert_eq!(body, "\"ok\"");
+    }
+
+    #[test]
+    fn preview_route_sources_can_use_require_fallbacks() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_request_sources(
+            &[r#"
+route GET "/api/admin"
+  require request.cookies.session else redirect("/login")
+  return json("ok")
+"#],
+            &server::AxHttpRequest::new("GET", "/api/admin"),
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 303);
+        assert_eq!(
+            response.headers.get("Location").map(String::as_str),
+            Some("/login")
+        );
     }
 
     #[test]

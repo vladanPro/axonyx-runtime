@@ -80,6 +80,7 @@ pub enum AxStepPlan {
     },
     Require {
         value: AxRustExpr,
+        fallback: Option<AxReturnPlan>,
     },
     Return(AxReturnPlan),
     Send {
@@ -347,8 +348,9 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
         AxBackendStmt::ClearCookie(name) => AxStepPlan::ClearCookie {
             name: lower_expr(name),
         },
-        AxBackendStmt::Require(value) => AxStepPlan::Require {
-            value: lower_expr(value),
+        AxBackendStmt::Require(requirement) => AxStepPlan::Require {
+            value: lower_expr(&requirement.value),
+            fallback: requirement.fallback.as_ref().map(lower_return),
         },
         AxBackendStmt::Return(value) => AxStepPlan::Return(lower_return(value)),
         AxBackendStmt::Send(send) => AxStepPlan::Send {
@@ -944,6 +946,7 @@ route GET "/api/session"
             handler.steps[0],
             AxStepPlan::Require {
                 value: AxRustExpr::new("request.cookies.session"),
+                fallback: None,
             }
         );
         assert_eq!(
@@ -964,6 +967,31 @@ route GET "/api/session"
             handler.steps[3],
             AxStepPlan::ClearCookie {
                 name: AxRustExpr::new(r#""flash".to_string()"#),
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_require_fallback_step() {
+        let document = parse_backend_ax(
+            r#"
+route GET "/api/admin"
+  require request.cookies.session else redirect("/login")
+  return json("ok")
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert_eq!(
+            plan.handlers[0].steps[0],
+            AxStepPlan::Require {
+                value: AxRustExpr::new("request.cookies.session"),
+                fallback: Some(AxReturnPlan::Redirect {
+                    target: AxRustExpr::new(r#""/login".to_string()"#),
+                    status: None,
+                }),
             }
         );
     }
