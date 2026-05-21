@@ -773,7 +773,7 @@ fn execute_preview_route(
     scope.insert("params".to_string(), AxValue::Record(route_match.params));
     scope.insert("query".to_string(), build_preview_query_record(query));
     scope.insert("request".to_string(), build_preview_request_record(request));
-    scope.insert("Auth".to_string(), build_preview_auth_record(request));
+    scope.insert("Auth".to_string(), build_preview_auth_record(request, env));
     let mut headers = BTreeMap::new();
     let mut set_cookies = Vec::new();
     for step in &route_match.handler.steps {
@@ -1431,7 +1431,13 @@ fn build_preview_request_record(request: &server::AxHttpRequest) -> AxValue {
     ]))
 }
 
-fn build_preview_auth_record(request: &server::AxHttpRequest) -> AxValue {
+fn build_preview_auth_record(request: &server::AxHttpRequest, env: &backend::AxEnv) -> AxValue {
+    let signed_session = env
+        .secret("session_key")
+        .ok()
+        .and_then(|secret| server::AxAuth::signed_session(request, &secret).map(str::to_string))
+        .unwrap_or_default();
+
     AxValue::Record(BTreeMap::from([
         (
             "bearer".to_string(),
@@ -1449,6 +1455,7 @@ fn build_preview_auth_record(request: &server::AxHttpRequest) -> AxValue {
                     .to_string(),
             ),
         ),
+        ("signedSession".to_string(), AxValue::String(signed_session)),
     ]))
 }
 
@@ -3504,6 +3511,47 @@ route GET "/api/admin"
         assert_eq!(response.status, 200);
         let body = String::from_utf8(response.body).expect("json response should be utf-8");
         assert_eq!(body, "\"abc\"");
+    }
+
+    #[test]
+    fn preview_route_sources_can_use_signed_session_alias() {
+        let secret_prev = std::env::var("AX_SECRET_SESSION_KEY").ok();
+        std::env::set_var("AX_SECRET_SESSION_KEY", "local-secret");
+
+        let mut store = AxPreviewStore::default();
+        let source = r#"
+route GET "/api/admin"
+  require Auth.signedSession else redirect("/login")
+  data session = Auth.signedSession
+  return json(session)
+"#;
+
+        let response = execute_preview_route_request_sources(
+            &[source],
+            &server::AxHttpRequest::new("GET", "/api/admin"),
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 303);
+
+        let signed = server::AxAuth::sign_session("s123", "local-secret");
+        let request = server::AxHttpRequest::new("GET", "/api/admin")
+            .with_header("Cookie", format!("session={signed}"));
+        let response = execute_preview_route_request_sources(&[source], &request, &mut store)
+            .expect("route should execute")
+            .expect("route should match");
+
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert_eq!(body, "\"s123\"");
+
+        if let Some(value) = secret_prev {
+            std::env::set_var("AX_SECRET_SESSION_KEY", value);
+        } else {
+            std::env::remove_var("AX_SECRET_SESSION_KEY");
+        }
     }
 
     #[test]

@@ -16,4 +16,6 @@ categories = ["web-programming", "gui"]
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
+hmac.workspace = true
+sha2.workspace = true
 axonyx-core = { version = "0.1.9", path = "../axonyx-core" }

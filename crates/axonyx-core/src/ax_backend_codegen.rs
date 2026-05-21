@@ -422,6 +422,10 @@ fn render_auth_lookup(field: &str) -> Option<String> {
     match field {
         "bearer" => Some("&AxAuth::bearer(request).unwrap_or_default()".to_string()),
         "session" => Some("&AxAuth::session(request).unwrap_or_default()".to_string()),
+        "signedSession" => Some(
+            "&AxAuth::signed_session(request, &runtime.env().secret(\"session_key\")?).unwrap_or_default()"
+                .to_string(),
+        ),
         _ => None,
     }
 }
@@ -725,6 +729,7 @@ route POST "/api/session"
   data slug = request.json.slug
   data token = Auth.bearer
   data session = Auth.session
+  data signed = Auth.signedSession
   return json(theme)
 "#,
         )
@@ -737,6 +742,8 @@ route POST "/api/session"
         assert!(module.contains("request.json_field_string(\"slug\").unwrap_or_default()"));
         assert!(module.contains("AxAuth::bearer(request).unwrap_or_default()"));
         assert!(module.contains("AxAuth::session(request).unwrap_or_default()"));
+        assert!(module
+            .contains("AxAuth::signed_session(request, &runtime.env().secret(\"session_key\")?)"));
     }
 
     #[test]

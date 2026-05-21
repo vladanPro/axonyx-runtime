@@ -502,6 +502,7 @@ fn try_render_auth(expr: &AxExpr) -> Option<String> {
     match normalized.as_slice() {
         ["Auth", "bearer"] => Some("Auth.bearer".to_string()),
         ["Auth", "session"] => Some("Auth.session".to_string()),
+        ["Auth", "signedSession"] => Some("Auth.signedSession".to_string()),
         _ => None,
     }
 }
@@ -1009,6 +1010,39 @@ route GET "/api/admin"
                     target: AxRustExpr::new(r#""/login".to_string()"#),
                     status: None,
                 }),
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_auth_signed_session_alias() {
+        let document = parse_backend_ax(
+            r#"
+route GET "/api/admin"
+  require Auth.signedSession else redirect("/login")
+  data session = Auth.signedSession
+  return json(session)
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert_eq!(
+            plan.handlers[0].steps[0],
+            AxStepPlan::Require {
+                value: AxRustExpr::new("Auth.signedSession"),
+                fallback: Some(AxReturnPlan::Redirect {
+                    target: AxRustExpr::new(r#""/login".to_string()"#),
+                    status: None,
+                }),
+            }
+        );
+        assert_eq!(
+            plan.handlers[0].steps[1],
+            AxStepPlan::Let {
+                binding: "session".to_string(),
+                value: AxValuePlan::Expr(AxRustExpr::new("Auth.signedSession")),
             }
         );
     }

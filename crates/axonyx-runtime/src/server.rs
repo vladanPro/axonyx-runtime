@@ -1,6 +1,10 @@
 use std::collections::BTreeMap;
 
+use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AxServerMode {
@@ -59,6 +63,69 @@ impl AxAuth {
 
     pub fn session<'a>(request: &'a AxHttpRequest) -> Option<&'a str> {
         request.cookie_value("session")
+    }
+
+    pub fn signed_session<'a>(request: &'a AxHttpRequest, secret: &str) -> Option<&'a str> {
+        let cookie = request.cookie_value("session")?;
+        let (value, signature) = cookie.rsplit_once('.')?;
+        Self::verify_signature(value, signature, secret).then_some(value)
+    }
+
+    pub fn sign_session(value: &str, secret: &str) -> String {
+        format!("{value}.{}", Self::signature_hex(value, secret))
+    }
+
+    fn verify_signature(value: &str, signature: &str, secret: &str) -> bool {
+        let Some(signature) = hex_decode(signature) else {
+            return false;
+        };
+        let Ok(mut mac) = HmacSha256::new_from_slice(secret.as_bytes()) else {
+            return false;
+        };
+        mac.update(value.as_bytes());
+        mac.verify_slice(&signature).is_ok()
+    }
+
+    fn signature_hex(value: &str, secret: &str) -> String {
+        let mut mac =
+            HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+        mac.update(value.as_bytes());
+        hex_encode(&mac.finalize().into_bytes())
+    }
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
+fn hex_decode(input: &str) -> Option<Vec<u8>> {
+    if input.len() % 2 != 0 {
+        return None;
+    }
+
+    input
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|chunk| {
+            let high = hex_value(chunk[0])?;
+            let low = hex_value(chunk[1])?;
+            Some((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
     }
 }
 
@@ -604,6 +671,12 @@ mod tests {
 
         let session = AxHttpRequest::new("GET", "/admin").with_header("Cookie", "session=s123");
         assert_eq!(AxAuth::session(&session), Some("s123"));
+
+        let signed = AxAuth::sign_session("s123", "secret");
+        let session =
+            AxHttpRequest::new("GET", "/admin").with_header("Cookie", format!("session={signed}"));
+        assert_eq!(AxAuth::signed_session(&session, "secret"), Some("s123"));
+        assert_eq!(AxAuth::signed_session(&session, "wrong"), None);
     }
 
     #[test]
