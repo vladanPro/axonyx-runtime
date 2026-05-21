@@ -4,6 +4,14 @@ All notable changes to the Axonyx runtime workspace will be documented in this f
 
 The format is intentionally simple while the project is still early-stage.
 
+## 0.1.9 - 2026-05-21
+
+### Added
+
+- Server-Sent Events response contract through `AxHttpResponse::sse_events`
+- `AxSseEvent` helper for typed event stream chunks
+- JSX-like `page` params/defaults for importable `.ax` component files
+
 ## 0.1.8 - 2026-05-19
 
 ### Added
