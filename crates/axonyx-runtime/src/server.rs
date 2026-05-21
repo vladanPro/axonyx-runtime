@@ -108,6 +108,15 @@ impl AxHttpRequest {
             serde_json::Value::Array(_) | serde_json::Value::Object(_) => value.to_string(),
         })
     }
+
+    pub fn bearer_token(&self) -> Option<&str> {
+        let authorization = self.header_value("Authorization")?.trim();
+        authorization
+            .strip_prefix("Bearer ")
+            .or_else(|| authorization.strip_prefix("bearer "))
+            .map(str::trim)
+            .filter(|token| !token.is_empty())
+    }
 }
 
 fn parse_urlencoded_fields(body: &str) -> BTreeMap<String, String> {
@@ -576,6 +585,9 @@ mod tests {
             .with_body(br#"{"title":"Hello","count":3}"#.to_vec());
         assert_eq!(json.json_field_string("title"), Some("Hello".to_string()));
         assert_eq!(json.json_field_string("count"), Some("3".to_string()));
+
+        let auth = AxHttpRequest::new("GET", "/admin").with_header("Authorization", "Bearer abc");
+        assert_eq!(auth.bearer_token(), Some("abc"));
     }
 
     #[test]

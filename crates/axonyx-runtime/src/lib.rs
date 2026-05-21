@@ -773,6 +773,7 @@ fn execute_preview_route(
     scope.insert("params".to_string(), AxValue::Record(route_match.params));
     scope.insert("query".to_string(), build_preview_query_record(query));
     scope.insert("request".to_string(), build_preview_request_record(request));
+    scope.insert("Auth".to_string(), build_preview_auth_record(request));
     let mut headers = BTreeMap::new();
     let mut set_cookies = Vec::new();
     for step in &route_match.handler.steps {
@@ -1427,6 +1428,24 @@ fn build_preview_request_record(request: &server::AxHttpRequest) -> AxValue {
         ("cookies".to_string(), AxValue::Record(cookies)),
         ("form".to_string(), AxValue::Record(form)),
         ("json".to_string(), json),
+    ]))
+}
+
+fn build_preview_auth_record(request: &server::AxHttpRequest) -> AxValue {
+    AxValue::Record(BTreeMap::from([
+        (
+            "bearer".to_string(),
+            AxValue::String(request.bearer_token().unwrap_or_default().to_string()),
+        ),
+        (
+            "session".to_string(),
+            AxValue::String(
+                request
+                    .cookie_value("session")
+                    .unwrap_or_default()
+                    .to_string(),
+            ),
+        ),
     ]))
 }
 
@@ -3446,6 +3465,42 @@ route GET "/api/admin"
             response.headers.get("Location").map(String::as_str),
             Some("/login")
         );
+    }
+
+    #[test]
+    fn preview_route_sources_can_use_auth_request_aliases() {
+        let mut store = AxPreviewStore::default();
+        let source = r#"
+route GET "/api/admin"
+  require Auth.bearer else redirect("/login")
+  data token = Auth.bearer
+  data session = Auth.session
+  return json(token)
+"#;
+        let response = execute_preview_route_request_sources(
+            &[source],
+            &server::AxHttpRequest::new("GET", "/api/admin"),
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 303);
+        assert_eq!(
+            response.headers.get("Location").map(String::as_str),
+            Some("/login")
+        );
+
+        let request = server::AxHttpRequest::new("GET", "/api/admin")
+            .with_header("Authorization", "Bearer abc")
+            .with_header("Cookie", "session=s123");
+        let response = execute_preview_route_request_sources(&[source], &request, &mut store)
+            .expect("route should execute")
+            .expect("route should match");
+
+        assert_eq!(response.status, 200);
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert_eq!(body, "\"abc\"");
     }
 
     #[test]

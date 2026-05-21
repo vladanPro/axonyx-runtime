@@ -413,6 +413,15 @@ fn render_context_lookup(code: &str) -> Option<String> {
         "params" => Some(format!("&context.param({field:?})?")),
         "query" => Some(format!("&context.query({field:?})?")),
         "request" => render_request_lookup(field),
+        "Auth" => render_auth_lookup(field),
+        _ => None,
+    }
+}
+
+fn render_auth_lookup(field: &str) -> Option<String> {
+    match field {
+        "bearer" => Some("&request.bearer_token().unwrap_or_default()".to_string()),
+        "session" => Some("&request.cookie_value(\"session\").unwrap_or_default()".to_string()),
         _ => None,
     }
 }
@@ -714,6 +723,8 @@ route POST "/api/session"
   data body = request.body
   data title = request.form.title
   data slug = request.json.slug
+  data token = Auth.bearer
+  data session = Auth.session
   return json(theme)
 "#,
         )
@@ -724,6 +735,8 @@ route POST "/api/session"
         assert!(module.contains("request.body_text_lossy()"));
         assert!(module.contains("request.form_value(\"title\").unwrap_or_default()"));
         assert!(module.contains("request.json_field_string(\"slug\").unwrap_or_default()"));
+        assert!(module.contains("request.bearer_token().unwrap_or_default()"));
+        assert!(module.contains("request.cookie_value(\"session\").unwrap_or_default()"));
     }
 
     #[test]

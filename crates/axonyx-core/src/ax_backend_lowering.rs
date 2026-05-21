@@ -471,6 +471,9 @@ fn render_expr(expr: &AxExpr) -> String {
     if let Some(env_expr) = try_render_runtime_env(expr) {
         return env_expr;
     }
+    if let Some(auth_expr) = try_render_auth(expr) {
+        return auth_expr;
+    }
 
     match expr {
         AxExpr::String(value) => format!("{value:?}.to_string()"),
@@ -486,6 +489,20 @@ fn render_expr(expr: &AxExpr) -> String {
             let args = args.iter().map(render_expr).collect::<Vec<_>>().join(", ");
             format!("{fn_name}({args})")
         }
+    }
+}
+
+fn try_render_auth(expr: &AxExpr) -> Option<String> {
+    let path = expr_member_path(expr)?;
+    let normalized = path
+        .iter()
+        .map(|segment| segment.as_str())
+        .collect::<Vec<_>>();
+
+    match normalized.as_slice() {
+        ["Auth", "bearer"] => Some("Auth.bearer".to_string()),
+        ["Auth", "session"] => Some("Auth.session".to_string()),
+        _ => None,
     }
 }
 
