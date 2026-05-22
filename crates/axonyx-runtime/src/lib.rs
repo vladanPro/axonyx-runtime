@@ -929,7 +929,7 @@ fn eval_preview_require_expr(
 ) -> Result<AxValue, PreviewError> {
     match eval_preview_expr(expr, scope, env) {
         Ok(value) => Ok(value),
-        Err(error) if expr.code.trim().starts_with("request.") => {
+        Err(_error) if expr.code.trim().starts_with("request.") => {
             Ok(AxValue::String(String::new()))
         }
         Err(error) => Err(error),
