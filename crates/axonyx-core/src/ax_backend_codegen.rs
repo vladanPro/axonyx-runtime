@@ -46,9 +46,14 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("    }\n");
     out.push_str("    response\n");
     out.push_str("}\n\n");
+    out.push_str(
+        "fn __ax_request_input_field(request: &AxHttpRequest, name: &str) -> Option<String> {\n",
+    );
+    out.push_str("    request.form_value(name).or_else(|| request.json_field_string(name))\n");
+    out.push_str("}\n\n");
 
     for handler in &plan.handlers {
-        if let AxHandlerKind::Action { input } = &handler.kind {
+        if let Some(input) = handler_input_fields(handler) {
             out.push_str(&render_input_struct(handler, input));
             out.push('\n');
         }
@@ -97,7 +102,7 @@ fn render_input_struct(handler: &AxHandlerPlan, input: &[AxFieldPlan]) -> String
     out.push_str("#[derive(Debug, Clone)]\n");
     out.push_str(&format!(
         "pub struct {} {{\n",
-        action_input_struct_name(&handler.rust_fn)
+        input_struct_name(&handler.rust_fn)
     ));
 
     for field in input {
@@ -113,7 +118,7 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
         AxHandlerKind::Action { .. } => format!(
             "pub fn {}(runtime: &impl AxBackendRuntime, input: &{}) -> AxRuntimeResult<Value>",
             handler.rust_fn,
-            action_input_struct_name(&handler.rust_fn)
+            input_struct_name(&handler.rust_fn)
         ),
         AxHandlerKind::Loader => format!(
             "pub fn {}(runtime: &impl AxBackendRuntime, context: &AxLoaderContext) -> AxRuntimeResult<Value>",
@@ -133,11 +138,19 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
     out.push_str(&signature);
     out.push_str(" {\n");
 
-    if let AxHandlerKind::Route { method, path } = &handler.kind {
+    if let AxHandlerKind::Route {
+        method,
+        path,
+        input,
+    } = &handler.kind
+    {
         if path.is_empty() {
             return Err(AxBackendCodegenError::MissingRoutePath);
         }
         out.push_str(&format!("    // route {method} {path}\n"));
+        if !input.is_empty() {
+            out.push_str(&render_route_input_binding(handler, input));
+        }
     }
 
     let route_response = matches!(&handler.kind, AxHandlerKind::Route { .. });
@@ -163,6 +176,84 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
 
     out.push_str("}\n");
     Ok(out)
+}
+
+fn handler_input_fields(handler: &AxHandlerPlan) -> Option<&[AxFieldPlan]> {
+    match &handler.kind {
+        AxHandlerKind::Action { input } | AxHandlerKind::Route { input, .. }
+            if !input.is_empty() =>
+        {
+            Some(input)
+        }
+        _ => None,
+    }
+}
+
+fn render_route_input_binding(handler: &AxHandlerPlan, input: &[AxFieldPlan]) -> String {
+    let mut out = format!(
+        "    let input = {} {{\n",
+        input_struct_name(&handler.rust_fn)
+    );
+
+    for field in input {
+        out.push_str(&format!(
+            "        {}: {},\n",
+            field.name,
+            render_route_input_field(field)
+        ));
+    }
+
+    out.push_str("    };\n");
+    out
+}
+
+fn render_route_input_field(field: &AxFieldPlan) -> String {
+    let raw = format!("__ax_request_input_field(request, {:?})", field.name);
+    let missing_error = format!("missing required input `{}`", field.name);
+
+    if !field.optional && field.default.is_none() && field.rust_ty != "bool" {
+        return match field.rust_ty.as_str() {
+            "String" => format!("{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?"),
+            "i64" | "u64" | "f64" => format!(
+                "{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?.trim().parse::<{}>().map_err(|_| AxRuntimeError::message({:?}))?",
+                field.rust_ty,
+                format!("input `{}` expected {}", field.name, field.rust_ty)
+            ),
+            _ => format!("{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?"),
+        };
+    }
+
+    let missing = if let Some(default) = &field.default {
+        render_owned_expr(default)
+    } else if field.optional {
+        default_value_for_rust_type(&field.rust_ty)
+    } else if field.rust_ty == "bool" {
+        "false".to_string()
+    } else {
+        unreachable!("required non-bool fields return before fallback rendering");
+    };
+
+    match field.rust_ty.as_str() {
+        "String" => format!("{raw}.unwrap_or_else(|| ({missing}).to_string())"),
+        "bool" => format!(
+            "{raw}.map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), \"true\" | \"1\" | \"on\" | \"yes\")).unwrap_or({missing})"
+        ),
+        "i64" | "u64" | "f64" => format!(
+            "{raw}.map(|value| value.trim().parse::<{}>().map_err(|_| AxRuntimeError::message(format!(\"input `{}` expected {} but received `{{}}`\", value)))).transpose()?.unwrap_or({missing})",
+            field.rust_ty, field.name, field.rust_ty
+        ),
+        _ => format!("{raw}.unwrap_or_else(|| ({missing}).to_string())"),
+    }
+}
+
+fn default_value_for_rust_type(rust_ty: &str) -> String {
+    match rust_ty {
+        "String" => "String::new()".to_string(),
+        "bool" => "false".to_string(),
+        "i64" | "u64" => "0".to_string(),
+        "f64" => "0.0".to_string(),
+        _ => "Default::default()".to_string(),
+    }
 }
 
 fn render_step(step: &AxStepPlan, route_response: bool) -> String {
@@ -479,9 +570,17 @@ fn render_option_u32(value: Option<u32>) -> String {
     }
 }
 
-fn action_input_struct_name(rust_fn: &str) -> String {
-    let suffix = rust_fn.strip_prefix("action_").unwrap_or(rust_fn);
-    let mut out = String::from("Action");
+fn input_struct_name(rust_fn: &str) -> String {
+    let (prefix, suffix) = rust_fn
+        .strip_prefix("action_")
+        .map(|suffix| ("Action", suffix))
+        .or_else(|| {
+            rust_fn
+                .strip_prefix("route_")
+                .map(|suffix| ("Route", suffix))
+        })
+        .unwrap_or(("Handler", rust_fn));
+    let mut out = String::from(prefix);
 
     for part in suffix.split('_').filter(|part| !part.is_empty()) {
         let mut chars = part.chars();
@@ -744,6 +843,29 @@ route POST "/api/session"
         assert!(module.contains("AxAuth::session(request).unwrap_or_default()"));
         assert!(module
             .contains("AxAuth::signed_session(request, &runtime.env().secret(\"session_key\")?)"));
+    }
+
+    #[test]
+    fn compiles_route_typed_input_into_request_coercion() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route POST "/api/posts"
+  input:
+    title: string
+    count: i64
+    featured?: bool = false
+
+  return json(input.title)
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("pub struct RoutePostApiPostsInput"));
+        assert!(module.contains("__ax_request_input_field(request, \"title\")"));
+        assert!(module.contains("missing required input `title`"));
+        assert!(module.contains("parse::<i64>()"));
+        assert!(module.contains("let input = RoutePostApiPostsInput"));
+        assert!(module.contains("AxHttpResponse::json(200, &json!(&input.title))"));
     }
 
     #[test]

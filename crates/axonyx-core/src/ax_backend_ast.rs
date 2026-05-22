@@ -28,6 +28,7 @@ pub enum AxBackendBlock {
 pub struct AxRoute {
     pub method: String,
     pub path: String,
+    pub input: Vec<AxField>,
     pub body: Vec<AxBackendStmt>,
 }
 
@@ -40,8 +41,14 @@ impl AxRoute {
         Self {
             method: method.into(),
             path: path.into(),
+            input: Vec::new(),
             body: body.into_iter().collect(),
         }
+    }
+
+    pub fn input(mut self, fields: impl IntoIterator<Item = AxField>) -> Self {
+        self.input = fields.into_iter().collect();
+        self
     }
 }
 

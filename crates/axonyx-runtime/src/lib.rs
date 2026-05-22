@@ -774,6 +774,14 @@ fn execute_preview_route(
     scope.insert("query".to_string(), build_preview_query_record(query));
     scope.insert("request".to_string(), build_preview_request_record(request));
     scope.insert("Auth".to_string(), build_preview_auth_record(request, env));
+    if let AxHandlerKind::Route { input, .. } = &route_match.handler.kind {
+        if !input.is_empty() {
+            scope.insert(
+                "input".to_string(),
+                build_preview_route_input_record(input, request)?,
+            );
+        }
+    }
     let mut headers = BTreeMap::new();
     let mut set_cookies = Vec::new();
     for step in &route_match.handler.steps {
@@ -1287,6 +1295,23 @@ fn build_preview_input_record(
     Ok(AxValue::Record(record))
 }
 
+fn build_preview_route_input_record(
+    fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
+    request: &server::AxHttpRequest,
+) -> Result<AxValue, PreviewError> {
+    let input_fields = fields
+        .iter()
+        .filter_map(|field| {
+            request
+                .form_value(&field.name)
+                .or_else(|| request.json_field_string(&field.name))
+                .map(|value| (field.name.clone(), value))
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    build_preview_input_record(fields, &input_fields)
+}
+
 fn coerce_preview_default_input_value(
     field_name: &str,
     rust_ty: &str,
@@ -1544,6 +1569,7 @@ fn match_preview_route<'a>(
         let AxHandlerKind::Route {
             method: route_method,
             path,
+            ..
         } = &route.kind
         else {
             continue;
@@ -3591,6 +3617,36 @@ route POST "/api/json"
 
         let body = String::from_utf8(response.body).expect("json response should be utf-8");
         assert_eq!(body, "3");
+    }
+
+    #[test]
+    fn preview_route_sources_can_use_typed_request_input() {
+        let mut store = AxPreviewStore::default();
+        let source = r#"
+route POST "/api/posts"
+  input:
+    title: string
+    count: i64
+    featured?: bool = false
+
+  return json(input.count)
+"#;
+
+        let request = server::AxHttpRequest::new("POST", "/api/posts")
+            .with_body(br#"{"title":"Hello","count":3}"#.to_vec());
+        let response = execute_preview_route_request_sources(&[source], &request, &mut store)
+            .expect("json route should execute")
+            .expect("route should match");
+
+        let body = String::from_utf8(response.body).expect("json response should be utf-8");
+        assert_eq!(body, "3");
+
+        let request =
+            server::AxHttpRequest::new("POST", "/api/posts").with_body(b"title=Hello".to_vec());
+        let error = execute_preview_route_request_sources(&[source], &request, &mut store)
+            .expect_err("missing typed input should fail");
+
+        assert!(error.to_string().contains("missing required input `count`"));
     }
 
     #[test]

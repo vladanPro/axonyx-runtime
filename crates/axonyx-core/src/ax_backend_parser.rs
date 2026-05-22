@@ -96,12 +96,10 @@ impl Parser {
             }
 
             self.pos += 1;
-            let body = self.parse_body(2)?;
-            return Ok(AxBackendBlock::Route(AxRoute::new(
-                method,
-                trim_quotes(path),
-                body,
-            )));
+            let (input, body) = self.parse_input_sections(2)?;
+            return Ok(AxBackendBlock::Route(
+                AxRoute::new(method, trim_quotes(path), body).input(input),
+            ));
         }
 
         if let Some(name) = text.strip_prefix("loader ") {
@@ -122,7 +120,7 @@ impl Parser {
             }
 
             self.pos += 1;
-            let (input, body) = self.parse_action_sections(2)?;
+            let (input, body) = self.parse_input_sections(2)?;
             return Ok(AxBackendBlock::Action(
                 AxAction::new(name).input(input).body(body),
             ));
@@ -142,7 +140,7 @@ impl Parser {
         Err(AxBackendParseError::InvalidBlock { line: line.line })
     }
 
-    fn parse_action_sections(
+    fn parse_input_sections(
         &mut self,
         indent: usize,
     ) -> Result<(Vec<AxField>, Vec<AxBackendStmt>), AxBackendParseError> {
@@ -1022,6 +1020,31 @@ action SetLanguage
             action.input[1],
             AxField::with_default("count", "i64", AxExpr::number(0))
         );
+    }
+
+    #[test]
+    fn parses_route_with_typed_input_fields() {
+        let input = r#"
+route POST "/api/posts"
+  input:
+    title: string
+    featured?: bool = false
+
+  return json(input.title)
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Route(route) = &document.blocks[0] else {
+            panic!("expected route block");
+        };
+
+        assert_eq!(route.input[0], AxField::new("title", "string"));
+        assert_eq!(
+            route.input[1],
+            AxField::optional_with_default("featured", "bool", AxExpr::bool(false))
+        );
+        assert_eq!(route.body.len(), 1);
     }
 
     #[test]

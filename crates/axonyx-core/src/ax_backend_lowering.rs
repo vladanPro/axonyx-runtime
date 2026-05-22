@@ -27,9 +27,15 @@ pub struct AxHandlerPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxHandlerKind {
-    Route { method: String, path: String },
+    Route {
+        method: String,
+        path: String,
+        input: Vec<AxFieldPlan>,
+    },
     Loader,
-    Action { input: Vec<AxFieldPlan> },
+    Action {
+        input: Vec<AxFieldPlan>,
+    },
     Job,
 }
 
@@ -213,12 +219,19 @@ fn lower_route(route: &AxRoute) -> Result<AxHandlerPlan, AxBackendLowerError> {
         route_path_ident(&route.path)
     );
 
+    let input = route
+        .input
+        .iter()
+        .map(lower_input_field)
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(AxHandlerPlan {
         name,
         rust_fn,
         kind: AxHandlerKind::Route {
             method: route.method.clone(),
             path: route.path.clone(),
+            input,
         },
         steps: lower_steps(&route.body),
     })
@@ -873,6 +886,7 @@ action RemovePost
             AxHandlerKind::Route {
                 method: "GET".to_string(),
                 path: "/api/posts".to_string(),
+                input: Vec::new(),
             }
         );
     }
@@ -1010,6 +1024,45 @@ route GET "/api/admin"
                     target: AxRustExpr::new(r#""/login".to_string()"#),
                     status: None,
                 }),
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_route_input_fields() {
+        let document = parse_backend_ax(
+            r#"
+route POST "/api/posts"
+  input:
+    title: string
+    featured?: bool = false
+
+  return json(input.title)
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert_eq!(
+            plan.handlers[0].kind,
+            AxHandlerKind::Route {
+                method: "POST".to_string(),
+                path: "/api/posts".to_string(),
+                input: vec![
+                    AxFieldPlan {
+                        name: "title".to_string(),
+                        rust_ty: "String".to_string(),
+                        optional: false,
+                        default: None,
+                    },
+                    AxFieldPlan {
+                        name: "featured".to_string(),
+                        rust_ty: "bool".to_string(),
+                        optional: true,
+                        default: Some(AxRustExpr::new("false")),
+                    },
+                ],
             }
         );
     }
