@@ -91,39 +91,48 @@ impl Parser {
             let mut parts = rest.splitn(2, ' ');
             let method = parts.next().unwrap_or_default().trim();
             let path = parts.next().unwrap_or_default().trim();
+            let (path, returns) = split_return_contract(path);
             if method.is_empty() || path.is_empty() {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
             }
 
             self.pos += 1;
             let (input, body) = self.parse_input_sections(2)?;
-            return Ok(AxBackendBlock::Route(
-                AxRoute::new(method, trim_quotes(path), body).input(input),
-            ));
+            let mut route = AxRoute::new(method, trim_quotes(path), body).input(input);
+            if let Some(returns) = returns {
+                route = route.returns(returns);
+            }
+            return Ok(AxBackendBlock::Route(route));
         }
 
         if let Some(name) = text.strip_prefix("loader ") {
-            let name = name.trim();
+            let (name, returns) = split_return_contract(name.trim());
             if name.is_empty() {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
             }
 
             self.pos += 1;
             let body = self.parse_body(2)?;
-            return Ok(AxBackendBlock::Loader(AxLoader::new(name, body)));
+            let mut loader = AxLoader::new(name, body);
+            if let Some(returns) = returns {
+                loader = loader.returns(returns);
+            }
+            return Ok(AxBackendBlock::Loader(loader));
         }
 
         if let Some(name) = text.strip_prefix("action ") {
-            let name = name.trim();
+            let (name, returns) = split_return_contract(name.trim());
             if name.is_empty() {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
             }
 
             self.pos += 1;
             let (input, body) = self.parse_input_sections(2)?;
-            return Ok(AxBackendBlock::Action(
-                AxAction::new(name).input(input).body(body),
-            ));
+            let mut action = AxAction::new(name).input(input).body(body);
+            if let Some(returns) = returns {
+                action = action.returns(returns);
+            }
+            return Ok(AxBackendBlock::Action(action));
         }
 
         if let Some(name) = text.strip_prefix("job ") {
@@ -836,6 +845,20 @@ fn trim_quotes(input: &str) -> String {
         .to_string()
 }
 
+fn split_return_contract(input: &str) -> (&str, Option<String>) {
+    match input.split_once("->") {
+        Some((head, returns)) => {
+            let returns = returns.trim();
+            if returns.is_empty() {
+                (head.trim(), None)
+            } else {
+                (head.trim(), Some(returns.to_string()))
+            }
+        }
+        None => (input.trim(), None),
+    }
+}
+
 pub mod prelude {
     pub use super::parse_backend_ax;
     pub use super::AxBackendParseError;
@@ -891,6 +914,43 @@ route GET "/api/posts"
         };
         assert_eq!(route.method, "GET");
         assert_eq!(route.path, "/api/posts");
+    }
+
+    #[test]
+    fn parses_backend_return_contracts() {
+        let input = r#"
+loader PostsList -> Post[]
+  return posts
+
+route GET "/api/posts" -> Post[]
+  return json(posts)
+
+action CreatePost -> Post
+  input:
+    title: string
+
+  return json(input.title)
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected loader block");
+        };
+        assert_eq!(loader.name, "PostsList");
+        assert_eq!(loader.returns.as_deref(), Some("Post[]"));
+
+        let AxBackendBlock::Route(route) = &document.blocks[1] else {
+            panic!("expected route block");
+        };
+        assert_eq!(route.path, "/api/posts");
+        assert_eq!(route.returns.as_deref(), Some("Post[]"));
+
+        let AxBackendBlock::Action(action) = &document.blocks[2] else {
+            panic!("expected action block");
+        };
+        assert_eq!(action.name, "CreatePost");
+        assert_eq!(action.returns.as_deref(), Some("Post"));
     }
 
     #[test]

@@ -120,7 +120,7 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
             handler.rust_fn,
             input_struct_name(&handler.rust_fn)
         ),
-        AxHandlerKind::Loader => format!(
+        AxHandlerKind::Loader { .. } => format!(
             "pub fn {}(runtime: &impl AxBackendRuntime, context: &AxLoaderContext) -> AxRuntimeResult<Value>",
             handler.rust_fn
         ),
@@ -142,6 +142,7 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
         method,
         path,
         input,
+        ..
     } = &handler.kind
     {
         if path.is_empty() {
@@ -180,7 +181,7 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
 
 fn handler_input_fields(handler: &AxHandlerPlan) -> Option<&[AxFieldPlan]> {
     match &handler.kind {
-        AxHandlerKind::Action { input } | AxHandlerKind::Route { input, .. }
+        AxHandlerKind::Action { input, .. } | AxHandlerKind::Route { input, .. }
             if !input.is_empty() =>
         {
             Some(input)

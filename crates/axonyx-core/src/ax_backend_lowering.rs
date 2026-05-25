@@ -30,10 +30,14 @@ pub enum AxHandlerKind {
     Route {
         method: String,
         path: String,
+        returns: Option<String>,
         input: Vec<AxFieldPlan>,
     },
-    Loader,
+    Loader {
+        returns: Option<String>,
+    },
     Action {
+        returns: Option<String>,
         input: Vec<AxFieldPlan>,
     },
     Job,
@@ -231,6 +235,7 @@ fn lower_route(route: &AxRoute) -> Result<AxHandlerPlan, AxBackendLowerError> {
         kind: AxHandlerKind::Route {
             method: route.method.clone(),
             path: route.path.clone(),
+            returns: route.returns.clone(),
             input,
         },
         steps: lower_steps(&route.body),
@@ -246,7 +251,9 @@ fn lower_loader(loader: &AxLoader) -> Result<AxHandlerPlan, AxBackendLowerError>
     Ok(AxHandlerPlan {
         name: loader.name.clone(),
         rust_fn: format!("loader_{}", normalize_ident(name)),
-        kind: AxHandlerKind::Loader,
+        kind: AxHandlerKind::Loader {
+            returns: loader.returns.clone(),
+        },
         steps: lower_steps(&loader.body),
     })
 }
@@ -266,7 +273,10 @@ fn lower_action(action: &AxAction) -> Result<AxHandlerPlan, AxBackendLowerError>
     Ok(AxHandlerPlan {
         name: action.name.clone(),
         rust_fn: format!("action_{}", normalize_ident(name)),
-        kind: AxHandlerKind::Action { input },
+        kind: AxHandlerKind::Action {
+            returns: action.returns.clone(),
+            input,
+        },
         steps: lower_steps(&action.body),
     })
 }
@@ -649,7 +659,7 @@ loader PostsList
         let handler = &plan.handlers[0];
         assert_eq!(handler.name, "PostsList");
         assert_eq!(handler.rust_fn, "loader_posts_list");
-        assert_eq!(handler.kind, AxHandlerKind::Loader);
+        assert_eq!(handler.kind, AxHandlerKind::Loader { returns: None });
 
         let AxStepPlan::Let { binding, value } = &handler.steps[0] else {
             panic!("expected let step");
@@ -707,6 +717,7 @@ action CreatePost
         assert_eq!(
             handler.kind,
             AxHandlerKind::Action {
+                returns: None,
                 input: vec![
                     AxFieldPlan {
                         name: "title".to_string(),
@@ -886,7 +897,58 @@ action RemovePost
             AxHandlerKind::Route {
                 method: "GET".to_string(),
                 path: "/api/posts".to_string(),
+                returns: None,
                 input: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_backend_return_contracts() {
+        let document = parse_backend_ax(
+            r#"
+loader PostsList -> Post[]
+  return posts
+
+route GET "/api/posts" -> Post[]
+  return json(posts)
+
+action CreatePost -> Post
+  input:
+    title: string
+
+  return json(input.title)
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert_eq!(
+            plan.handlers[0].kind,
+            AxHandlerKind::Loader {
+                returns: Some("Post[]".to_string()),
+            }
+        );
+        assert_eq!(
+            plan.handlers[1].kind,
+            AxHandlerKind::Route {
+                method: "GET".to_string(),
+                path: "/api/posts".to_string(),
+                returns: Some("Post[]".to_string()),
+                input: Vec::new(),
+            }
+        );
+        assert_eq!(
+            plan.handlers[2].kind,
+            AxHandlerKind::Action {
+                returns: Some("Post".to_string()),
+                input: vec![AxFieldPlan {
+                    name: "title".to_string(),
+                    rust_ty: "String".to_string(),
+                    optional: false,
+                    default: None,
+                }],
             }
         );
     }
@@ -1049,6 +1111,7 @@ route POST "/api/posts"
             AxHandlerKind::Route {
                 method: "POST".to_string(),
                 path: "/api/posts".to_string(),
+                returns: None,
                 input: vec![
                     AxFieldPlan {
                         name: "title".to_string(),

@@ -533,7 +533,7 @@ fn collect_preview_handlers(
         let plan = lower_backend_document(&document)?;
 
         for handler in plan.handlers {
-            if matches!(handler.kind, AxHandlerKind::Loader) {
+            if matches!(handler.kind, AxHandlerKind::Loader { .. }) {
                 loaders.insert(handler.name.clone(), handler);
             }
         }
@@ -677,7 +677,7 @@ fn execute_preview_action(
             message: format!("action `{action_name}` was not found for this route"),
         })?;
 
-    let AxHandlerKind::Action { input } = &action.kind else {
+    let AxHandlerKind::Action { input, .. } = &action.kind else {
         return Err(PreviewError::Runtime {
             message: format!("handler `{action_name}` is not an action"),
         });
