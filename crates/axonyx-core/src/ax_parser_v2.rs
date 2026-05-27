@@ -8,6 +8,8 @@ pub enum AxParseV2Error {
     EmptyDocument,
     #[error("invalid import syntax at line {line}")]
     InvalidImport { line: usize },
+    #[error("invalid use syntax at line {line}")]
+    InvalidUse { line: usize },
     #[error("missing `from` in import at line {line}")]
     MissingImportFrom { line: usize },
     #[error("empty import list at line {line}")]
@@ -77,9 +79,14 @@ impl<'a> Parser<'a> {
 
         self.skip_layout_whitespace();
 
+        let mut package_uses = Vec::new();
         let mut imports = Vec::new();
-        while self.starts_with_keyword("import") {
-            imports.push(self.parse_import()?);
+        while self.starts_with_keyword("use") || self.starts_with_keyword("import") {
+            if self.starts_with_keyword("use") {
+                package_uses.push(self.parse_use()?);
+            } else {
+                imports.push(self.parse_import()?);
+            }
             self.skip_layout_whitespace();
         }
 
@@ -114,6 +121,7 @@ impl<'a> Parser<'a> {
         let body = self.parse_nodes(None)?;
 
         Ok(AxFileV2 {
+            package_uses,
             imports,
             page,
             types,
@@ -123,6 +131,24 @@ impl<'a> Parser<'a> {
             components,
             body,
         })
+    }
+
+    fn parse_use(&mut self) -> Result<String, AxParseV2Error> {
+        let line = self.line;
+        self.expect_keyword("use")
+            .map_err(|_| AxParseV2Error::InvalidUse { line })?;
+        self.skip_spaces();
+
+        let source = self
+            .parse_string_literal()
+            .map_err(|_| AxParseV2Error::InvalidUse { line })?;
+        self.skip_spaces();
+        if !matches!(self.peek_char(), None | Some('\n') | Some('\r')) {
+            return Err(AxParseV2Error::InvalidUse { line });
+        }
+        self.consume_until_line_end();
+
+        Ok(source)
     }
 
     fn parse_import(&mut self) -> Result<AxImportDecl, AxParseV2Error> {
@@ -1138,6 +1164,24 @@ page Home
         assert_eq!(card.attrs.len(), 1);
         assert!(!card.self_closing);
         assert_eq!(card.children.len(), 2);
+    }
+
+    #[test]
+    fn parses_package_use_directives_before_page() {
+        let input = r#"
+use "@axonyx/ui"
+import { Card } from "@axonyx/ui/foundry/Card.ax"
+
+page Home
+
+<Card title="Hello" />
+"#;
+
+        let file = parse_ax_v2(input).expect("v2 file should parse");
+
+        assert_eq!(file.package_uses, vec!["@axonyx/ui"]);
+        assert_eq!(file.imports.len(), 1);
+        assert_eq!(file.page.name, "Home");
     }
 
     #[test]

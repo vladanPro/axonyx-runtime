@@ -64,7 +64,10 @@ pub enum AxConvertV2Error {
 pub fn looks_like_ax_v2(input: &str) -> bool {
     input.lines().map(str::trim).any(|line| {
         !line.is_empty()
-            && (line.starts_with("import ") || line.starts_with('<') || line.starts_with("</"))
+            && (line.starts_with("import ")
+                || line.starts_with("use ")
+                || line.starts_with('<')
+                || line.starts_with("</"))
     })
 }
 

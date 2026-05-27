@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxFileV2 {
+    pub package_uses: Vec<String>,
     pub imports: Vec<AxImportDecl>,
     pub page: AxPageDecl,
     pub types: Vec<AxTypeDeclV2>,
@@ -377,6 +378,7 @@ mod tests {
     #[test]
     fn builds_v2_ast_for_imports_and_elements() {
         let file = AxFileV2 {
+            package_uses: Vec::new(),
             imports: vec![AxImportDecl::new(
                 [
                     AxImportBinding::named("Card"),
