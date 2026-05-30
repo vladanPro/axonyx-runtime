@@ -4,6 +4,14 @@ All notable changes to the Axonyx runtime workspace will be documented in this f
 
 The format is intentionally simple while the project is still early-stage.
 
+## 0.1.12 - 2026-05-30
+
+### Added
+
+- JSX-like `.ax` package use directives such as `use "@axonyx/ui"`
+- parser/AST support for package-level asset activation before `page`
+- auto-detection of `use` directives as AX v2 source
+
 ## 0.1.9 - 2026-05-21
 
 ### Added
