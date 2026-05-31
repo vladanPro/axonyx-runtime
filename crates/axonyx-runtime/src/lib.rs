@@ -158,6 +158,30 @@ pub fn ax_page_route_definition(
     ))
 }
 
+pub fn ax_page_route_definition_with_backend(
+    method: impl Into<String>,
+    path: impl Into<String>,
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    store: &AxPreviewStore,
+) -> Result<server::AxRouteDefinition, PreviewError> {
+    Ok(server::AxRouteDefinition::new_response(
+        method,
+        path,
+        preview_ax_route_stream_response_with_backend(
+            layout_sources,
+            loader_sources,
+            action_sources,
+            page_source,
+            request_target,
+            store,
+        )?,
+    ))
+}
+
 pub fn preview_ax_page_with_imports(
     ax_source: &str,
     import_resolver: &impl AxImportResolver,
@@ -194,8 +218,22 @@ pub fn preview_ax_route_with_imports(
     page_source: &str,
     import_resolver: &impl AxImportResolver,
 ) -> Result<String, PreviewError> {
+    let response = preview_ax_route_stream_response_with_imports(
+        layout_sources,
+        page_source,
+        import_resolver,
+    )?;
+    Ok(String::from_utf8(response.body.into_bytes())
+        .expect("preview renderer only emits UTF-8 HTML"))
+}
+
+pub fn preview_ax_route_stream_response_with_imports(
+    layout_sources: &[&str],
+    page_source: &str,
+    import_resolver: &impl AxImportResolver,
+) -> Result<server::AxHttpResponse, PreviewError> {
     let store = AxPreviewStore::default();
-    preview_ax_route_with_backend_and_imports(
+    preview_ax_route_stream_response_with_backend_and_imports(
         layout_sources,
         &[],
         &[],
@@ -212,7 +250,32 @@ pub fn preview_ax_route_with_loaders(
     page_source: &str,
 ) -> Result<String, PreviewError> {
     let store = AxPreviewStore::default();
-    preview_ax_route_with_backend(
+    let response = preview_ax_route_stream_response_with_backend(
+        layout_sources,
+        loader_sources,
+        &[],
+        page_source,
+        "/",
+        &store,
+    )?;
+    Ok(String::from_utf8(response.body.into_bytes())
+        .expect("preview renderer only emits UTF-8 HTML"))
+}
+
+pub fn preview_ax_route_stream_response(
+    layout_sources: &[&str],
+    page_source: &str,
+) -> Result<server::AxHttpResponse, PreviewError> {
+    preview_ax_route_stream_response_with_loaders(layout_sources, &[], page_source)
+}
+
+pub fn preview_ax_route_stream_response_with_loaders(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    page_source: &str,
+) -> Result<server::AxHttpResponse, PreviewError> {
+    let store = AxPreviewStore::default();
+    preview_ax_route_stream_response_with_backend(
         layout_sources,
         loader_sources,
         &[],
@@ -333,7 +396,7 @@ pub fn preview_ax_route_with_backend(
     store: &AxPreviewStore,
 ) -> Result<String, PreviewError> {
     let import_resolver = |_: &str| None;
-    preview_ax_route_with_backend_and_imports(
+    let response = preview_ax_route_stream_response_with_backend_and_imports(
         layout_sources,
         loader_sources,
         action_sources,
@@ -341,7 +404,9 @@ pub fn preview_ax_route_with_backend(
         request_target,
         store,
         &import_resolver,
-    )
+    )?;
+    Ok(String::from_utf8(response.body.into_bytes())
+        .expect("preview renderer only emits UTF-8 HTML"))
 }
 
 pub fn preview_ax_route_with_backend_and_imports(
@@ -353,6 +418,48 @@ pub fn preview_ax_route_with_backend_and_imports(
     store: &AxPreviewStore,
     import_resolver: &impl AxImportResolver,
 ) -> Result<String, PreviewError> {
+    let response = preview_ax_route_stream_response_with_backend_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        request_target,
+        store,
+        import_resolver,
+    )?;
+    Ok(String::from_utf8(response.body.into_bytes())
+        .expect("preview renderer only emits UTF-8 HTML"))
+}
+
+pub fn preview_ax_route_stream_response_with_backend(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    store: &AxPreviewStore,
+) -> Result<server::AxHttpResponse, PreviewError> {
+    let import_resolver = |_: &str| None;
+    preview_ax_route_stream_response_with_backend_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        request_target,
+        store,
+        &import_resolver,
+    )
+}
+
+pub fn preview_ax_route_stream_response_with_backend_and_imports(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
+) -> Result<server::AxHttpResponse, PreviewError> {
     let page_document = parse_ax_auto(page_source)?;
     let mut document = page_document;
 
@@ -410,7 +517,7 @@ pub fn preview_ax_route_with_backend_and_imports(
         return Err(runtime_error);
     }
 
-    Ok(render_preview_document(&document, &node))
+    Ok(render_preview_document_response(&document, &node))
 }
 
 pub fn preview_ax_route_with_request_context(
@@ -2774,6 +2881,51 @@ page Home
         let html = String::from_utf8(response.body.into_bytes()).expect("HTML should be UTF-8");
         assert!(html.contains("Route Page"));
         assert!(html.contains("Served through AxRouteDefinition"));
+    }
+
+    #[test]
+    fn builds_route_definition_from_ax_page_with_layout_and_loaders() {
+        let store = AxPreviewStore::default();
+        let route = ax_page_route_definition_with_backend(
+            "GET",
+            "/blog",
+            &[r#"
+page Docs
+  Container max: "xl", recipe: "docs-shell"
+    Copy tone: "eyebrow" -> "Docs Layout"
+    Slot
+"#],
+            &[r#"
+loader PostsList
+  data posts = Db.Stream("posts")
+    where status = "published"
+    limit 1
+  return posts
+"#],
+            &[],
+            r#"
+page Blog
+<Each item="post" in={load PostsList}>
+  <Card title={post.title}>
+    <Copy>{post.excerpt}</Copy>
+  </Card>
+</Each>
+"#,
+            "/blog",
+            &store,
+        )
+        .expect("page route with backend context should build");
+
+        let response = route.handle(server::AxHttpRequest::new("GET", "/blog"), None);
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_streaming());
+
+        let html = String::from_utf8(response.body.into_bytes()).expect("HTML should be UTF-8");
+        assert!(html.contains("Docs Layout"));
+        assert!(html.contains("data-recipe=\"docs-shell\""));
+        assert!(html.contains("Hello Axonyx"));
+        assert!(html.contains("A fast page rendered from .ax"));
     }
 
     #[test]
