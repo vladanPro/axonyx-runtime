@@ -77,6 +77,10 @@ pub enum AxStepPlan {
         signal: AxRustExpr,
         value: AxRustExpr,
     },
+    Hook {
+        phase: AxHookPhasePlan,
+        value: AxRustExpr,
+    },
     Header {
         name: AxRustExpr,
         value: AxRustExpr,
@@ -97,6 +101,12 @@ pub enum AxStepPlan {
         target: String,
         payload: AxRustExpr,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxHookPhasePlan {
+    Before,
+    After,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -360,6 +370,13 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
             signal: lower_patch_signal(&patch.signal),
             value: lower_expr(&patch.value),
         },
+        AxBackendStmt::Hook(hook) => AxStepPlan::Hook {
+            phase: match hook.phase {
+                AxHookPhase::Before => AxHookPhasePlan::Before,
+                AxHookPhase::After => AxHookPhasePlan::After,
+            },
+            value: lower_expr(&hook.value),
+        },
         AxBackendStmt::Header(header) => AxStepPlan::Header {
             name: lower_expr(&header.name),
             value: lower_expr(&header.value),
@@ -621,6 +638,7 @@ pub mod prelude {
     pub use super::AxFieldPlan;
     pub use super::AxHandlerKind;
     pub use super::AxHandlerPlan;
+    pub use super::AxHookPhasePlan;
     pub use super::AxQueryFilterOpPlan;
     pub use super::AxQueryFilterPlan;
     pub use super::AxQueryOrderDirectionPlan;
@@ -1086,6 +1104,45 @@ route GET "/api/admin"
                     target: AxRustExpr::new(r#""/login".to_string()"#),
                     status: None,
                 }),
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_route_hooks_into_plan() {
+        let document = parse_backend_ax(
+            r#"
+route GET "/api/admin"
+  before Auth.session
+  before Security.headers
+  after Cache.noStore
+  return json("ok")
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+        let handler = &plan.handlers[0];
+
+        assert_eq!(
+            handler.steps[0],
+            AxStepPlan::Hook {
+                phase: AxHookPhasePlan::Before,
+                value: AxRustExpr::new("Auth.session"),
+            }
+        );
+        assert_eq!(
+            handler.steps[1],
+            AxStepPlan::Hook {
+                phase: AxHookPhasePlan::Before,
+                value: AxRustExpr::new("Security.headers"),
+            }
+        );
+        assert_eq!(
+            handler.steps[2],
+            AxStepPlan::Hook {
+                phase: AxHookPhasePlan::After,
+                value: AxRustExpr::new("Cache.noStore"),
             }
         );
     }

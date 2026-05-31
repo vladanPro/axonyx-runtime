@@ -288,6 +288,16 @@ fn render_step(step: &AxStepPlan, route_response: bool) -> String {
         AxStepPlan::Patch { signal, value } => {
             format!("    // patch {} = {}\n", signal.code, value.code)
         }
+        AxStepPlan::Hook { phase, value } if route_response => {
+            render_route_hook_step(*phase, value)
+        }
+        AxStepPlan::Hook { phase, value } => {
+            let phase = match phase {
+                AxHookPhasePlan::Before => "before",
+                AxHookPhasePlan::After => "after",
+            };
+            format!("    // {phase} hook {}\n", value.code)
+        }
         AxStepPlan::Header { name, value } if route_response => format!(
             "    __ax_headers.insert({}, {});\n",
             render_string_expr(name),
@@ -321,6 +331,30 @@ fn render_step(step: &AxStepPlan, route_response: bool) -> String {
             target,
             render_borrowed_expr(payload)
         ),
+    }
+}
+
+fn render_route_hook_step(phase: AxHookPhasePlan, value: &AxRustExpr) -> String {
+    match value.code.as_str() {
+        "Security.headers" => {
+            "    __ax_headers.insert(\"X-Content-Type-Options\".to_string(), \"nosniff\".to_string());\n    __ax_headers.insert(\"Referrer-Policy\".to_string(), \"strict-origin-when-cross-origin\".to_string());\n".to_string()
+        }
+        "Cache.noStore" => {
+            "    __ax_headers.insert(\"Cache-Control\".to_string(), \"no-store\".to_string());\n"
+                .to_string()
+        }
+        "Auth.session" | "Auth.bearer" | "Auth.signedSession" => format!(
+            "    if {}.is_empty() {{\n{}    }}\n",
+            render_string_expr(value),
+            render_require_fallback(None)
+        ),
+        _ => {
+            let phase = match phase {
+                AxHookPhasePlan::Before => "before",
+                AxHookPhasePlan::After => "after",
+            };
+            format!("    // {phase} hook {}\n", value.code)
+        }
     }
 }
 
@@ -798,6 +832,33 @@ route GET "/api/session"
         assert!(module.contains("__ax_cookies.push(AxCookie::new((\"theme\".to_string()).to_string(), (\"gold\".to_string()).to_string()).with_path(\"/\"));"));
         assert!(module.contains("__ax_cookies.push(AxCookie::new((\"flash\".to_string()).to_string(), \"\").with_path(\"/\").with_max_age(0));"));
         assert!(module.contains("__ax_finalize_response(AxHttpResponse::json"));
+    }
+
+    #[test]
+    fn compiles_route_hooks_into_known_response_policies() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route GET "/api/admin"
+  before Security.headers
+  before Auth.session
+  after Cache.noStore
+  return json("ok")
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains(
+            "__ax_headers.insert(\"X-Content-Type-Options\".to_string(), \"nosniff\".to_string())"
+        ));
+        assert!(module.contains(
+            "__ax_headers.insert(\"Referrer-Policy\".to_string(), \"strict-origin-when-cross-origin\".to_string())"
+        ));
+        assert!(module.contains(
+            "if (AxAuth::session(request).unwrap_or_default()).to_string().is_empty()"
+        ));
+        assert!(module.contains(
+            "__ax_headers.insert(\"Cache-Control\".to_string(), \"no-store\".to_string())"
+        ));
     }
 
     #[test]

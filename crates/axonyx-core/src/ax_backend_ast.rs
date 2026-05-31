@@ -137,6 +137,7 @@ pub enum AxBackendStmt {
     Update(AxMutation),
     Delete(AxMutation),
     Patch(AxPatch),
+    Hook(AxHook),
     Header(AxResponseHeader),
     Cookie(AxResponseCookie),
     ClearCookie(AxExpr),
@@ -177,6 +178,14 @@ impl AxBackendStmt {
         Self::Patch(AxPatch::new(signal, value))
     }
 
+    pub fn before(value: impl Into<AxExpr>) -> Self {
+        Self::Hook(AxHook::before(value))
+    }
+
+    pub fn after(value: impl Into<AxExpr>) -> Self {
+        Self::Hook(AxHook::after(value))
+    }
+
     pub fn header(name: impl Into<AxExpr>, value: impl Into<AxExpr>) -> Self {
         Self::Header(AxResponseHeader::new(name, value))
     }
@@ -204,6 +213,34 @@ impl AxBackendStmt {
     pub fn send(target: impl Into<String>, payload: impl Into<AxExpr>) -> Self {
         Self::Send(AxSend::new(target, payload))
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxHook {
+    pub phase: AxHookPhase,
+    pub value: AxExpr,
+}
+
+impl AxHook {
+    pub fn before(value: impl Into<AxExpr>) -> Self {
+        Self {
+            phase: AxHookPhase::Before,
+            value: value.into(),
+        }
+    }
+
+    pub fn after(value: impl Into<AxExpr>) -> Self {
+        Self {
+            phase: AxHookPhase::After,
+            value: value.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxHookPhase {
+    Before,
+    After,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -444,6 +481,8 @@ pub mod prelude {
     pub use super::AxBackendStmt;
     pub use super::AxBackendValue;
     pub use super::AxField;
+    pub use super::AxHook;
+    pub use super::AxHookPhase;
     pub use super::AxJob;
     pub use super::AxLoader;
     pub use super::AxMutation;

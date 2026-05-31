@@ -10,7 +10,7 @@ use axonyx_core::ax_ast_prelude::{
 };
 use axonyx_core::ax_backend_lowering::AxBackendLowerError;
 use axonyx_core::ax_backend_lowering_prelude::{
-    lower_backend_document, AxHandlerKind, AxHandlerPlan, AxQueryFilterOpPlan,
+    lower_backend_document, AxHandlerKind, AxHandlerPlan, AxHookPhasePlan, AxQueryFilterOpPlan,
     AxQueryOrderDirectionPlan, AxQueryPlan, AxQuerySourcePlan, AxReturnPlan, AxRustExpr,
     AxStepPlan, AxValuePlan,
 };
@@ -653,6 +653,7 @@ fn execute_preview_loader(
             | AxStepPlan::Delete { .. }
             | AxStepPlan::Revalidate { .. }
             | AxStepPlan::Patch { .. }
+            | AxStepPlan::Hook { .. }
             | AxStepPlan::Header { .. }
             | AxStepPlan::Cookie { .. }
             | AxStepPlan::ClearCookie { .. }
@@ -743,6 +744,7 @@ fn execute_preview_action(
                 value = eval_preview_return(result, &scope, env)?;
             }
             AxStepPlan::Header { .. }
+            | AxStepPlan::Hook { .. }
             | AxStepPlan::Cookie { .. }
             | AxStepPlan::ClearCookie { .. }
             | AxStepPlan::Require { .. }
@@ -784,6 +786,7 @@ fn execute_preview_route(
     }
     let mut headers = BTreeMap::new();
     let mut set_cookies = Vec::new();
+    let mut after_hooks = Vec::new();
     for step in &route_match.handler.steps {
         match step {
             AxStepPlan::Let {
@@ -822,6 +825,21 @@ fn execute_preview_route(
                     .ensure_collection(collection)
                     .retain(|item| !preview_record_matches_all(item, &filters));
             }
+            AxStepPlan::Hook { phase, value } => match phase {
+                AxHookPhasePlan::Before => {
+                    if let Some(response) =
+                        apply_preview_route_hook(value, &scope, env, &mut headers)?
+                    {
+                        apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
+                        return Ok(Some(apply_preview_response_metadata(
+                            response,
+                            headers,
+                            set_cookies,
+                        )));
+                    }
+                }
+                AxHookPhasePlan::After => after_hooks.push(value),
+            },
             AxStepPlan::Header { name, value } => {
                 headers.insert(
                     eval_preview_expr(name, &scope, env)?.as_string(),
@@ -852,6 +870,7 @@ fn execute_preview_route(
                     .is_empty()
                 {
                     let response = render_preview_require_fallback(fallback.as_ref(), &scope, env)?;
+                    apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
                     return Ok(Some(apply_preview_response_metadata(
                         response,
                         headers,
@@ -860,12 +879,14 @@ fn execute_preview_route(
                 }
             }
             AxStepPlan::Return(result) => {
+                apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
                 return render_preview_route_return(result, &scope, env, headers, set_cookies)
             }
             AxStepPlan::Revalidate { .. } | AxStepPlan::Patch { .. } | AxStepPlan::Send { .. } => {}
         }
     }
 
+    apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
     Ok(Some(apply_preview_response_metadata(
         render_preview_json_response(&AxValue::Null)?,
         headers,
@@ -920,6 +941,47 @@ fn render_preview_require_fallback(
     }
 
     Ok(response)
+}
+
+fn apply_preview_route_hook(
+    hook: &AxRustExpr,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    headers: &mut BTreeMap<String, String>,
+) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    match hook.code.trim() {
+        "Security.headers" => {
+            headers.insert("X-Content-Type-Options".to_string(), "nosniff".to_string());
+            headers.insert(
+                "Referrer-Policy".to_string(),
+                "strict-origin-when-cross-origin".to_string(),
+            );
+            Ok(None)
+        }
+        "Cache.noStore" => {
+            headers.insert("Cache-Control".to_string(), "no-store".to_string());
+            Ok(None)
+        }
+        "Auth.session" | "Auth.bearer" | "Auth.signedSession" => {
+            if eval_preview_require_expr(hook, scope, env)?.as_string().is_empty() {
+                return render_preview_require_fallback(None, scope, env).map(Some);
+            }
+            Ok(None)
+        }
+        _ => Ok(None),
+    }
+}
+
+fn apply_preview_route_after_hooks(
+    hooks: &[&AxRustExpr],
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    headers: &mut BTreeMap<String, String>,
+) -> Result<(), PreviewError> {
+    for hook in hooks {
+        let _ = apply_preview_route_hook(hook, scope, env, headers)?;
+    }
+    Ok(())
 }
 
 fn eval_preview_require_expr(
@@ -3425,6 +3487,54 @@ route GET "/api/session"
             .set_cookies
             .iter()
             .any(|cookie| cookie == "flash=; Path=/; Max-Age=0"));
+    }
+
+    #[test]
+    fn preview_route_sources_apply_production_hooks() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_sources(
+            &[r#"
+route GET "/api/admin"
+  before Security.headers
+  after Cache.noStore
+  before Auth.session
+  return json("ok")
+"#],
+            "GET",
+            "/api/admin",
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 401);
+        assert_eq!(
+            response
+                .headers
+                .get("X-Content-Type-Options")
+                .map(String::as_str),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response.headers.get("Cache-Control").map(String::as_str),
+            Some("no-store")
+        );
+
+        let request = server::AxHttpRequest::new("GET", "/api/admin")
+            .with_header("Cookie", "session=abc123");
+        let response = execute_preview_route_request_sources(
+            &[r#"
+route GET "/api/admin"
+  before Auth.session
+  return json(Auth.session)
+"#],
+            &request,
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 200);
     }
 
     #[test]

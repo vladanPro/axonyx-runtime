@@ -30,6 +30,8 @@ pub enum AxBackendParseError {
     InvalidHeader { line: usize },
     #[error("invalid response cookie at line {line}")]
     InvalidCookie { line: usize },
+    #[error("invalid hook at line {line}")]
+    InvalidHook { line: usize },
     #[error("invalid requirement at line {line}")]
     InvalidRequirement { line: usize },
     #[error("invalid return statement at line {line}")]
@@ -291,6 +293,26 @@ impl Parser {
                 parse_expr(signal, line.line)?,
                 parse_expr(value, line.line)?,
             ));
+        }
+
+        if let Some(value) = text.strip_prefix("before ") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(AxBackendParseError::InvalidHook { line: line.line });
+            }
+
+            self.pos += 1;
+            return Ok(AxBackendStmt::before(parse_expr(value, line.line)?));
+        }
+
+        if let Some(value) = text.strip_prefix("after ") {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(AxBackendParseError::InvalidHook { line: line.line });
+            }
+
+            self.pos += 1;
+            return Ok(AxBackendStmt::after(parse_expr(value, line.line)?));
         }
 
         if let Some(rest) = text.strip_prefix("header ") {
@@ -1166,6 +1188,36 @@ route GET "/api/session"
         assert_eq!(
             route.body[3],
             AxBackendStmt::clear_cookie(AxExpr::string("flash"))
+        );
+    }
+
+    #[test]
+    fn parses_route_hooks() {
+        let input = r#"
+route GET "/api/admin"
+  before Auth.session
+  before Security.headers
+  after Cache.noStore
+  return json("ok")
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Route(route) = &document.blocks[0] else {
+            panic!("expected route block");
+        };
+
+        assert_eq!(
+            route.body[0],
+            AxBackendStmt::before(AxExpr::ident("Auth").member("session"))
+        );
+        assert_eq!(
+            route.body[1],
+            AxBackendStmt::before(AxExpr::ident("Security").member("headers"))
+        );
+        assert_eq!(
+            route.body[2],
+            AxBackendStmt::after(AxExpr::ident("Cache").member("noStore"))
         );
     }
 
