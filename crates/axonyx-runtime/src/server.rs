@@ -6,6 +6,8 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
+use crate::backend::AxEnv;
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,6 +102,7 @@ impl AxAuth {
 pub struct AxRequestContext {
     pub request: AxHttpRequest,
     pub route: String,
+    pub env: Option<AxEnv>,
 }
 
 impl AxRequestContext {
@@ -107,11 +110,21 @@ impl AxRequestContext {
         Self {
             request,
             route: route.into(),
+            env: None,
         }
     }
 
     pub fn request(&self) -> &AxHttpRequest {
         &self.request
+    }
+
+    pub fn with_env(mut self, env: AxEnv) -> Self {
+        self.env = Some(env);
+        self
+    }
+
+    pub fn env(&self) -> Option<&AxEnv> {
+        self.env.as_ref()
     }
 }
 
@@ -224,6 +237,9 @@ impl AxMiddlewareChain {
             (AxMiddlewarePhase::Before, "Auth.bearer") => {
                 Ok(self.before(require_bearer_middleware))
             }
+            (AxMiddlewarePhase::Before, "Auth.signedSession") => {
+                Ok(self.before(require_signed_session_middleware))
+            }
             (_, "Security.headers") => Ok(self.after(security_headers_middleware)),
             (_, "Cache.noStore") => Ok(self.after(no_store_middleware)),
             (phase, hook) => Err(AxUnknownMiddlewareHook::new(phase, hook)),
@@ -295,6 +311,21 @@ pub fn require_session_middleware(context: &AxRequestContext) -> AxMiddlewareRes
 
 pub fn require_bearer_middleware(context: &AxRequestContext) -> AxMiddlewareResult {
     if AxAuth::bearer(context.request()).is_some() {
+        AxMiddlewareResult::Continue
+    } else {
+        AxMiddlewareResult::unauthorized()
+    }
+}
+
+pub fn require_signed_session_middleware(context: &AxRequestContext) -> AxMiddlewareResult {
+    let Some(env) = context.env() else {
+        return AxMiddlewareResult::unauthorized();
+    };
+    let Ok(secret) = env.secret("session_key") else {
+        return AxMiddlewareResult::unauthorized();
+    };
+
+    if AxAuth::signed_session(context.request(), &secret).is_some() {
         AxMiddlewareResult::Continue
     } else {
         AxMiddlewareResult::unauthorized()
@@ -811,10 +842,11 @@ pub trait AxServer {
 pub mod prelude {
     pub use super::{
         no_store_middleware, require_bearer_middleware, require_session_middleware,
-        security_headers_middleware, status_reason, AxAfterMiddleware, AxAuth, AxBeforeMiddleware,
-        AxBody, AxBodyChunks, AxCookie, AxHttpRequest, AxHttpResponse, AxMiddlewareChain,
-        AxMiddlewarePhase, AxMiddlewareResult, AxRequestContext, AxResponseContext, AxServer,
-        AxServerConfig, AxServerMode, AxSseEvent, AxUnknownMiddlewareHook,
+        require_signed_session_middleware, security_headers_middleware, status_reason,
+        AxAfterMiddleware, AxAuth, AxBeforeMiddleware, AxBody, AxBodyChunks, AxCookie,
+        AxHttpRequest, AxHttpResponse, AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult,
+        AxRequestContext, AxResponseContext, AxServer, AxServerConfig, AxServerMode, AxSseEvent,
+        AxUnknownMiddlewareHook,
     };
 }
 
@@ -953,11 +985,37 @@ mod tests {
     #[test]
     fn middleware_chain_reports_unknown_builtin_hooks() {
         let error = AxMiddlewareChain::new()
-            .try_builtin_hook(AxMiddlewarePhase::Before, "Auth.signedSession")
-            .expect_err("signed session needs env-aware middleware context");
+            .try_builtin_hook(AxMiddlewarePhase::Before, "Project.custom")
+            .expect_err("custom hook should need future registry");
 
         assert_eq!(error.phase, AxMiddlewarePhase::Before);
-        assert_eq!(error.hook, "Auth.signedSession");
+        assert_eq!(error.hook, "Project.custom");
+    }
+
+    #[test]
+    fn middleware_chain_can_require_signed_session_with_env_context() {
+        let signed = AxAuth::sign_session("s123", "secret");
+        let context = AxRequestContext::new(
+            AxHttpRequest::new("GET", "/api/admin")
+                .with_header("Cookie", format!("session={signed}")),
+            "/api/admin",
+        )
+        .with_env(AxEnv::new().with_secret("session_key", "secret"));
+        let chain = AxMiddlewareChain::new()
+            .try_builtin_hook(AxMiddlewarePhase::Before, "Auth.signedSession")
+            .expect("signed session hook should register");
+
+        let response = chain.run(&context, |_context| AxHttpResponse::text(200, "ok"));
+
+        assert_eq!(response.status, 200);
+
+        let missing_env_context =
+            AxRequestContext::new(AxHttpRequest::new("GET", "/api/admin"), "/api/admin");
+        let response = chain.run(&missing_env_context, |_context| {
+            panic!("handler should not run without env/secret")
+        });
+
+        assert_eq!(response.status, 401);
     }
 
     #[test]
