@@ -880,7 +880,7 @@ fn execute_preview_route(
             }
             AxStepPlan::Return(result) => {
                 apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
-                return render_preview_route_return(result, &scope, env, headers, set_cookies)
+                return render_preview_route_return(result, &scope, env, headers, set_cookies);
             }
             AxStepPlan::Revalidate { .. } | AxStepPlan::Patch { .. } | AxStepPlan::Send { .. } => {}
         }
@@ -963,7 +963,10 @@ fn apply_preview_route_hook(
             Ok(None)
         }
         "Auth.session" | "Auth.bearer" | "Auth.signedSession" => {
-            if eval_preview_require_expr(hook, scope, env)?.as_string().is_empty() {
+            if eval_preview_require_expr(hook, scope, env)?
+                .as_string()
+                .is_empty()
+            {
                 return render_preview_require_fallback(None, scope, env).map(Some);
             }
             Ok(None)
@@ -3520,8 +3523,8 @@ route GET "/api/admin"
             Some("no-store")
         );
 
-        let request = server::AxHttpRequest::new("GET", "/api/admin")
-            .with_header("Cookie", "session=abc123");
+        let request =
+            server::AxHttpRequest::new("GET", "/api/admin").with_header("Cookie", "session=abc123");
         let response = execute_preview_route_request_sources(
             &[r#"
 route GET "/api/admin"

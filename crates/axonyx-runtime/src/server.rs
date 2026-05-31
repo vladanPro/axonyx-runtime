@@ -94,6 +94,150 @@ impl AxAuth {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxRequestContext {
+    pub request: AxHttpRequest,
+    pub route: String,
+}
+
+impl AxRequestContext {
+    pub fn new(request: AxHttpRequest, route: impl Into<String>) -> Self {
+        Self {
+            request,
+            route: route.into(),
+        }
+    }
+
+    pub fn request(&self) -> &AxHttpRequest {
+        &self.request
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxResponseContext {
+    pub response: AxHttpResponse,
+}
+
+impl AxResponseContext {
+    pub fn new(response: AxHttpResponse) -> Self {
+        Self { response }
+    }
+
+    pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+        self.response = self.response.with_header(name, value);
+        self
+    }
+
+    pub fn with_cookie(mut self, cookie: AxCookie) -> Self {
+        self.response = self.response.with_cookie(cookie);
+        self
+    }
+
+    pub fn into_response(self) -> AxHttpResponse {
+        self.response
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AxMiddlewareResult {
+    Continue,
+    Stop(AxHttpResponse),
+}
+
+impl AxMiddlewareResult {
+    pub fn unauthorized() -> Self {
+        Self::Stop(
+            AxHttpResponse::json(401, &serde_json::json!({ "error": "unauthorized" }))
+                .expect("static unauthorized JSON should serialize"),
+        )
+    }
+}
+
+pub type AxBeforeMiddleware = fn(&AxRequestContext) -> AxMiddlewareResult;
+pub type AxAfterMiddleware = fn(&AxRequestContext, AxResponseContext) -> AxResponseContext;
+
+#[derive(Debug, Clone, Default)]
+pub struct AxMiddlewareChain {
+    before: Vec<AxBeforeMiddleware>,
+    after: Vec<AxAfterMiddleware>,
+}
+
+impl AxMiddlewareChain {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn before(mut self, middleware: AxBeforeMiddleware) -> Self {
+        self.before.push(middleware);
+        self
+    }
+
+    pub fn after(mut self, middleware: AxAfterMiddleware) -> Self {
+        self.after.push(middleware);
+        self
+    }
+
+    pub fn run(
+        &self,
+        context: &AxRequestContext,
+        handler: impl FnOnce(&AxRequestContext) -> AxHttpResponse,
+    ) -> AxHttpResponse {
+        for middleware in &self.before {
+            match middleware(context) {
+                AxMiddlewareResult::Continue => {}
+                AxMiddlewareResult::Stop(response) => {
+                    return self.run_after(context, AxResponseContext::new(response));
+                }
+            }
+        }
+
+        self.run_after(context, AxResponseContext::new(handler(context)))
+    }
+
+    pub fn run_after(
+        &self,
+        context: &AxRequestContext,
+        mut response: AxResponseContext,
+    ) -> AxHttpResponse {
+        for middleware in &self.after {
+            response = middleware(context, response);
+        }
+        response.into_response()
+    }
+}
+
+pub fn security_headers_middleware(
+    _context: &AxRequestContext,
+    response: AxResponseContext,
+) -> AxResponseContext {
+    response
+        .with_header("X-Content-Type-Options", "nosniff")
+        .with_header("Referrer-Policy", "strict-origin-when-cross-origin")
+}
+
+pub fn no_store_middleware(
+    _context: &AxRequestContext,
+    response: AxResponseContext,
+) -> AxResponseContext {
+    response.with_header("Cache-Control", "no-store")
+}
+
+pub fn require_session_middleware(context: &AxRequestContext) -> AxMiddlewareResult {
+    if AxAuth::session(context.request()).is_some() {
+        AxMiddlewareResult::Continue
+    } else {
+        AxMiddlewareResult::unauthorized()
+    }
+}
+
+pub fn require_bearer_middleware(context: &AxRequestContext) -> AxMiddlewareResult {
+    if AxAuth::bearer(context.request()).is_some() {
+        AxMiddlewareResult::Continue
+    } else {
+        AxMiddlewareResult::unauthorized()
+    }
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -603,8 +747,11 @@ pub trait AxServer {
 
 pub mod prelude {
     pub use super::{
-        status_reason, AxAuth, AxBody, AxBodyChunks, AxCookie, AxHttpRequest, AxHttpResponse,
-        AxServer, AxServerConfig, AxServerMode, AxSseEvent,
+        no_store_middleware, require_bearer_middleware, require_session_middleware,
+        security_headers_middleware, status_reason, AxAfterMiddleware, AxAuth, AxBeforeMiddleware,
+        AxBody, AxBodyChunks, AxCookie, AxHttpRequest, AxHttpResponse, AxMiddlewareChain,
+        AxMiddlewareResult, AxRequestContext, AxResponseContext, AxServer, AxServerConfig,
+        AxServerMode, AxSseEvent,
     };
 }
 
@@ -678,6 +825,42 @@ mod tests {
             AxHttpRequest::new("GET", "/admin").with_header("Cookie", format!("session={signed}"));
         assert_eq!(AxAuth::signed_session(&session, "secret"), Some("s123"));
         assert_eq!(AxAuth::signed_session(&session, "wrong"), None);
+    }
+
+    #[test]
+    fn middleware_chain_runs_before_handler_and_after_response() {
+        let context = AxRequestContext::new(
+            AxHttpRequest::new("GET", "/api/admin").with_header("Cookie", "session=abc123"),
+            "/api/admin",
+        );
+        let chain = AxMiddlewareChain::new()
+            .before(require_session_middleware)
+            .after(security_headers_middleware)
+            .after(no_store_middleware);
+
+        let response = chain.run(&context, |_context| AxHttpResponse::text(200, "ok"));
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.header_value("X-Content-Type-Options"),
+            Some("nosniff")
+        );
+        assert_eq!(response.header_value("Cache-Control"), Some("no-store"));
+    }
+
+    #[test]
+    fn middleware_chain_can_stop_before_handler_but_still_runs_after_hooks() {
+        let context = AxRequestContext::new(AxHttpRequest::new("GET", "/api/admin"), "/api/admin");
+        let chain = AxMiddlewareChain::new()
+            .before(require_session_middleware)
+            .after(no_store_middleware);
+
+        let response = chain.run(&context, |_context| {
+            panic!("handler should not run when middleware stops")
+        });
+
+        assert_eq!(response.status, 401);
+        assert_eq!(response.header_value("Cache-Control"), Some("no-store"));
     }
 
     #[test]
