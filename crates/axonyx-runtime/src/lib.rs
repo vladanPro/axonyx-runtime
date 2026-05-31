@@ -146,6 +146,18 @@ pub fn preview_ax_page_stream_response(
     Ok(render_preview_document_response(&document, &node))
 }
 
+pub fn ax_page_route_definition(
+    method: impl Into<String>,
+    path: impl Into<String>,
+    page_source: &str,
+) -> Result<server::AxRouteDefinition, PreviewError> {
+    Ok(server::AxRouteDefinition::new_response(
+        method,
+        path,
+        preview_ax_page_stream_response(page_source)?,
+    ))
+}
+
 pub fn preview_ax_page_with_imports(
     ax_source: &str,
     import_resolver: &impl AxImportResolver,
@@ -2734,6 +2746,34 @@ page Home
         assert!(html.contains("Stream Ready"));
         assert!(html.contains("Chunked preview path"));
         assert!(html.contains("</body></html>"));
+    }
+
+    #[test]
+    fn builds_route_definition_from_ax_page_source() {
+        let route = ax_page_route_definition(
+            "GET",
+            "/",
+            r#"
+page Home
+<Container max="xl">
+  <Card title="Route Page">
+    <Copy>Served through AxRouteDefinition</Copy>
+  </Card>
+</Container>
+"#,
+        )
+        .expect("page route should build");
+
+        assert!(route.matches(&server::AxHttpRequest::new("GET", "/")));
+
+        let response = route.handle(server::AxHttpRequest::new("GET", "/"), None);
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_streaming());
+
+        let html = String::from_utf8(response.body.into_bytes()).expect("HTML should be UTF-8");
+        assert!(html.contains("Route Page"));
+        assert!(html.contains("Served through AxRouteDefinition"));
     }
 
     #[test]

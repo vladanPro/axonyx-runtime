@@ -361,6 +361,29 @@ pub fn require_signed_session_middleware(context: &AxRequestContext) -> AxMiddle
 
 pub type AxRouteHandler = fn(&AxRequestContext) -> AxHttpResponse;
 
+#[derive(Debug, Clone)]
+pub enum AxRouteTarget {
+    Handler(AxRouteHandler),
+    Response(AxHttpResponse),
+}
+
+impl AxRouteTarget {
+    pub fn handler(handler: AxRouteHandler) -> Self {
+        Self::Handler(handler)
+    }
+
+    pub fn response(response: AxHttpResponse) -> Self {
+        Self::Response(response)
+    }
+
+    pub fn handle(&self, context: &AxRequestContext) -> AxHttpResponse {
+        match self {
+            Self::Handler(handler) => handler(context),
+            Self::Response(response) => response.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AxRouteHook {
     pub phase: AxMiddlewarePhase,
@@ -381,7 +404,7 @@ pub struct AxRouteDefinition {
     pub method: String,
     pub path: String,
     pub middleware: AxMiddlewareChain,
-    pub handler: AxRouteHandler,
+    pub target: AxRouteTarget,
 }
 
 impl AxRouteDefinition {
@@ -394,7 +417,20 @@ impl AxRouteDefinition {
             method: method.into(),
             path: path.into(),
             middleware: AxMiddlewareChain::new(),
-            handler,
+            target: AxRouteTarget::handler(handler),
+        }
+    }
+
+    pub fn new_response(
+        method: impl Into<String>,
+        path: impl Into<String>,
+        response: AxHttpResponse,
+    ) -> Self {
+        Self {
+            method: method.into(),
+            path: path.into(),
+            middleware: AxMiddlewareChain::new(),
+            target: AxRouteTarget::response(response),
         }
     }
 
@@ -424,7 +460,8 @@ impl AxRouteDefinition {
         if let Some(env) = env {
             context = context.with_env(env);
         }
-        self.middleware.run(&context, self.handler)
+        self.middleware
+            .run(&context, |context| self.target.handle(context))
     }
 }
 
@@ -1310,8 +1347,8 @@ pub mod prelude {
         AxCookie, AxHtmlStream, AxHttpRequest, AxHttpResponse, AxMemoryServerAdapter,
         AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult, AxRequestContext,
         AxResponseContext, AxRouteBuildError, AxRouteDefinition, AxRouteHandler, AxRouteHook,
-        AxRouteTable, AxServer, AxServerAdapter, AxServerConfig, AxServerMode, AxSseEvent,
-        AxUnknownMiddlewareHook,
+        AxRouteTable, AxRouteTarget, AxServer, AxServerAdapter, AxServerConfig, AxServerMode,
+        AxSseEvent, AxUnknownMiddlewareHook,
     };
 
     #[cfg(feature = "axum")]
@@ -1556,6 +1593,39 @@ mod tests {
         assert!(table
             .handle(AxHttpRequest::new("GET", "/api/missing"))
             .is_none());
+    }
+
+    #[test]
+    fn route_definition_can_return_prebuilt_streaming_response() {
+        let route = AxRouteDefinition::new_response(
+            "GET",
+            "/",
+            AxHttpResponse::html_stream(
+                200,
+                [
+                    b"<!doctype html>".to_vec(),
+                    b"<main>Stream route</main>".to_vec(),
+                ],
+            ),
+        )
+        .with_builtin_hooks(&[AxRouteHook::new(
+            AxMiddlewarePhase::After,
+            "Security.headers",
+        )])
+        .expect("built-in hooks should register");
+
+        let response = route.handle(AxHttpRequest::new("GET", "/"), None);
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_streaming());
+        assert_eq!(
+            response.header_value("X-Content-Type-Options"),
+            Some("nosniff")
+        );
+        assert_eq!(
+            response.body.into_bytes(),
+            b"<!doctype html><main>Stream route</main>".to_vec()
+        );
     }
 
     #[test]
