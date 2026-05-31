@@ -501,6 +501,195 @@ impl AxServerAdapter for AxMemoryServerAdapter {
     }
 }
 
+#[cfg(feature = "axum")]
+#[derive(Debug, Clone)]
+pub struct AxAxumServerAdapter {
+    pub table: AxRouteTable,
+    pub body_limit: usize,
+}
+
+#[cfg(feature = "axum")]
+impl AxAxumServerAdapter {
+    pub fn new(routes: Vec<AxRouteDefinition>) -> Self {
+        Self {
+            table: AxRouteTable::new(routes),
+            body_limit: 1024 * 1024,
+        }
+    }
+
+    pub fn with_env(mut self, env: AxEnv) -> Self {
+        self.table = self.table.with_env(env);
+        self
+    }
+
+    pub fn with_body_limit(mut self, body_limit: usize) -> Self {
+        self.body_limit = body_limit;
+        self
+    }
+
+    pub fn router(&self) -> axum::Router {
+        axum_router_from_table_with_limit(self.table.clone(), self.body_limit)
+    }
+}
+
+#[cfg(feature = "axum")]
+impl AxServerAdapter for AxAxumServerAdapter {
+    fn name(&self) -> &'static str {
+        "axum"
+    }
+
+    fn serve_routes(
+        &self,
+        config: &AxServerConfig,
+        routes: Vec<AxRouteDefinition>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        let table = AxRouteTable::new(routes);
+        let router = axum_router_from_table_with_limit(table, self.body_limit);
+        let bind_addr = config.bind_addr();
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()?;
+
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+            axum::serve(listener, router).await?;
+            Ok::<(), Box<dyn Error + Send + Sync>>(())
+        })
+    }
+}
+
+#[cfg(feature = "axum")]
+pub fn axum_router_from_table(table: AxRouteTable) -> axum::Router {
+    axum_router_from_table_with_limit(table, 1024 * 1024)
+}
+
+#[cfg(feature = "axum")]
+#[derive(Debug, Clone)]
+pub struct AxAxumRouter {
+    pub table: AxRouteTable,
+    pub body_limit: usize,
+}
+
+#[cfg(feature = "axum")]
+impl AxAxumRouter {
+    pub fn new(table: AxRouteTable) -> Self {
+        Self {
+            table,
+            body_limit: 1024 * 1024,
+        }
+    }
+
+    pub fn with_body_limit(mut self, body_limit: usize) -> Self {
+        self.body_limit = body_limit;
+        self
+    }
+
+    pub fn into_router(self) -> axum::Router {
+        use std::sync::Arc;
+
+        axum::Router::new()
+            .fallback(axum::routing::any(axum_route_table_handler))
+            .with_state(Arc::new(AxAxumState {
+                table: self.table,
+                body_limit: self.body_limit,
+            }))
+    }
+}
+
+#[cfg(feature = "axum")]
+#[derive(Debug, Clone)]
+struct AxAxumState {
+    table: AxRouteTable,
+    body_limit: usize,
+}
+
+#[cfg(feature = "axum")]
+pub fn axum_router_from_table_with_limit(table: AxRouteTable, body_limit: usize) -> axum::Router {
+    use std::sync::Arc;
+
+    axum::Router::new()
+        .fallback(axum::routing::any(axum_route_table_handler))
+        .with_state(Arc::new(AxAxumState { table, body_limit }))
+}
+
+#[cfg(feature = "axum")]
+async fn axum_route_table_handler(
+    axum::extract::State(state): axum::extract::State<std::sync::Arc<AxAxumState>>,
+    request: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    match axum_request_to_axonyx_with_limit(request, state.body_limit).await {
+        Ok(request) => axonyx_response_to_axum(
+            state
+                .table
+                .handle(request)
+                .unwrap_or_else(|| AxHttpResponse::text(404, "Not Found")),
+        ),
+        Err(error) => axonyx_response_to_axum(AxHttpResponse::text(400, error.to_string())),
+    }
+}
+
+#[cfg(feature = "axum")]
+pub async fn axum_request_to_axonyx(
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<AxHttpRequest, Box<dyn Error + Send + Sync>> {
+    axum_request_to_axonyx_with_limit(request, usize::MAX).await
+}
+
+#[cfg(feature = "axum")]
+pub async fn axum_request_to_axonyx_with_limit(
+    request: axum::http::Request<axum::body::Body>,
+    limit: usize,
+) -> Result<AxHttpRequest, Box<dyn Error + Send + Sync>> {
+    let (parts, body) = request.into_parts();
+    let body = axum::body::to_bytes(body, limit).await?;
+    let target = parts
+        .uri
+        .path_and_query()
+        .map(|value| value.as_str().to_string())
+        .unwrap_or_else(|| parts.uri.path().to_string());
+    let mut request = AxHttpRequest::new(parts.method.as_str(), target).with_body(body.to_vec());
+
+    for (name, value) in parts.headers.iter() {
+        if let Ok(value) = value.to_str() {
+            request = request.with_header(name.as_str(), value);
+        }
+    }
+
+    Ok(request)
+}
+
+#[cfg(feature = "axum")]
+pub fn axonyx_response_to_axum(response: AxHttpResponse) -> axum::response::Response {
+    use axum::body::Body;
+    use axum::http::header::{CONTENT_TYPE, SET_COOKIE};
+    use axum::http::{HeaderName, HeaderValue, StatusCode};
+
+    let status = StatusCode::from_u16(response.status).unwrap_or(StatusCode::OK);
+    let mut out = axum::response::Response::builder()
+        .status(status)
+        .header(CONTENT_TYPE, response.content_type.clone())
+        .body(Body::from(response.body.into_bytes()))
+        .expect("Axonyx response should build an Axum response");
+
+    for (name, value) in response.headers {
+        let Ok(name) = HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = HeaderValue::from_str(&value) else {
+            continue;
+        };
+        out.headers_mut().insert(name, value);
+    }
+
+    for cookie in response.set_cookies {
+        if let Ok(cookie) = HeaderValue::from_str(&cookie) {
+            out.headers_mut().append(SET_COOKIE, cookie);
+        }
+    }
+
+    out
+}
+
 pub trait AxServerAdapter {
     fn name(&self) -> &'static str;
 
@@ -980,6 +1169,13 @@ impl AxBody {
             Self::Chunks(chunks) => AxBodyChunks::Chunks(chunks.iter().map(Vec::as_slice)),
         }
     }
+
+    pub fn into_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Fixed(body) => body,
+            Self::Chunks(chunks) => chunks.into_iter().flatten().collect(),
+        }
+    }
 }
 
 pub enum AxBodyChunks<'a> {
@@ -1034,6 +1230,13 @@ pub mod prelude {
         AxMiddlewareResult, AxRequestContext, AxResponseContext, AxRouteBuildError,
         AxRouteDefinition, AxRouteHandler, AxRouteHook, AxRouteTable, AxServer, AxServerAdapter,
         AxServerConfig, AxServerMode, AxSseEvent, AxUnknownMiddlewareHook,
+    };
+
+    #[cfg(feature = "axum")]
+    pub use super::{
+        axonyx_response_to_axum, axum_request_to_axonyx, axum_request_to_axonyx_with_limit,
+        axum_router_from_table, axum_router_from_table_with_limit, AxAxumRouter,
+        AxAxumServerAdapter,
     };
 }
 
@@ -1388,5 +1591,94 @@ mod tests {
         assert!(body.contains("retry: 1500\n"));
         assert!(body.contains("data: {\"ready\":true}\n\n"));
         assert!(body.contains("data: line one\ndata: line two\n\n"));
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn axum_response_conversion_preserves_status_headers_cookies_and_body() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime should build for Axum adapter tests");
+
+        runtime.block_on(async {
+            let response = AxHttpResponse::stream_chunks(
+                202,
+                "text/plain; charset=utf-8",
+                vec![b"hello ".to_vec(), b"axum".to_vec()],
+            )
+            .with_header("X-Axonyx", "foundry")
+            .with_cookie(AxCookie::new("session", "s123").with_path("/").http_only());
+
+            let response = axonyx_response_to_axum(response);
+
+            assert_eq!(response.status(), axum::http::StatusCode::ACCEPTED);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("text/plain; charset=utf-8")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get("X-Axonyx")
+                    .and_then(|value| value.to_str().ok()),
+                Some("foundry")
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(axum::http::header::SET_COOKIE)
+                    .and_then(|value| value.to_str().ok()),
+                Some("session=s123; Path=/; HttpOnly")
+            );
+
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("Axum body should be readable");
+            assert_eq!(body.as_ref(), b"hello axum");
+        });
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn axum_request_conversion_preserves_method_target_headers_and_body() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime should build for Axum adapter tests");
+
+        runtime.block_on(async {
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/api/posts?draft=true")
+                .header("Authorization", "Bearer token")
+                .body(axum::body::Body::from("title=Hello"))
+                .expect("Axum request should build");
+
+            let request = axum_request_to_axonyx_with_limit(request, 1024)
+                .await
+                .expect("Axum request should convert to Axonyx request");
+
+            assert_eq!(request.method, "POST");
+            assert_eq!(request.target, "/api/posts?draft=true");
+            assert_eq!(request.header_value("authorization"), Some("Bearer token"));
+            assert_eq!(request.body_text_lossy(), "title=Hello");
+        });
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn axum_adapter_can_build_router_from_route_table() {
+        let config = AxServerConfig::new("127.0.0.1", 3000, AxServerMode::Start);
+        let route = AxRouteDefinition::new("GET", "/health", ok_handler);
+        let adapter = AxAxumServerAdapter::new(vec![route]).with_body_limit(2048);
+
+        assert_eq!(adapter.name(), "axum");
+        assert_eq!(adapter.body_limit, 2048);
+        let _router = adapter.router();
+        let _server_config = config;
     }
 }

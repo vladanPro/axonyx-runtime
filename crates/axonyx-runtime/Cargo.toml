@@ -19,3 +19,9 @@ thiserror.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 axonyx-core = { version = "0.1.13", path = "../axonyx-core" }
+axum = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["net", "rt-multi-thread"] }
+
+[features]
+default = []
+axum = ["dep:axum", "dep:tokio"]
