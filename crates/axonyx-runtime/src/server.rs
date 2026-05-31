@@ -939,6 +939,14 @@ impl AxHttpResponse {
         }
     }
 
+    pub fn html_stream(status: u16, chunks: impl IntoIterator<Item = impl Into<Vec<u8>>>) -> Self {
+        Self::stream_chunks(
+            status,
+            "text/html; charset=utf-8",
+            chunks.into_iter().map(Into::into).collect(),
+        )
+    }
+
     pub fn sse_events(events: impl IntoIterator<Item = AxSseEvent>) -> Self {
         Self::stream_chunks(
             200,
@@ -990,6 +998,65 @@ impl AxHttpResponse {
     pub fn body_len(&self) -> usize {
         self.body.len()
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxHtmlStream {
+    chunks: Vec<Vec<u8>>,
+}
+
+impl AxHtmlStream {
+    pub fn new() -> Self {
+        Self { chunks: Vec::new() }
+    }
+
+    pub fn with_chunk(mut self, chunk: impl Into<Vec<u8>>) -> Self {
+        self.push(chunk);
+        self
+    }
+
+    pub fn push(&mut self, chunk: impl Into<Vec<u8>>) {
+        let chunk = chunk.into();
+        if !chunk.is_empty() {
+            self.chunks.push(chunk);
+        }
+    }
+
+    pub fn push_str(&mut self, chunk: impl AsRef<str>) {
+        self.push(chunk.as_ref().as_bytes().to_vec());
+    }
+
+    pub fn len(&self) -> usize {
+        self.chunks.iter().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.chunks.is_empty()
+    }
+
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+
+    pub fn into_chunks(self) -> Vec<Vec<u8>> {
+        self.chunks
+    }
+
+    pub fn into_response(self, status: u16) -> AxHttpResponse {
+        AxHttpResponse::html_stream(status, self.chunks)
+    }
+}
+
+impl Default for AxHtmlStream {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub fn html_stream_response(
+    chunks: impl IntoIterator<Item = impl Into<Vec<u8>>>,
+) -> AxHttpResponse {
+    AxHttpResponse::html_stream(200, chunks)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1237,13 +1304,14 @@ pub trait AxServer {
 
 pub mod prelude {
     pub use super::{
-        no_store_middleware, require_bearer_middleware, require_session_middleware,
-        require_signed_session_middleware, security_headers_middleware, status_reason,
-        AxAfterMiddleware, AxAuth, AxBeforeMiddleware, AxBody, AxBodyChunks, AxCookie,
-        AxHttpRequest, AxHttpResponse, AxMemoryServerAdapter, AxMiddlewareChain, AxMiddlewarePhase,
-        AxMiddlewareResult, AxRequestContext, AxResponseContext, AxRouteBuildError,
-        AxRouteDefinition, AxRouteHandler, AxRouteHook, AxRouteTable, AxServer, AxServerAdapter,
-        AxServerConfig, AxServerMode, AxSseEvent, AxUnknownMiddlewareHook,
+        html_stream_response, no_store_middleware, require_bearer_middleware,
+        require_session_middleware, require_signed_session_middleware, security_headers_middleware,
+        status_reason, AxAfterMiddleware, AxAuth, AxBeforeMiddleware, AxBody, AxBodyChunks,
+        AxCookie, AxHtmlStream, AxHttpRequest, AxHttpResponse, AxMemoryServerAdapter,
+        AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult, AxRequestContext,
+        AxResponseContext, AxRouteBuildError, AxRouteDefinition, AxRouteHandler, AxRouteHook,
+        AxRouteTable, AxServer, AxServerAdapter, AxServerConfig, AxServerMode, AxSseEvent,
+        AxUnknownMiddlewareHook,
     };
 
     #[cfg(feature = "axum")]
@@ -1579,6 +1647,54 @@ mod tests {
                 b"Hello".as_slice(),
                 b"</main>".as_slice()
             ]
+        );
+    }
+
+    #[test]
+    fn html_stream_response_builds_chunked_html_body() {
+        let response = AxHttpResponse::html_stream(
+            200,
+            [
+                b"<!doctype html><html><head>".to_vec(),
+                b"</head><body>".to_vec(),
+                b"<main>Hello stream</main>".to_vec(),
+                b"</body></html>".to_vec(),
+            ],
+        );
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "text/html; charset=utf-8");
+        assert!(response.body.is_streaming());
+        assert_eq!(
+            response.body.chunks_iter().collect::<Vec<_>>(),
+            vec![
+                b"<!doctype html><html><head>".as_slice(),
+                b"</head><body>".as_slice(),
+                b"<main>Hello stream</main>".as_slice(),
+                b"</body></html>".as_slice(),
+            ]
+        );
+    }
+
+    #[test]
+    fn html_stream_builder_ignores_empty_chunks_and_returns_response() {
+        let mut stream = AxHtmlStream::new()
+            .with_chunk(b"<!doctype html>".to_vec())
+            .with_chunk(Vec::new());
+        stream.push_str("<main>");
+        stream.push_str("");
+        stream.push_str("Axonyx");
+        stream.push_str("</main>");
+
+        assert_eq!(stream.chunk_count(), 4);
+        assert_eq!(stream.len(), "<!doctype html><main>Axonyx</main>".len());
+
+        let response = stream.into_response(200);
+
+        assert!(response.body.is_streaming());
+        assert_eq!(
+            response.body.into_bytes(),
+            b"<!doctype html><main>Axonyx</main>".to_vec()
         );
     }
 
