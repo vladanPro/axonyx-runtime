@@ -31,6 +31,23 @@ use thiserror::Error;
 pub use backend::prelude as backend_prelude;
 pub use server::prelude as server_prelude;
 
+pub fn route_hooks_from_handler_plan(handler: &AxHandlerPlan) -> Vec<server::AxRouteHook> {
+    handler
+        .steps
+        .iter()
+        .filter_map(|step| {
+            let AxStepPlan::Hook { phase, value } = step else {
+                return None;
+            };
+            let phase = match phase {
+                AxHookPhasePlan::Before => server::AxMiddlewarePhase::Before,
+                AxHookPhasePlan::After => server::AxMiddlewarePhase::After,
+            };
+            Some(server::AxRouteHook::new(phase, value.code.clone()))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RenderPlan {
     pub source: String,
@@ -113,6 +130,58 @@ pub fn preview_ax_page(ax_source: &str) -> Result<String, PreviewError> {
     preview_ax_app(None, ax_source)
 }
 
+pub fn preview_ax_page_stream_response(
+    ax_source: &str,
+) -> Result<server::AxHttpResponse, PreviewError> {
+    let document = parse_ax_auto(ax_source)?;
+    let resolver = |_: &[String], _: &[AxValue]| None;
+    let import_resolver = |_: &str| None;
+    let node = lower_document_with_scope_and_imports(
+        &document,
+        BTreeMap::new(),
+        &resolver,
+        &import_resolver,
+    )?;
+
+    Ok(render_preview_document_response(&document, &node))
+}
+
+pub fn ax_page_route_definition(
+    method: impl Into<String>,
+    path: impl Into<String>,
+    page_source: &str,
+) -> Result<server::AxRouteDefinition, PreviewError> {
+    Ok(server::AxRouteDefinition::new_response(
+        method,
+        path,
+        preview_ax_page_stream_response(page_source)?,
+    ))
+}
+
+pub fn ax_page_route_definition_with_backend(
+    method: impl Into<String>,
+    path: impl Into<String>,
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    store: &AxPreviewStore,
+) -> Result<server::AxRouteDefinition, PreviewError> {
+    Ok(server::AxRouteDefinition::new_response(
+        method,
+        path,
+        preview_ax_route_stream_response_with_backend(
+            layout_sources,
+            loader_sources,
+            action_sources,
+            page_source,
+            request_target,
+            store,
+        )?,
+    ))
+}
+
 pub fn preview_ax_page_with_imports(
     ax_source: &str,
     import_resolver: &impl AxImportResolver,
@@ -149,8 +218,22 @@ pub fn preview_ax_route_with_imports(
     page_source: &str,
     import_resolver: &impl AxImportResolver,
 ) -> Result<String, PreviewError> {
+    let response = preview_ax_route_stream_response_with_imports(
+        layout_sources,
+        page_source,
+        import_resolver,
+    )?;
+    Ok(String::from_utf8(response.body.into_bytes())
+        .expect("preview renderer only emits UTF-8 HTML"))
+}
+
+pub fn preview_ax_route_stream_response_with_imports(
+    layout_sources: &[&str],
+    page_source: &str,
+    import_resolver: &impl AxImportResolver,
+) -> Result<server::AxHttpResponse, PreviewError> {
     let store = AxPreviewStore::default();
-    preview_ax_route_with_backend_and_imports(
+    preview_ax_route_stream_response_with_backend_and_imports(
         layout_sources,
         &[],
         &[],
@@ -167,7 +250,32 @@ pub fn preview_ax_route_with_loaders(
     page_source: &str,
 ) -> Result<String, PreviewError> {
     let store = AxPreviewStore::default();
-    preview_ax_route_with_backend(
+    let response = preview_ax_route_stream_response_with_backend(
+        layout_sources,
+        loader_sources,
+        &[],
+        page_source,
+        "/",
+        &store,
+    )?;
+    Ok(String::from_utf8(response.body.into_bytes())
+        .expect("preview renderer only emits UTF-8 HTML"))
+}
+
+pub fn preview_ax_route_stream_response(
+    layout_sources: &[&str],
+    page_source: &str,
+) -> Result<server::AxHttpResponse, PreviewError> {
+    preview_ax_route_stream_response_with_loaders(layout_sources, &[], page_source)
+}
+
+pub fn preview_ax_route_stream_response_with_loaders(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    page_source: &str,
+) -> Result<server::AxHttpResponse, PreviewError> {
+    let store = AxPreviewStore::default();
+    preview_ax_route_stream_response_with_backend(
         layout_sources,
         loader_sources,
         &[],
@@ -288,7 +396,7 @@ pub fn preview_ax_route_with_backend(
     store: &AxPreviewStore,
 ) -> Result<String, PreviewError> {
     let import_resolver = |_: &str| None;
-    preview_ax_route_with_backend_and_imports(
+    let response = preview_ax_route_stream_response_with_backend_and_imports(
         layout_sources,
         loader_sources,
         action_sources,
@@ -296,7 +404,9 @@ pub fn preview_ax_route_with_backend(
         request_target,
         store,
         &import_resolver,
-    )
+    )?;
+    Ok(String::from_utf8(response.body.into_bytes())
+        .expect("preview renderer only emits UTF-8 HTML"))
 }
 
 pub fn preview_ax_route_with_backend_and_imports(
@@ -308,6 +418,48 @@ pub fn preview_ax_route_with_backend_and_imports(
     store: &AxPreviewStore,
     import_resolver: &impl AxImportResolver,
 ) -> Result<String, PreviewError> {
+    let response = preview_ax_route_stream_response_with_backend_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        request_target,
+        store,
+        import_resolver,
+    )?;
+    Ok(String::from_utf8(response.body.into_bytes())
+        .expect("preview renderer only emits UTF-8 HTML"))
+}
+
+pub fn preview_ax_route_stream_response_with_backend(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    store: &AxPreviewStore,
+) -> Result<server::AxHttpResponse, PreviewError> {
+    let import_resolver = |_: &str| None;
+    preview_ax_route_stream_response_with_backend_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        request_target,
+        store,
+        &import_resolver,
+    )
+}
+
+pub fn preview_ax_route_stream_response_with_backend_and_imports(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
+) -> Result<server::AxHttpResponse, PreviewError> {
     let page_document = parse_ax_auto(page_source)?;
     let mut document = page_document;
 
@@ -365,7 +517,7 @@ pub fn preview_ax_route_with_backend_and_imports(
         return Err(runtime_error);
     }
 
-    Ok(render_preview_document(&document, &node))
+    Ok(render_preview_document_response(&document, &node))
 }
 
 pub fn preview_ax_route_with_request_context(
@@ -880,7 +1032,7 @@ fn execute_preview_route(
             }
             AxStepPlan::Return(result) => {
                 apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
-                return render_preview_route_return(result, &scope, env, headers, set_cookies)
+                return render_preview_route_return(result, &scope, env, headers, set_cookies);
             }
             AxStepPlan::Revalidate { .. } | AxStepPlan::Patch { .. } | AxStepPlan::Send { .. } => {}
         }
@@ -963,7 +1115,10 @@ fn apply_preview_route_hook(
             Ok(None)
         }
         "Auth.session" | "Auth.bearer" | "Auth.signedSession" => {
-            if eval_preview_require_expr(hook, scope, env)?.as_string().is_empty() {
+            if eval_preview_require_expr(hook, scope, env)?
+                .as_string()
+                .is_empty()
+            {
                 return render_preview_require_fallback(None, scope, env).map(Some);
             }
             Ok(None)
@@ -1914,6 +2069,18 @@ fn is_slot_component(component: &AxComponent) -> bool {
 }
 
 fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
+    String::from_utf8(render_preview_document_chunks(document, root).concat())
+        .expect("preview renderer only emits UTF-8 HTML")
+}
+
+fn render_preview_document_response(
+    document: &AxDocument,
+    root: &AxNode,
+) -> server::AxHttpResponse {
+    server::AxHttpResponse::html_stream(200, render_preview_document_chunks(document, root))
+}
+
+fn render_preview_document_chunks(document: &AxDocument, root: &AxNode) -> Vec<Vec<u8>> {
     let mut body = String::new();
     render_node(root, &mut body);
     let head = render_head_html(&document.head);
@@ -1934,16 +2101,24 @@ fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
         ""
     };
 
-    format!(
-        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>{}</head><body>{}{}{}{}</body></html>",
-        html_attrs,
-        preview_styles(),
+    [
+        format!(
+            "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>",
+            html_attrs,
+            preview_styles()
+        ),
         head,
+        "</head><body>".to_string(),
         body,
-        state_bridge_script,
-        action_script,
-        behavior_script
-    )
+        state_bridge_script.to_string(),
+        action_script.to_string(),
+        behavior_script.to_string(),
+        "</body></html>".to_string(),
+    ]
+    .into_iter()
+    .filter(|chunk| !chunk.is_empty())
+    .map(String::into_bytes)
+    .collect()
 }
 
 fn ax_behavior_script() -> &'static str {
@@ -2602,6 +2777,32 @@ mod tests {
     }
 
     #[test]
+    fn extracts_route_hooks_from_backend_handler_plan() {
+        let document = parse_backend_ax(
+            r#"
+route GET "/api/admin"
+  before Auth.session
+  before Security.headers
+  after Cache.noStore
+  return json("ok")
+"#,
+        )
+        .expect("backend source should parse");
+        let plan = lower_backend_document(&document).expect("backend source should lower");
+
+        let hooks = route_hooks_from_handler_plan(&plan.handlers[0]);
+
+        assert_eq!(
+            hooks,
+            vec![
+                server::AxRouteHook::new(server::AxMiddlewarePhase::Before, "Auth.session"),
+                server::AxRouteHook::new(server::AxMiddlewarePhase::Before, "Security.headers"),
+                server::AxRouteHook::new(server::AxMiddlewarePhase::After, "Cache.noStore"),
+            ]
+        );
+    }
+
+    #[test]
     fn previews_static_ax_page_as_html_document() {
         let html = preview_ax_page(
             r#"
@@ -2620,6 +2821,111 @@ page Home
         assert!(html.contains("Edit app/page.ax"));
         assert!(html.contains("class=\"ax-container\""));
         assert!(html.contains("class=\"ax-card__title\""));
+    }
+
+    #[test]
+    fn previews_static_ax_page_as_streaming_html_response() {
+        let response = preview_ax_page_stream_response(
+            r#"
+page Home
+<Container max="xl">
+  <Card title="Stream Ready">
+    <Copy>Chunked preview path</Copy>
+  </Card>
+</Container>
+"#,
+        )
+        .expect("streaming preview should render");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "text/html; charset=utf-8");
+        assert!(response.body.is_streaming());
+
+        let chunks = response.body.chunks_iter().collect::<Vec<_>>();
+        assert!(chunks.len() >= 4);
+
+        let html = chunks
+            .iter()
+            .map(|chunk| String::from_utf8_lossy(chunk))
+            .collect::<String>();
+
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("Stream Ready"));
+        assert!(html.contains("Chunked preview path"));
+        assert!(html.contains("</body></html>"));
+    }
+
+    #[test]
+    fn builds_route_definition_from_ax_page_source() {
+        let route = ax_page_route_definition(
+            "GET",
+            "/",
+            r#"
+page Home
+<Container max="xl">
+  <Card title="Route Page">
+    <Copy>Served through AxRouteDefinition</Copy>
+  </Card>
+</Container>
+"#,
+        )
+        .expect("page route should build");
+
+        assert!(route.matches(&server::AxHttpRequest::new("GET", "/")));
+
+        let response = route.handle(server::AxHttpRequest::new("GET", "/"), None);
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_streaming());
+
+        let html = String::from_utf8(response.body.into_bytes()).expect("HTML should be UTF-8");
+        assert!(html.contains("Route Page"));
+        assert!(html.contains("Served through AxRouteDefinition"));
+    }
+
+    #[test]
+    fn builds_route_definition_from_ax_page_with_layout_and_loaders() {
+        let store = AxPreviewStore::default();
+        let route = ax_page_route_definition_with_backend(
+            "GET",
+            "/blog",
+            &[r#"
+page Docs
+  Container max: "xl", recipe: "docs-shell"
+    Copy tone: "eyebrow" -> "Docs Layout"
+    Slot
+"#],
+            &[r#"
+loader PostsList
+  data posts = Db.Stream("posts")
+    where status = "published"
+    limit 1
+  return posts
+"#],
+            &[],
+            r#"
+page Blog
+<Each item="post" in={load PostsList}>
+  <Card title={post.title}>
+    <Copy>{post.excerpt}</Copy>
+  </Card>
+</Each>
+"#,
+            "/blog",
+            &store,
+        )
+        .expect("page route with backend context should build");
+
+        let response = route.handle(server::AxHttpRequest::new("GET", "/blog"), None);
+
+        assert_eq!(response.status, 200);
+        assert!(response.body.is_streaming());
+
+        let html = String::from_utf8(response.body.into_bytes()).expect("HTML should be UTF-8");
+        assert!(html.contains("Docs Layout"));
+        assert!(html.contains("data-recipe=\"docs-shell\""));
+        assert!(html.contains("Hello Axonyx"));
+        assert!(html.contains("A fast page rendered from .ax"));
     }
 
     #[test]
@@ -3520,8 +3826,8 @@ route GET "/api/admin"
             Some("no-store")
         );
 
-        let request = server::AxHttpRequest::new("GET", "/api/admin")
-            .with_header("Cookie", "session=abc123");
+        let request =
+            server::AxHttpRequest::new("GET", "/api/admin").with_header("Cookie", "session=abc123");
         let response = execute_preview_route_request_sources(
             &[r#"
 route GET "/api/admin"

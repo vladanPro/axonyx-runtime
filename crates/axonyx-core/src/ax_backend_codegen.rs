@@ -853,9 +853,8 @@ route GET "/api/admin"
         assert!(module.contains(
             "__ax_headers.insert(\"Referrer-Policy\".to_string(), \"strict-origin-when-cross-origin\".to_string())"
         ));
-        assert!(module.contains(
-            "if (AxAuth::session(request).unwrap_or_default()).to_string().is_empty()"
-        ));
+        assert!(module
+            .contains("if (AxAuth::session(request).unwrap_or_default()).to_string().is_empty()"));
         assert!(module.contains(
             "__ax_headers.insert(\"Cache-Control\".to_string(), \"no-store\".to_string())"
         ));
