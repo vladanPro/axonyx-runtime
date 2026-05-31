@@ -428,6 +428,39 @@ impl AxRouteDefinition {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct AxRouteTable {
+    pub routes: Vec<AxRouteDefinition>,
+    pub env: Option<AxEnv>,
+}
+
+impl AxRouteTable {
+    pub fn new(routes: impl IntoIterator<Item = AxRouteDefinition>) -> Self {
+        Self {
+            routes: routes.into_iter().collect(),
+            env: None,
+        }
+    }
+
+    pub fn with_env(mut self, env: AxEnv) -> Self {
+        self.env = Some(env);
+        self
+    }
+
+    pub fn push(&mut self, route: AxRouteDefinition) {
+        self.routes.push(route);
+    }
+
+    pub fn route_for(&self, request: &AxHttpRequest) -> Option<&AxRouteDefinition> {
+        self.routes.iter().find(|route| route.matches(request))
+    }
+
+    pub fn handle(&self, request: AxHttpRequest) -> Option<AxHttpResponse> {
+        self.route_for(&request)
+            .map(|route| route.handle(request, self.env.clone()))
+    }
+}
+
 pub trait AxServerAdapter {
     fn name(&self) -> &'static str;
 
@@ -959,8 +992,8 @@ pub mod prelude {
         AxAfterMiddleware, AxAuth, AxBeforeMiddleware, AxBody, AxBodyChunks, AxCookie,
         AxHttpRequest, AxHttpResponse, AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult,
         AxRequestContext, AxResponseContext, AxRouteBuildError, AxRouteDefinition, AxRouteHandler,
-        AxRouteHook, AxServer, AxServerAdapter, AxServerConfig, AxServerMode, AxSseEvent,
-        AxUnknownMiddlewareHook,
+        AxRouteHook, AxRouteTable, AxServer, AxServerAdapter, AxServerConfig, AxServerMode,
+        AxSseEvent, AxUnknownMiddlewareHook,
     };
 }
 
@@ -1168,6 +1201,36 @@ mod tests {
 
         assert_eq!(error.route, "/api/admin");
         assert_eq!(error.source.hook, "Project.custom");
+    }
+
+    #[test]
+    fn route_table_dispatches_first_matching_route_with_shared_env() {
+        let signed = AxAuth::sign_session("s123", "secret");
+        let admin = AxRouteDefinition::new("GET", "/api/admin", ok_handler)
+            .with_builtin_hooks(&[
+                AxRouteHook::new(AxMiddlewarePhase::Before, "Auth.signedSession"),
+                AxRouteHook::new(AxMiddlewarePhase::After, "Security.headers"),
+            ])
+            .expect("built-in hooks should register");
+        let posts = AxRouteDefinition::new("GET", "/api/posts", ok_handler);
+        let table = AxRouteTable::new([admin, posts])
+            .with_env(AxEnv::new().with_secret("session_key", "secret"));
+
+        let response = table
+            .handle(
+                AxHttpRequest::new("GET", "/api/admin")
+                    .with_header("Cookie", format!("session={signed}")),
+            )
+            .expect("admin route should match");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.header_value("X-Content-Type-Options"),
+            Some("nosniff")
+        );
+        assert!(table
+            .handle(AxHttpRequest::new("GET", "/api/missing"))
+            .is_none());
     }
 
     #[test]
