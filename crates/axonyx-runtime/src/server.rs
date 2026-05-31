@@ -660,7 +660,6 @@ pub async fn axum_request_to_axonyx_with_limit(
 
 #[cfg(feature = "axum")]
 pub fn axonyx_response_to_axum(response: AxHttpResponse) -> axum::response::Response {
-    use axum::body::Body;
     use axum::http::header::{CONTENT_TYPE, SET_COOKIE};
     use axum::http::{HeaderName, HeaderValue, StatusCode};
 
@@ -668,7 +667,7 @@ pub fn axonyx_response_to_axum(response: AxHttpResponse) -> axum::response::Resp
     let mut out = axum::response::Response::builder()
         .status(status)
         .header(CONTENT_TYPE, response.content_type.clone())
-        .body(Body::from(response.body.into_bytes()))
+        .body(ax_body_to_axum_body(response.body))
         .expect("Axonyx response should build an Axum response");
 
     for (name, value) in response.headers {
@@ -688,6 +687,21 @@ pub fn axonyx_response_to_axum(response: AxHttpResponse) -> axum::response::Resp
     }
 
     out
+}
+
+#[cfg(feature = "axum")]
+pub fn ax_body_to_axum_body(body: AxBody) -> axum::body::Body {
+    match body {
+        AxBody::Fixed(body) => axum::body::Body::from(body),
+        AxBody::Chunks(chunks) => {
+            let stream = futures_util::stream::iter(
+                chunks
+                    .into_iter()
+                    .map(|chunk| Ok::<_, std::convert::Infallible>(bytes::Bytes::from(chunk))),
+            );
+            axum::body::Body::from_stream(stream)
+        }
+    }
 }
 
 pub trait AxServerAdapter {
@@ -1234,9 +1248,9 @@ pub mod prelude {
 
     #[cfg(feature = "axum")]
     pub use super::{
-        axonyx_response_to_axum, axum_request_to_axonyx, axum_request_to_axonyx_with_limit,
-        axum_router_from_table, axum_router_from_table_with_limit, AxAxumRouter,
-        AxAxumServerAdapter,
+        ax_body_to_axum_body, axonyx_response_to_axum, axum_request_to_axonyx,
+        axum_request_to_axonyx_with_limit, axum_router_from_table,
+        axum_router_from_table_with_limit, AxAxumRouter, AxAxumServerAdapter,
     };
 }
 
@@ -1639,6 +1653,28 @@ mod tests {
                 .await
                 .expect("Axum body should be readable");
             assert_eq!(body.as_ref(), b"hello axum");
+        });
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn axum_body_conversion_streams_chunked_bodies() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime should build for Axum adapter tests");
+
+        runtime.block_on(async {
+            let body = ax_body_to_axum_body(AxBody::chunks(vec![
+                b"<main>".to_vec(),
+                b"stream".to_vec(),
+                b"</main>".to_vec(),
+            ]));
+            let body = axum::body::to_bytes(body, usize::MAX)
+                .await
+                .expect("streaming Axum body should be readable");
+
+            assert_eq!(body.as_ref(), b"<main>stream</main>");
         });
     }
 
