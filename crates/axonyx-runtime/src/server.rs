@@ -1,4 +1,6 @@
 use std::collections::BTreeMap;
+use std::error::Error;
+use std::fmt;
 
 use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
@@ -156,6 +158,39 @@ impl AxMiddlewareResult {
 pub type AxBeforeMiddleware = fn(&AxRequestContext) -> AxMiddlewareResult;
 pub type AxAfterMiddleware = fn(&AxRequestContext, AxResponseContext) -> AxResponseContext;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AxMiddlewarePhase {
+    Before,
+    After,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxUnknownMiddlewareHook {
+    pub phase: AxMiddlewarePhase,
+    pub hook: String,
+}
+
+impl AxUnknownMiddlewareHook {
+    pub fn new(phase: AxMiddlewarePhase, hook: impl Into<String>) -> Self {
+        Self {
+            phase,
+            hook: hook.into(),
+        }
+    }
+}
+
+impl fmt::Display for AxUnknownMiddlewareHook {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "unknown {:?} middleware hook `{}`",
+            self.phase, self.hook
+        )
+    }
+}
+
+impl Error for AxUnknownMiddlewareHook {}
+
 #[derive(Debug, Clone, Default)]
 pub struct AxMiddlewareChain {
     before: Vec<AxBeforeMiddleware>,
@@ -175,6 +210,34 @@ impl AxMiddlewareChain {
     pub fn after(mut self, middleware: AxAfterMiddleware) -> Self {
         self.after.push(middleware);
         self
+    }
+
+    pub fn try_builtin_hook(
+        self,
+        phase: AxMiddlewarePhase,
+        hook: impl AsRef<str>,
+    ) -> Result<Self, AxUnknownMiddlewareHook> {
+        match (phase, hook.as_ref()) {
+            (AxMiddlewarePhase::Before, "Auth.session") => {
+                Ok(self.before(require_session_middleware))
+            }
+            (AxMiddlewarePhase::Before, "Auth.bearer") => {
+                Ok(self.before(require_bearer_middleware))
+            }
+            (_, "Security.headers") => Ok(self.after(security_headers_middleware)),
+            (_, "Cache.noStore") => Ok(self.after(no_store_middleware)),
+            (phase, hook) => Err(AxUnknownMiddlewareHook::new(phase, hook)),
+        }
+    }
+
+    pub fn try_builtin_hooks<'a>(
+        mut self,
+        hooks: impl IntoIterator<Item = (AxMiddlewarePhase, &'a str)>,
+    ) -> Result<Self, AxUnknownMiddlewareHook> {
+        for (phase, hook) in hooks {
+            self = self.try_builtin_hook(phase, hook)?;
+        }
+        Ok(self)
     }
 
     pub fn run(
@@ -750,8 +813,8 @@ pub mod prelude {
         no_store_middleware, require_bearer_middleware, require_session_middleware,
         security_headers_middleware, status_reason, AxAfterMiddleware, AxAuth, AxBeforeMiddleware,
         AxBody, AxBodyChunks, AxCookie, AxHttpRequest, AxHttpResponse, AxMiddlewareChain,
-        AxMiddlewareResult, AxRequestContext, AxResponseContext, AxServer, AxServerConfig,
-        AxServerMode, AxSseEvent,
+        AxMiddlewarePhase, AxMiddlewareResult, AxRequestContext, AxResponseContext, AxServer,
+        AxServerConfig, AxServerMode, AxSseEvent, AxUnknownMiddlewareHook,
     };
 }
 
@@ -861,6 +924,40 @@ mod tests {
 
         assert_eq!(response.status, 401);
         assert_eq!(response.header_value("Cache-Control"), Some("no-store"));
+    }
+
+    #[test]
+    fn middleware_chain_can_register_builtin_hooks_by_ax_name() {
+        let context = AxRequestContext::new(
+            AxHttpRequest::new("GET", "/api/admin").with_header("Authorization", "Bearer token"),
+            "/api/admin",
+        );
+        let chain = AxMiddlewareChain::new()
+            .try_builtin_hooks([
+                (AxMiddlewarePhase::Before, "Auth.bearer"),
+                (AxMiddlewarePhase::Before, "Security.headers"),
+                (AxMiddlewarePhase::After, "Cache.noStore"),
+            ])
+            .expect("built-in hooks should register");
+
+        let response = chain.run(&context, |_context| AxHttpResponse::text(200, "ok"));
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            response.header_value("X-Content-Type-Options"),
+            Some("nosniff")
+        );
+        assert_eq!(response.header_value("Cache-Control"), Some("no-store"));
+    }
+
+    #[test]
+    fn middleware_chain_reports_unknown_builtin_hooks() {
+        let error = AxMiddlewareChain::new()
+            .try_builtin_hook(AxMiddlewarePhase::Before, "Auth.signedSession")
+            .expect_err("signed session needs env-aware middleware context");
+
+        assert_eq!(error.phase, AxMiddlewarePhase::Before);
+        assert_eq!(error.hook, "Auth.signedSession");
     }
 
     #[test]
