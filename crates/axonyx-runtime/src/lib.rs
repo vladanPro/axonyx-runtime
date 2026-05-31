@@ -31,6 +31,23 @@ use thiserror::Error;
 pub use backend::prelude as backend_prelude;
 pub use server::prelude as server_prelude;
 
+pub fn route_hooks_from_handler_plan(handler: &AxHandlerPlan) -> Vec<server::AxRouteHook> {
+    handler
+        .steps
+        .iter()
+        .filter_map(|step| {
+            let AxStepPlan::Hook { phase, value } = step else {
+                return None;
+            };
+            let phase = match phase {
+                AxHookPhasePlan::Before => server::AxMiddlewarePhase::Before,
+                AxHookPhasePlan::After => server::AxMiddlewarePhase::After,
+            };
+            Some(server::AxRouteHook::new(phase, value.code.clone()))
+        })
+        .collect()
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct RenderPlan {
     pub source: String,
@@ -2602,6 +2619,32 @@ mod tests {
         assert_eq!(plan.source, "users");
         assert_eq!(plan.layout.columns, 2);
         assert_eq!(plan.view.component, "ProfileCard");
+    }
+
+    #[test]
+    fn extracts_route_hooks_from_backend_handler_plan() {
+        let document = parse_backend_ax(
+            r#"
+route GET "/api/admin"
+  before Auth.session
+  before Security.headers
+  after Cache.noStore
+  return json("ok")
+"#,
+        )
+        .expect("backend source should parse");
+        let plan = lower_backend_document(&document).expect("backend source should lower");
+
+        let hooks = route_hooks_from_handler_plan(&plan.handlers[0]);
+
+        assert_eq!(
+            hooks,
+            vec![
+                server::AxRouteHook::new(server::AxMiddlewarePhase::Before, "Auth.session"),
+                server::AxRouteHook::new(server::AxMiddlewarePhase::Before, "Security.headers"),
+                server::AxRouteHook::new(server::AxMiddlewarePhase::After, "Cache.noStore"),
+            ]
+        );
     }
 
     #[test]

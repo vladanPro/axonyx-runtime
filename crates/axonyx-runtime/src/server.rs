@@ -204,6 +204,33 @@ impl fmt::Display for AxUnknownMiddlewareHook {
 
 impl Error for AxUnknownMiddlewareHook {}
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxRouteBuildError {
+    pub route: String,
+    pub source: AxUnknownMiddlewareHook,
+}
+
+impl AxRouteBuildError {
+    pub fn new(route: impl Into<String>, source: AxUnknownMiddlewareHook) -> Self {
+        Self {
+            route: route.into(),
+            source,
+        }
+    }
+}
+
+impl fmt::Display for AxRouteBuildError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "failed to build route `{}`: {}",
+            self.route, self.source
+        )
+    }
+}
+
+impl Error for AxRouteBuildError {}
+
 #[derive(Debug, Clone, Default)]
 pub struct AxMiddlewareChain {
     before: Vec<AxBeforeMiddleware>,
@@ -334,7 +361,22 @@ pub fn require_signed_session_middleware(context: &AxRequestContext) -> AxMiddle
 
 pub type AxRouteHandler = fn(&AxRequestContext) -> AxHttpResponse;
 
-#[derive(Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxRouteHook {
+    pub phase: AxMiddlewarePhase,
+    pub hook: String,
+}
+
+impl AxRouteHook {
+    pub fn new(phase: AxMiddlewarePhase, hook: impl Into<String>) -> Self {
+        Self {
+            phase,
+            hook: hook.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct AxRouteDefinition {
     pub method: String,
     pub path: String,
@@ -359,6 +401,17 @@ impl AxRouteDefinition {
     pub fn with_middleware(mut self, middleware: AxMiddlewareChain) -> Self {
         self.middleware = middleware;
         self
+    }
+
+    pub fn with_builtin_hooks(mut self, hooks: &[AxRouteHook]) -> Result<Self, AxRouteBuildError> {
+        let route = self.path.clone();
+        for hook in hooks {
+            self.middleware = self
+                .middleware
+                .try_builtin_hook(hook.phase, hook.hook.as_str())
+                .map_err(|error| AxRouteBuildError::new(route.clone(), error))?;
+        }
+        Ok(self)
     }
 
     pub fn matches(&self, request: &AxHttpRequest) -> bool {
@@ -905,8 +958,9 @@ pub mod prelude {
         require_signed_session_middleware, security_headers_middleware, status_reason,
         AxAfterMiddleware, AxAuth, AxBeforeMiddleware, AxBody, AxBodyChunks, AxCookie,
         AxHttpRequest, AxHttpResponse, AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult,
-        AxRequestContext, AxResponseContext, AxRouteDefinition, AxRouteHandler, AxServer,
-        AxServerAdapter, AxServerConfig, AxServerMode, AxSseEvent, AxUnknownMiddlewareHook,
+        AxRequestContext, AxResponseContext, AxRouteBuildError, AxRouteDefinition, AxRouteHandler,
+        AxRouteHook, AxServer, AxServerAdapter, AxServerConfig, AxServerMode, AxSseEvent,
+        AxUnknownMiddlewareHook,
     };
 }
 
@@ -1084,14 +1138,12 @@ mod tests {
 
     #[test]
     fn route_definition_matches_and_runs_through_middleware_chain() {
-        let route = AxRouteDefinition::new("GET", "/api/admin", ok_handler).with_middleware(
-            AxMiddlewareChain::new()
-                .try_builtin_hooks([
-                    (AxMiddlewarePhase::Before, "Auth.session"),
-                    (AxMiddlewarePhase::After, "Cache.noStore"),
-                ])
-                .expect("built-in hooks should register"),
-        );
+        let route = AxRouteDefinition::new("GET", "/api/admin", ok_handler)
+            .with_builtin_hooks(&[
+                AxRouteHook::new(AxMiddlewarePhase::Before, "Auth.session"),
+                AxRouteHook::new(AxMiddlewarePhase::After, "Cache.noStore"),
+            ])
+            .expect("built-in hooks should register");
 
         let request = AxHttpRequest::new("GET", "/api/admin?tab=profile")
             .with_header("Cookie", "session=s123");
@@ -1103,6 +1155,19 @@ mod tests {
         assert_eq!(response.header_value("Cache-Control"), Some("no-store"));
 
         assert!(!route.matches(&AxHttpRequest::new("POST", "/api/admin")));
+    }
+
+    #[test]
+    fn route_definition_reports_unknown_hook_with_route_context() {
+        let error = AxRouteDefinition::new("GET", "/api/admin", ok_handler)
+            .with_builtin_hooks(&[AxRouteHook::new(
+                AxMiddlewarePhase::Before,
+                "Project.custom",
+            )])
+            .expect_err("custom hooks should need future registry");
+
+        assert_eq!(error.route, "/api/admin");
+        assert_eq!(error.source.hook, "Project.custom");
     }
 
     #[test]
