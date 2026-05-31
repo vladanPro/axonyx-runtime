@@ -461,6 +461,46 @@ impl AxRouteTable {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct AxMemoryServerAdapter {
+    pub table: AxRouteTable,
+    pub config: AxServerConfig,
+}
+
+impl AxMemoryServerAdapter {
+    pub fn new(config: AxServerConfig, routes: Vec<AxRouteDefinition>) -> Self {
+        Self {
+            table: AxRouteTable::new(routes),
+            config,
+        }
+    }
+
+    pub fn with_env(mut self, env: AxEnv) -> Self {
+        self.table = self.table.with_env(env);
+        self
+    }
+
+    pub fn handle(&self, request: AxHttpRequest) -> AxHttpResponse {
+        self.table
+            .handle(request)
+            .unwrap_or_else(|| AxHttpResponse::text(404, "Not Found"))
+    }
+}
+
+impl AxServerAdapter for AxMemoryServerAdapter {
+    fn name(&self) -> &'static str {
+        "memory"
+    }
+
+    fn serve_routes(
+        &self,
+        _config: &AxServerConfig,
+        _routes: Vec<AxRouteDefinition>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>> {
+        Ok(())
+    }
+}
+
 pub trait AxServerAdapter {
     fn name(&self) -> &'static str;
 
@@ -990,10 +1030,10 @@ pub mod prelude {
         no_store_middleware, require_bearer_middleware, require_session_middleware,
         require_signed_session_middleware, security_headers_middleware, status_reason,
         AxAfterMiddleware, AxAuth, AxBeforeMiddleware, AxBody, AxBodyChunks, AxCookie,
-        AxHttpRequest, AxHttpResponse, AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult,
-        AxRequestContext, AxResponseContext, AxRouteBuildError, AxRouteDefinition, AxRouteHandler,
-        AxRouteHook, AxRouteTable, AxServer, AxServerAdapter, AxServerConfig, AxServerMode,
-        AxSseEvent, AxUnknownMiddlewareHook,
+        AxHttpRequest, AxHttpResponse, AxMemoryServerAdapter, AxMiddlewareChain, AxMiddlewarePhase,
+        AxMiddlewareResult, AxRequestContext, AxResponseContext, AxRouteBuildError,
+        AxRouteDefinition, AxRouteHandler, AxRouteHook, AxRouteTable, AxServer, AxServerAdapter,
+        AxServerConfig, AxServerMode, AxSseEvent, AxUnknownMiddlewareHook,
     };
 }
 
@@ -1231,6 +1271,26 @@ mod tests {
         assert!(table
             .handle(AxHttpRequest::new("GET", "/api/missing"))
             .is_none());
+    }
+
+    #[test]
+    fn memory_server_adapter_handles_routes_without_network() {
+        let config = AxServerConfig::new("127.0.0.1", 3000, AxServerMode::Dev);
+        let route = AxRouteDefinition::new("GET", "/api/posts", ok_handler)
+            .with_builtin_hooks(&[AxRouteHook::new(AxMiddlewarePhase::After, "Cache.noStore")])
+            .expect("built-in hooks should register");
+        let adapter = AxMemoryServerAdapter::new(config, vec![route]);
+
+        assert_eq!(adapter.name(), "memory");
+
+        let response = adapter.handle(AxHttpRequest::new("GET", "/api/posts"));
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.header_value("Cache-Control"), Some("no-store"));
+
+        let missing = adapter.handle(AxHttpRequest::new("GET", "/api/missing"));
+
+        assert_eq!(missing.status, 404);
     }
 
     #[test]
