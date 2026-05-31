@@ -332,6 +332,66 @@ pub fn require_signed_session_middleware(context: &AxRequestContext) -> AxMiddle
     }
 }
 
+pub type AxRouteHandler = fn(&AxRequestContext) -> AxHttpResponse;
+
+#[derive(Clone)]
+pub struct AxRouteDefinition {
+    pub method: String,
+    pub path: String,
+    pub middleware: AxMiddlewareChain,
+    pub handler: AxRouteHandler,
+}
+
+impl AxRouteDefinition {
+    pub fn new(
+        method: impl Into<String>,
+        path: impl Into<String>,
+        handler: AxRouteHandler,
+    ) -> Self {
+        Self {
+            method: method.into(),
+            path: path.into(),
+            middleware: AxMiddlewareChain::new(),
+            handler,
+        }
+    }
+
+    pub fn with_middleware(mut self, middleware: AxMiddlewareChain) -> Self {
+        self.middleware = middleware;
+        self
+    }
+
+    pub fn matches(&self, request: &AxHttpRequest) -> bool {
+        self.method.eq_ignore_ascii_case(&request.method)
+            && request_path_without_query(&request.target) == self.path
+    }
+
+    pub fn handle(&self, request: AxHttpRequest, env: Option<AxEnv>) -> AxHttpResponse {
+        let mut context = AxRequestContext::new(request, self.path.clone());
+        if let Some(env) = env {
+            context = context.with_env(env);
+        }
+        self.middleware.run(&context, self.handler)
+    }
+}
+
+pub trait AxServerAdapter {
+    fn name(&self) -> &'static str;
+
+    fn serve_routes(
+        &self,
+        config: &AxServerConfig,
+        routes: Vec<AxRouteDefinition>,
+    ) -> Result<(), Box<dyn Error + Send + Sync>>;
+}
+
+fn request_path_without_query(target: &str) -> &str {
+    target
+        .split_once('?')
+        .map(|(path, _)| path)
+        .unwrap_or(target)
+}
+
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len() * 2);
@@ -845,14 +905,18 @@ pub mod prelude {
         require_signed_session_middleware, security_headers_middleware, status_reason,
         AxAfterMiddleware, AxAuth, AxBeforeMiddleware, AxBody, AxBodyChunks, AxCookie,
         AxHttpRequest, AxHttpResponse, AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult,
-        AxRequestContext, AxResponseContext, AxServer, AxServerConfig, AxServerMode, AxSseEvent,
-        AxUnknownMiddlewareHook,
+        AxRequestContext, AxResponseContext, AxRouteDefinition, AxRouteHandler, AxServer,
+        AxServerAdapter, AxServerConfig, AxServerMode, AxSseEvent, AxUnknownMiddlewareHook,
     };
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ok_handler(_context: &AxRequestContext) -> AxHttpResponse {
+        AxHttpResponse::text(200, "ok")
+    }
 
     #[test]
     fn server_config_builds_bind_address() {
@@ -1016,6 +1080,29 @@ mod tests {
         });
 
         assert_eq!(response.status, 401);
+    }
+
+    #[test]
+    fn route_definition_matches_and_runs_through_middleware_chain() {
+        let route = AxRouteDefinition::new("GET", "/api/admin", ok_handler).with_middleware(
+            AxMiddlewareChain::new()
+                .try_builtin_hooks([
+                    (AxMiddlewarePhase::Before, "Auth.session"),
+                    (AxMiddlewarePhase::After, "Cache.noStore"),
+                ])
+                .expect("built-in hooks should register"),
+        );
+
+        let request = AxHttpRequest::new("GET", "/api/admin?tab=profile")
+            .with_header("Cookie", "session=s123");
+        assert!(route.matches(&request));
+
+        let response = route.handle(request, None);
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.header_value("Cache-Control"), Some("no-store"));
+
+        assert!(!route.matches(&AxHttpRequest::new("POST", "/api/admin")));
     }
 
     #[test]
