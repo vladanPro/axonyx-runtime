@@ -130,6 +130,22 @@ pub fn preview_ax_page(ax_source: &str) -> Result<String, PreviewError> {
     preview_ax_app(None, ax_source)
 }
 
+pub fn preview_ax_page_stream_response(
+    ax_source: &str,
+) -> Result<server::AxHttpResponse, PreviewError> {
+    let document = parse_ax_auto(ax_source)?;
+    let resolver = |_: &[String], _: &[AxValue]| None;
+    let import_resolver = |_: &str| None;
+    let node = lower_document_with_scope_and_imports(
+        &document,
+        BTreeMap::new(),
+        &resolver,
+        &import_resolver,
+    )?;
+
+    Ok(render_preview_document_response(&document, &node))
+}
+
 pub fn preview_ax_page_with_imports(
     ax_source: &str,
     import_resolver: &impl AxImportResolver,
@@ -1934,6 +1950,18 @@ fn is_slot_component(component: &AxComponent) -> bool {
 }
 
 fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
+    String::from_utf8(render_preview_document_chunks(document, root).concat())
+        .expect("preview renderer only emits UTF-8 HTML")
+}
+
+fn render_preview_document_response(
+    document: &AxDocument,
+    root: &AxNode,
+) -> server::AxHttpResponse {
+    server::AxHttpResponse::html_stream(200, render_preview_document_chunks(document, root))
+}
+
+fn render_preview_document_chunks(document: &AxDocument, root: &AxNode) -> Vec<Vec<u8>> {
     let mut body = String::new();
     render_node(root, &mut body);
     let head = render_head_html(&document.head);
@@ -1954,16 +1982,24 @@ fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
         ""
     };
 
-    format!(
-        "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>{}</head><body>{}{}{}{}</body></html>",
-        html_attrs,
-        preview_styles(),
+    [
+        format!(
+            "<!DOCTYPE html><html{}><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><style>{}</style>",
+            html_attrs,
+            preview_styles()
+        ),
         head,
+        "</head><body>".to_string(),
         body,
-        state_bridge_script,
-        action_script,
-        behavior_script
-    )
+        state_bridge_script.to_string(),
+        action_script.to_string(),
+        behavior_script.to_string(),
+        "</body></html>".to_string(),
+    ]
+    .into_iter()
+    .filter(|chunk| !chunk.is_empty())
+    .map(String::into_bytes)
+    .collect()
 }
 
 fn ax_behavior_script() -> &'static str {
@@ -2666,6 +2702,38 @@ page Home
         assert!(html.contains("Edit app/page.ax"));
         assert!(html.contains("class=\"ax-container\""));
         assert!(html.contains("class=\"ax-card__title\""));
+    }
+
+    #[test]
+    fn previews_static_ax_page_as_streaming_html_response() {
+        let response = preview_ax_page_stream_response(
+            r#"
+page Home
+<Container max="xl">
+  <Card title="Stream Ready">
+    <Copy>Chunked preview path</Copy>
+  </Card>
+</Container>
+"#,
+        )
+        .expect("streaming preview should render");
+
+        assert_eq!(response.status, 200);
+        assert_eq!(response.content_type, "text/html; charset=utf-8");
+        assert!(response.body.is_streaming());
+
+        let chunks = response.body.chunks_iter().collect::<Vec<_>>();
+        assert!(chunks.len() >= 4);
+
+        let html = chunks
+            .iter()
+            .map(|chunk| String::from_utf8_lossy(chunk))
+            .collect::<String>();
+
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("Stream Ready"));
+        assert!(html.contains("Chunked preview path"));
+        assert!(html.contains("</body></html>"));
     }
 
     #[test]
