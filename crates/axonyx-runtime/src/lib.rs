@@ -2423,6 +2423,10 @@ fn render_head_html(head: &AxHead) -> String {
         None => html.push_str("<title>Axonyx Preview</title>"),
     }
 
+    if head.theme_preflight {
+        html.push_str(&render_theme_preflight_script(head));
+    }
+
     for tag in &head.metas {
         html.push_str(&render_head_void_tag("meta", tag));
     }
@@ -2436,6 +2440,25 @@ fn render_head_html(head: &AxHead) -> String {
     }
 
     html
+}
+
+fn render_theme_preflight_script(head: &AxHead) -> String {
+    let storage_key = head
+        .theme_storage_key
+        .as_ref()
+        .map(head_expr_to_string)
+        .unwrap_or_else(|| "axonyx-theme".to_string());
+    let fallback_theme = head
+        .theme
+        .as_ref()
+        .map(head_expr_to_string)
+        .unwrap_or_else(|| "silver".to_string());
+
+    format!(
+        "<script>(function(){{try{{var k=\"{}\";var t=window.localStorage&&window.localStorage.getItem(k);if(!t)t=\"{}\";if(t)document.documentElement.setAttribute(\"data-theme\",t);}}catch(e){{}}}})();</script>",
+        escape_js_string(&storage_key),
+        escape_js_string(&fallback_theme)
+    )
 }
 
 fn render_head_void_tag(tag: &str, head_tag: &AxHeadTag) -> String {
@@ -2531,6 +2554,15 @@ fn escape_html(value: &str) -> String {
         .replace('<', "&lt;")
         .replace('>', "&gt;")
         .replace('"', "&quot;")
+}
+
+fn escape_js_string(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('<', "\\u003c")
 }
 
 fn preview_styles() -> &'static str {
@@ -2952,6 +2984,33 @@ page Home
         assert!(html.contains("<meta name=\"description\" content=\"Docs without bloat\">"));
         assert!(html.contains("Runtime V2"));
         assert!(html.contains("Body from JSX-like .ax"));
+    }
+
+    #[test]
+    fn theme_preflight_script_renders_before_head_links() {
+        let html = preview_ax_page(
+            r#"
+page Home
+<Head>
+  <Title>Theme Test</Title>
+  <Theme default="silver" storageKey="axonyx-site-theme" preflight />
+  <Link rel="stylesheet" href="/css/site.css" />
+</Head>
+<Copy>Body</Copy>
+"#,
+        )
+        .expect("theme preflight preview should render");
+
+        let script_index = html
+            .find("localStorage.getItem(k)")
+            .expect("preflight script should read storage");
+        let link_index = html
+            .find("<link rel=\"stylesheet\" href=\"/css/site.css\">")
+            .expect("stylesheet link should render");
+
+        assert!(html.contains("var k=\"axonyx-site-theme\""));
+        assert!(html.contains("if(!t)t=\"silver\""));
+        assert!(script_index < link_index);
     }
 
     #[test]

@@ -676,7 +676,7 @@ impl<'a> Parser<'a> {
         self.skip_spaces();
 
         if self.peek_char() != Some('=') {
-            return Err(AxParseV2Error::MissingAttributeValue { line, name });
+            return Ok(AxAttributeNode::string(name, "true"));
         }
         self.bump_char();
         self.skip_spaces();

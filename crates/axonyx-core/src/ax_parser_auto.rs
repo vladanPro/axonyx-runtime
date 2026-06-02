@@ -196,7 +196,7 @@ fn merge_head_element(head: &mut AxHead, element: &AxElementNode) -> Result<(), 
 
         match tag.name.as_str() {
             "Title" => head.title = Some(convert_head_value(tag)?),
-            "Theme" => head.theme = Some(convert_head_value(tag)?),
+            "Theme" => convert_theme_head_tag(head, tag)?,
             "Meta" => head.metas.push(convert_head_tag(tag)?),
             "Link" => head.links.push(convert_head_tag(tag)?),
             "Script" => head.scripts.push(convert_head_tag(tag)?),
@@ -209,6 +209,46 @@ fn merge_head_element(head: &mut AxHead, element: &AxElementNode) -> Result<(), 
     }
 
     Ok(())
+}
+
+fn convert_theme_head_tag(
+    head: &mut AxHead,
+    element: &AxElementNode,
+) -> Result<(), AxConvertV2Error> {
+    if element.attrs.is_empty() {
+        head.theme = Some(convert_head_value(element)?);
+        return Ok(());
+    }
+
+    if !element.children.is_empty() {
+        return Err(AxConvertV2Error::HeadTagChildrenNotSupported {
+            tag: element.name.clone(),
+        });
+    }
+
+    for attr in &element.attrs {
+        match attr.name.as_str() {
+            "default" => head.theme = Some(convert_attr_value(&attr.value)?),
+            "storageKey" => head.theme_storage_key = Some(convert_attr_value(&attr.value)?),
+            "preflight" => {
+                head.theme_preflight = head_attr_is_truthy(attr)?;
+            }
+            _ => {}
+        }
+    }
+
+    Ok(())
+}
+
+fn head_attr_is_truthy(attr: &AxAttributeNode) -> Result<bool, AxConvertV2Error> {
+    Ok(match &attr.value {
+        AxAttributeValue::String(value) => value != "false",
+        AxAttributeValue::Expr(source) => match parse_v2_expr(source)? {
+            AxExpr::Bool(value) => value,
+            AxExpr::String(value) => value != "false",
+            _ => true,
+        },
+    })
 }
 
 fn convert_head_value(element: &AxElementNode) -> Result<AxExpr, AxConvertV2Error> {
@@ -768,6 +808,27 @@ page Home
         assert_eq!(document.head.metas.len(), 1);
         assert_eq!(document.head.links.len(), 1);
         assert_eq!(document.page.body.len(), 1);
+    }
+
+    #[test]
+    fn converts_theme_preflight_attrs_into_document_head() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+<Head>
+  <Theme default="silver" storageKey="axonyx-site-theme" preflight />
+</Head>
+<Copy>Body</Copy>
+"#,
+        )
+        .expect("auto parse should support theme preflight attrs");
+
+        assert_eq!(document.head.theme, Some(AxExpr::string("silver")));
+        assert_eq!(
+            document.head.theme_storage_key,
+            Some(AxExpr::string("axonyx-site-theme"))
+        );
+        assert!(document.head.theme_preflight);
     }
 
     #[test]

@@ -159,6 +159,8 @@ impl AxPage {
 pub struct AxHead {
     pub title: Option<AxExpr>,
     pub theme: Option<AxExpr>,
+    pub theme_storage_key: Option<AxExpr>,
+    pub theme_preflight: bool,
     pub metas: Vec<AxHeadTag>,
     pub links: Vec<AxHeadTag>,
     pub scripts: Vec<AxHeadTag>,
@@ -172,6 +174,16 @@ impl AxHead {
 
     pub fn with_theme(mut self, value: impl Into<AxExpr>) -> Self {
         self.theme = Some(value.into());
+        self
+    }
+
+    pub fn with_theme_storage_key(mut self, value: impl Into<AxExpr>) -> Self {
+        self.theme_storage_key = Some(value.into());
+        self
+    }
+
+    pub fn with_theme_preflight(mut self) -> Self {
+        self.theme_preflight = true;
         self
     }
 
@@ -196,6 +208,12 @@ impl AxHead {
         }
         if other.theme.is_some() {
             self.theme = other.theme;
+        }
+        if other.theme_storage_key.is_some() {
+            self.theme_storage_key = other.theme_storage_key;
+        }
+        if other.theme_preflight {
+            self.theme_preflight = true;
         }
         self.metas.extend(other.metas);
         self.links.extend(other.links);
