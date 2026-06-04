@@ -18,7 +18,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 hmac.workspace = true
 sha2.workspace = true
-axonyx-core = { version = "0.1.15", path = "../axonyx-core" }
+axonyx-core = { version = "0.1.16", path = "../axonyx-core" }
 axum = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }

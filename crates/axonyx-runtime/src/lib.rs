@@ -2308,6 +2308,16 @@ fn ax_state_bridge_script() -> &'static str {
     else node.setAttribute("value", next);
   };
 
+  const valueFromSnapshot = (entry) => {
+    if (!entry || typeof entry !== "object") return entry;
+    const value = entry.value;
+    if (value && typeof value === "object" && "kind" in value) {
+      if (value.kind === "null") return null;
+      return value.value;
+    }
+    return value;
+  };
+
   const emitPatch = (signal, value, source) => {
     const detail = { op: "set", signal, value, source };
     window.dispatchEvent(new CustomEvent("axonyx:state-patch", { detail }));
@@ -2355,6 +2365,36 @@ fn ax_state_bridge_script() -> &'static str {
     return writeSignal(patch.signal, patch.value, patch.source || "patch", false);
   };
 
+  const hydrateSnapshot = (snapshot, source = "snapshot") => {
+    if (!snapshot || !Array.isArray(snapshot.signals)) return 0;
+    let count = 0;
+    snapshot.signals.forEach((entry) => {
+      if (!entry || !entry.key) return;
+      if (entry.ty && !types.has(entry.key)) types.set(entry.key, entry.ty);
+      writeSignal(entry.key, valueFromSnapshot(entry), source, false);
+      count += 1;
+    });
+    return count;
+  };
+
+  const loadSnapshot = async (url = "/_ax/state/snapshot.json") => {
+    if (!window.fetch) return false;
+    try {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) return false;
+      const snapshot = await response.json();
+      const count = hydrateSnapshot(snapshot, "snapshot");
+      if (count > 0) {
+        window.dispatchEvent(new CustomEvent("axonyx:state-snapshot", {
+          detail: { url, count, snapshot },
+        }));
+      }
+      return count > 0;
+    } catch (_) {
+      return false;
+    }
+  };
+
   const subscribe = (signal, listener) => {
     if (typeof listener !== "function") return () => {};
     if (!subscribers.has(signal)) subscribers.set(signal, new Set());
@@ -2387,6 +2427,8 @@ fn ax_state_bridge_script() -> &'static str {
     set: setSignal,
     subscribe,
     applyPatch,
+    hydrateSnapshot,
+    loadSnapshot,
     snapshot: () => Object.fromEntries(state.entries()),
   };
   window.__axonyx.applyPatch = applyPatch;
@@ -2397,6 +2439,7 @@ fn ax_state_bridge_script() -> &'static str {
   } else {
     init();
   }
+  loadSnapshot();
 })();
 </script>"##
 }
@@ -3087,6 +3130,10 @@ page Home
         assert!(state_html.contains("axonyx:state-change"));
         assert!(state_html.contains("window.__axonyx.state"));
         assert!(state_html.contains("applyPatch"));
+        assert!(state_html.contains("hydrateSnapshot"));
+        assert!(state_html.contains("loadSnapshot"));
+        assert!(state_html.contains("/_ax/state/snapshot.json"));
+        assert!(state_html.contains("axonyx:state-snapshot"));
         assert!(state_html.contains("subscribe"));
         assert!(state_html.contains("window.__axonyxStateBridge"));
     }
