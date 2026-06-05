@@ -2229,6 +2229,22 @@ fn ax_action_script() -> &'static str {
     }
   };
 
+  const getTabId = () => {
+    const existing = window.__axonyx?.state?.tabId;
+    if (existing) return existing;
+    try {
+      const key = "axonyx:tab-id";
+      let value = window.sessionStorage && window.sessionStorage.getItem(key);
+      if (!value) {
+        value = "tab-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+        if (window.sessionStorage) window.sessionStorage.setItem(key, value);
+      }
+      return value;
+    } catch (_) {
+      return "tab-" + Math.random().toString(36).slice(2);
+    }
+  };
+
   document.addEventListener("submit", async (event) => {
     const form = event.target;
     if (!(form instanceof HTMLFormElement) || !isAxonyxActionForm(form)) return;
@@ -2236,12 +2252,18 @@ fn ax_action_script() -> &'static str {
 
     const body = new FormData(form);
     if (!body.has("__ax_patch")) body.append("__ax_patch", "1");
+    if (!body.has("__ax_protocol")) body.append("__ax_protocol", "ax-state/1");
+    if (!body.has("__ax_tab")) body.append("__ax_tab", getTabId());
     form.setAttribute("data-ax-action-state", "pending");
 
     try {
       const response = await fetch(form.action, {
         method: form.method || "POST",
-        headers: { Accept: "application/ax-patch+json" },
+        headers: {
+          Accept: "application/ax-patch+json",
+          "X-Axonyx-State-Protocol": "ax-state/1",
+          "X-Axonyx-Tab": getTabId(),
+        },
         body,
         cache: "no-store",
       });
@@ -2318,6 +2340,27 @@ fn ax_state_bridge_script() -> &'static str {
     }
     return value;
   };
+
+  const getTabId = () => {
+    try {
+      const key = "axonyx:tab-id";
+      let value = window.sessionStorage && window.sessionStorage.getItem(key);
+      if (!value) {
+        value = "tab-" + Math.random().toString(36).slice(2) + Date.now().toString(36);
+        if (window.sessionStorage) window.sessionStorage.setItem(key, value);
+      }
+      return value;
+    } catch (_) {
+      return "tab-" + Math.random().toString(36).slice(2);
+    }
+  };
+
+  const tabId = getTabId();
+
+  const stateRequestHeaders = () => ({
+    "X-Axonyx-State-Protocol": "ax-state/1",
+    "X-Axonyx-Tab": tabId,
+  });
 
   const emitPatch = (signal, value, source) => {
     const detail = { op: "set", signal, value, source };
@@ -2396,7 +2439,10 @@ fn ax_state_bridge_script() -> &'static str {
   const loadManifest = async (url = "/_ax/state/manifest.json") => {
     if (!window.fetch) return false;
     try {
-      const response = await fetch(url, { cache: "no-store" });
+      const response = await fetch(url, {
+        cache: "no-store",
+        headers: stateRequestHeaders(),
+      });
       if (!response.ok) return false;
       const manifest = await response.json();
       return hydrateManifest(manifest, "manifest") > 0;
@@ -2420,7 +2466,10 @@ fn ax_state_bridge_script() -> &'static str {
   const loadSnapshot = async (url = "/_ax/state/snapshot.json") => {
     if (!window.fetch) return false;
     try {
-      const response = await fetch(url, { cache: "no-store" });
+      const response = await fetch(url, {
+        cache: "no-store",
+        headers: stateRequestHeaders(),
+      });
       if (!response.ok) return false;
       const snapshot = await response.json();
       const count = hydrateSnapshot(snapshot, "snapshot");
@@ -2475,6 +2524,8 @@ fn ax_state_bridge_script() -> &'static str {
   window.__axonyx = window.__axonyx || {};
   window.__axonyx.state = {
     version: 1,
+    protocol: "ax-state/1",
+    tabId,
     get: (signal) => state.get(signal),
     set: setSignal,
     subscribe,
@@ -3189,6 +3240,11 @@ page Home
         assert!(state_html.contains("axonyx:state-patch"));
         assert!(state_html.contains("axonyx:state-change"));
         assert!(state_html.contains("window.__axonyx.state"));
+        assert!(state_html.contains("protocol: \"ax-state/1\""));
+        assert!(state_html.contains("tabId"));
+        assert!(state_html.contains("axonyx:tab-id"));
+        assert!(state_html.contains("X-Axonyx-State-Protocol"));
+        assert!(state_html.contains("X-Axonyx-Tab"));
         assert!(state_html.contains("applyPatch"));
         assert!(state_html.contains("hydrateManifest"));
         assert!(state_html.contains("loadManifest"));
@@ -3562,6 +3618,10 @@ page Posts
         assert!(html.contains("data-ax-runtime=\"actions\""));
         assert!(html.contains("application/ax-patch+json"));
         assert!(html.contains("__ax_patch"));
+        assert!(html.contains("__ax_protocol"));
+        assert!(html.contains("__ax_tab"));
+        assert!(html.contains("X-Axonyx-State-Protocol"));
+        assert!(html.contains("X-Axonyx-Tab"));
     }
 
     #[test]
