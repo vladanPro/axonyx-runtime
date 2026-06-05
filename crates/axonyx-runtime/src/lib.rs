@@ -2090,7 +2090,8 @@ fn render_preview_document_chunks(document: &AxDocument, root: &AxNode) -> Vec<V
     } else {
         ""
     };
-    let state_bridge_script = if body.contains("data-ax-signal=") {
+    let state_bridge_script =
+        if body.contains("data-ax-signal=") || body.contains("data-ax-state-name=") {
         ax_state_bridge_script()
     } else {
         ""
@@ -2298,6 +2299,8 @@ fn ax_state_bridge_script() -> &'static str {
   const bindings = new Map();
   const types = new Map();
   const metadata = new Map();
+  const metadataByName = new Map();
+  const readBindings = new Map();
   const subscribers = new Map();
 
   const readValue = (node, target) => {
@@ -2386,12 +2389,35 @@ fn ax_state_bridge_script() -> &'static str {
     bindings.get(signal).push({ node, target, type });
   };
 
+  const registerRead = (node) => {
+    const name = node.getAttribute("data-ax-state-name");
+    if (!name) return;
+    const target = node.getAttribute("data-ax-state-target") || "text";
+    const signal = metadataByName.get(name) || node.getAttribute("data-ax-state-key");
+    if (!signal) return;
+    node.setAttribute("data-ax-state-key", signal);
+    if (!readBindings.has(signal)) readBindings.set(signal, []);
+    readBindings.get(signal).push({ node, target });
+    if (state.has(signal)) {
+      writeValue(node, target, state.get(signal));
+      node.setAttribute("data-ax-state-source", "state");
+    }
+  };
+
+  const registerReads = () => {
+    document.querySelectorAll("[data-ax-state-name]").forEach(registerRead);
+  };
+
   const writeSignal = (signal, value, source = "client", emit = true) => {
     const type = types.get(signal) || "String";
     const nextValue = castValue(value, type);
     state.set(signal, nextValue);
     (bindings.get(signal) || []).forEach(({ node, target }) => {
       writeValue(node, target, nextValue);
+    });
+    (readBindings.get(signal) || []).forEach(({ node, target }) => {
+      writeValue(node, target, nextValue);
+      node.setAttribute("data-ax-state-source", source);
     });
     notifySubscribers(signal, nextValue, source);
     if (emit) emitPatch(signal, nextValue, source);
@@ -2424,10 +2450,12 @@ fn ax_state_bridge_script() -> &'static str {
           file: file.file || "",
         };
         metadata.set(signal.key, meta);
+        if (meta.name && !metadataByName.has(meta.name)) metadataByName.set(meta.name, signal.key);
         if (meta.ty && !types.has(signal.key)) types.set(signal.key, meta.ty);
         count += 1;
       });
     });
+    registerReads();
     if (count > 0) {
       window.dispatchEvent(new CustomEvent("axonyx:state-manifest", {
         detail: { count, manifest, source },
@@ -2505,6 +2533,7 @@ fn ax_state_bridge_script() -> &'static str {
 
   const init = () => {
     document.querySelectorAll("[data-ax-signal]").forEach(register);
+    registerReads();
   };
 
   document.addEventListener("input", (event) => {
@@ -3260,6 +3289,26 @@ page Home
         assert!(state_html.contains("bindings: (bindings.get(signal) || []).length"));
         assert!(state_html.contains("subscribe"));
         assert!(state_html.contains("window.__axonyxStateBridge"));
+    }
+
+    #[test]
+    fn preview_injects_state_bridge_for_named_state_reads() {
+        let html = preview_ax_page(
+            r#"
+page Home
+
+<span data-ax-state-name="packageVersions">Loading...</span>
+"#,
+        )
+        .expect("named state read preview should render");
+
+        assert!(html.contains("data-ax-state-name=\"packageVersions\""));
+        assert!(html.contains("data-ax-runtime=\"state-bridge\""));
+        assert!(html.contains("metadataByName"));
+        assert!(html.contains("readBindings"));
+        assert!(html.contains("registerRead"));
+        assert!(html.contains("data-ax-state-key"));
+        assert!(html.contains("data-ax-state-source"));
     }
 
     #[test]
