@@ -2092,10 +2092,10 @@ fn render_preview_document_chunks(document: &AxDocument, root: &AxNode) -> Vec<V
     };
     let state_bridge_script =
         if body.contains("data-ax-signal=") || body.contains("data-ax-state-name=") {
-        ax_state_bridge_script()
-    } else {
-        ""
-    };
+            ax_state_bridge_script()
+        } else {
+            ""
+        };
     let action_script = if body.contains("/__axonyx/action?") {
         ax_action_script()
     } else {
