@@ -2275,6 +2275,7 @@ fn ax_state_bridge_script() -> &'static str {
   const state = new Map();
   const bindings = new Map();
   const types = new Map();
+  const metadata = new Map();
   const subscribers = new Map();
 
   const readValue = (node, target) => {
@@ -2365,6 +2366,45 @@ fn ax_state_bridge_script() -> &'static str {
     return writeSignal(patch.signal, patch.value, patch.source || "patch", false);
   };
 
+  const hydrateManifest = (manifest, source = "manifest") => {
+    if (!manifest || !Array.isArray(manifest.files)) return 0;
+    let count = 0;
+    manifest.files.forEach((file) => {
+      (file.signals || []).forEach((signal) => {
+        if (!signal || !signal.key) return;
+        const meta = {
+          key: signal.key,
+          name: signal.name || "",
+          scope: signal.scope || "",
+          owner: signal.owner || "",
+          ty: signal.ty || "String",
+          file: file.file || "",
+        };
+        metadata.set(signal.key, meta);
+        if (meta.ty && !types.has(signal.key)) types.set(signal.key, meta.ty);
+        count += 1;
+      });
+    });
+    if (count > 0) {
+      window.dispatchEvent(new CustomEvent("axonyx:state-manifest", {
+        detail: { count, manifest, source },
+      }));
+    }
+    return count;
+  };
+
+  const loadManifest = async (url = "/_ax/state/manifest.json") => {
+    if (!window.fetch) return false;
+    try {
+      const response = await fetch(url, { cache: "no-store" });
+      if (!response.ok) return false;
+      const manifest = await response.json();
+      return hydrateManifest(manifest, "manifest") > 0;
+    } catch (_) {
+      return false;
+    }
+  };
+
   const hydrateSnapshot = (snapshot, source = "snapshot") => {
     if (!snapshot || !Array.isArray(snapshot.signals)) return 0;
     let count = 0;
@@ -2427,8 +2467,12 @@ fn ax_state_bridge_script() -> &'static str {
     set: setSignal,
     subscribe,
     applyPatch,
+    hydrateManifest,
+    loadManifest,
     hydrateSnapshot,
     loadSnapshot,
+    meta: (signal) => metadata.get(signal),
+    manifest: () => Array.from(metadata.values()),
     snapshot: () => Object.fromEntries(state.entries()),
   };
   window.__axonyx.applyPatch = applyPatch;
@@ -2439,7 +2483,10 @@ fn ax_state_bridge_script() -> &'static str {
   } else {
     init();
   }
-  loadSnapshot();
+  (async () => {
+    await loadManifest();
+    await loadSnapshot();
+  })();
 })();
 </script>"##
 }
@@ -3130,10 +3177,16 @@ page Home
         assert!(state_html.contains("axonyx:state-change"));
         assert!(state_html.contains("window.__axonyx.state"));
         assert!(state_html.contains("applyPatch"));
+        assert!(state_html.contains("hydrateManifest"));
+        assert!(state_html.contains("loadManifest"));
+        assert!(state_html.contains("/_ax/state/manifest.json"));
+        assert!(state_html.contains("axonyx:state-manifest"));
         assert!(state_html.contains("hydrateSnapshot"));
         assert!(state_html.contains("loadSnapshot"));
         assert!(state_html.contains("/_ax/state/snapshot.json"));
         assert!(state_html.contains("axonyx:state-snapshot"));
+        assert!(state_html.contains("meta: (signal) => metadata.get(signal)"));
+        assert!(state_html.contains("manifest: () => Array.from(metadata.values())"));
         assert!(state_html.contains("subscribe"));
         assert!(state_html.contains("window.__axonyxStateBridge"));
     }
