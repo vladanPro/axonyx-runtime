@@ -2442,6 +2442,18 @@ fn ax_state_bridge_script() -> &'static str {
     return () => subscribers.get(signal)?.delete(listener);
   };
 
+  const describe = (signal) => {
+    if (!signal) return undefined;
+    const meta = metadata.get(signal);
+    return {
+      key: signal,
+      value: state.get(signal),
+      ty: types.get(signal) || meta?.ty || "String",
+      meta,
+      bindings: (bindings.get(signal) || []).length,
+    };
+  };
+
   const init = () => {
     document.querySelectorAll("[data-ax-signal]").forEach(register);
   };
@@ -2473,6 +2485,7 @@ fn ax_state_bridge_script() -> &'static str {
     loadSnapshot,
     meta: (signal) => metadata.get(signal),
     manifest: () => Array.from(metadata.values()),
+    describe,
     snapshot: () => Object.fromEntries(state.entries()),
   };
   window.__axonyx.applyPatch = applyPatch;
@@ -3187,6 +3200,8 @@ page Home
         assert!(state_html.contains("axonyx:state-snapshot"));
         assert!(state_html.contains("meta: (signal) => metadata.get(signal)"));
         assert!(state_html.contains("manifest: () => Array.from(metadata.values())"));
+        assert!(state_html.contains("describe"));
+        assert!(state_html.contains("bindings: (bindings.get(signal) || []).length"));
         assert!(state_html.contains("subscribe"));
         assert!(state_html.contains("window.__axonyxStateBridge"));
     }
