@@ -2251,10 +2251,15 @@ fn ax_action_script() -> &'static str {
     if (!(form instanceof HTMLFormElement) || !isAxonyxActionForm(form)) return;
     event.preventDefault();
 
-    const body = new FormData(form);
-    if (!body.has("__ax_patch")) body.append("__ax_patch", "1");
-    if (!body.has("__ax_protocol")) body.append("__ax_protocol", "ax-state/1");
-    if (!body.has("__ax_tab")) body.append("__ax_tab", getTabId());
+    const formData = new FormData(form);
+    if (!formData.has("__ax_patch")) formData.append("__ax_patch", "1");
+    if (!formData.has("__ax_protocol")) formData.append("__ax_protocol", "ax-state/1");
+    if (!formData.has("__ax_tab")) formData.append("__ax_tab", getTabId());
+    const hasFile = Array.from(formData.values()).some((value) => value instanceof File);
+    const body = hasFile ? formData : new URLSearchParams(formData);
+    const contentHeaders = hasFile ? {} : {
+      "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+    };
     form.setAttribute("data-ax-action-state", "pending");
 
     try {
@@ -2264,6 +2269,7 @@ fn ax_action_script() -> &'static str {
           Accept: "application/ax-patch+json",
           "X-Axonyx-State-Protocol": "ax-state/1",
           "X-Axonyx-Tab": getTabId(),
+          ...contentHeaders,
         },
         body,
         cache: "no-store",
@@ -2300,6 +2306,7 @@ fn ax_state_bridge_script() -> &'static str {
   const types = new Map();
   const metadata = new Map();
   const metadataByName = new Map();
+  const aliases = new Map();
   const readBindings = new Map();
   const subscribers = new Map();
 
@@ -2370,6 +2377,38 @@ fn ax_state_bridge_script() -> &'static str {
     window.dispatchEvent(new CustomEvent("axonyx:state-patch", { detail }));
   };
 
+  const canonicalSignal = (signal) => aliases.get(signal) || signal;
+
+  const bindAlias = (alias, signal) => {
+    if (!alias || !signal) return;
+    aliases.set(alias, signal);
+  };
+
+  const moveSignalBucket = (bucket, from, to) => {
+    if (!from || !to || from === to || !bucket.has(from)) return;
+    const current = bucket.get(from) || [];
+    if (!bucket.has(to)) bucket.set(to, []);
+    bucket.get(to).push(...current);
+    bucket.delete(from);
+  };
+
+  const rebindAliasedSignals = () => {
+    aliases.forEach((signal, alias) => {
+      if (alias === signal) return;
+      moveSignalBucket(bindings, alias, signal);
+      moveSignalBucket(readBindings, alias, signal);
+      moveSignalBucket(subscribers, alias, signal);
+      if (state.has(alias) && !state.has(signal)) state.set(signal, state.get(alias));
+      if (types.has(alias) && !types.has(signal)) types.set(signal, types.get(alias));
+      document.querySelectorAll(`[data-ax-signal="${alias}"]`).forEach((node) => {
+        node.setAttribute("data-ax-signal", signal);
+      });
+      document.querySelectorAll(`[data-ax-state-key="${alias}"]`).forEach((node) => {
+        node.setAttribute("data-ax-state-key", signal);
+      });
+    });
+  };
+
   const notifySubscribers = (signal, value, source) => {
     const detail = { signal, value, source };
     window.dispatchEvent(new CustomEvent("axonyx:state-change", { detail }));
@@ -2377,8 +2416,10 @@ fn ax_state_bridge_script() -> &'static str {
   };
 
   const register = (node) => {
-    const signal = node.getAttribute("data-ax-signal");
+    const rawSignal = node.getAttribute("data-ax-signal");
+    const signal = canonicalSignal(rawSignal);
     if (!signal) return;
+    if (rawSignal !== signal) node.setAttribute("data-ax-signal", signal);
     const target = node.getAttribute("data-ax-bind") || "value";
     const type = node.getAttribute("data-ax-state-type") || "String";
     const initial = castValue(readValue(node, target), type);
@@ -2393,7 +2434,7 @@ fn ax_state_bridge_script() -> &'static str {
     const name = node.getAttribute("data-ax-state-name");
     if (!name) return;
     const target = node.getAttribute("data-ax-state-target") || "text";
-    const signal = metadataByName.get(name) || node.getAttribute("data-ax-state-key");
+    const signal = canonicalSignal(metadataByName.get(name) || node.getAttribute("data-ax-state-key"));
     if (!signal) return;
     node.setAttribute("data-ax-state-key", signal);
     if (!readBindings.has(signal)) readBindings.set(signal, []);
@@ -2409,6 +2450,7 @@ fn ax_state_bridge_script() -> &'static str {
   };
 
   const writeSignal = (signal, value, source = "client", emit = true) => {
+    signal = canonicalSignal(signal);
     const type = types.get(signal) || "String";
     const nextValue = castValue(value, type);
     state.set(signal, nextValue);
@@ -2452,9 +2494,15 @@ fn ax_state_bridge_script() -> &'static str {
         metadata.set(signal.key, meta);
         if (meta.name && !metadataByName.has(meta.name)) metadataByName.set(meta.name, signal.key);
         if (meta.ty && !types.has(signal.key)) types.set(signal.key, meta.ty);
+        bindAlias(signal.key, signal.key);
+        bindAlias(meta.name, signal.key);
+        const keyParts = String(signal.key).split(":");
+        const index = keyParts[keyParts.length - 1] || "1";
+        bindAlias(`root:${meta.name}:${index}`, signal.key);
         count += 1;
       });
     });
+    rebindAliasedSignals();
     registerReads();
     if (count > 0) {
       window.dispatchEvent(new CustomEvent("axonyx:state-manifest", {
@@ -2513,6 +2561,7 @@ fn ax_state_bridge_script() -> &'static str {
   };
 
   const subscribe = (signal, listener) => {
+    signal = canonicalSignal(signal);
     if (typeof listener !== "function") return () => {};
     if (!subscribers.has(signal)) subscribers.set(signal, new Set());
     subscribers.get(signal).add(listener);
@@ -2521,6 +2570,7 @@ fn ax_state_bridge_script() -> &'static str {
 
   const describe = (signal) => {
     if (!signal) return undefined;
+    signal = canonicalSignal(signal);
     const meta = metadata.get(signal);
     return {
       key: signal,
@@ -2555,7 +2605,7 @@ fn ax_state_bridge_script() -> &'static str {
     version: 1,
     protocol: "ax-state/1",
     tabId,
-    get: (signal) => state.get(signal),
+    get: (signal) => state.get(canonicalSignal(signal)),
     set: setSignal,
     subscribe,
     applyPatch,
@@ -2563,7 +2613,7 @@ fn ax_state_bridge_script() -> &'static str {
     loadManifest,
     hydrateSnapshot,
     loadSnapshot,
-    meta: (signal) => metadata.get(signal),
+    meta: (signal) => metadata.get(canonicalSignal(signal)),
     manifest: () => Array.from(metadata.values()),
     describe,
     snapshot: () => Object.fromEntries(state.entries()),
@@ -3283,7 +3333,10 @@ page Home
         assert!(state_html.contains("loadSnapshot"));
         assert!(state_html.contains("/_ax/state/snapshot.json"));
         assert!(state_html.contains("axonyx:state-snapshot"));
-        assert!(state_html.contains("meta: (signal) => metadata.get(signal)"));
+        assert!(state_html.contains("canonicalSignal"));
+        assert!(state_html.contains("rebindAliasedSignals"));
+        assert!(state_html.contains("bindAlias(`root:${meta.name}:${index}`, signal.key)"));
+        assert!(state_html.contains("meta: (signal) => metadata.get(canonicalSignal(signal))"));
         assert!(state_html.contains("manifest: () => Array.from(metadata.values())"));
         assert!(state_html.contains("describe"));
         assert!(state_html.contains("bindings: (bindings.get(signal) || []).length"));
@@ -3671,6 +3724,8 @@ page Posts
         assert!(html.contains("__ax_tab"));
         assert!(html.contains("X-Axonyx-State-Protocol"));
         assert!(html.contains("X-Axonyx-Tab"));
+        assert!(html.contains("new URLSearchParams(formData)"));
+        assert!(html.contains("application/x-www-form-urlencoded;charset=UTF-8"));
     }
 
     #[test]
