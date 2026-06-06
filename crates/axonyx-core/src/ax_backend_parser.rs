@@ -374,11 +374,11 @@ impl Parser {
             }
 
             self.pos += 1;
-            let value = parse_expr(value, line.line)?;
+            let value = parse_requirement_expr(value, line.line)?;
             return match fallback {
                 Some(fallback) => Ok(AxBackendStmt::require_with_fallback(
                     value,
-                    parse_expr(fallback, line.line)?,
+                    parse_requirement_fallback_expr(fallback, line.line)?,
                 )),
                 None => Ok(AxBackendStmt::require(value)),
             };
@@ -751,6 +751,20 @@ fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxBackendParseError> {
         return Ok(AxExpr::number(value));
     }
 
+    if input.starts_with('[') && input.ends_with(']') {
+        let items = &input[1..input.len() - 1];
+        let args = if items.trim().is_empty() {
+            Vec::new()
+        } else {
+            split_top_level(items, ',')
+                .into_iter()
+                .map(|part| parse_expr(part.trim(), line))
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        return Ok(AxExpr::call(["list"], args));
+    }
+
     if input.ends_with(')') {
         if let Some(open_index) = find_call_open(input) {
             let path = input[..open_index].trim();
@@ -808,6 +822,39 @@ fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxBackendParseError> {
     Ok(AxExpr::ident(input))
 }
 
+fn parse_requirement_expr(input: &str, line: usize) -> Result<AxExpr, AxBackendParseError> {
+    if let Some((value, options)) = split_top_level_once(input, " in ") {
+        let value = value.trim();
+        let options = options.trim();
+        if value.is_empty() || options.is_empty() {
+            return Err(AxBackendParseError::InvalidRequirement { line });
+        }
+
+        return Ok(AxExpr::call(
+            ["contains"],
+            [parse_expr(options, line)?, parse_expr(value, line)?],
+        ));
+    }
+
+    parse_expr(input, line)
+}
+
+fn parse_requirement_fallback_expr(
+    input: &str,
+    line: usize,
+) -> Result<AxExpr, AxBackendParseError> {
+    let input = input.trim();
+    if let Some(message) = input.strip_prefix("error ") {
+        let message = message.trim();
+        if message.is_empty() {
+            return Err(AxBackendParseError::InvalidRequirement { line });
+        }
+        return Ok(AxExpr::call(["error"], [parse_expr(message, line)?]));
+    }
+
+    parse_expr(input, line)
+}
+
 fn find_call_open(input: &str) -> Option<usize> {
     let mut in_string: Option<char> = None;
 
@@ -844,8 +891,8 @@ fn split_top_level(input: &str, delimiter: char) -> Vec<&str> {
             }
             None => match ch {
                 '"' | '\'' => in_string = Some(ch),
-                '(' => depth += 1,
-                ')' => depth = depth.saturating_sub(1),
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth = depth.saturating_sub(1),
                 _ if ch == delimiter && depth == 0 => {
                     result.push(input[start..index].trim());
                     start = index + ch.len_utf8();
@@ -857,6 +904,32 @@ fn split_top_level(input: &str, delimiter: char) -> Vec<&str> {
 
     result.push(input[start..].trim());
     result
+}
+
+fn split_top_level_once<'a>(input: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> {
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if ch == quote {
+                    in_string = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => in_string = Some(ch),
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth = depth.saturating_sub(1),
+                _ if depth == 0 && input[index..].starts_with(delimiter) => {
+                    return Some((&input[..index], &input[index + delimiter.len()..]));
+                }
+                _ => {}
+            },
+        }
+    }
+
+    None
 }
 
 fn trim_quotes(input: &str) -> String {
@@ -1151,6 +1224,85 @@ action SetTheme
 
         assert_eq!(patch.signal, AxExpr::ident("theme"));
         assert_eq!(patch.value, AxExpr::ident("input").member("theme"));
+    }
+
+    #[test]
+    fn parses_require_in_list_with_error_fallback() {
+        let input = r#"
+action SetTheme
+  input:
+    theme: string
+
+  require input.theme in ["silver", "bronze", "gold"] else error "Theme is not supported."
+  return ok
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+        let AxBackendStmt::Require(requirement) = &action.body[0] else {
+            panic!("expected require statement");
+        };
+
+        assert_eq!(
+            requirement.value,
+            AxExpr::call(
+                ["contains"],
+                [
+                    AxExpr::call(
+                        ["list"],
+                        [
+                            AxExpr::string("silver"),
+                            AxExpr::string("bronze"),
+                            AxExpr::string("gold"),
+                        ],
+                    ),
+                    AxExpr::ident("input").member("theme"),
+                ],
+            )
+        );
+        assert_eq!(
+            requirement.fallback,
+            Some(AxReturn::Expr(AxExpr::call(
+                ["error"],
+                [AxExpr::string("Theme is not supported.")]
+            )))
+        );
+    }
+
+    #[test]
+    fn parses_require_in_variable_list() {
+        let input = r#"
+action SetTheme
+  input:
+    theme: string
+
+  data themes = ["silver", "bronze", "gold"]
+  require input.theme in themes else error "Theme is not supported."
+  return ok
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+        let AxBackendStmt::Require(requirement) = &action.body[1] else {
+            panic!("expected require statement");
+        };
+
+        assert_eq!(
+            requirement.value,
+            AxExpr::call(
+                ["contains"],
+                [
+                    AxExpr::ident("themes"),
+                    AxExpr::ident("input").member("theme")
+                ],
+            )
+        );
     }
 
     #[test]

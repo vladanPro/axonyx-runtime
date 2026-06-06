@@ -337,6 +337,24 @@ pub struct AxPreviewActionResult {
     pub redirect_to: Option<String>,
     pub value: AxValue,
     pub patches: Vec<AxPreviewStatePatch>,
+    pub error: Option<AxPreviewActionError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxPreviewActionError {
+    pub message: String,
+    pub status: u16,
+    pub value: AxValue,
+}
+
+impl AxPreviewActionError {
+    pub fn validation(message: impl Into<String>, value: AxValue) -> Self {
+        Self {
+            message: message.into(),
+            status: 422,
+            value,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -892,6 +910,21 @@ fn execute_preview_action(
                 let value = eval_preview_expr(value, &scope, env)?;
                 patches.push(AxPreviewStatePatch::set(signal, value));
             }
+            AxStepPlan::Require {
+                value: requirement,
+                fallback,
+            } => {
+                if preview_require_passes(&eval_preview_require_expr(requirement, &scope, env)?) {
+                    continue;
+                }
+                let error = eval_preview_action_error_fallback(fallback.as_ref(), &scope, env)?;
+                return Ok(AxPreviewActionResult {
+                    redirect_to,
+                    value,
+                    patches,
+                    error: Some(error),
+                });
+            }
             AxStepPlan::Return(result) => {
                 value = eval_preview_return(result, &scope, env)?;
             }
@@ -899,7 +932,6 @@ fn execute_preview_action(
             | AxStepPlan::Hook { .. }
             | AxStepPlan::Cookie { .. }
             | AxStepPlan::ClearCookie { .. }
-            | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {}
         }
     }
@@ -908,6 +940,7 @@ fn execute_preview_action(
         redirect_to,
         value,
         patches,
+        error: None,
     })
 }
 
@@ -1017,10 +1050,7 @@ fn execute_preview_route(
                 );
             }
             AxStepPlan::Require { value, fallback } => {
-                if eval_preview_require_expr(value, &scope, env)?
-                    .as_string()
-                    .is_empty()
-                {
+                if !preview_require_passes(&eval_preview_require_expr(value, &scope, env)?) {
                     let response = render_preview_require_fallback(fallback.as_ref(), &scope, env)?;
                     apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
                     return Ok(Some(apply_preview_response_metadata(
@@ -1115,10 +1145,7 @@ fn apply_preview_route_hook(
             Ok(None)
         }
         "Auth.session" | "Auth.bearer" | "Auth.signedSession" => {
-            if eval_preview_require_expr(hook, scope, env)?
-                .as_string()
-                .is_empty()
-            {
+            if !preview_require_passes(&eval_preview_require_expr(hook, scope, env)?) {
                 return render_preview_require_fallback(None, scope, env).map(Some);
             }
             Ok(None)
@@ -1151,6 +1178,45 @@ fn eval_preview_require_expr(
         }
         Err(error) => Err(error),
     }
+}
+
+fn preview_require_passes(value: &AxValue) -> bool {
+    match value {
+        AxValue::Null => false,
+        AxValue::Bool(value) => *value,
+        AxValue::String(value) => !value.is_empty(),
+        AxValue::Number(_) => true,
+        AxValue::Record(fields) => !fields.is_empty(),
+        AxValue::List(items) => !items.is_empty(),
+    }
+}
+
+fn eval_preview_action_error_fallback(
+    fallback: Option<&AxReturnPlan>,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+) -> Result<AxPreviewActionError, PreviewError> {
+    let value = match fallback {
+        Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
+            eval_preview_expr(expr, scope, env)?
+        }
+        Some(AxReturnPlan::Redirect { target, .. }) => {
+            AxValue::String(eval_preview_expr(target, scope, env)?.as_string())
+        }
+        Some(AxReturnPlan::Ok) | Some(AxReturnPlan::NoContent) | None => {
+            AxValue::String("Action requirement failed.".to_string())
+        }
+    };
+    let message = match &value {
+        AxValue::Record(fields) => fields
+            .get("error")
+            .or_else(|| fields.get("message"))
+            .map(AxValue::as_string)
+            .unwrap_or_else(|| "Action requirement failed.".to_string()),
+        other => other.as_string(),
+    };
+
+    Ok(AxPreviewActionError::validation(message, value))
 }
 
 fn eval_preview_value(
@@ -1327,6 +1393,38 @@ fn eval_preview_expr(
 
     if let Some(key) = parse_preview_env_call(code, "secret") {
         return Ok(AxValue::String(env.secret(&key)?));
+    }
+
+    if let Some(args) = parse_preview_call_args(code, "list") {
+        let items = args
+            .iter()
+            .map(|arg| eval_preview_expr(&AxRustExpr::new(arg), scope, env))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(AxValue::List(items));
+    }
+
+    if let Some(args) = parse_preview_call_args(code, "contains") {
+        if args.len() != 2 {
+            return Err(PreviewError::Runtime {
+                message: "contains(list, value) expects exactly two arguments".to_string(),
+            });
+        }
+        let options = eval_preview_expr(&AxRustExpr::new(&args[0]), scope, env)?;
+        let needle = eval_preview_expr(&AxRustExpr::new(&args[1]), scope, env)?;
+        let AxValue::List(items) = options else {
+            return Ok(AxValue::Bool(false));
+        };
+        return Ok(AxValue::Bool(items.iter().any(|item| item == &needle)));
+    }
+
+    if let Some(args) = parse_preview_call_args(code, "error") {
+        if args.len() != 1 {
+            return Err(PreviewError::Runtime {
+                message: "error(message) expects exactly one argument".to_string(),
+            });
+        }
+        let message = eval_preview_expr(&AxRustExpr::new(&args[0]), scope, env)?;
+        return Ok(AxValue::record([("error", message)]));
     }
 
     if let Some(value) = lookup_preview_scope(scope, code) {
@@ -2303,6 +2401,14 @@ fn ax_action_script() -> &'static str {
         setActionState(form, "complete");
         return;
       }
+      if (contentType.includes("application/ax-error+json")) {
+        const payload = await response.json();
+        setActionState(form, "error");
+        window.dispatchEvent(new CustomEvent("axonyx:action-error", {
+          detail: { form, payload, error: payload?.error },
+        }));
+        return;
+      }
       if (response.redirected) {
         window.location.assign(response.url);
         return;
@@ -2323,6 +2429,51 @@ fn ax_action_script() -> &'static str {
   }
 })();
 </script>"##
+}
+
+fn parse_preview_call_args(code: &str, name: &str) -> Option<Vec<String>> {
+    let prefix = format!("{name}(");
+    let inner = code.strip_prefix(&prefix)?.strip_suffix(')')?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+
+    Some(
+        split_preview_args(inner)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn split_preview_args(input: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if ch == quote {
+                    in_string = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => in_string = Some(ch),
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    result.push(input[start..index].trim());
+                    start = index + 1;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    result.push(input[start..].trim());
+    result
 }
 
 fn ax_state_bridge_script() -> &'static str {
@@ -3759,6 +3910,8 @@ page Posts
         assert!(html.contains("setActionState"));
         assert!(html.contains("status.hidden = !active"));
         assert!(html.contains("aria-live"));
+        assert!(html.contains("application/ax-error+json"));
+        assert!(html.contains("setActionState(form, \"error\")"));
     }
 
     #[test]
@@ -3895,6 +4048,56 @@ action SetTheme
         assert_eq!(result.patches[0].signal, "root:theme:1");
         assert_eq!(result.patches[0].value, AxValue::String("gold".to_string()));
         assert_eq!(result.patches[0].source.as_deref(), Some("action"));
+    }
+
+    #[test]
+    fn preview_action_require_in_list_can_return_validation_error() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action SetTheme
+  input:
+    theme: string
+
+  require input.theme in ["silver", "bronze", "gold"] else error "Theme is not supported."
+  patch theme = input.theme
+  return ok
+"#],
+            "SetTheme",
+            &BTreeMap::from([("theme".to_string(), "blue".to_string())]),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        let error = result.error.expect("invalid theme should return error");
+        assert_eq!(error.status, 422);
+        assert_eq!(error.message, "Theme is not supported.");
+        assert!(result.patches.is_empty());
+    }
+
+    #[test]
+    fn preview_action_require_in_variable_list_allows_valid_value() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action SetTheme
+  input:
+    theme: string
+
+  data themes = ["silver", "bronze", "gold"]
+  require input.theme in themes else error "Theme is not supported."
+  patch theme = input.theme
+  return ok
+"#],
+            "SetTheme",
+            &BTreeMap::from([("theme".to_string(), "gold".to_string())]),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert!(result.error.is_none());
+        assert_eq!(result.patches.len(), 1);
+        assert_eq!(result.patches[0].value, AxValue::String("gold".to_string()));
     }
 
     #[test]
