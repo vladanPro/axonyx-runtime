@@ -13,7 +13,7 @@ repository = "https://github.com/vladanPro/axonyx-runtime"
 homepage = "https://github.com/vladanPro/axonyx-runtime"
 documentation = "https://github.com/vladanPro/axonyx-runtime"
 rust-version = "1.82"
-version = "0.1.21"
+version = "0.1.22"
 
 [workspace.dependencies]
 thiserror = "2.0.12"

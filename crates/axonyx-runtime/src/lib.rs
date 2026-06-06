@@ -2217,6 +2217,29 @@ fn ax_action_script() -> &'static str {
     }
   };
 
+  const actionStatuses = (form) => Array.from(form.querySelectorAll(".ax-action-status[data-state]"));
+
+  const syncActionStatus = (form) => {
+    const current = form.getAttribute("data-ax-action-state") || "";
+    actionStatuses(form).forEach((status) => {
+      const active = current && status.getAttribute("data-state") === current;
+      status.hidden = !active;
+      status.setAttribute("aria-hidden", active ? "false" : "true");
+      if (!status.hasAttribute("aria-live")) status.setAttribute("aria-live", "polite");
+    });
+  };
+
+  const setActionState = (form, state) => {
+    form.setAttribute("data-ax-action-state", state);
+    syncActionStatus(form);
+  };
+
+  const initActionForms = () => {
+    document.querySelectorAll("form").forEach((form) => {
+      if (isAxonyxActionForm(form)) syncActionStatus(form);
+    });
+  };
+
   const applyPatchResponse = (payload, form) => {
     const patches = Array.isArray(payload?.patches) ? payload.patches : [];
     const applyPatch = window.__axonyx?.state?.applyPatch;
@@ -2260,7 +2283,7 @@ fn ax_action_script() -> &'static str {
     const contentHeaders = hasFile ? {} : {
       "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
     };
-    form.setAttribute("data-ax-action-state", "pending");
+    setActionState(form, "pending");
 
     try {
       const response = await fetch(form.action, {
@@ -2277,7 +2300,7 @@ fn ax_action_script() -> &'static str {
       const contentType = response.headers.get("content-type") || "";
       if (contentType.includes("application/ax-patch+json")) {
         applyPatchResponse(await response.json(), form);
-        form.setAttribute("data-ax-action-state", "complete");
+        setActionState(form, "complete");
         return;
       }
       if (response.redirected) {
@@ -2286,12 +2309,18 @@ fn ax_action_script() -> &'static str {
       }
       window.location.reload();
     } catch (error) {
-      form.setAttribute("data-ax-action-state", "error");
+      setActionState(form, "error");
       window.dispatchEvent(new CustomEvent("axonyx:action-error", {
         detail: { form, error },
       }));
     }
   });
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initActionForms, { once: true });
+  } else {
+    initActionForms();
+  }
 })();
 </script>"##
 }
@@ -3726,6 +3755,10 @@ page Posts
         assert!(html.contains("X-Axonyx-Tab"));
         assert!(html.contains("new URLSearchParams(formData)"));
         assert!(html.contains("application/x-www-form-urlencoded;charset=UTF-8"));
+        assert!(html.contains("syncActionStatus"));
+        assert!(html.contains("setActionState"));
+        assert!(html.contains("status.hidden = !active"));
+        assert!(html.contains("aria-live"));
     }
 
     #[test]
