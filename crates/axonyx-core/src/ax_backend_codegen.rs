@@ -75,6 +75,7 @@ pub fn compile_backend_sources_to_module(
     sources: &[(&str, &str)],
 ) -> Result<String, AxBackendBundleError> {
     let mut globals = Vec::new();
+    let mut envs = Vec::new();
     let mut handlers = Vec::new();
 
     for (name, input) in sources {
@@ -87,16 +88,17 @@ pub fn compile_backend_sources_to_module(
                 name: (*name).to_string(),
                 source: AxBackendCompileError::Lower(source),
             })?;
+        envs.extend(plan.envs);
         globals.extend(plan.globals);
         handlers.extend(plan.handlers);
     }
 
-    generate_backend_module(&AxBackendPlan::with_globals(globals, handlers)).map_err(|source| {
-        AxBackendBundleError::Source {
+    generate_backend_module(&AxBackendPlan::with_globals(envs, globals, handlers)).map_err(
+        |source| AxBackendBundleError::Source {
             name: "bundle".to_string(),
             source: AxBackendCompileError::Codegen(source),
-        }
-    })
+        },
+    )
 }
 
 fn render_input_struct(handler: &AxHandlerPlan, input: &[AxFieldPlan]) -> String {
@@ -751,9 +753,13 @@ loader PostDetail
     fn compiles_runtime_env_access_into_runtime_env_calls() {
         let module = compile_backend_ax_to_module(
             r#"
+backend
+  env PUBLIC_SITE_URL: Public<String>
+
 loader PostsList
   data db_url = Runtime.Env.secret.db_url
   data app_name = Runtime.Env.public.app_name
+  data site_url = env.PUBLIC_SITE_URL
   return app_name
 "#,
         )
@@ -761,6 +767,9 @@ loader PostsList
 
         assert!(module.contains(r#"let db_url = json!(&runtime.env().secret("db_url")?);"#));
         assert!(module.contains(r#"let app_name = json!(&runtime.env().public("app_name")?);"#));
+        assert!(
+            module.contains(r#"let site_url = json!(&runtime.env().value("PUBLIC_SITE_URL")?);"#)
+        );
     }
 
     #[test]

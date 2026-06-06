@@ -147,6 +147,7 @@ impl AxJob {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxBackendStmt {
     Data(AxBackendData),
+    Env(AxBackendEnv),
     Insert(AxMutation),
     Update(AxMutation),
     Delete(AxMutation),
@@ -164,6 +165,14 @@ pub enum AxBackendStmt {
 impl AxBackendStmt {
     pub fn data(name: impl Into<String>, value: impl Into<AxBackendValue>) -> Self {
         Self::Data(AxBackendData::new(name, value))
+    }
+
+    pub fn env(
+        name: impl Into<String>,
+        visibility: AxBackendEnvVisibility,
+        ty: impl Into<String>,
+    ) -> Self {
+        Self::Env(AxBackendEnv::new(name, visibility, ty))
     }
 
     pub fn insert(
@@ -338,6 +347,33 @@ pub struct AxField {
     pub default: Option<AxExpr>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxBackendEnv {
+    pub name: String,
+    pub visibility: AxBackendEnvVisibility,
+    pub ty: String,
+}
+
+impl AxBackendEnv {
+    pub fn new(
+        name: impl Into<String>,
+        visibility: AxBackendEnvVisibility,
+        ty: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            visibility,
+            ty: ty.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxBackendEnvVisibility {
+    Public,
+    Secret,
+}
+
 impl AxField {
     pub fn new(name: impl Into<String>, ty: impl Into<String>) -> Self {
         Self {
@@ -492,6 +528,8 @@ pub mod prelude {
     pub use super::AxBackendBlock;
     pub use super::AxBackendData;
     pub use super::AxBackendDocument;
+    pub use super::AxBackendEnv;
+    pub use super::AxBackendEnvVisibility;
     pub use super::AxBackendRoot;
     pub use super::AxBackendStmt;
     pub use super::AxBackendValue;

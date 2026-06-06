@@ -277,7 +277,10 @@ impl AxEnv {
 
             if let Some(secret_key) = key.strip_prefix("AX_SECRET_") {
                 env.secret.insert(normalize_env_key(secret_key), value);
+                continue;
             }
+
+            env.secret.insert(normalize_env_key(&key), value);
         }
 
         env
@@ -303,8 +306,18 @@ impl AxEnv {
     pub fn secret(&self, key: &str) -> AxRuntimeResult<String> {
         self.secret
             .get(key)
+            .or_else(|| self.secret.get(&normalize_env_key(key)))
             .cloned()
             .ok_or_else(|| AxRuntimeError::message(format!("missing secret env key `{key}`")))
+    }
+
+    pub fn value(&self, key: &str) -> AxRuntimeResult<String> {
+        let normalized = normalize_env_key(key);
+        self.public
+            .get(&normalized)
+            .or_else(|| self.secret.get(&normalized))
+            .cloned()
+            .ok_or_else(|| AxRuntimeError::message(format!("missing env key `{key}`")))
     }
 
     pub fn database_driver(&self) -> AxRuntimeResult<AxDatabaseDriver> {
@@ -1302,6 +1315,23 @@ mod tests {
                 .env()
                 .secret("db_url")
                 .expect("secret key should exist"),
+            "postgres://local/axonyx".to_string()
+        );
+        assert_eq!(
+            runtime
+                .env()
+                .value("AXONYX_CUSTOM_VALUE")
+                .unwrap_or_else(|_| "missing".to_string()),
+            "missing".to_string()
+        );
+    }
+
+    #[test]
+    fn env_value_can_read_plain_backend_keys() {
+        let env = AxEnv::new().with_secret("database_url", "postgres://local/axonyx");
+
+        assert_eq!(
+            env.value("DATABASE_URL").expect("env key should resolve"),
             "postgres://local/axonyx".to_string()
         );
     }

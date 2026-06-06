@@ -1423,6 +1423,10 @@ fn eval_preview_expr(
         return Ok(AxValue::String(env.secret(&key)?));
     }
 
+    if let Some(key) = parse_preview_env_call(code, "value") {
+        return Ok(AxValue::String(env.value(&key)?));
+    }
+
     if let Some(args) = parse_preview_call_args(code, "list") {
         let items = args
             .iter()

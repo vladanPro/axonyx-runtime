@@ -18,6 +18,8 @@ pub enum AxBackendParseError {
     InvalidBlock { line: usize },
     #[error("invalid data binding at line {line}")]
     InvalidDataBinding { line: usize },
+    #[error("invalid env declaration at line {line}")]
+    InvalidEnvDeclaration { line: usize },
     #[error("invalid input section at line {line}")]
     InvalidInputSection { line: usize },
     #[error("invalid field declaration at line {line}")]
@@ -271,11 +273,15 @@ impl Parser {
                 return Err(AxBackendParseError::UnexpectedIndentation { line: line.line });
             }
 
-            if !line.text.starts_with("data ") {
+            if !(line.text.starts_with("data ") || line.text.starts_with("env ")) {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
             }
 
-            body.push(self.parse_data()?);
+            if line.text.starts_with("env ") {
+                body.push(self.parse_env()?);
+            } else {
+                body.push(self.parse_data()?);
+            }
         }
 
         Ok(body)
@@ -478,6 +484,25 @@ impl Parser {
         }
 
         Ok(AxBackendStmt::data(name, expr))
+    }
+
+    fn parse_env(&mut self) -> Result<AxBackendStmt, AxBackendParseError> {
+        let line = self.current().expect("env line exists").clone();
+        let body = line.text["env ".len()..].trim();
+        let Some((name, ty)) = body.split_once(':') else {
+            return Err(AxBackendParseError::InvalidEnvDeclaration { line: line.line });
+        };
+
+        let name = name.trim();
+        let ty = ty.trim();
+        if name.is_empty() || ty.is_empty() {
+            return Err(AxBackendParseError::InvalidEnvDeclaration { line: line.line });
+        }
+
+        let (visibility, inner_ty) = parse_env_type(ty, line.line)?;
+        self.pos += 1;
+
+        Ok(AxBackendStmt::env(name, visibility, inner_ty))
     }
 
     fn parse_mutation(
@@ -889,6 +914,31 @@ fn parse_requirement_fallback_expr(
     }
 
     parse_expr(input, line)
+}
+
+fn parse_env_type(
+    input: &str,
+    line: usize,
+) -> Result<(AxBackendEnvVisibility, String), AxBackendParseError> {
+    let input = input.trim();
+    let Some((visibility, inner)) = input.split_once('<') else {
+        return Err(AxBackendParseError::InvalidEnvDeclaration { line });
+    };
+    let Some(inner) = inner.strip_suffix('>') else {
+        return Err(AxBackendParseError::InvalidEnvDeclaration { line });
+    };
+
+    let visibility = match visibility.trim() {
+        "Public" => AxBackendEnvVisibility::Public,
+        "Secret" => AxBackendEnvVisibility::Secret,
+        _ => return Err(AxBackendParseError::InvalidEnvDeclaration { line }),
+    };
+    let inner = inner.trim();
+    if inner.is_empty() {
+        return Err(AxBackendParseError::InvalidEnvDeclaration { line });
+    }
+
+    Ok((visibility, inner.to_string()))
 }
 
 fn find_call_open(input: &str) -> Option<usize> {
@@ -1347,6 +1397,8 @@ action SetTheme
 backend
   data themes: List<String> = ["silver", "bronze", "gold"]
   data defaultTheme: String = "silver"
+  env DATABASE_URL: Secret<String>
+  env PUBLIC_SITE_URL: Public<String>
 "#;
 
         let document = parse_backend_ax(input).expect("document should parse");
@@ -1355,7 +1407,7 @@ backend
             panic!("expected backend root block");
         };
 
-        assert_eq!(root.body.len(), 2);
+        assert_eq!(root.body.len(), 4);
         let AxBackendStmt::Data(themes) = &root.body[0] else {
             panic!("expected data statement");
         };
@@ -1364,6 +1416,17 @@ backend
             panic!("expected data statement");
         };
         assert_eq!(default_theme.name, "defaultTheme");
+        let AxBackendStmt::Env(database_url) = &root.body[2] else {
+            panic!("expected env statement");
+        };
+        assert_eq!(database_url.name, "DATABASE_URL");
+        assert_eq!(database_url.visibility, AxBackendEnvVisibility::Secret);
+        assert_eq!(database_url.ty, "String");
+        let AxBackendStmt::Env(site_url) = &root.body[3] else {
+            panic!("expected env statement");
+        };
+        assert_eq!(site_url.name, "PUBLIC_SITE_URL");
+        assert_eq!(site_url.visibility, AxBackendEnvVisibility::Public);
     }
 
     #[test]

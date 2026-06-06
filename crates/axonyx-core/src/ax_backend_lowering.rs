@@ -6,6 +6,7 @@ use crate::ax_query_ast::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxBackendPlan {
+    pub envs: Vec<AxEnvPlan>,
     pub globals: Vec<AxStepPlan>,
     pub handlers: Vec<AxHandlerPlan>,
 }
@@ -13,20 +14,36 @@ pub struct AxBackendPlan {
 impl AxBackendPlan {
     pub fn new(handlers: impl IntoIterator<Item = AxHandlerPlan>) -> Self {
         Self {
+            envs: Vec::new(),
             globals: Vec::new(),
             handlers: handlers.into_iter().collect(),
         }
     }
 
     pub fn with_globals(
+        envs: impl IntoIterator<Item = AxEnvPlan>,
         globals: impl IntoIterator<Item = AxStepPlan>,
         handlers: impl IntoIterator<Item = AxHandlerPlan>,
     ) -> Self {
         Self {
+            envs: envs.into_iter().collect(),
             globals: globals.into_iter().collect(),
             handlers: handlers.into_iter().collect(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxEnvPlan {
+    pub name: String,
+    pub visibility: AxEnvVisibilityPlan,
+    pub ty: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxEnvVisibilityPlan {
+    Public,
+    Secret,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,19 +229,25 @@ pub enum AxBackendLowerError {
 pub fn lower_backend_document(
     document: &AxBackendDocument,
 ) -> Result<AxBackendPlan, AxBackendLowerError> {
+    let mut envs = Vec::new();
     let mut globals = Vec::new();
     let mut handlers = Vec::new();
 
     for block in &document.blocks {
         match block {
             AxBackendBlock::Backend(root) => {
-                globals.extend(root.body.iter().map(lower_step));
+                for stmt in &root.body {
+                    match stmt {
+                        AxBackendStmt::Env(env) => envs.push(lower_env(env)),
+                        _ => globals.push(lower_step(stmt)),
+                    }
+                }
             }
             _ => handlers.push(lower_backend_block(block)?),
         }
     }
 
-    Ok(AxBackendPlan::with_globals(globals, handlers))
+    Ok(AxBackendPlan::with_globals(envs, globals, handlers))
 }
 
 fn lower_backend_block(block: &AxBackendBlock) -> Result<AxHandlerPlan, AxBackendLowerError> {
@@ -339,6 +362,17 @@ fn lower_input_field(field: &AxField) -> Result<AxFieldPlan, AxBackendLowerError
     })
 }
 
+fn lower_env(env: &AxBackendEnv) -> AxEnvPlan {
+    AxEnvPlan {
+        name: env.name.clone(),
+        visibility: match env.visibility {
+            AxBackendEnvVisibility::Public => AxEnvVisibilityPlan::Public,
+            AxBackendEnvVisibility::Secret => AxEnvVisibilityPlan::Secret,
+        },
+        ty: env.ty.clone(),
+    }
+}
+
 fn lower_steps(steps: &[AxBackendStmt]) -> Vec<AxStepPlan> {
     steps.iter().map(lower_step).collect()
 }
@@ -349,6 +383,7 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
             binding: data.name.clone(),
             value: lower_backend_value(&data.value),
         },
+        AxBackendStmt::Env(_) => unreachable!("env declarations are lowered at document level"),
         AxBackendStmt::Insert(mutation) => AxStepPlan::Insert {
             collection: mutation.collection.clone(),
             fields: lower_assignments(&mutation.fields),
@@ -578,6 +613,7 @@ fn try_render_runtime_env(expr: &AxExpr) -> Option<String> {
         .collect::<Vec<_>>();
 
     match normalized.as_slice() {
+        ["env", key] => Some(format!("runtime.env().value({key:?})?")),
         ["Runtime", "Env", "public", key] => Some(format!("runtime.env().public({key:?})?")),
         ["Runtime", "Env", "secret", key] => Some(format!("runtime.env().secret({key:?})?")),
         _ => None,
@@ -658,6 +694,8 @@ pub mod prelude {
     pub use super::AxAssignmentPlan;
     pub use super::AxBackendLowerError;
     pub use super::AxBackendPlan;
+    pub use super::AxEnvPlan;
+    pub use super::AxEnvVisibilityPlan;
     pub use super::AxFieldPlan;
     pub use super::AxHandlerKind;
     pub use super::AxHandlerPlan;
@@ -1249,6 +1287,7 @@ route GET "/api/admin"
             r#"
 backend
   data themes = ["silver", "bronze", "gold"]
+  env PUBLIC_SITE_URL: Public<String>
 
 action SetTheme
   input:
@@ -1263,6 +1302,9 @@ action SetTheme
         let plan = lower_backend_document(&document).expect("document should lower");
 
         assert_eq!(plan.globals.len(), 1);
+        assert_eq!(plan.envs.len(), 1);
+        assert_eq!(plan.envs[0].name, "PUBLIC_SITE_URL");
+        assert_eq!(plan.envs[0].visibility, AxEnvVisibilityPlan::Public);
         assert_eq!(
             plan.globals[0],
             AxStepPlan::Let {
@@ -1274,5 +1316,32 @@ action SetTheme
         );
         assert_eq!(plan.handlers.len(), 1);
         assert_eq!(plan.handlers[0].name, "SetTheme");
+    }
+
+    #[test]
+    fn lowers_env_scope_into_runtime_env_lookup() {
+        let document = parse_backend_ax(
+            r#"
+backend
+  env PUBLIC_SITE_URL: Public<String>
+
+loader SiteConfig
+  data siteUrl = env.PUBLIC_SITE_URL
+  return siteUrl
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert_eq!(
+            plan.handlers[0].steps[0],
+            AxStepPlan::Let {
+                binding: "siteUrl".to_string(),
+                value: AxValuePlan::Expr(AxRustExpr::new(
+                    r#"runtime.env().value("PUBLIC_SITE_URL")?"#
+                )),
+            }
+        );
     }
 }
