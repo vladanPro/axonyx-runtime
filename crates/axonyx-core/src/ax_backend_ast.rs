@@ -18,10 +18,24 @@ impl AxBackendDocument {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxBackendBlock {
+    Backend(AxBackendRoot),
     Route(AxRoute),
     Loader(AxLoader),
     Action(AxAction),
     Job(AxJob),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxBackendRoot {
+    pub body: Vec<AxBackendStmt>,
+}
+
+impl AxBackendRoot {
+    pub fn new(body: impl IntoIterator<Item = AxBackendStmt>) -> Self {
+        Self {
+            body: body.into_iter().collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -478,6 +492,7 @@ pub mod prelude {
     pub use super::AxBackendBlock;
     pub use super::AxBackendData;
     pub use super::AxBackendDocument;
+    pub use super::AxBackendRoot;
     pub use super::AxBackendStmt;
     pub use super::AxBackendValue;
     pub use super::AxField;

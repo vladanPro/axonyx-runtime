@@ -684,10 +684,12 @@ fn collect_preview_handlers(
     let mut routes = Vec::new();
     let mut loaders = BTreeMap::new();
     let mut actions = BTreeMap::new();
+    let mut globals = Vec::new();
 
     for source in route_sources {
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
+        globals.extend(plan.globals);
 
         for handler in plan.handlers {
             if !matches!(handler.kind, AxHandlerKind::Route { .. }) {
@@ -701,6 +703,7 @@ fn collect_preview_handlers(
     for source in loader_sources {
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
+        globals.extend(plan.globals);
 
         for handler in plan.handlers {
             if matches!(handler.kind, AxHandlerKind::Loader { .. }) {
@@ -712,6 +715,7 @@ fn collect_preview_handlers(
     for source in action_sources {
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
+        globals.extend(plan.globals);
 
         for handler in plan.handlers {
             if matches!(handler.kind, AxHandlerKind::Action { .. }) {
@@ -719,6 +723,19 @@ fn collect_preview_handlers(
             }
         }
     }
+
+    routes = routes
+        .into_iter()
+        .map(|handler| with_preview_globals(handler, &globals))
+        .collect();
+    loaders = loaders
+        .into_iter()
+        .map(|(name, handler)| (name, with_preview_globals(handler, &globals)))
+        .collect();
+    actions = actions
+        .into_iter()
+        .map(|(name, handler)| (name, with_preview_globals(handler, &globals)))
+        .collect();
 
     Ok(PreviewHandlers {
         routes,
@@ -942,6 +959,17 @@ fn execute_preview_action(
         patches,
         error: None,
     })
+}
+
+fn with_preview_globals(mut handler: AxHandlerPlan, globals: &[AxStepPlan]) -> AxHandlerPlan {
+    if globals.is_empty() {
+        return handler;
+    }
+
+    let mut steps = globals.to_vec();
+    steps.extend(handler.steps);
+    handler.steps = steps;
+    handler
 }
 
 fn execute_preview_route(
@@ -1396,6 +1424,14 @@ fn eval_preview_expr(
     }
 
     if let Some(args) = parse_preview_call_args(code, "list") {
+        let items = args
+            .iter()
+            .map(|arg| eval_preview_expr(&AxRustExpr::new(arg), scope, env))
+            .collect::<Result<Vec<_>, _>>()?;
+        return Ok(AxValue::List(items));
+    }
+
+    if let Some(args) = parse_preview_vec_args(code) {
         let items = args
             .iter()
             .map(|arg| eval_preview_expr(&AxRustExpr::new(arg), scope, env))
@@ -2434,6 +2470,20 @@ fn ax_action_script() -> &'static str {
 fn parse_preview_call_args(code: &str, name: &str) -> Option<Vec<String>> {
     let prefix = format!("{name}(");
     let inner = code.strip_prefix(&prefix)?.strip_suffix(')')?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+
+    Some(
+        split_preview_args(inner)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+    )
+}
+
+fn parse_preview_vec_args(code: &str) -> Option<Vec<String>> {
+    let inner = code.strip_prefix("vec![")?.strip_suffix(']')?;
     if inner.trim().is_empty() {
         return Some(Vec::new());
     }
@@ -4097,6 +4147,35 @@ action SetTheme
 
         assert!(result.error.is_none());
         assert_eq!(result.patches.len(), 1);
+        assert_eq!(result.patches[0].value, AxValue::String("gold".to_string()));
+    }
+
+    #[test]
+    fn preview_action_can_use_backend_root_data() {
+        let mut store = AxPreviewStore::default();
+        let backend = r#"
+backend
+  data themes: List<String> = ["silver", "bronze", "gold"]
+"#;
+        let action = r#"
+action SetTheme
+  input:
+    theme: string
+
+  require input.theme in themes else error "Theme is not supported."
+  patch theme = input.theme
+  return ok
+"#;
+
+        let result = execute_preview_action_sources(
+            &[backend, action],
+            "SetTheme",
+            &BTreeMap::from([("theme".to_string(), "gold".to_string())]),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert!(result.error.is_none());
         assert_eq!(result.patches[0].value, AxValue::String("gold".to_string()));
     }
 

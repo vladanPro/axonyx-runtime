@@ -58,7 +58,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
             out.push('\n');
         }
 
-        out.push_str(&render_handler_fn(handler)?);
+        out.push_str(&render_handler_fn(handler, &plan.globals)?);
         out.push('\n');
     }
 
@@ -74,6 +74,7 @@ pub fn compile_backend_ax_to_module(input: &str) -> Result<String, AxBackendComp
 pub fn compile_backend_sources_to_module(
     sources: &[(&str, &str)],
 ) -> Result<String, AxBackendBundleError> {
+    let mut globals = Vec::new();
     let mut handlers = Vec::new();
 
     for (name, input) in sources {
@@ -86,10 +87,11 @@ pub fn compile_backend_sources_to_module(
                 name: (*name).to_string(),
                 source: AxBackendCompileError::Lower(source),
             })?;
+        globals.extend(plan.globals);
         handlers.extend(plan.handlers);
     }
 
-    generate_backend_module(&AxBackendPlan::new(handlers)).map_err(|source| {
+    generate_backend_module(&AxBackendPlan::with_globals(globals, handlers)).map_err(|source| {
         AxBackendBundleError::Source {
             name: "bundle".to_string(),
             source: AxBackendCompileError::Codegen(source),
@@ -113,7 +115,10 @@ fn render_input_struct(handler: &AxHandlerPlan, input: &[AxFieldPlan]) -> String
     out
 }
 
-fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegenError> {
+fn render_handler_fn(
+    handler: &AxHandlerPlan,
+    globals: &[AxStepPlan],
+) -> Result<String, AxBackendCodegenError> {
     let signature = match &handler.kind {
         AxHandlerKind::Action { .. } => format!(
             "pub fn {}(runtime: &impl AxBackendRuntime, input: &{}) -> AxRuntimeResult<Value>",
@@ -159,7 +164,7 @@ fn render_handler_fn(handler: &AxHandlerPlan) -> Result<String, AxBackendCodegen
         out.push_str("    let mut __ax_headers: BTreeMap<String, String> = BTreeMap::new();\n");
         out.push_str("    let mut __ax_cookies: Vec<AxCookie> = Vec::new();\n");
     }
-    for step in &handler.steps {
+    for step in globals.iter().chain(handler.steps.iter()) {
         out.push_str(&render_step(step, route_response));
     }
 
@@ -762,6 +767,13 @@ loader PostsList
     fn bundles_multiple_backend_sources_into_single_module() {
         let module = compile_backend_sources_to_module(&[
             (
+                "app/backend.ax",
+                r#"
+backend
+  data themes = ["silver", "bronze", "gold"]
+"#,
+            ),
+            (
                 "app/posts/loader.ax",
                 r#"
 loader PostsList
@@ -782,6 +794,9 @@ route GET "/api/posts"
 
         assert!(module.contains(
             "pub fn loader_posts_list(runtime: &impl AxBackendRuntime, context: &AxLoaderContext)"
+        ));
+        assert!(module.contains(
+            r#"let themes = json!(&vec!["silver".to_string(), "bronze".to_string(), "gold".to_string()]);"#
         ));
         assert!(module
             .contains("pub fn route_get_api_posts(runtime: &impl AxBackendRuntime, request: &AxHttpRequest) -> AxRuntimeResult<AxHttpResponse>"));

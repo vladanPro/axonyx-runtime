@@ -89,6 +89,13 @@ impl Parser {
         let line = self.current().expect("block line exists").clone();
         let text = line.text.as_str();
 
+        if text == "backend" {
+            self.pos += 1;
+            return Ok(AxBackendBlock::Backend(AxBackendRoot::new(
+                self.parse_backend_root_body(2)?,
+            )));
+        }
+
         if let Some(rest) = text.strip_prefix("route ") {
             let mut parts = rest.splitn(2, ' ');
             let method = parts.next().unwrap_or_default().trim();
@@ -244,6 +251,31 @@ impl Parser {
             }
 
             body.push(self.parse_statement(indent)?);
+        }
+
+        Ok(body)
+    }
+
+    fn parse_backend_root_body(
+        &mut self,
+        indent: usize,
+    ) -> Result<Vec<AxBackendStmt>, AxBackendParseError> {
+        let mut body = Vec::new();
+
+        while let Some(line) = self.current() {
+            if line.indent < indent {
+                break;
+            }
+
+            if line.indent > indent {
+                return Err(AxBackendParseError::UnexpectedIndentation { line: line.line });
+            }
+
+            if !line.text.starts_with("data ") {
+                return Err(AxBackendParseError::InvalidBlock { line: line.line });
+            }
+
+            body.push(self.parse_data()?);
         }
 
         Ok(body)
@@ -421,7 +453,11 @@ impl Parser {
             return Err(AxBackendParseError::InvalidDataBinding { line: line.line });
         };
 
-        let name = name.trim();
+        let name = name
+            .split_once(':')
+            .map(|(name, _)| name)
+            .unwrap_or(name)
+            .trim();
         let expr = expr.trim();
         if name.is_empty() || expr.is_empty() {
             return Err(AxBackendParseError::InvalidDataBinding { line: line.line });
@@ -1303,6 +1339,31 @@ action SetTheme
                 ],
             )
         );
+    }
+
+    #[test]
+    fn parses_backend_root_data_with_optional_type_annotations() {
+        let input = r#"
+backend
+  data themes: List<String> = ["silver", "bronze", "gold"]
+  data defaultTheme: String = "silver"
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Backend(root) = &document.blocks[0] else {
+            panic!("expected backend root block");
+        };
+
+        assert_eq!(root.body.len(), 2);
+        let AxBackendStmt::Data(themes) = &root.body[0] else {
+            panic!("expected data statement");
+        };
+        assert_eq!(themes.name, "themes");
+        let AxBackendStmt::Data(default_theme) = &root.body[1] else {
+            panic!("expected data statement");
+        };
+        assert_eq!(default_theme.name, "defaultTheme");
     }
 
     #[test]

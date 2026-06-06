@@ -6,12 +6,24 @@ use crate::ax_query_ast::prelude::*;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxBackendPlan {
+    pub globals: Vec<AxStepPlan>,
     pub handlers: Vec<AxHandlerPlan>,
 }
 
 impl AxBackendPlan {
     pub fn new(handlers: impl IntoIterator<Item = AxHandlerPlan>) -> Self {
         Self {
+            globals: Vec::new(),
+            handlers: handlers.into_iter().collect(),
+        }
+    }
+
+    pub fn with_globals(
+        globals: impl IntoIterator<Item = AxStepPlan>,
+        handlers: impl IntoIterator<Item = AxHandlerPlan>,
+    ) -> Self {
+        Self {
+            globals: globals.into_iter().collect(),
             handlers: handlers.into_iter().collect(),
         }
     }
@@ -200,17 +212,24 @@ pub enum AxBackendLowerError {
 pub fn lower_backend_document(
     document: &AxBackendDocument,
 ) -> Result<AxBackendPlan, AxBackendLowerError> {
-    let handlers = document
-        .blocks
-        .iter()
-        .map(lower_backend_block)
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut globals = Vec::new();
+    let mut handlers = Vec::new();
 
-    Ok(AxBackendPlan::new(handlers))
+    for block in &document.blocks {
+        match block {
+            AxBackendBlock::Backend(root) => {
+                globals.extend(root.body.iter().map(lower_step));
+            }
+            _ => handlers.push(lower_backend_block(block)?),
+        }
+    }
+
+    Ok(AxBackendPlan::with_globals(globals, handlers))
 }
 
 fn lower_backend_block(block: &AxBackendBlock) -> Result<AxHandlerPlan, AxBackendLowerError> {
     match block {
+        AxBackendBlock::Backend(_) => unreachable!("backend root is lowered at document level"),
         AxBackendBlock::Route(route) => lower_route(route),
         AxBackendBlock::Loader(loader) => lower_loader(loader),
         AxBackendBlock::Action(action) => lower_action(action),
@@ -525,6 +544,10 @@ fn render_expr(expr: &AxExpr) -> String {
             format!("{}.{}", render_expr(object), property)
         }
         AxExpr::Call { path, args } => {
+            if path.as_slice() == ["list"] {
+                let args = args.iter().map(render_expr).collect::<Vec<_>>().join(", ");
+                return format!("vec![{args}]");
+            }
             let fn_name = path.join("::");
             let args = args.iter().map(render_expr).collect::<Vec<_>>().join(", ");
             format!("{fn_name}({args})")
@@ -1218,5 +1241,38 @@ route GET "/api/admin"
                 value: AxValuePlan::Expr(AxRustExpr::new("Auth.signedSession")),
             }
         );
+    }
+
+    #[test]
+    fn lowers_backend_root_data_as_global_steps() {
+        let document = parse_backend_ax(
+            r#"
+backend
+  data themes = ["silver", "bronze", "gold"]
+
+action SetTheme
+  input:
+    theme: string
+
+  require input.theme in themes else error "Theme is not supported."
+  return ok
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert_eq!(plan.globals.len(), 1);
+        assert_eq!(
+            plan.globals[0],
+            AxStepPlan::Let {
+                binding: "themes".to_string(),
+                value: AxValuePlan::Expr(AxRustExpr::new(
+                    r#"vec!["silver".to_string(), "bronze".to_string(), "gold".to_string()]"#,
+                )),
+            }
+        );
+        assert_eq!(plan.handlers.len(), 1);
+        assert_eq!(plan.handlers[0].name, "SetTheme");
     }
 }
