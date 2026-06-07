@@ -368,7 +368,12 @@ fn render_route_hook_step(phase: AxHookPhasePlan, value: &AxRustExpr) -> String 
 fn render_value_plan(value: &AxValuePlan) -> String {
     match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
-        AxValuePlan::Query(query) => format!("runtime.load(&{})?", render_query_plan(query)),
+        AxValuePlan::Query(query) => match &query.source {
+            AxQuerySourcePlan::RawSql { .. } => {
+                format!("runtime.query(&{})?", render_raw_sql_query_plan(query))
+            }
+            _ => format!("runtime.load(&{})?", render_query_plan(query)),
+        },
     }
 }
 
@@ -415,12 +420,37 @@ fn render_query_plan(query: &AxQueryPlan) -> String {
         AxQuerySourcePlan::ContentCollection { collection } => {
             format!("{collection:?}.to_string()")
         }
+        AxQuerySourcePlan::RawSql { .. } => {
+            unreachable!("raw sql queries are rendered by render_raw_sql_query_plan")
+        }
     };
 
     format!(
         "AxQueryRequest {{ collection: {source}, filters: {filters}, orders: {orders}, limit: {}, offset: {} }}",
         render_option_u32(query.limit),
         render_option_u32(query.offset)
+    )
+}
+
+fn render_raw_sql_query_plan(query: &AxQueryPlan) -> String {
+    let AxQuerySourcePlan::RawSql { sql, params } = &query.source else {
+        unreachable!("raw sql renderer requires raw sql source");
+    };
+
+    let params = if params.is_empty() {
+        "vec![]".to_string()
+    } else {
+        let entries = params
+            .iter()
+            .map(|param| format!("json!({})", render_borrowed_expr(param)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("vec![{entries}]")
+    };
+
+    format!(
+        "AxRawSqlRequest {{ sql: {:?}.to_string(), params: {params} }}",
+        sql
     )
 }
 
@@ -713,7 +743,7 @@ mod tests {
         let module = compile_backend_ax_to_module(
             r#"
 loader PostsList
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where status = "published"
     limit 12
   return posts
@@ -729,11 +759,43 @@ loader PostsList
     }
 
     #[test]
+    fn compiles_db_all_query_source_into_runtime_load() {
+        let module = compile_backend_ax_to_module(
+            r#"
+loader PostsList
+  data posts = db.posts.all()
+  return posts
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("runtime.load(&AxQueryRequest"));
+        assert!(module.contains(r#"collection: "posts".to_string()"#));
+    }
+
+    #[test]
+    fn compiles_raw_sql_query_source_into_runtime_query() {
+        let module = compile_backend_ax_to_module(
+            r#"
+loader PostsList
+  data posts = db.query("select * from posts where status = ?", "published")
+  return posts
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("runtime.query(&AxRawSqlRequest"));
+        assert!(module.contains(r#"sql: "select * from posts where status = ?".to_string()"#));
+        assert!(module.contains("params: vec![json!("));
+        assert!(module.contains("published"));
+    }
+
+    #[test]
     fn compiles_loader_params_and_query_into_context_lookups() {
         let module = compile_backend_ax_to_module(
             r#"
 loader PostDetail
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where slug = params.slug
     where status = query.status
     limit 1
@@ -786,7 +848,7 @@ backend
                 "app/posts/loader.ax",
                 r#"
 loader PostsList
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
   return posts
 "#,
             ),
@@ -794,7 +856,7 @@ loader PostsList
                 "routes/api/posts.ax",
                 r#"
 route GET "/api/posts"
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
   return posts
 "#,
             ),
@@ -816,7 +878,7 @@ route GET "/api/posts"
         let module = compile_backend_ax_to_module(
             r#"
 route GET "/api/posts"
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
   return json(posts)
 
 route GET "/go"

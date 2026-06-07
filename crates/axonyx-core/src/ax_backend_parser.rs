@@ -762,15 +762,21 @@ fn is_query_clause(text: &str) -> bool {
 
 fn query_source_from_expr(expr: AxExpr, line: usize) -> Result<AxQuerySource, AxBackendParseError> {
     match expr {
+        AxExpr::Call { path, args } if path == vec!["db".to_string(), "query".to_string()] => {
+            let Some(AxExpr::String(sql)) = args.first() else {
+                return Err(AxBackendParseError::InvalidQuerySource { line });
+            };
+            Ok(AxQuerySource::RawSql {
+                sql: sql.clone(),
+                params: args.into_iter().skip(1).collect(),
+            })
+        }
         AxExpr::Call { path, args }
-            if path == vec!["Db".to_string(), "Stream".to_string()] && args.len() == 1 =>
+            if path.len() == 3 && path[0] == "db" && path[2] == "all" && args.is_empty() =>
         {
-            match &args[0] {
-                AxExpr::String(collection) => Ok(AxQuerySource::Stream {
-                    collection: collection.clone(),
-                }),
-                _ => Err(AxBackendParseError::InvalidQuerySource { line }),
-            }
+            Ok(AxQuerySource::Stream {
+                collection: path[1].clone(),
+            })
         }
         AxExpr::Call { path, args }
             if path == vec!["Content".to_string(), "Collection".to_string()] && args.len() == 1 =>
@@ -1053,14 +1059,14 @@ mod tests {
     fn parses_loader_and_route_blocks() {
         let input = r#"
 loader PostsList
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where status = "published"
     order created_at desc
     limit 20
   return posts
 
 route GET "/api/posts"
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
   return posts
 "#;
 
@@ -1135,10 +1141,10 @@ action CreatePost -> Post
     }
 
     #[test]
-    fn parses_plain_stream_binding_as_query_without_extra_clauses() {
+    fn parses_db_all_binding_as_query_without_extra_clauses() {
         let input = r#"
 loader PostsList
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
   return posts
 "#;
 
@@ -1185,6 +1191,32 @@ loader DocsList
                 })
                 .order(AxQueryOrder::new("slug", AxQueryOrderDirection::Asc))
             )
+        );
+    }
+
+    #[test]
+    fn parses_raw_sql_binding_as_query_escape_hatch() {
+        let input = r#"
+loader PostsList
+  data posts = db.query("select * from posts where status = ?", "published")
+  return posts
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected loader block");
+        };
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected data statement");
+        };
+
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(AxQuerySpec::new(AxQuerySource::RawSql {
+                sql: "select * from posts where status = ?".to_string(),
+                params: vec![AxExpr::String("published".to_string())],
+            }))
         );
     }
 

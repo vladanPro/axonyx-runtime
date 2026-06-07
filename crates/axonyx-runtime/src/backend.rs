@@ -18,6 +18,8 @@ use thiserror::Error;
 pub enum AxRuntimeError {
     #[error("runtime operation failed: {message}")]
     Message { message: String },
+    #[error("runtime database operation failed: {error}")]
+    Database { error: AxDbError },
 }
 
 impl AxRuntimeError {
@@ -26,9 +28,251 @@ impl AxRuntimeError {
             message: message.into(),
         }
     }
+
+    pub fn database(error: AxDbError) -> Self {
+        Self::Database { error }
+    }
+
+    pub fn public_error_payload(&self) -> Value {
+        match self {
+            Self::Message { message } => json!({
+                "ok": false,
+                "code": "runtime.error",
+                "message": message,
+            }),
+            Self::Database { error } => error.public_payload(),
+        }
+    }
 }
 
 pub type AxRuntimeResult<T> = Result<T, AxRuntimeError>;
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxDbErrorCode {
+    UnknownResource,
+    UniqueViolation,
+    ConstraintViolation,
+    InvalidQuery,
+    ConnectionFailed,
+    Timeout,
+    DriverError,
+}
+
+impl AxDbErrorCode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::UnknownResource => "db.unknown_resource",
+            Self::UniqueViolation => "db.unique_violation",
+            Self::ConstraintViolation => "db.constraint_violation",
+            Self::InvalidQuery => "db.invalid_query",
+            Self::ConnectionFailed => "db.connection_failed",
+            Self::Timeout => "db.timeout",
+            Self::DriverError => "db.driver_error",
+        }
+    }
+
+    pub fn default_message(&self) -> &'static str {
+        match self {
+            Self::UnknownResource => "Database resource was not found.",
+            Self::UniqueViolation => "Record already exists.",
+            Self::ConstraintViolation => "Database constraint failed.",
+            Self::InvalidQuery => "Database query is invalid.",
+            Self::ConnectionFailed => "Database connection failed.",
+            Self::Timeout => "Database operation timed out.",
+            Self::DriverError => "Database operation failed.",
+        }
+    }
+
+    pub fn status(&self) -> u16 {
+        match self {
+            Self::UnknownResource | Self::InvalidQuery => 400,
+            Self::UniqueViolation | Self::ConstraintViolation => 409,
+            Self::ConnectionFailed | Self::Timeout => 503,
+            Self::DriverError => 500,
+        }
+    }
+}
+
+#[derive(Debug, Error, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[error("{code}: {message}")]
+pub struct AxDbError {
+    pub code: String,
+    pub message: String,
+    pub status: u16,
+    pub driver: Option<String>,
+    pub resource: Option<String>,
+    pub field: Option<String>,
+    pub detail: Option<String>,
+}
+
+impl AxDbError {
+    pub fn new(code: AxDbErrorCode) -> Self {
+        Self {
+            code: code.as_str().to_string(),
+            message: code.default_message().to_string(),
+            status: code.status(),
+            driver: None,
+            resource: None,
+            field: None,
+            detail: None,
+        }
+    }
+
+    pub fn with_message(mut self, message: impl Into<String>) -> Self {
+        self.message = message.into();
+        self
+    }
+
+    pub fn with_driver(mut self, driver: AxDatabaseDriver) -> Self {
+        self.driver = Some(driver.as_str().to_string());
+        self
+    }
+
+    pub fn with_resource(mut self, resource: impl Into<String>) -> Self {
+        self.resource = Some(resource.into());
+        self
+    }
+
+    pub fn with_field(mut self, field: impl Into<String>) -> Self {
+        self.field = Some(field.into());
+        self
+    }
+
+    pub fn with_detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    pub fn invalid_query(
+        driver: AxDatabaseDriver,
+        resource: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        Self::new(AxDbErrorCode::InvalidQuery)
+            .with_driver(driver)
+            .with_resource(resource)
+            .with_detail(detail)
+    }
+
+    pub fn from_driver_detail(
+        driver: AxDatabaseDriver,
+        resource: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
+        let detail = detail.into();
+        let code = classify_driver_error(driver.clone(), &detail);
+        let mut error = Self::new(code)
+            .with_driver(driver)
+            .with_resource(resource)
+            .with_detail(detail.clone());
+        if let Some(field) = extract_driver_error_field(&detail) {
+            error = error.with_field(field);
+        }
+        error
+    }
+
+    pub fn public_payload(&self) -> Value {
+        let mut error = serde_json::Map::from_iter([
+            ("code".to_string(), json!(self.code)),
+            ("message".to_string(), json!(self.message)),
+            ("status".to_string(), json!(self.status)),
+        ]);
+
+        if let Some(resource) = &self.resource {
+            error.insert("resource".to_string(), json!(resource));
+        }
+        if let Some(field) = &self.field {
+            error.insert("field".to_string(), json!(field));
+        }
+
+        json!({
+            "ok": false,
+            "error": Value::Object(error),
+        })
+    }
+}
+
+fn classify_driver_error(driver: AxDatabaseDriver, detail: &str) -> AxDbErrorCode {
+    let normalized = detail.to_ascii_lowercase();
+
+    match driver {
+        AxDatabaseDriver::Sqlite => {
+            if normalized.contains("no such table") {
+                AxDbErrorCode::UnknownResource
+            } else if normalized.contains("unique constraint failed") {
+                AxDbErrorCode::UniqueViolation
+            } else if normalized.contains("constraint failed")
+                || normalized.contains("not null constraint failed")
+                || normalized.contains("foreign key constraint failed")
+            {
+                AxDbErrorCode::ConstraintViolation
+            } else if normalized.contains("no such column") {
+                AxDbErrorCode::InvalidQuery
+            } else if normalized.contains("unable to open database file")
+                || normalized.contains("database is locked")
+            {
+                AxDbErrorCode::ConnectionFailed
+            } else {
+                AxDbErrorCode::DriverError
+            }
+        }
+        AxDatabaseDriver::Postgres => {
+            if normalized.contains("42p01") || normalized.contains("undefined table") {
+                AxDbErrorCode::UnknownResource
+            } else if normalized.contains("23505") || normalized.contains("duplicate key") {
+                AxDbErrorCode::UniqueViolation
+            } else if normalized.contains("23503")
+                || normalized.contains("23502")
+                || normalized.contains("check violation")
+            {
+                AxDbErrorCode::ConstraintViolation
+            } else if normalized.contains("timeout") {
+                AxDbErrorCode::Timeout
+            } else if normalized.contains("connection refused")
+                || normalized.contains("could not connect")
+                || normalized.contains("connection error")
+            {
+                AxDbErrorCode::ConnectionFailed
+            } else {
+                AxDbErrorCode::DriverError
+            }
+        }
+        AxDatabaseDriver::MySql => {
+            if normalized.contains("duplicate entry") || normalized.contains("1062") {
+                AxDbErrorCode::UniqueViolation
+            } else if normalized.contains("foreign key constraint")
+                || normalized.contains("cannot be null")
+                || normalized.contains("1452")
+            {
+                AxDbErrorCode::ConstraintViolation
+            } else if normalized.contains("timeout") {
+                AxDbErrorCode::Timeout
+            } else if normalized.contains("connection") {
+                AxDbErrorCode::ConnectionFailed
+            } else {
+                AxDbErrorCode::DriverError
+            }
+        }
+        AxDatabaseDriver::Memory => AxDbErrorCode::DriverError,
+    }
+}
+
+fn extract_driver_error_field(detail: &str) -> Option<String> {
+    let marker = "constraint failed:";
+    let lower = detail.to_ascii_lowercase();
+    let start = lower.find(marker)?;
+    let path = detail[start + marker.len()..].trim();
+    let field = path
+        .rsplit_once('.')
+        .map(|(_, field)| field)
+        .unwrap_or(path);
+    let field = field.trim_matches(['`', '"', '\'', ' ', '.']);
+    if field.is_empty() {
+        None
+    } else {
+        Some(field.to_string())
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AxQueryRequest {
@@ -37,6 +281,12 @@ pub struct AxQueryRequest {
     pub orders: Vec<AxQueryOrderRequest>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AxRawSqlRequest {
+    pub sql: String,
+    pub params: Vec<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -325,6 +575,8 @@ impl AxEnv {
             .secret
             .get("db_dialect")
             .or_else(|| self.secret.get("db_driver"))
+            .or_else(|| self.secret.get("database_dialect"))
+            .or_else(|| self.secret.get("database_driver"))
         {
             Some(driver) => AxDatabaseDriver::parse(driver),
             None => Ok(AxDatabaseDriver::Postgres),
@@ -332,7 +584,12 @@ impl AxEnv {
     }
 
     pub fn data_transport(&self) -> AxRuntimeResult<AxDataTransport> {
-        match self.secret.get("db_transport") {
+        match self
+            .secret
+            .get("db_transport")
+            .or_else(|| self.secret.get("data_transport"))
+            .or_else(|| self.secret.get("database_transport"))
+        {
             Some(transport) => AxDataTransport::parse(transport),
             None => Ok(AxDataTransport::Direct),
         }
@@ -342,7 +599,11 @@ impl AxEnv {
         Ok(AxDatabaseConfig {
             driver: self.database_driver()?,
             transport: self.data_transport()?,
-            url: self.secret.get("db_url").cloned(),
+            url: self
+                .secret
+                .get("db_url")
+                .cloned()
+                .or_else(|| self.secret.get("database_url").cloned()),
             api_url: self
                 .public
                 .get("data_api_url")
@@ -401,6 +662,7 @@ pub trait AxRuntimeEnvAccess {
 pub trait AxDatabaseAdapter {
     fn driver(&self) -> AxDatabaseDriver;
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value>;
+    fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value>;
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value>;
     fn update(&self, request: &AxUpdateRequest) -> AxRuntimeResult<Value>;
     fn delete(&self, request: &AxDeleteRequest) -> AxRuntimeResult<Value>;
@@ -418,6 +680,10 @@ where
         (**self).load(request)
     }
 
+    fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value> {
+        (**self).query(request)
+    }
+
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value> {
         (**self).insert(request)
     }
@@ -433,6 +699,7 @@ where
 
 pub trait AxQueryExecutor {
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value>;
+    fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value>;
 }
 
 pub trait AxMutationExecutor {
@@ -482,6 +749,10 @@ where
 {
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value> {
         self.adapter.load(request)
+    }
+
+    fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value> {
+        self.adapter.query(request)
     }
 }
 
@@ -553,6 +824,16 @@ impl AxDatabaseAdapter for PostgresAdapter {
         )
     }
 
+    fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value> {
+        dispatch_raw_query(
+            self.driver(),
+            self.transport,
+            &self.url,
+            &self.api_url,
+            request,
+        )
+    }
+
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value> {
         dispatch_insert(
             self.driver(),
@@ -599,6 +880,16 @@ impl AxDatabaseAdapter for MySqlAdapter {
         )
     }
 
+    fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value> {
+        dispatch_raw_query(
+            self.driver(),
+            self.transport,
+            &self.url,
+            &self.api_url,
+            request,
+        )
+    }
+
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value> {
         dispatch_insert(
             self.driver(),
@@ -637,6 +928,16 @@ impl AxDatabaseAdapter for SqliteAdapter {
 
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value> {
         dispatch_load(
+            self.driver(),
+            self.transport,
+            &self.url,
+            &self.api_url,
+            request,
+        )
+    }
+
+    fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value> {
+        dispatch_raw_query(
             self.driver(),
             self.transport,
             &self.url,
@@ -695,6 +996,16 @@ impl AxDatabaseAdapter for MemoryAdapter {
                 "offset": request.offset,
             }),
         ))
+    }
+
+    fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value> {
+        Ok(json!({
+            "driver": self.driver().as_str(),
+            "transport": "direct",
+            "action": "query",
+            "sql": request.sql,
+            "params": request.params,
+        }))
     }
 
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value> {
@@ -817,6 +1128,19 @@ fn dispatch_load(
     }
 }
 
+fn dispatch_raw_query(
+    driver: AxDatabaseDriver,
+    transport: AxDataTransport,
+    url: &Option<String>,
+    api_url: &Option<String>,
+    request: &AxRawSqlRequest,
+) -> AxRuntimeResult<Value> {
+    match transport {
+        AxDataTransport::Direct => direct_raw_query_plan(driver, url, request),
+        AxDataTransport::Api => api_raw_query_plan(driver, api_url, request),
+    }
+}
+
 fn dispatch_insert(
     driver: AxDatabaseDriver,
     transport: AxDataTransport,
@@ -891,8 +1215,14 @@ fn direct_load_plan(
         ));
     };
 
-    let plan = compile_query_plan_to_sql(&query_request_to_plan(request), dialect)
-        .map_err(|error| AxRuntimeError::message(error.to_string()))?;
+    let plan =
+        compile_query_plan_to_sql(&query_request_to_plan(request), dialect).map_err(|error| {
+            AxRuntimeError::database(AxDbError::invalid_query(
+                driver.clone(),
+                request.collection.clone(),
+                error.to_string(),
+            ))
+        })?;
     let execution = AxDirectSqlPlan {
         dialect: dialect.name().to_string(),
         sql: plan.sql,
@@ -904,9 +1234,49 @@ fn direct_load_plan(
         url: url.clone(),
     };
 
+    if driver == AxDatabaseDriver::Sqlite {
+        return sqlite_execute_query(url, &request.collection, &execution.sql, &execution.params);
+    }
+
     Ok(json!({
         "driver": driver.as_str(),
         "transport": "direct",
+        "execution": execution,
+    }))
+}
+
+fn direct_raw_query_plan(
+    driver: AxDatabaseDriver,
+    url: &Option<String>,
+    request: &AxRawSqlRequest,
+) -> AxRuntimeResult<Value> {
+    validate_raw_select_sql(&driver, &request.sql)?;
+
+    let Some(dialect) = driver.sql_dialect() else {
+        return Ok(json!({
+            "driver": driver.as_str(),
+            "transport": "direct",
+            "action": "query",
+            "sql": request.sql,
+            "params": request.params,
+        }));
+    };
+
+    let execution = AxDirectSqlPlan {
+        dialect: dialect.name().to_string(),
+        sql: request.sql.clone(),
+        params: request.params.clone(),
+        url: url.clone(),
+    };
+
+    if driver == AxDatabaseDriver::Sqlite {
+        return sqlite_execute_query(url, "raw_sql", &execution.sql, &execution.params);
+    }
+
+    Ok(json!({
+        "driver": driver.as_str(),
+        "transport": "direct",
+        "action": "query",
         "execution": execution,
     }))
 }
@@ -929,14 +1299,30 @@ fn direct_insert_plan(
     };
 
     let fields = fields_to_assignment_plans(&request.fields);
-    let plan = compile_insert_plan_to_sql(&request.collection, &fields, dialect)
-        .map_err(|error| AxRuntimeError::message(error.to_string()))?;
+    let plan =
+        compile_insert_plan_to_sql(&request.collection, &fields, dialect).map_err(|error| {
+            AxRuntimeError::database(AxDbError::invalid_query(
+                driver.clone(),
+                request.collection.clone(),
+                error.to_string(),
+            ))
+        })?;
     let execution = AxDirectSqlPlan {
         dialect: dialect.name().to_string(),
         sql: plan.sql,
         params: request.fields.values().cloned().collect(),
         url: url.clone(),
     };
+
+    if driver == AxDatabaseDriver::Sqlite {
+        return sqlite_execute_mutation(
+            url,
+            "insert",
+            &request.collection,
+            &execution.sql,
+            &execution.params,
+        );
+    }
 
     Ok(json!({
         "driver": driver.as_str(),
@@ -966,7 +1352,13 @@ fn direct_update_plan(
     let fields = fields_to_assignment_plans(&request.fields);
     let filters = query_filters_to_plan(&request.filters);
     let plan = compile_update_plan_to_sql(&request.collection, &fields, &filters, dialect)
-        .map_err(|error| AxRuntimeError::message(error.to_string()))?;
+        .map_err(|error| {
+            AxRuntimeError::database(AxDbError::invalid_query(
+                driver.clone(),
+                request.collection.clone(),
+                error.to_string(),
+            ))
+        })?;
     let execution = AxDirectSqlPlan {
         dialect: dialect.name().to_string(),
         sql: plan.sql,
@@ -978,6 +1370,16 @@ fn direct_update_plan(
             .collect(),
         url: url.clone(),
     };
+
+    if driver == AxDatabaseDriver::Sqlite {
+        return sqlite_execute_mutation(
+            url,
+            "update",
+            &request.collection,
+            &execution.sql,
+            &execution.params,
+        );
+    }
 
     Ok(json!({
         "driver": driver.as_str(),
@@ -1003,8 +1405,14 @@ fn direct_delete_plan(
     };
 
     let filters = query_filters_to_plan(&request.filters);
-    let plan = compile_delete_plan_to_sql(&request.collection, &filters, dialect)
-        .map_err(|error| AxRuntimeError::message(error.to_string()))?;
+    let plan =
+        compile_delete_plan_to_sql(&request.collection, &filters, dialect).map_err(|error| {
+            AxRuntimeError::database(AxDbError::invalid_query(
+                driver.clone(),
+                request.collection.clone(),
+                error.to_string(),
+            ))
+        })?;
     let execution = AxDirectSqlPlan {
         dialect: dialect.name().to_string(),
         sql: plan.sql,
@@ -1016,12 +1424,200 @@ fn direct_delete_plan(
         url: url.clone(),
     };
 
+    if driver == AxDatabaseDriver::Sqlite {
+        return sqlite_execute_mutation(
+            url,
+            "delete",
+            &request.collection,
+            &execution.sql,
+            &execution.params,
+        );
+    }
+
     Ok(json!({
         "driver": driver.as_str(),
         "transport": "direct",
         "action": "delete",
         "execution": execution,
     }))
+}
+
+fn sqlite_execute_query(
+    url: &Option<String>,
+    resource: &str,
+    sql: &str,
+    params: &[Value],
+) -> AxRuntimeResult<Value> {
+    let connection = sqlite_open_connection(url, resource)?;
+    let sqlite_params = json_params_to_sqlite(params)?;
+    let mut statement = connection
+        .prepare(sql)
+        .map_err(|error| sqlite_runtime_error(resource, error))?;
+    let column_names = statement
+        .column_names()
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let rows = statement
+        .query_map(rusqlite::params_from_iter(sqlite_params), |row| {
+            sqlite_row_to_json(row, &column_names)
+        })
+        .map_err(|error| sqlite_runtime_error(resource, error))?;
+
+    let mut items = Vec::new();
+    for row in rows {
+        items.push(row.map_err(|error| sqlite_runtime_error(resource, error))?);
+    }
+
+    Ok(Value::Array(items))
+}
+
+fn sqlite_execute_mutation(
+    url: &Option<String>,
+    action: &str,
+    resource: &str,
+    sql: &str,
+    params: &[Value],
+) -> AxRuntimeResult<Value> {
+    let connection = sqlite_open_connection(url, resource)?;
+    let sqlite_params = json_params_to_sqlite(params)?;
+    let changes = connection
+        .execute(sql, rusqlite::params_from_iter(sqlite_params))
+        .map_err(|error| sqlite_runtime_error(resource, error))?;
+
+    Ok(json!({
+        "ok": true,
+        "driver": "sqlite",
+        "action": action,
+        "resource": resource,
+        "changes": changes,
+        "last_insert_rowid": connection.last_insert_rowid(),
+    }))
+}
+
+fn sqlite_open_connection(
+    url: &Option<String>,
+    resource: &str,
+) -> AxRuntimeResult<rusqlite::Connection> {
+    let Some(url) = url else {
+        return Err(AxRuntimeError::database(
+            AxDbError::new(AxDbErrorCode::ConnectionFailed)
+                .with_driver(AxDatabaseDriver::Sqlite)
+                .with_resource(resource)
+                .with_detail("missing sqlite database url"),
+        ));
+    };
+
+    rusqlite::Connection::open(sqlite_database_path(url))
+        .map_err(|error| sqlite_runtime_error(resource, error))
+}
+
+fn sqlite_database_path(url: &str) -> String {
+    if matches!(url, ":memory:" | "sqlite::memory:" | "sqlite://:memory:") {
+        return ":memory:".to_string();
+    }
+
+    if let Some(path) = url.strip_prefix("sqlite:///") {
+        return format!("/{path}");
+    }
+
+    if let Some(path) = url.strip_prefix("sqlite://") {
+        return path.to_string();
+    }
+
+    if let Some(path) = url.strip_prefix("sqlite:") {
+        return path.to_string();
+    }
+
+    url.to_string()
+}
+
+fn json_params_to_sqlite(params: &[Value]) -> AxRuntimeResult<Vec<rusqlite::types::Value>> {
+    params
+        .iter()
+        .map(json_value_to_sqlite)
+        .collect::<AxRuntimeResult<Vec<_>>>()
+}
+
+fn json_value_to_sqlite(value: &Value) -> AxRuntimeResult<rusqlite::types::Value> {
+    match value {
+        Value::Null => Ok(rusqlite::types::Value::Null),
+        Value::Bool(value) => Ok(rusqlite::types::Value::Integer(i64::from(*value))),
+        Value::Number(value) => {
+            if let Some(value) = value.as_i64() {
+                Ok(rusqlite::types::Value::Integer(value))
+            } else if let Some(value) = value.as_u64() {
+                i64::try_from(value)
+                    .map(rusqlite::types::Value::Integer)
+                    .map_err(|_| {
+                        AxRuntimeError::database(
+                            AxDbError::new(AxDbErrorCode::InvalidQuery)
+                                .with_driver(AxDatabaseDriver::Sqlite)
+                                .with_detail("sqlite integer parameter is out of i64 range"),
+                        )
+                    })
+            } else if let Some(value) = value.as_f64() {
+                Ok(rusqlite::types::Value::Real(value))
+            } else {
+                Err(AxRuntimeError::database(
+                    AxDbError::new(AxDbErrorCode::InvalidQuery)
+                        .with_driver(AxDatabaseDriver::Sqlite)
+                        .with_detail("unsupported sqlite number parameter"),
+                ))
+            }
+        }
+        Value::String(value) => Ok(rusqlite::types::Value::Text(value.clone())),
+        Value::Array(_) | Value::Object(_) => Err(AxRuntimeError::database(
+            AxDbError::new(AxDbErrorCode::InvalidQuery)
+                .with_driver(AxDatabaseDriver::Sqlite)
+                .with_detail("sqlite parameters cannot be arrays or objects"),
+        )),
+    }
+}
+
+fn sqlite_row_to_json(row: &rusqlite::Row<'_>, column_names: &[String]) -> rusqlite::Result<Value> {
+    let mut record = serde_json::Map::new();
+    for (index, name) in column_names.iter().enumerate() {
+        let value = match row.get_ref(index)? {
+            rusqlite::types::ValueRef::Null => Value::Null,
+            rusqlite::types::ValueRef::Integer(value) => json!(value),
+            rusqlite::types::ValueRef::Real(value) => json!(value),
+            rusqlite::types::ValueRef::Text(value) => {
+                Value::String(String::from_utf8_lossy(value).to_string())
+            }
+            rusqlite::types::ValueRef::Blob(value) => {
+                Value::String(format!("<{} byte sqlite blob>", value.len()))
+            }
+        };
+        record.insert(name.clone(), value);
+    }
+    Ok(Value::Object(record))
+}
+
+fn sqlite_runtime_error(resource: &str, error: rusqlite::Error) -> AxRuntimeError {
+    AxRuntimeError::database(AxDbError::from_driver_detail(
+        AxDatabaseDriver::Sqlite,
+        resource,
+        error.to_string(),
+    ))
+}
+
+fn validate_raw_select_sql(driver: &AxDatabaseDriver, sql: &str) -> AxRuntimeResult<()> {
+    let trimmed = sql.trim();
+    let normalized = trimmed.to_ascii_lowercase();
+    let is_select = normalized.starts_with("select ") || normalized.starts_with("with ");
+    let has_multiple_statements = trimmed.trim_end_matches(';').contains(';');
+
+    if !is_select || has_multiple_statements {
+        return Err(AxRuntimeError::database(
+            AxDbError::new(AxDbErrorCode::InvalidQuery)
+                .with_driver(driver.clone())
+                .with_resource("raw_sql")
+                .with_detail("db.query only supports a single SELECT/WITH statement"),
+        ));
+    }
+
+    Ok(())
 }
 
 fn api_load_plan(
@@ -1043,6 +1639,34 @@ fn api_load_plan(
             "orders": request.orders,
             "limit": request.limit,
             "offset": request.offset,
+        }),
+    };
+
+    Ok(json!({
+        "driver": driver.as_str(),
+        "transport": "api",
+        "request": plan,
+    }))
+}
+
+fn api_raw_query_plan(
+    driver: AxDatabaseDriver,
+    api_url: &Option<String>,
+    request: &AxRawSqlRequest,
+) -> AxRuntimeResult<Value> {
+    validate_raw_select_sql(&driver, &request.sql)?;
+    let plan = AxApiRequestPlan {
+        dialect: driver
+            .sql_dialect()
+            .map(|dialect| dialect.name().to_string())
+            .unwrap_or_else(|| driver.as_str().to_string()),
+        base_url: api_url.clone().unwrap_or_default(),
+        token: "<redacted-by-runtime-config>".to_string(),
+        action: "query".to_string(),
+        resource: "raw_sql".to_string(),
+        payload: json!({
+            "sql": request.sql,
+            "params": request.params,
         }),
     };
 
@@ -1172,6 +1796,8 @@ pub mod prelude {
     pub use super::AxDatabaseConfig;
     pub use super::AxDatabaseDriver;
     pub use super::AxDatabaseRuntime;
+    pub use super::AxDbError;
+    pub use super::AxDbErrorCode;
     pub use super::AxDeleteRequest;
     pub use super::AxEnv;
     pub use super::AxInsertRequest;
@@ -1184,6 +1810,7 @@ pub mod prelude {
     pub use super::AxQueryOrderDirection;
     pub use super::AxQueryOrderRequest;
     pub use super::AxQueryRequest;
+    pub use super::AxRawSqlRequest;
     pub use super::AxRevalidator;
     pub use super::AxRuntimeEnvAccess;
     pub use super::AxRuntimeError;
@@ -1216,6 +1843,13 @@ mod tests {
             Ok(json!({
                 "collection": request.collection,
                 "limit": request.limit,
+            }))
+        }
+
+        fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value> {
+            Ok(json!({
+                "sql": request.sql,
+                "params": request.params,
             }))
         }
     }
@@ -1293,6 +1927,103 @@ mod tests {
     #[test]
     fn ok_payload_returns_framework_success_shape() {
         assert_eq!(ok_payload(), json!({ "ok": true }));
+    }
+
+    #[test]
+    fn db_error_public_payload_hides_internal_detail() {
+        let error = AxDbError::new(AxDbErrorCode::UniqueViolation)
+            .with_driver(AxDatabaseDriver::Sqlite)
+            .with_resource("posts")
+            .with_field("slug")
+            .with_detail("UNIQUE constraint failed: posts.slug");
+
+        assert_eq!(
+            error.public_payload(),
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "db.unique_violation",
+                    "message": "Record already exists.",
+                    "status": 409,
+                    "resource": "posts",
+                    "field": "slug",
+                }
+            })
+        );
+        assert_eq!(
+            error.detail.as_deref(),
+            Some("UNIQUE constraint failed: posts.slug")
+        );
+    }
+
+    #[test]
+    fn runtime_error_can_render_safe_database_payload() {
+        let error = AxRuntimeError::database(
+            AxDbError::new(AxDbErrorCode::ConnectionFailed)
+                .with_driver(AxDatabaseDriver::Postgres)
+                .with_detail("connection refused on 127.0.0.1:5432"),
+        );
+
+        assert_eq!(
+            error.public_error_payload(),
+            json!({
+                "ok": false,
+                "error": {
+                    "code": "db.connection_failed",
+                    "message": "Database connection failed.",
+                    "status": 503,
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn db_error_translator_maps_sqlite_unique_violation() {
+        let error = AxDbError::from_driver_detail(
+            AxDatabaseDriver::Sqlite,
+            "posts",
+            "UNIQUE constraint failed: posts.slug",
+        );
+
+        assert_eq!(error.code, "db.unique_violation");
+        assert_eq!(error.status, 409);
+        assert_eq!(error.field.as_deref(), Some("slug"));
+        assert_eq!(
+            error.public_payload()["error"]["message"],
+            json!("Record already exists.")
+        );
+    }
+
+    #[test]
+    fn db_error_translator_maps_postgres_unique_violation() {
+        let error = AxDbError::from_driver_detail(
+            AxDatabaseDriver::Postgres,
+            "users",
+            "ERROR: duplicate key value violates unique constraint \"users_email_key\" SQLSTATE 23505",
+        );
+
+        assert_eq!(error.code, "db.unique_violation");
+        assert_eq!(error.status, 409);
+        assert_eq!(error.resource.as_deref(), Some("users"));
+    }
+
+    #[test]
+    fn db_error_translator_maps_connection_and_timeout_errors() {
+        let sqlite = AxDbError::from_driver_detail(
+            AxDatabaseDriver::Sqlite,
+            "posts",
+            "unable to open database file",
+        );
+        let postgres = AxDbError::from_driver_detail(
+            AxDatabaseDriver::Postgres,
+            "posts",
+            "statement timeout after 2000ms",
+        );
+
+        assert_eq!(sqlite.code, "db.connection_failed");
+        assert_eq!(sqlite.status, 503);
+        assert_eq!(postgres.code, "db.timeout");
+        assert_eq!(postgres.status, 503);
     }
 
     #[test]
@@ -1382,6 +2113,26 @@ mod tests {
                 driver: AxDatabaseDriver::MySql,
                 transport: AxDataTransport::Direct,
                 url: Some("mysql://root:root@localhost:3306/axonyx".to_string()),
+                api_url: None,
+                api_key: None,
+            }
+        );
+    }
+
+    #[test]
+    fn env_can_resolve_database_config_from_plain_database_keys() {
+        let env = AxEnv::new()
+            .with_secret("database_driver", "sqlite")
+            .with_secret("database_url", "sqlite://data/app.db");
+
+        let config = env.database_config().expect("config should resolve");
+
+        assert_eq!(
+            config,
+            AxDatabaseConfig {
+                driver: AxDatabaseDriver::Sqlite,
+                transport: AxDataTransport::Direct,
+                url: Some("sqlite://data/app.db".to_string()),
                 api_url: None,
                 api_key: None,
             }
@@ -1526,6 +2277,198 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_direct_load_reads_rows_from_database() {
+        let (_path, url) = temp_sqlite_database("load");
+        seed_sqlite_posts(&url);
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+
+        let value = runtime
+            .load(&AxQueryRequest {
+                collection: "posts".to_string(),
+                filters: vec![AxQueryFilterRequest {
+                    field: "status".to_string(),
+                    op: AxQueryFilterOp::Eq,
+                    value: json!("published"),
+                }],
+                orders: vec![AxQueryOrderRequest {
+                    field: "id".to_string(),
+                    direction: AxQueryOrderDirection::Asc,
+                }],
+                limit: Some(10),
+                offset: None,
+            })
+            .expect("sqlite query should execute");
+
+        assert_eq!(
+            value,
+            json!([
+                {
+                    "id": 1,
+                    "title": "Hello",
+                    "slug": "hello",
+                    "status": "published"
+                }
+            ])
+        );
+    }
+
+    #[test]
+    fn sqlite_raw_query_reads_rows_with_params() {
+        let (_path, url) = temp_sqlite_database("raw_query");
+        seed_sqlite_posts(&url);
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+
+        let value = runtime
+            .query(&AxRawSqlRequest {
+                sql: "select title from posts where status = ?".to_string(),
+                params: vec![json!("published")],
+            })
+            .expect("raw sqlite query should execute");
+
+        assert_eq!(value, json!([{ "title": "Hello" }]));
+    }
+
+    #[test]
+    fn raw_query_rejects_mutating_sql() {
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", ":memory:"),
+        )
+        .expect("runtime should initialize");
+
+        let error = runtime
+            .query(&AxRawSqlRequest {
+                sql: "delete from posts".to_string(),
+                params: vec![],
+            })
+            .expect_err("raw query should only support reads");
+
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.invalid_query");
+    }
+
+    #[test]
+    fn sqlite_direct_mutations_write_to_database() {
+        let (_path, url) = temp_sqlite_database("mutations");
+        seed_sqlite_posts(&url);
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+
+        let inserted = runtime
+            .insert(&AxInsertRequest {
+                collection: "posts".to_string(),
+                fields: BTreeMap::from([
+                    ("title".to_string(), json!("Draft")),
+                    ("slug".to_string(), json!("draft")),
+                    ("status".to_string(), json!("draft")),
+                ]),
+            })
+            .expect("sqlite insert should execute");
+        assert_eq!(inserted["ok"], json!(true));
+        assert_eq!(inserted["changes"], json!(1));
+
+        let updated = runtime
+            .update(&AxUpdateRequest {
+                collection: "posts".to_string(),
+                fields: BTreeMap::from([("status".to_string(), json!("published"))]),
+                filters: vec![AxQueryFilterRequest {
+                    field: "slug".to_string(),
+                    op: AxQueryFilterOp::Eq,
+                    value: json!("draft"),
+                }],
+            })
+            .expect("sqlite update should execute");
+        assert_eq!(updated["changes"], json!(1));
+
+        let deleted = runtime
+            .delete(&AxDeleteRequest {
+                collection: "posts".to_string(),
+                filters: vec![AxQueryFilterRequest {
+                    field: "slug".to_string(),
+                    op: AxQueryFilterOp::Eq,
+                    value: json!("draft"),
+                }],
+            })
+            .expect("sqlite delete should execute");
+        assert_eq!(deleted["changes"], json!(1));
+    }
+
+    #[test]
+    fn sqlite_direct_errors_use_db_translator() {
+        let (_path, url) = temp_sqlite_database("errors");
+        seed_sqlite_posts(&url);
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+
+        let error = runtime
+            .insert(&AxInsertRequest {
+                collection: "posts".to_string(),
+                fields: BTreeMap::from([
+                    ("title".to_string(), json!("Again")),
+                    ("slug".to_string(), json!("hello")),
+                    ("status".to_string(), json!("draft")),
+                ]),
+            })
+            .expect_err("duplicate slug should fail");
+
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.unique_violation");
+        assert_eq!(error.field.as_deref(), Some("slug"));
+        assert!(!error.public_payload().to_string().contains("UNIQUE"));
+    }
+
+    #[test]
+    fn direct_sql_errors_become_database_errors() {
+        let env = AxEnv::new()
+            .with_secret("db_dialect", "sqlite")
+            .with_secret("db_url", "sqlite://local/axonyx.db");
+        let runtime = runtime_from_env(env).expect("runtime should initialize");
+
+        let error = runtime
+            .delete(&AxDeleteRequest {
+                collection: "posts".to_string(),
+                filters: Vec::new(),
+            })
+            .expect_err("delete without filters should fail safely");
+
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.invalid_query");
+        assert_eq!(error.status, 400);
+        assert_eq!(error.driver.as_deref(), Some("sqlite"));
+        assert_eq!(error.resource.as_deref(), Some("posts"));
+        assert!(error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("delete")));
+        assert!(!error.public_payload().to_string().contains("delete"));
+    }
+
+    #[test]
     fn runtime_defaults_to_postgres_when_driver_is_missing() {
         let env = AxEnv::new().with_secret("db_url", "postgres://local/axonyx");
         let config = env.database_config().expect("config should resolve");
@@ -1640,5 +2583,47 @@ mod tests {
             error,
             AxRuntimeError::message("missing AX_SECRET_DATA_API_KEY for api data transport")
         );
+    }
+
+    fn temp_sqlite_database(name: &str) -> (std::path::PathBuf, String) {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "axonyx-runtime-{name}-{}-{nanos}.db",
+            std::process::id(),
+        ));
+        let _ = fs::remove_file(&path);
+        let url = path.to_string_lossy().to_string();
+        (path, url)
+    }
+
+    fn seed_sqlite_posts(url: &str) {
+        let connection =
+            rusqlite::Connection::open(sqlite_database_path(url)).expect("sqlite should open");
+        connection
+            .execute(
+                "create table posts (
+                    id integer primary key autoincrement,
+                    title text not null,
+                    slug text not null unique,
+                    status text not null
+                )",
+                [],
+            )
+            .expect("posts table should create");
+        connection
+            .execute(
+                "insert into posts (title, slug, status) values (?1, ?2, ?3)",
+                ("Hello", "hello", "published"),
+            )
+            .expect("published post should insert");
+        connection
+            .execute(
+                "insert into posts (title, slug, status) values (?1, ?2, ?3)",
+                ("Hidden", "hidden", "draft"),
+            )
+            .expect("draft post should insert");
     }
 }

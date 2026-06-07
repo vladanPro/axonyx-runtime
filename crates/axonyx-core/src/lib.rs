@@ -254,8 +254,17 @@ pub fn compile_ir(pipeline: &Pipeline) -> Result<AxonyxIr, CompileError> {
 
 fn compile_source(call: &Call) -> Result<Source, CompileError> {
     let normalized = normalize_path(&call.path);
-    let is_collection_source =
-        normalized.as_slice() == ["db", "stream"] || normalized.as_slice() == ["from"];
+    if normalized.len() == 3 && normalized[0] == "db" && normalized[2] == "all" {
+        let collection = normalized[1].clone();
+        if collection.is_empty() {
+            return Err(CompileError::MissingArgument(call.path.clone()));
+        }
+        return Ok(Source {
+            kind: SourceKind::Collection { name: collection },
+        });
+    }
+
+    let is_collection_source = normalized.as_slice() == ["from"];
     if !is_collection_source {
         return Err(CompileError::InvalidSource(call.path.clone()));
     }
@@ -330,17 +339,17 @@ mod tests {
 
     #[test]
     fn parses_three_stage_pipeline() {
-        let parsed = parse_pipeline(r#"Db.Stream("posts") |> layout.Grid(3) |> Card()"#)
+        let parsed = parse_pipeline(r#"db.posts.all() |> layout.Grid(3) |> Card()"#)
             .expect("pipeline should parse");
         assert_eq!(parsed.stages.len(), 3);
-        assert_eq!(parsed.stages[0].path, vec!["Db", "Stream"]);
+        assert_eq!(parsed.stages[0].path, vec!["db", "posts", "all"]);
         assert_eq!(parsed.stages[1].path, vec!["layout", "Grid"]);
         assert_eq!(parsed.stages[2].path, vec!["Card"]);
     }
 
     #[test]
     fn compiles_pipeline_to_ir() {
-        let parsed = parse_pipeline(r#"Db.Stream("posts") |> layout.Grid(4) |> Card()"#)
+        let parsed = parse_pipeline(r#"db.posts.all() |> layout.Grid(4) |> Card()"#)
             .expect("pipeline should parse");
         let ir = compile_ir(&parsed).expect("pipeline should compile");
 

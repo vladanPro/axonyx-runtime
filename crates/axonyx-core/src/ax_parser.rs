@@ -732,7 +732,7 @@ mod tests {
     fn parses_indentation_first_page() {
         let input = r#"
 page Home
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
 
   Container max: "xl"
     Grid cols: 3, gap: "md"
@@ -821,7 +821,7 @@ page Home
     fn parses_pipeline_sketch() {
         let input = r#"
 page Home
-  Db.Stream("users")
+  db.users.all()
     |> Grid cols: 2
     |> Each user
     |> ProfileCard

@@ -797,14 +797,14 @@ fn preview_resolve_call(
         ))));
     }
 
-    if path == ["Db".to_string(), "Stream".to_string()] {
-        let [AxValue::String(collection)] = args else {
+    if path.len() == 3 && path[0] == "db" && path[2] == "all" {
+        if !args.is_empty() {
             return Err(PreviewError::Runtime {
-                message: "Db.Stream(...) expects a collection name".to_string(),
+                message: "db.<collection>.all() does not accept arguments".to_string(),
             });
-        };
+        }
 
-        return Ok(Some(AxValue::List(store.collection_items(collection))));
+        return Ok(Some(AxValue::List(store.collection_items(&path[1]))));
     }
 
     if path == ["Content".to_string(), "Collection".to_string()] {
@@ -1335,6 +1335,7 @@ fn eval_preview_query(
     let collection = match &query.source {
         AxQuerySourcePlan::Stream { collection } => collection,
         AxQuerySourcePlan::ContentCollection { collection } => collection,
+        AxQuerySourcePlan::RawSql { .. } => return Ok(AxValue::List(Vec::new())),
     };
     let mut items = store.collection_items(collection);
 
@@ -3253,7 +3254,7 @@ mod tests {
 
     #[test]
     fn builds_render_plan_from_ir() {
-        let ir = compile_pipeline(r#"Db.Stream("posts") |> layout.Grid(3) |> Card()"#)
+        let ir = compile_pipeline(r#"db.posts.all() |> layout.Grid(3) |> Card()"#)
             .expect("pipeline should compile");
         let plan = execute(&ir);
 
@@ -3265,7 +3266,7 @@ mod tests {
 
     #[test]
     fn builds_render_plan_from_json() {
-        let ir = compile_pipeline(r#"Db.Stream("users") |> layout.Grid(2) |> ProfileCard()"#)
+        let ir = compile_pipeline(r#"db.users.all() |> layout.Grid(2) |> ProfileCard()"#)
             .expect("pipeline should compile");
         let ir_json = serde_json::to_string(&ir).expect("serialize");
         let plan = execute_json(&ir_json).expect("json execution should work");
@@ -3396,7 +3397,7 @@ page Docs
 "#],
             &[r#"
 loader PostsList
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where status = "published"
     limit 1
   return posts
@@ -3667,7 +3668,7 @@ page Home
             &[],
             &[r#"
 loader PostsList
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where status = "published"
     order created_at desc
     limit 2
@@ -3699,7 +3700,7 @@ page Posts
             &[],
             &[r#"
 loader EmptyPosts
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where status = "archived"
   return posts
 "#],
@@ -3859,7 +3860,7 @@ page DocsHome
             &[],
             &[r#"
 loader PostsList
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where status = "published"
     order created_at desc
     limit 2
@@ -3923,7 +3924,7 @@ page Docs
             &[],
             &[r#"
 loader PostsList
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
   return posts
 "#],
             &[r#"
@@ -4048,7 +4049,7 @@ action CreatePost
             &[],
             &[r#"
 loader PostsList
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
   return posts
 "#],
             &[r#"
@@ -4345,7 +4346,7 @@ action SetCount
         let response = execute_preview_route_sources(
             &[r#"
 route GET "/api/posts"
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where status = "published"
     order created_at desc
     limit 2
@@ -4373,7 +4374,7 @@ route GET "/api/posts"
         let response = execute_preview_route_sources(
             &[r#"
 route GET "/api/posts"
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
   return json(posts)
 "#],
             "GET",
@@ -4728,7 +4729,7 @@ route POST "/api/posts"
         let response = execute_preview_route_sources(
             &[r#"
 route GET "/api/posts/:slug"
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where slug = params.slug
     where status = query.status
   return posts
@@ -4774,7 +4775,7 @@ route GET "/api/posts/featured"
             &[],
             &[r#"
 loader PostDetail
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where slug = params.slug
     where status = query.status
   return posts

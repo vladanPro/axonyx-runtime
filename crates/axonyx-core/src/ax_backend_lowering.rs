@@ -173,8 +173,16 @@ pub struct AxQueryPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxQuerySourcePlan {
-    Stream { collection: String },
-    ContentCollection { collection: String },
+    Stream {
+        collection: String,
+    },
+    ContentCollection {
+        collection: String,
+    },
+    RawSql {
+        sql: String,
+        params: Vec<AxRustExpr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -519,6 +527,10 @@ fn lower_query(query: &AxQuerySpec) -> AxQueryPlan {
                     collection: collection.clone(),
                 }
             }
+            AxQuerySource::RawSql { sql, params } => AxQuerySourcePlan::RawSql {
+                sql: sql.clone(),
+                params: params.iter().map(lower_expr).collect(),
+            },
         },
         filters: query
             .filters
@@ -722,7 +734,7 @@ mod tests {
         let document = parse_backend_ax(
             r#"
 loader PostsList
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
     where status = "published"
     order created_at desc
     limit 20
@@ -767,6 +779,37 @@ loader PostsList
         assert_eq!(
             handler.steps[1],
             AxStepPlan::Return(AxReturnPlan::Expr(AxRustExpr::new("posts")))
+        );
+    }
+
+    #[test]
+    fn lowers_db_all_query_into_backend_plan() {
+        let document = parse_backend_ax(
+            r#"
+loader PostsList
+  data posts = db.posts.all()
+  return posts
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+        let handler = &plan.handlers[0];
+
+        let AxStepPlan::Let { value, .. } = &handler.steps[0] else {
+            panic!("expected let step");
+        };
+        assert_eq!(
+            value,
+            &AxValuePlan::Query(AxQueryPlan {
+                source: AxQuerySourcePlan::Stream {
+                    collection: "posts".to_string(),
+                },
+                filters: Vec::new(),
+                orders: Vec::new(),
+                limit: None,
+                offset: None,
+            })
         );
     }
 
@@ -1067,7 +1110,7 @@ loader PostsList
         let document = parse_backend_ax(
             r#"
 route GET "/api/posts"
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
   return json(posts)
 
 route GET "/go"

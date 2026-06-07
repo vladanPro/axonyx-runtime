@@ -47,6 +47,7 @@ impl AxQuerySpec {
 pub enum AxQuerySource {
     Stream { collection: String },
     ContentCollection { collection: String },
+    RawSql { sql: String, params: Vec<AxExpr> },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -154,5 +155,21 @@ mod tests {
             }
         );
         assert_eq!(query.orders.len(), 1);
+    }
+
+    #[test]
+    fn query_spec_can_model_raw_sql_escape_hatch() {
+        let query = AxQuerySpec::new(AxQuerySource::RawSql {
+            sql: "select * from posts where status = ?".to_string(),
+            params: vec![AxExpr::string("published")],
+        });
+
+        assert_eq!(
+            query.source,
+            AxQuerySource::RawSql {
+                sql: "select * from posts where status = ?".to_string(),
+                params: vec![AxExpr::String("published".to_string())],
+            }
+        );
     }
 }

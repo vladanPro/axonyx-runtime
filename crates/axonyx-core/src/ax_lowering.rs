@@ -1148,7 +1148,7 @@ mod tests {
         let document = parse_ax(
             r#"
 page Home
-  data posts = Db.Stream("posts")
+  data posts = db.posts.all()
 
   Container max: "xl"
     Grid cols: 3, gap: "md", recipe: "screen-center"
@@ -1160,8 +1160,7 @@ page Home
         .expect("document should parse");
 
         let resolver = |path: &[String], args: &[AxValue]| -> Option<AxValue> {
-            if path == ["Db".to_string(), "Stream".to_string()]
-                && args == [AxValue::String("posts".to_string())]
+            if path == ["db".to_string(), "posts".to_string(), "all".to_string()] && args.is_empty()
             {
                 return Some(AxValue::list([
                     AxValue::record([

@@ -55,6 +55,8 @@ pub struct AxSqlParam {
 pub enum AxSqlCompileError {
     #[error("query collection cannot be empty")]
     EmptyCollection,
+    #[error("raw SQL queries are executed by the runtime escape hatch")]
+    RawSqlRuntimeOnly,
     #[error("identifier `{ident}` contains unsupported characters")]
     InvalidIdentifier { ident: String },
     #[error("unsupported query filter operator")]
@@ -72,6 +74,7 @@ pub fn compile_query_plan_to_sql(
     let collection = match &query.source {
         AxQuerySourcePlan::Stream { collection } => collection,
         AxQuerySourcePlan::ContentCollection { collection } => collection,
+        AxQuerySourcePlan::RawSql { .. } => return Err(AxSqlCompileError::RawSqlRuntimeOnly),
     };
     validate_ident(collection)?;
 

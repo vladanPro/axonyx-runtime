@@ -198,11 +198,8 @@ mod tests {
                 .field("status", "published"),
         ];
 
-        let node = render_pipeline_node(
-            r#"Db.Stream("posts") |> layout.Grid(2) |> Card()"#,
-            &records,
-        )
-        .expect("pipeline should render");
+        let node = render_pipeline_node(r#"db.posts.all() |> layout.Grid(2) |> Card()"#, &records)
+            .expect("pipeline should render");
 
         assert_eq!(
             node,
@@ -357,7 +354,7 @@ mod tests {
     fn named_view_keeps_view_identity_in_output() {
         let records = vec![PipelineRecord::new("u1").field("role", "founder")];
 
-        let node = render_pipeline_node(r#"Db.Stream("users") |> ProfileCard()"#, &records)
+        let node = render_pipeline_node(r#"db.users.all() |> ProfileCard()"#, &records)
             .expect("pipeline should render");
 
         assert_eq!(
