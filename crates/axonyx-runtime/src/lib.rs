@@ -664,6 +664,28 @@ pub fn execute_preview_route_request_sources(
         &request_path,
         &query,
         &env,
+        None,
+        store,
+    )
+}
+
+pub fn execute_preview_route_request_sources_with_runtime(
+    route_sources: &[&str],
+    request: &server::AxHttpRequest,
+    runtime: &dyn backend::AxBackendRuntime,
+    store: &mut AxPreviewStore,
+) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    let handlers = collect_preview_handlers(&[], &[], route_sources)?;
+    let env = runtime.env();
+    let request_path = normalize_preview_request_path(&request.target)?;
+    let query = parse_preview_query_fields(&request.target);
+    execute_preview_route(
+        &handlers.routes,
+        request,
+        &request_path,
+        &query,
+        env,
+        Some(runtime),
         store,
     )
 }
@@ -831,7 +853,7 @@ fn execute_preview_loader(
     for step in &loader.steps {
         match step {
             AxStepPlan::Let { binding, value } => {
-                let value = eval_preview_value(value, &scope, env, store)?;
+                let value = eval_preview_value(value, &scope, env, None, store)?;
                 scope.insert(binding.clone(), value);
             }
             AxStepPlan::Return(value) => return eval_preview_return(value, &scope, env),
@@ -887,7 +909,7 @@ fn execute_preview_action(
                 binding,
                 value: plan,
             } => {
-                let evaluated = eval_preview_value(plan, &scope, env, store)?;
+                let evaluated = eval_preview_value(plan, &scope, env, None, store)?;
                 scope.insert(binding.clone(), evaluated);
             }
             AxStepPlan::Insert { collection, fields } => {
@@ -978,6 +1000,7 @@ fn execute_preview_route(
     request_path: &str,
     query: &BTreeMap<String, String>,
     env: &backend::AxEnv,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &mut AxPreviewStore,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
     let Some(route_match) = match_preview_route(routes, &request.method, request_path) else {
@@ -1006,15 +1029,25 @@ fn execute_preview_route(
                 binding,
                 value: plan,
             } => {
-                let evaluated = eval_preview_value(plan, &scope, env, store)?;
+                let evaluated = eval_preview_value(plan, &scope, env, runtime, store)?;
                 scope.insert(binding.clone(), evaluated);
             }
             AxStepPlan::Insert { collection, fields } => {
                 let mut record = eval_preview_fields(fields, &scope, env)?;
-                assign_preview_id(&mut record, store.collection_items(collection).len());
-                store
-                    .ensure_collection(collection)
-                    .push(AxValue::Record(record));
+                if let Some(runtime) = runtime {
+                    runtime.insert(&backend::AxInsertRequest {
+                        collection: collection.clone(),
+                        fields: record
+                            .into_iter()
+                            .map(|(key, value)| (key, preview_value_to_json(&value)))
+                            .collect(),
+                    })?;
+                } else {
+                    assign_preview_id(&mut record, store.collection_items(collection).len());
+                    store
+                        .ensure_collection(collection)
+                        .push(AxValue::Record(record));
+                }
             }
             AxStepPlan::Update {
                 collection,
@@ -1023,9 +1056,27 @@ fn execute_preview_route(
             } => {
                 let fields = eval_preview_fields(fields, &scope, env)?;
                 let filters = eval_preview_filters(filters, &scope, env)?;
-                for item in store.ensure_collection(collection).iter_mut() {
-                    if preview_record_matches_all(item, &filters) {
-                        apply_preview_fields(item, &fields);
+                if let Some(runtime) = runtime {
+                    runtime.update(&backend::AxUpdateRequest {
+                        collection: collection.clone(),
+                        fields: fields
+                            .into_iter()
+                            .map(|(key, value)| (key, preview_value_to_json(&value)))
+                            .collect(),
+                        filters: filters
+                            .into_iter()
+                            .map(|filter| backend::AxQueryFilterRequest {
+                                field: filter.field,
+                                op: preview_filter_op_to_runtime(filter.op),
+                                value: preview_value_to_json(&filter.value),
+                            })
+                            .collect(),
+                    })?;
+                } else {
+                    for item in store.ensure_collection(collection).iter_mut() {
+                        if preview_record_matches_all(item, &filters) {
+                            apply_preview_fields(item, &fields);
+                        }
                     }
                 }
             }
@@ -1034,9 +1085,23 @@ fn execute_preview_route(
                 filters,
             } => {
                 let filters = eval_preview_filters(filters, &scope, env)?;
-                store
-                    .ensure_collection(collection)
-                    .retain(|item| !preview_record_matches_all(item, &filters));
+                if let Some(runtime) = runtime {
+                    runtime.delete(&backend::AxDeleteRequest {
+                        collection: collection.clone(),
+                        filters: filters
+                            .into_iter()
+                            .map(|filter| backend::AxQueryFilterRequest {
+                                field: filter.field,
+                                op: preview_filter_op_to_runtime(filter.op),
+                                value: preview_value_to_json(&filter.value),
+                            })
+                            .collect(),
+                    })?;
+                } else {
+                    store
+                        .ensure_collection(collection)
+                        .retain(|item| !preview_record_matches_all(item, &filters));
+                }
             }
             AxStepPlan::Hook { phase, value } => match phase {
                 AxHookPhasePlan::Before => {
@@ -1251,11 +1316,12 @@ fn eval_preview_value(
     value: &AxValuePlan,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &AxPreviewStore,
 ) -> Result<AxValue, PreviewError> {
     match value {
         AxValuePlan::Expr(expr) => eval_preview_expr(expr, scope, env),
-        AxValuePlan::Query(query) => eval_preview_query(query, scope, env, store),
+        AxValuePlan::Query(query) => eval_preview_query(query, scope, env, runtime, store),
     }
 }
 
@@ -1330,8 +1396,34 @@ fn eval_preview_query(
     query: &AxQueryPlan,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &AxPreviewStore,
 ) -> Result<AxValue, PreviewError> {
+    if let Some(runtime) = runtime {
+        match &query.source {
+            AxQuerySourcePlan::Stream { collection } => {
+                let request = preview_query_to_runtime_request(collection, query, scope, env)?;
+                return Ok(preview_json_to_value(runtime.load(&request)?));
+            }
+            AxQuerySourcePlan::RawSql { sql, params } => {
+                let params = params
+                    .iter()
+                    .map(|param| {
+                        eval_preview_expr(param, scope, env)
+                            .map(|value| preview_value_to_json(&value))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?;
+                return Ok(preview_json_to_value(runtime.query(
+                    &backend::AxRawSqlRequest {
+                        sql: sql.clone(),
+                        params,
+                    },
+                )?));
+            }
+            AxQuerySourcePlan::ContentCollection { .. } => {}
+        }
+    }
+
     let collection = match &query.source {
         AxQuerySourcePlan::Stream { collection } => collection,
         AxQuerySourcePlan::ContentCollection { collection } => collection,
@@ -1369,6 +1461,47 @@ fn eval_preview_query(
     }
 
     Ok(AxValue::List(items))
+}
+
+fn preview_query_to_runtime_request(
+    collection: &str,
+    query: &AxQueryPlan,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+) -> Result<backend::AxQueryRequest, PreviewError> {
+    Ok(backend::AxQueryRequest {
+        collection: collection.to_string(),
+        filters: query
+            .filters
+            .iter()
+            .map(|filter| {
+                Ok(backend::AxQueryFilterRequest {
+                    field: filter.field.clone(),
+                    op: preview_filter_op_to_runtime(filter.op),
+                    value: preview_value_to_json(&eval_preview_expr(&filter.value, scope, env)?),
+                })
+            })
+            .collect::<Result<Vec<_>, PreviewError>>()?,
+        orders: query
+            .orders
+            .iter()
+            .map(|order| backend::AxQueryOrderRequest {
+                field: order.field.clone(),
+                direction: match order.direction {
+                    AxQueryOrderDirectionPlan::Asc => backend::AxQueryOrderDirection::Asc,
+                    AxQueryOrderDirectionPlan::Desc => backend::AxQueryOrderDirection::Desc,
+                },
+            })
+            .collect(),
+        limit: query.limit,
+        offset: query.offset,
+    })
+}
+
+fn preview_filter_op_to_runtime(op: AxQueryFilterOpPlan) -> backend::AxQueryFilterOp {
+    match op {
+        AxQueryFilterOpPlan::Eq => backend::AxQueryFilterOp::Eq,
+    }
 }
 
 fn preview_record_matches(
