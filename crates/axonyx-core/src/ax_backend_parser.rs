@@ -118,6 +118,23 @@ impl Parser {
 
         if let Some(name) = text.strip_prefix("loader ") {
             let (name, returns) = split_return_contract(name.trim());
+            let name = parse_backend_callable_name(name);
+            if name.is_empty() {
+                return Err(AxBackendParseError::InvalidBlock { line: line.line });
+            }
+
+            self.pos += 1;
+            let body = self.parse_body(2)?;
+            let mut loader = AxLoader::new(name, body);
+            if let Some(returns) = returns {
+                loader = loader.returns(returns);
+            }
+            return Ok(AxBackendBlock::Loader(loader));
+        }
+
+        if let Some(name) = text.strip_prefix("query ") {
+            let (name, returns) = split_return_contract(name.trim());
+            let name = parse_backend_callable_name(name);
             if name.is_empty() {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
             }
@@ -1046,6 +1063,14 @@ fn split_return_contract(input: &str) -> (&str, Option<String>) {
     }
 }
 
+fn parse_backend_callable_name(input: &str) -> &str {
+    let input = input.trim();
+    if let Some(name) = input.strip_suffix("()") {
+        return name.trim();
+    }
+    input
+}
+
 pub mod prelude {
     pub use super::parse_backend_ax;
     pub use super::AxBackendParseError;
@@ -1138,6 +1163,45 @@ action CreatePost -> Post
         };
         assert_eq!(action.name, "CreatePost");
         assert_eq!(action.returns.as_deref(), Some("Post"));
+    }
+
+    #[test]
+    fn parses_query_function_as_loader_block() {
+        let input = r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.all()
+    where status = "published"
+    order created_at desc
+    limit 6
+  return posts
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+
+        assert_eq!(loader.name, "loadPosts");
+        assert_eq!(loader.returns.as_deref(), Some("Post[]"));
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected data statement");
+        };
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "status",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::string("published"),
+                ))
+                .order(AxQueryOrder::new("created_at", AxQueryOrderDirection::Desc,))
+                .limit(6)
+            )
+        );
     }
 
     #[test]
