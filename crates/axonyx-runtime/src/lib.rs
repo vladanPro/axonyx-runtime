@@ -499,6 +499,7 @@ pub fn preview_ax_route_stream_response_with_backend_and_imports(
             &handlers,
             &cache,
             &env,
+            None,
             request_target,
             &route_scope,
             store,
@@ -589,6 +590,7 @@ pub fn preview_ax_route_with_request_context_and_imports(
             &handlers,
             &cache,
             &env,
+            None,
             request_target,
             &route_scope,
             store,
@@ -770,6 +772,7 @@ fn preview_resolve_call(
     handlers: &PreviewHandlers,
     cache: &RefCell<BTreeMap<String, AxValue>>,
     env: &backend::AxEnv,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
     request_target: &str,
     route_scope: &BTreeMap<String, AxValue>,
     store: &AxPreviewStore,
@@ -793,11 +796,26 @@ fn preview_resolve_call(
             .ok_or_else(|| PreviewError::Runtime {
                 message: format!("loader `{loader_name}` was not found for this route"),
             })?;
-        let value = execute_preview_loader(loader, route_scope, env, store)?;
+        let value = execute_preview_loader(loader, route_scope, env, runtime, store)?;
         cache
             .borrow_mut()
             .insert(loader_name.clone(), value.clone());
         return Ok(Some(value));
+    }
+
+    if path.len() == 1 && args.is_empty() {
+        let loader_name = &path[0];
+        if let Some(cached) = cache.borrow().get(loader_name).cloned() {
+            return Ok(Some(cached));
+        }
+
+        if let Some(loader) = handlers.loaders.get(loader_name) {
+            let value = execute_preview_loader(loader, route_scope, env, runtime, store)?;
+            cache
+                .borrow_mut()
+                .insert(loader_name.clone(), value.clone());
+            return Ok(Some(value));
+        }
     }
 
     if path == ["action".to_string()] {
@@ -846,6 +864,7 @@ fn execute_preview_loader(
     loader: &AxHandlerPlan,
     initial_scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &AxPreviewStore,
 ) -> Result<AxValue, PreviewError> {
     let mut scope = initial_scope.clone();
@@ -853,7 +872,7 @@ fn execute_preview_loader(
     for step in &loader.steps {
         match step {
             AxStepPlan::Let { binding, value } => {
-                let value = eval_preview_value(value, &scope, env, None, store)?;
+                let value = eval_preview_value(value, &scope, env, runtime, store)?;
                 scope.insert(binding.clone(), value);
             }
             AxStepPlan::Return(value) => return eval_preview_return(value, &scope, env),
@@ -4009,6 +4028,34 @@ page Posts
 "#,
         )
         .expect("route loader preview should render");
+
+        assert!(html.contains("Hello Axonyx"));
+        assert!(html.contains("Docs Without Bloat"));
+        assert!(!html.contains("Draft Preview"));
+    }
+
+    #[test]
+    fn previews_query_function_data_inside_page() {
+        let html = preview_ax_route_with_loaders(
+            &[],
+            &[r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.all()
+    where status = "published"
+    order created_at desc
+    limit 6
+  return posts
+"#],
+            r#"
+page Posts
+  data posts = loadPosts()
+  Grid cols: 2
+    each post in posts
+      Card title: post.title
+        Copy -> post.excerpt
+"#,
+        )
+        .expect("query function preview should render");
 
         assert!(html.contains("Hello Axonyx"));
         assert!(html.contains("Docs Without Bloat"));
