@@ -100,14 +100,15 @@ impl<'a> Parser<'a> {
         let mut components = Vec::new();
         while self.starts_with_keyword("type")
             || self.starts_with_keyword("let")
+            || self.starts_with_keyword("data")
             || self.is_state_decl_start()
             || self.starts_with_keyword("fn")
             || self.starts_with_keyword("component")
         {
             if self.starts_with_keyword("type") {
                 types.push(self.parse_type_decl()?);
-            } else if self.starts_with_keyword("let") {
-                lets.push(self.parse_let_decl()?);
+            } else if self.starts_with_keyword("let") || self.starts_with_keyword("data") {
+                lets.push(self.parse_let_or_data_decl()?);
             } else if self.is_state_decl_start() {
                 states.push(self.parse_state_decl()?);
             } else if self.starts_with_keyword("fn") {
@@ -240,10 +241,15 @@ impl<'a> Parser<'a> {
         Ok(AxPageDecl::with_params(name, params))
     }
 
-    fn parse_let_decl(&mut self) -> Result<AxLetDeclV2, AxParseV2Error> {
+    fn parse_let_or_data_decl(&mut self) -> Result<AxLetDeclV2, AxParseV2Error> {
         let line = self.line;
-        self.expect_keyword("let")
-            .map_err(|_| AxParseV2Error::InvalidLet { line })?;
+        if self.starts_with_keyword("let") {
+            self.expect_keyword("let")
+                .map_err(|_| AxParseV2Error::InvalidLet { line })?;
+        } else {
+            self.expect_keyword("data")
+                .map_err(|_| AxParseV2Error::InvalidLet { line })?;
+        }
         self.skip_spaces();
 
         let name = self.parse_identifier()?;
@@ -1378,6 +1384,26 @@ let posts: List<Post> = load PostsList
         assert_eq!(
             file.lets[0],
             AxLetDeclV2::typed("posts", "List<Post>", "load PostsList")
+        );
+    }
+
+    #[test]
+    fn parses_typed_top_level_data_declarations() {
+        let input = r#"
+page Blog
+
+data posts: List<Post> = loadPosts()
+
+<Each items={posts} as="post">
+  <Card title={post.title} />
+</Each>
+"#;
+
+        let file = parse_ax_v2(input).expect("typed data declaration should parse");
+
+        assert_eq!(
+            file.lets[0],
+            AxLetDeclV2::typed("posts", "List<Post>", "loadPosts()")
         );
     }
 
