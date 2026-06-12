@@ -26,6 +26,8 @@ pub enum AxParseV2Error {
     InvalidFunction { line: usize },
     #[error("invalid component syntax at line {line}")]
     InvalidComponent { line: usize },
+    #[error("invalid `return ASX` syntax at line {line}")]
+    InvalidReturnAsx { line: usize },
     #[error("duplicate page declaration at line {line}")]
     DuplicatePage { line: usize },
     #[error("missing page declaration")]
@@ -90,7 +92,7 @@ impl<'a> Parser<'a> {
             self.skip_layout_whitespace();
         }
 
-        let page = self.parse_page_decl()?;
+        let (page, function_body) = self.parse_page_decl()?;
         self.skip_layout_whitespace();
 
         let mut types = Vec::new();
@@ -119,7 +121,21 @@ impl<'a> Parser<'a> {
             self.skip_layout_whitespace();
         }
 
-        let body = self.parse_nodes(None)?;
+        let body = if function_body {
+            let body = self.parse_return_asx_body()?;
+            self.skip_layout_whitespace();
+            if self.peek_char() != Some('}') {
+                return Err(AxParseV2Error::InvalidPage { line: self.line });
+            }
+            self.bump_char();
+            self.skip_layout_whitespace();
+            if !self.eof() {
+                return Err(AxParseV2Error::InvalidPage { line: self.line });
+            }
+            body
+        } else {
+            self.parse_nodes(None)?
+        };
 
         Ok(AxFileV2 {
             package_uses,
@@ -214,7 +230,7 @@ impl<'a> Parser<'a> {
         Ok(AxImportDecl::new(bindings, source))
     }
 
-    fn parse_page_decl(&mut self) -> Result<AxPageDecl, AxParseV2Error> {
+    fn parse_page_decl(&mut self) -> Result<(AxPageDecl, bool), AxParseV2Error> {
         let line = self.line;
         if self.page_seen {
             return Err(AxParseV2Error::DuplicatePage { line });
@@ -231,14 +247,52 @@ impl<'a> Parser<'a> {
         self.skip_spaces();
 
         let mut params = Vec::new();
+        let mut has_param_list = false;
         if self.peek_char() == Some('(') {
+            has_param_list = true;
             params = self.parse_param_list(line, AxParseV2Error::InvalidPage { line })?;
         }
+        if has_param_list {
+            self.skip_layout_whitespace();
+        } else {
+            self.skip_spaces();
+        }
 
-        self.consume_until_line_end();
+        let function_body = if self.peek_char() == Some('{') {
+            self.bump_char();
+            true
+        } else {
+            if !has_param_list {
+                self.consume_until_line_end();
+            }
+            false
+        };
         self.page_seen = true;
 
-        Ok(AxPageDecl::with_params(name, params))
+        Ok((AxPageDecl::with_params(name, params), function_body))
+    }
+
+    fn parse_return_asx_body(&mut self) -> Result<Vec<AxNodeV2>, AxParseV2Error> {
+        let line = self.line;
+        if !self.starts_with_keyword("return") {
+            return Err(AxParseV2Error::InvalidReturnAsx { line });
+        }
+        self.expect_keyword("return")
+            .map_err(|_| AxParseV2Error::InvalidReturnAsx { line })?;
+        self.skip_spaces();
+        if !self.starts_with_keyword("ASX") {
+            return Err(AxParseV2Error::InvalidReturnAsx { line });
+        }
+        self.expect_keyword("ASX")
+            .map_err(|_| AxParseV2Error::InvalidReturnAsx { line })?;
+        self.skip_layout_whitespace();
+        if self.peek_char() != Some('{') {
+            return Err(AxParseV2Error::InvalidReturnAsx { line });
+        }
+        self.bump_char();
+        self.skip_layout_whitespace();
+
+        self.parse_nodes_until_component_body_end()
     }
 
     fn parse_let_or_data_decl(&mut self) -> Result<AxLetDeclV2, AxParseV2Error> {
@@ -1405,6 +1459,61 @@ data posts: List<Post> = loadPosts()
             file.lets[0],
             AxLetDeclV2::typed("posts", "List<Post>", "loadPosts()")
         );
+    }
+
+    #[test]
+    fn parses_function_shaped_page_with_return_asx_body() {
+        let input = r#"
+page Posts() {
+  type Post {
+    title: String
+    excerpt?: String
+  }
+
+  data posts: List<Post> = loadPosts()
+
+  return ASX {
+    <Grid cols={2}>
+      <Each items={posts} as="post">
+        <Card title={post.title}>
+          <Copy>{post?.excerpt}</Copy>
+        </Card>
+      </Each>
+    </Grid>
+  }
+}
+"#;
+
+        let file = parse_ax_v2(input).expect("function-shaped page should parse");
+
+        assert_eq!(file.page.name, "Posts");
+        assert_eq!(file.types.len(), 1);
+        assert_eq!(
+            file.lets[0],
+            AxLetDeclV2::typed("posts", "List<Post>", "loadPosts()")
+        );
+        assert_eq!(file.body.len(), 1);
+        let AxNodeV2::Element(grid) = &file.body[0] else {
+            panic!("expected grid element");
+        };
+        assert_eq!(grid.name, "Grid");
+    }
+
+    #[test]
+    fn parses_function_shaped_page_with_next_line_body_brace() {
+        let input = r#"
+page Home()
+{
+  return ASX {
+    <Copy>Hello</Copy>
+  }
+}
+"#;
+
+        let file = parse_ax_v2(input).expect("function-shaped page should parse");
+
+        assert_eq!(file.page.name, "Home");
+        assert_eq!(file.body.len(), 1);
     }
 
     #[test]

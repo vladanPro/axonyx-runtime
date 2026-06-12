@@ -117,6 +117,7 @@ impl Parser {
         }
 
         if let Some(name) = text.strip_prefix("loader ") {
+            let (name, braced) = split_block_brace(name);
             let (name, returns) = split_return_contract(name.trim());
             let name = parse_backend_callable_name(name);
             if name.is_empty() {
@@ -125,6 +126,7 @@ impl Parser {
 
             self.pos += 1;
             let body = self.parse_body(2)?;
+            self.consume_block_brace(braced, 0)?;
             let mut loader = AxLoader::new(name, body);
             if let Some(returns) = returns {
                 loader = loader.returns(returns);
@@ -133,6 +135,7 @@ impl Parser {
         }
 
         if let Some(name) = text.strip_prefix("query ") {
+            let (name, braced) = split_block_brace(name);
             let (name, returns) = split_return_contract(name.trim());
             let name = parse_backend_callable_name(name);
             if name.is_empty() {
@@ -141,6 +144,7 @@ impl Parser {
 
             self.pos += 1;
             let body = self.parse_body(2)?;
+            self.consume_block_brace(braced, 0)?;
             let mut loader = AxLoader::new(name, body);
             if let Some(returns) = returns {
                 loader = loader.returns(returns);
@@ -149,6 +153,7 @@ impl Parser {
         }
 
         if let Some(name) = text.strip_prefix("action ") {
+            let (name, braced) = split_block_brace(name);
             let (name, returns) = split_return_contract(name.trim());
             if name.is_empty() {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
@@ -156,6 +161,7 @@ impl Parser {
 
             self.pos += 1;
             let (input, body) = self.parse_input_sections(2)?;
+            self.consume_block_brace(braced, 0)?;
             let mut action = AxAction::new(name).input(input).body(body);
             if let Some(returns) = returns {
                 action = action.returns(returns);
@@ -164,6 +170,7 @@ impl Parser {
         }
 
         if let Some(name) = text.strip_prefix("job ") {
+            let (name, braced) = split_block_brace(name);
             let name = name.trim();
             if name.is_empty() {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
@@ -171,6 +178,7 @@ impl Parser {
 
             self.pos += 1;
             let body = self.parse_body(2)?;
+            self.consume_block_brace(braced, 0)?;
             return Ok(AxBackendBlock::Job(AxJob::new(name, body)));
         }
 
@@ -273,6 +281,27 @@ impl Parser {
         }
 
         Ok(body)
+    }
+
+    fn consume_block_brace(
+        &mut self,
+        braced: bool,
+        indent: usize,
+    ) -> Result<(), AxBackendParseError> {
+        if !braced {
+            return Ok(());
+        }
+
+        let Some(line) = self.current() else {
+            return Err(AxBackendParseError::InvalidBlock { line: 1 });
+        };
+
+        if line.indent != indent || line.text != "}" {
+            return Err(AxBackendParseError::InvalidBlock { line: line.line });
+        }
+
+        self.pos += 1;
+        Ok(())
     }
 
     fn parse_backend_root_body(
@@ -1063,6 +1092,15 @@ fn split_return_contract(input: &str) -> (&str, Option<String>) {
     }
 }
 
+fn split_block_brace(input: &str) -> (&str, bool) {
+    let input = input.trim_end();
+    if let Some(header) = input.strip_suffix('{') {
+        (header.trim_end(), true)
+    } else {
+        (input, false)
+    }
+}
+
 fn parse_backend_callable_name(input: &str) -> &str {
     let input = input.trim();
     if let Some(name) = input.strip_suffix("()") {
@@ -1205,6 +1243,29 @@ query loadPosts() -> Post[]
     }
 
     #[test]
+    fn parses_braced_query_function_as_loader_block() {
+        let input = r#"
+query loadPosts() -> Post[] {
+  data posts = db.posts.all()
+    where status = "published"
+    order created_at desc
+    limit 6
+  return posts
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+
+        assert_eq!(loader.name, "loadPosts");
+        assert_eq!(loader.returns.as_deref(), Some("Post[]"));
+        assert_eq!(loader.body.len(), 2);
+    }
+
+    #[test]
     fn parses_db_all_binding_as_query_without_extra_clauses() {
         let input = r#"
 loader PostsList
@@ -1309,6 +1370,32 @@ action CreatePost
         assert_eq!(action.name, "CreatePost");
         assert_eq!(action.input.len(), 2);
         assert_eq!(action.body.len(), 3);
+    }
+
+    #[test]
+    fn parses_braced_action_block() {
+        let input = r#"
+action CreatePost -> Post {
+  input:
+    title: string
+
+  insert "posts"
+    title: input.title
+
+  return created
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(action.name, "CreatePost");
+        assert_eq!(action.returns.as_deref(), Some("Post"));
+        assert_eq!(action.input.len(), 1);
+        assert_eq!(action.body.len(), 2);
     }
 
     #[test]
