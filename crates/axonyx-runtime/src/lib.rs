@@ -4063,6 +4063,46 @@ page Posts
     }
 
     #[test]
+    fn previews_function_shaped_page_with_query_data() {
+        let html = preview_ax_route_with_loaders(
+            &[],
+            &[r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.all()
+    where status = "published"
+    order created_at desc
+    limit 6
+  return posts
+"#],
+            r#"
+page Posts() {
+  type Post {
+    title: String
+    excerpt?: String
+  }
+
+  data posts: List<Post> = loadPosts()
+
+  return ASX {
+    <Grid cols={2}>
+      <Each items={posts} as="post">
+        <Card title={post.title}>
+          <Copy>{post?.excerpt}</Copy>
+        </Card>
+      </Each>
+    </Grid>
+  }
+}
+"#,
+        )
+        .expect("function-shaped page preview should render");
+
+        assert!(html.contains("Hello Axonyx"));
+        assert!(html.contains("Docs Without Bloat"));
+        assert!(!html.contains("Draft Preview"));
+    }
+
+    #[test]
     fn previews_content_collection_loader_data_inside_page() {
         let store = AxPreviewStore::default().with_collection(
             "docs",

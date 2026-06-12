@@ -62,10 +62,17 @@ pub enum AxConvertV2Error {
 }
 
 pub fn looks_like_ax_v2(input: &str) -> bool {
+    let has_return_asx = input
+        .lines()
+        .map(str::trim_start)
+        .any(|line| line.starts_with("return ASX"));
+
     input.lines().map(str::trim).any(|line| {
         !line.is_empty()
             && (line.starts_with("import ")
                 || line.starts_with("use ")
+                || (line.starts_with("page ") && line.ends_with('{'))
+                || (line.starts_with("page ") && line.contains('(') && has_return_asx)
                 || line.starts_with('<')
                 || line.starts_with("</"))
     })
@@ -946,6 +953,31 @@ let heroTitle = "Hello Axonyx"
         assert_eq!(
             document.page.body[0],
             AxStatement::data("heroTitle", AxExpr::string("Hello Axonyx"))
+        );
+    }
+
+    #[test]
+    fn converts_function_shaped_page_return_asx_into_document() {
+        let document = parse_ax_auto(
+            r#"
+page Home() {
+  data title = "Hello Axonyx"
+
+  return ASX {
+    <Container max="xl">
+      <Copy>{title}</Copy>
+    </Container>
+  }
+}
+"#,
+        )
+        .expect("function-shaped page should convert");
+
+        assert_eq!(document.page.name, "Home");
+        assert_eq!(document.page.body.len(), 2);
+        assert_eq!(
+            document.page.body[0],
+            AxStatement::data("title", AxExpr::string("Hello Axonyx"))
         );
     }
 
