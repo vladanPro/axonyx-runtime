@@ -473,6 +473,66 @@ pub(crate) fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseErro
         });
     }
 
+    parse_operator_expr(input, line)
+}
+
+fn parse_operator_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
+    parse_binary_expr(input, line, 0)
+}
+
+fn parse_binary_expr(input: &str, line: usize, min_precedence: u8) -> Result<AxExpr, AxParseError> {
+    let Some((index, op, precedence)) = find_lowest_precedence_operator(input, min_precedence)
+    else {
+        return parse_unary_expr(input, line);
+    };
+
+    let left_source = input[..index].trim();
+    let right_source = input[index + binary_op_len(op)..].trim();
+    if left_source.is_empty() || right_source.is_empty() {
+        return Err(AxParseError::InvalidExpression {
+            line,
+            message: format!("missing operand in `{input}`"),
+        });
+    }
+
+    Ok(AxExpr::binary(
+        op,
+        parse_binary_expr(left_source, line, min_precedence)?,
+        parse_binary_expr(right_source, line, precedence + 1)?,
+    ))
+}
+
+fn parse_unary_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
+    let input = input.trim();
+    if let Some(rest) = input.strip_prefix('!') {
+        let rest = rest.trim();
+        if rest.is_empty() || rest.starts_with('=') {
+            return parse_primary_expr(input, line);
+        }
+        return Ok(AxExpr::unary(AxUnaryOp::Not, parse_unary_expr(rest, line)?));
+    }
+
+    if let Some(rest) = input.strip_prefix('-') {
+        let rest = rest.trim();
+        if rest.is_empty() {
+            return parse_primary_expr(input, line);
+        }
+        if let Ok(value) = input.parse::<i64>() {
+            return Ok(AxExpr::number(value));
+        }
+        return Ok(AxExpr::unary(AxUnaryOp::Neg, parse_unary_expr(rest, line)?));
+    }
+
+    parse_primary_expr(input, line)
+}
+
+fn parse_primary_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
+    let original = input.trim();
+    let input = trim_wrapping_parens(original);
+    if input != original {
+        return parse_operator_expr(input, line);
+    }
+
     if let Some(value) = parse_quoted_string(input, line)? {
         return Ok(AxExpr::string(value));
     }
@@ -524,6 +584,183 @@ pub(crate) fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseErro
     }
 
     Ok(AxExpr::ident(input))
+}
+
+fn find_lowest_precedence_operator(
+    input: &str,
+    min_precedence: u8,
+) -> Option<(usize, AxBinaryOp, u8)> {
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+    let mut result = None;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    in_string = None;
+                }
+                continue;
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    in_string = Some(ch);
+                    continue;
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    continue;
+                }
+                ')' | ']' | '}' => {
+                    depth = depth.saturating_sub(1);
+                    continue;
+                }
+                _ if depth > 0 => continue,
+                _ => {}
+            },
+        }
+
+        let Some(candidate) = binary_op_at(input, index) else {
+            continue;
+        };
+        if !operator_has_left_operand(input, index) {
+            continue;
+        }
+        let precedence = binary_precedence(candidate);
+        if precedence < min_precedence {
+            continue;
+        }
+
+        if result
+            .map(|(_, _, current_precedence)| precedence <= current_precedence)
+            .unwrap_or(true)
+        {
+            result = Some((index, candidate, precedence));
+        }
+    }
+
+    result
+}
+
+fn binary_op_at(input: &str, index: usize) -> Option<AxBinaryOp> {
+    let rest = &input[index..];
+    for (token, op) in [
+        ("??", AxBinaryOp::Fallback),
+        ("||", AxBinaryOp::Or),
+        ("&&", AxBinaryOp::And),
+        ("==", AxBinaryOp::Eq),
+        ("!=", AxBinaryOp::Ne),
+        (">=", AxBinaryOp::Ge),
+        ("<=", AxBinaryOp::Le),
+        (">", AxBinaryOp::Gt),
+        ("<", AxBinaryOp::Lt),
+        ("+", AxBinaryOp::Add),
+        ("-", AxBinaryOp::Sub),
+        ("*", AxBinaryOp::Mul),
+        ("/", AxBinaryOp::Div),
+        ("%", AxBinaryOp::Rem),
+    ] {
+        if rest.starts_with(token) {
+            return Some(op);
+        }
+    }
+    None
+}
+
+fn binary_precedence(op: AxBinaryOp) -> u8 {
+    match op {
+        AxBinaryOp::Fallback => 1,
+        AxBinaryOp::Or => 2,
+        AxBinaryOp::And => 3,
+        AxBinaryOp::Eq | AxBinaryOp::Ne => 4,
+        AxBinaryOp::Gt | AxBinaryOp::Ge | AxBinaryOp::Lt | AxBinaryOp::Le => 5,
+        AxBinaryOp::Add | AxBinaryOp::Sub => 6,
+        AxBinaryOp::Mul | AxBinaryOp::Div | AxBinaryOp::Rem => 7,
+    }
+}
+
+fn binary_op_len(op: AxBinaryOp) -> usize {
+    match op {
+        AxBinaryOp::Gt
+        | AxBinaryOp::Lt
+        | AxBinaryOp::Add
+        | AxBinaryOp::Sub
+        | AxBinaryOp::Mul
+        | AxBinaryOp::Div
+        | AxBinaryOp::Rem => 1,
+        AxBinaryOp::Fallback
+        | AxBinaryOp::Or
+        | AxBinaryOp::And
+        | AxBinaryOp::Eq
+        | AxBinaryOp::Ne
+        | AxBinaryOp::Ge
+        | AxBinaryOp::Le => 2,
+    }
+}
+
+fn operator_has_left_operand(input: &str, index: usize) -> bool {
+    input[..index]
+        .chars()
+        .rev()
+        .find(|ch| !ch.is_whitespace())
+        .is_some_and(|ch| !matches!(ch, '(' | '[' | '{' | ',' | '+' | '-' | '*' | '/' | '%'))
+}
+
+fn trim_wrapping_parens(input: &str) -> &str {
+    let mut current = input.trim();
+    loop {
+        if !current.starts_with('(') || !current.ends_with(')') {
+            return current;
+        }
+        if !outer_parens_wrap(current) {
+            return current;
+        }
+        let inner = &current[1..current.len() - 1];
+        current = inner.trim();
+    }
+}
+
+fn outer_parens_wrap(input: &str) -> bool {
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+    let last_index = input.len() - 1;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    in_string = None;
+                }
+                continue;
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    in_string = Some(ch);
+                    continue;
+                }
+                '(' => depth += 1,
+                ')' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && index != last_index {
+                        return false;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    depth == 0
 }
 
 fn parse_member_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
@@ -874,6 +1111,54 @@ page Home
         };
 
         assert_eq!(expr, &AxExpr::ident("post").optional_member("summary"));
+    }
+
+    #[test]
+    fn parses_binary_operator_precedence() {
+        let expr = parse_expr("count + 1 * 2", 1).expect("expression should parse");
+
+        assert_eq!(
+            expr,
+            AxExpr::binary(
+                AxBinaryOp::Add,
+                AxExpr::ident("count"),
+                AxExpr::binary(AxBinaryOp::Mul, AxExpr::number(1), AxExpr::number(2)),
+            )
+        );
+    }
+
+    #[test]
+    fn parses_optional_fallback_expression() {
+        let expr =
+            parse_expr(r#"post?.summary ?? "No summary""#, 1).expect("expression should parse");
+
+        assert_eq!(
+            expr,
+            AxExpr::binary(
+                AxBinaryOp::Fallback,
+                AxExpr::ident("post").optional_member("summary"),
+                AxExpr::string("No summary"),
+            )
+        );
+    }
+
+    #[test]
+    fn parses_logical_and_unary_expression() {
+        let expr =
+            parse_expr(r#"status == "published" && !hidden"#, 1).expect("expression should parse");
+
+        assert_eq!(
+            expr,
+            AxExpr::binary(
+                AxBinaryOp::And,
+                AxExpr::binary(
+                    AxBinaryOp::Eq,
+                    AxExpr::ident("status"),
+                    AxExpr::string("published"),
+                ),
+                AxExpr::unary(AxUnaryOp::Not, AxExpr::ident("hidden")),
+            )
+        );
     }
 
     #[test]

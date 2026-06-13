@@ -477,6 +477,15 @@ pub enum AxExpr {
     Number(i64),
     Bool(bool),
     Identifier(String),
+    Unary {
+        op: AxUnaryOp,
+        expr: Box<AxExpr>,
+    },
+    Binary {
+        op: AxBinaryOp,
+        left: Box<AxExpr>,
+        right: Box<AxExpr>,
+    },
     Member {
         object: Box<AxExpr>,
         property: String,
@@ -489,6 +498,30 @@ pub enum AxExpr {
         path: Vec<String>,
         args: Vec<AxExpr>,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxUnaryOp {
+    Not,
+    Neg,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxBinaryOp {
+    Add,
+    Sub,
+    Mul,
+    Div,
+    Rem,
+    Eq,
+    Ne,
+    Gt,
+    Ge,
+    Lt,
+    Le,
+    And,
+    Or,
+    Fallback,
 }
 
 impl AxExpr {
@@ -506,6 +539,21 @@ impl AxExpr {
 
     pub fn ident(value: impl Into<String>) -> Self {
         Self::Identifier(value.into())
+    }
+
+    pub fn unary(op: AxUnaryOp, expr: AxExpr) -> Self {
+        Self::Unary {
+            op,
+            expr: Box::new(expr),
+        }
+    }
+
+    pub fn binary(op: AxBinaryOp, left: AxExpr, right: AxExpr) -> Self {
+        Self::Binary {
+            op,
+            left: Box::new(left),
+            right: Box::new(right),
+        }
     }
 
     pub fn member(self, property: impl Into<String>) -> Self {
@@ -558,6 +606,7 @@ impl From<bool> for AxExpr {
 }
 
 pub mod prelude {
+    pub use super::AxBinaryOp;
     pub use super::AxBody;
     pub use super::AxComponent;
     pub use super::AxComponentDef;
@@ -579,6 +628,7 @@ pub mod prelude {
     pub use super::AxProp;
     pub use super::AxStatement;
     pub use super::AxStyle;
+    pub use super::AxUnaryOp;
 }
 
 #[cfg(test)]

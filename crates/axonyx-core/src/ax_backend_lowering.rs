@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::ax_ast::prelude::AxExpr;
+use crate::ax_ast::prelude::{AxBinaryOp, AxExpr, AxUnaryOp};
 use crate::ax_backend_ast::prelude::*;
 use crate::ax_query_ast::prelude::*;
 
@@ -586,6 +586,18 @@ fn render_expr(expr: &AxExpr) -> String {
         AxExpr::Number(value) => value.to_string(),
         AxExpr::Bool(value) => value.to_string(),
         AxExpr::Identifier(name) => name.clone(),
+        AxExpr::Unary { op, expr } => format!("({}{})", render_unary_op(*op), render_expr(expr)),
+        AxExpr::Binary { op, left, right } => {
+            if *op == AxBinaryOp::Fallback {
+                return format!("({}).unwrap_or({})", render_expr(left), render_expr(right));
+            }
+            format!(
+                "({} {} {})",
+                render_expr(left),
+                render_binary_op(*op),
+                render_expr(right)
+            )
+        }
         AxExpr::Member { object, property } => format!("{}.{}", render_expr(object), property),
         AxExpr::OptionalMember { object, property } => {
             format!("{}.{}", render_expr(object), property)
@@ -599,6 +611,32 @@ fn render_expr(expr: &AxExpr) -> String {
             let args = args.iter().map(render_expr).collect::<Vec<_>>().join(", ");
             format!("{fn_name}({args})")
         }
+    }
+}
+
+fn render_unary_op(op: AxUnaryOp) -> &'static str {
+    match op {
+        AxUnaryOp::Not => "!",
+        AxUnaryOp::Neg => "-",
+    }
+}
+
+fn render_binary_op(op: AxBinaryOp) -> &'static str {
+    match op {
+        AxBinaryOp::Add => "+",
+        AxBinaryOp::Sub => "-",
+        AxBinaryOp::Mul => "*",
+        AxBinaryOp::Div => "/",
+        AxBinaryOp::Rem => "%",
+        AxBinaryOp::Eq => "==",
+        AxBinaryOp::Ne => "!=",
+        AxBinaryOp::Gt => ">",
+        AxBinaryOp::Ge => ">=",
+        AxBinaryOp::Lt => "<",
+        AxBinaryOp::Le => "<=",
+        AxBinaryOp::And => "&&",
+        AxBinaryOp::Or => "||",
+        AxBinaryOp::Fallback => "??",
     }
 }
 

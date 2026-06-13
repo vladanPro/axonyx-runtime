@@ -99,6 +99,8 @@ pub enum AxLowerError {
     UnknownMember { property: String },
     #[error("unsupported call `{path}`")]
     UnsupportedCall { path: String },
+    #[error("unsupported expression: {message}")]
+    UnsupportedExpression { message: String },
     #[error("`each` requires a list source")]
     EachRequiresList,
     #[error("failed to parse imported component from `{import_path}`: {message}")]
@@ -695,6 +697,39 @@ fn eval_expr(
             .get(name)
             .cloned()
             .ok_or_else(|| AxLowerError::UnknownIdentifier { name: name.clone() }),
+        AxExpr::Unary { op, expr } => {
+            let value = eval_expr(expr, functions, scope, resolver)?;
+            eval_unary_expr(*op, value)
+        }
+        AxExpr::Binary { op, left, right } => {
+            if *op == AxBinaryOp::And {
+                let left = eval_expr(left, functions, scope, resolver)?;
+                if !is_truthy(&left) {
+                    return Ok(AxValue::Bool(false));
+                }
+                let right = eval_expr(right, functions, scope, resolver)?;
+                return Ok(AxValue::Bool(is_truthy(&right)));
+            }
+            if *op == AxBinaryOp::Or {
+                let left = eval_expr(left, functions, scope, resolver)?;
+                if is_truthy(&left) {
+                    return Ok(AxValue::Bool(true));
+                }
+                let right = eval_expr(right, functions, scope, resolver)?;
+                return Ok(AxValue::Bool(is_truthy(&right)));
+            }
+            if *op == AxBinaryOp::Fallback {
+                let left = eval_expr(left, functions, scope, resolver)?;
+                if !matches!(left, AxValue::Null) {
+                    return Ok(left);
+                }
+                return eval_expr(right, functions, scope, resolver);
+            }
+
+            let left = eval_expr(left, functions, scope, resolver)?;
+            let right = eval_expr(right, functions, scope, resolver)?;
+            eval_binary_expr(*op, left, right)
+        }
         AxExpr::Member { object, property } => {
             let value = eval_expr(object, functions, scope, resolver)?;
             match value {
@@ -735,6 +770,100 @@ fn eval_expr(
                     path: path.join("."),
                 })
         }
+    }
+}
+
+fn eval_unary_expr(op: AxUnaryOp, value: AxValue) -> Result<AxValue, AxLowerError> {
+    match op {
+        AxUnaryOp::Not => Ok(AxValue::Bool(!is_truthy(&value))),
+        AxUnaryOp::Neg => match value {
+            AxValue::Number(value) => Ok(AxValue::Number(-value)),
+            _ => Err(AxLowerError::UnsupportedExpression {
+                message: "unary `-` expects a number".to_string(),
+            }),
+        },
+    }
+}
+
+fn eval_binary_expr(
+    op: AxBinaryOp,
+    left: AxValue,
+    right: AxValue,
+) -> Result<AxValue, AxLowerError> {
+    match op {
+        AxBinaryOp::Add => match (left, right) {
+            (AxValue::Number(left), AxValue::Number(right)) => Ok(AxValue::Number(left + right)),
+            (left, right) => Ok(AxValue::String(format!(
+                "{}{}",
+                left.as_string(),
+                right.as_string()
+            ))),
+        },
+        AxBinaryOp::Sub => eval_number_binary(left, right, |left, right| left - right, "`-`"),
+        AxBinaryOp::Mul => eval_number_binary(left, right, |left, right| left * right, "`*`"),
+        AxBinaryOp::Div => {
+            eval_checked_number_binary(left, right, |left, right| left / right, "`/`", true)
+        }
+        AxBinaryOp::Rem => {
+            eval_checked_number_binary(left, right, |left, right| left % right, "`%`", true)
+        }
+        AxBinaryOp::Eq => Ok(AxValue::Bool(left == right)),
+        AxBinaryOp::Ne => Ok(AxValue::Bool(left != right)),
+        AxBinaryOp::Gt => eval_compare_binary(left, right, |ordering| ordering.is_gt(), "`>`"),
+        AxBinaryOp::Ge => eval_compare_binary(left, right, |ordering| ordering.is_ge(), "`>=`"),
+        AxBinaryOp::Lt => eval_compare_binary(left, right, |ordering| ordering.is_lt(), "`<`"),
+        AxBinaryOp::Le => eval_compare_binary(left, right, |ordering| ordering.is_le(), "`<=`"),
+        AxBinaryOp::And | AxBinaryOp::Or | AxBinaryOp::Fallback => {
+            unreachable!("short-circuit operators are evaluated before this point")
+        }
+    }
+}
+
+fn eval_number_binary(
+    left: AxValue,
+    right: AxValue,
+    operation: impl FnOnce(i64, i64) -> i64,
+    operator: &str,
+) -> Result<AxValue, AxLowerError> {
+    eval_checked_number_binary(left, right, operation, operator, false)
+}
+
+fn eval_checked_number_binary(
+    left: AxValue,
+    right: AxValue,
+    operation: impl FnOnce(i64, i64) -> i64,
+    operator: &str,
+    reject_zero_right: bool,
+) -> Result<AxValue, AxLowerError> {
+    let (AxValue::Number(left), AxValue::Number(right)) = (left, right) else {
+        return Err(AxLowerError::UnsupportedExpression {
+            message: format!("{operator} expects numbers"),
+        });
+    };
+    if reject_zero_right && right == 0 {
+        return Err(AxLowerError::UnsupportedExpression {
+            message: format!("{operator} cannot use zero as the right operand"),
+        });
+    }
+    Ok(AxValue::Number(operation(left, right)))
+}
+
+fn eval_compare_binary(
+    left: AxValue,
+    right: AxValue,
+    operation: impl FnOnce(std::cmp::Ordering) -> bool,
+    operator: &str,
+) -> Result<AxValue, AxLowerError> {
+    match (left, right) {
+        (AxValue::Number(left), AxValue::Number(right)) => {
+            Ok(AxValue::Bool(operation(left.cmp(&right))))
+        }
+        (AxValue::String(left), AxValue::String(right)) => {
+            Ok(AxValue::Bool(operation(left.cmp(&right))))
+        }
+        _ => Err(AxLowerError::UnsupportedExpression {
+            message: format!("{operator} expects comparable values"),
+        }),
     }
 }
 
@@ -1570,6 +1699,72 @@ page Home
         };
 
         assert_eq!(children, &[text("")]);
+    }
+
+    #[test]
+    fn fallback_operator_lowers_missing_optional_member() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::component(AxComponent::new("Copy").inline(
+                AxExpr::binary(
+                    AxBinaryOp::Fallback,
+                    AxExpr::ident("post").optional_member("summary"),
+                    AxExpr::string("No summary"),
+                ),
+            ))],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert(
+            "post".to_string(),
+            AxValue::record([("title", AxValue::from("Hello"))]),
+        );
+
+        let node =
+            lower_document_with_scope(&document, scope, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { children, .. } = &children[0] else {
+            panic!("expected copy element");
+        };
+
+        assert_eq!(children, &[text("No summary")]);
+    }
+
+    #[test]
+    fn logical_operator_lowers_if_condition() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::If(AxIfBlock::new(
+                AxExpr::binary(
+                    AxBinaryOp::And,
+                    AxExpr::binary(
+                        AxBinaryOp::Eq,
+                        AxExpr::ident("status"),
+                        AxExpr::string("published"),
+                    ),
+                    AxExpr::unary(AxUnaryOp::Not, AxExpr::ident("hidden")),
+                ),
+                [AxStatement::component(
+                    AxComponent::new("Copy").inline("Visible"),
+                )],
+            ))],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert("status".to_string(), AxValue::from("published"));
+        scope.insert("hidden".to_string(), AxValue::Bool(false));
+
+        let node =
+            lower_document_with_scope(&document, scope, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+
+        assert_eq!(children.len(), 1);
     }
 
     #[test]
