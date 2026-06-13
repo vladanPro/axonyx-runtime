@@ -3117,6 +3117,14 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
         AxExpr::String(value) => value.clone(),
         AxExpr::Number(value) => value.to_string(),
         AxExpr::Bool(value) => value.to_string(),
+        AxExpr::List(items) => {
+            let items = items
+                .iter()
+                .map(head_expr_to_string)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("[{items}]")
+        }
         AxExpr::Identifier(value) => value.clone(),
         AxExpr::Unary { op, expr } => {
             format!(

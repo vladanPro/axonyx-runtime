@@ -693,6 +693,11 @@ fn eval_expr(
         AxExpr::String(value) => Ok(AxValue::String(value.clone())),
         AxExpr::Number(value) => Ok(AxValue::Number(*value)),
         AxExpr::Bool(value) => Ok(AxValue::Bool(*value)),
+        AxExpr::List(items) => items
+            .iter()
+            .map(|item| eval_expr(item, functions, scope, resolver))
+            .collect::<Result<Vec<_>, _>>()
+            .map(AxValue::List),
         AxExpr::Identifier(name) => scope
             .get(name)
             .cloned()
@@ -1795,6 +1800,35 @@ page Home
             "themes".to_string(),
             AxValue::list([AxValue::from("silver"), AxValue::from("gold")]),
         );
+
+        let node =
+            lower_document_with_scope(&document, scope, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+
+        assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn list_literal_lowers_into_in_operator_condition() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::If(AxIfBlock::new(
+                AxExpr::binary(
+                    AxBinaryOp::In,
+                    AxExpr::ident("theme"),
+                    AxExpr::list([AxExpr::string("silver"), AxExpr::string("gold")]),
+                ),
+                [AxStatement::component(
+                    AxComponent::new("Copy").inline("Allowed"),
+                )],
+            ))],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert("theme".to_string(), AxValue::from("gold"));
 
         let node =
             lower_document_with_scope(&document, scope, &resolver).expect("document should lower");

@@ -476,6 +476,7 @@ pub enum AxExpr {
     String(String),
     Number(i64),
     Bool(bool),
+    List(Vec<AxExpr>),
     Identifier(String),
     Unary {
         op: AxUnaryOp,
@@ -536,6 +537,10 @@ impl AxExpr {
 
     pub fn bool(value: bool) -> Self {
         Self::Bool(value)
+    }
+
+    pub fn list(items: impl IntoIterator<Item = AxExpr>) -> Self {
+        Self::List(items.into_iter().collect())
     }
 
     pub fn ident(value: impl Into<String>) -> Self {
