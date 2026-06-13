@@ -649,6 +649,10 @@ fn find_lowest_precedence_operator(
 
 fn binary_op_at(input: &str, index: usize) -> Option<AxBinaryOp> {
     let rest = &input[index..];
+    if rest.starts_with("in") && is_word_operator_boundary(input, index, "in") {
+        return Some(AxBinaryOp::In);
+    }
+
     for (token, op) in [
         ("??", AxBinaryOp::Fallback),
         ("||", AxBinaryOp::Or),
@@ -678,7 +682,7 @@ fn binary_precedence(op: AxBinaryOp) -> u8 {
         AxBinaryOp::Or => 2,
         AxBinaryOp::And => 3,
         AxBinaryOp::Eq | AxBinaryOp::Ne => 4,
-        AxBinaryOp::Gt | AxBinaryOp::Ge | AxBinaryOp::Lt | AxBinaryOp::Le => 5,
+        AxBinaryOp::Gt | AxBinaryOp::Ge | AxBinaryOp::Lt | AxBinaryOp::Le | AxBinaryOp::In => 5,
         AxBinaryOp::Add | AxBinaryOp::Sub => 6,
         AxBinaryOp::Mul | AxBinaryOp::Div | AxBinaryOp::Rem => 7,
     }
@@ -699,8 +703,22 @@ fn binary_op_len(op: AxBinaryOp) -> usize {
         | AxBinaryOp::Eq
         | AxBinaryOp::Ne
         | AxBinaryOp::Ge
-        | AxBinaryOp::Le => 2,
+        | AxBinaryOp::Le
+        | AxBinaryOp::In => 2,
     }
+}
+
+fn is_word_operator_boundary(input: &str, index: usize, token: &str) -> bool {
+    let before = input[..index].chars().next_back();
+    let after_index = index + token.len();
+    let after = input[after_index..].chars().next();
+
+    before.is_none_or(|ch| !is_identifier_char(ch))
+        && after.is_none_or(|ch| !is_identifier_char(ch))
+}
+
+fn is_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_'
 }
 
 fn operator_has_left_operand(input: &str, index: usize) -> bool {
@@ -1157,6 +1175,20 @@ page Home
                     AxExpr::string("published"),
                 ),
                 AxExpr::unary(AxUnaryOp::Not, AxExpr::ident("hidden")),
+            )
+        );
+    }
+
+    #[test]
+    fn parses_in_operator_without_confusing_identifier_prefixes() {
+        let expr = parse_expr("input.theme in themes", 1).expect("expression should parse");
+
+        assert_eq!(
+            expr,
+            AxExpr::binary(
+                AxBinaryOp::In,
+                AxExpr::ident("input").member("theme"),
+                AxExpr::ident("themes"),
             )
         );
     }

@@ -194,6 +194,7 @@ impl AxDataContext {
                     | AxBinaryOp::Ge
                     | AxBinaryOp::Lt
                     | AxBinaryOp::Le
+                    | AxBinaryOp::In
                     | AxBinaryOp::And
                     | AxBinaryOp::Or => Ok(AxType::Bool),
                     AxBinaryOp::Fallback => match left_type {
@@ -608,6 +609,7 @@ fn format_binary_op(op: AxBinaryOp) -> &'static str {
         AxBinaryOp::Ge => ">=",
         AxBinaryOp::Lt => "<",
         AxBinaryOp::Le => "<=",
+        AxBinaryOp::In => "in",
         AxBinaryOp::And => "&&",
         AxBinaryOp::Or => "||",
         AxBinaryOp::Fallback => "??",
