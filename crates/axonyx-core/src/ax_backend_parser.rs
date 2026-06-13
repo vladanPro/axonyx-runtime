@@ -970,7 +970,7 @@ fn parse_fluent_call<'a>(
 fn parse_object_fields<'a>(
     input: &'a str,
     line: usize,
-) -> Result<Vec<(&'a str, &'a str)>, AxBackendParseError> {
+) -> Result<Vec<(String, &'a str)>, AxBackendParseError> {
     let input = input.trim();
     let Some(inner) = input
         .strip_prefix('{')
@@ -988,9 +988,9 @@ fn parse_object_fields<'a>(
 
         match split_top_level_once(part, ":") {
             Some((field, value)) => {
-                let field = field.trim();
+                let field = parse_object_key(field.trim(), line)?;
                 let value = value.trim();
-                if field.is_empty() || value.is_empty() {
+                if value.is_empty() {
                     return Err(AxBackendParseError::InvalidQueryClause { line });
                 }
                 fields.push((field, value));
@@ -999,7 +999,7 @@ fn parse_object_fields<'a>(
                 if part.contains(' ') {
                     return Err(AxBackendParseError::InvalidQueryClause { line });
                 }
-                fields.push((part, part));
+                fields.push((parse_object_key(part, line)?, part));
             }
         }
     }
@@ -1009,6 +1009,52 @@ fn parse_object_fields<'a>(
     }
 
     Ok(fields)
+}
+
+fn parse_object_key(input: &str, line: usize) -> Result<String, AxBackendParseError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    }
+
+    if let Some(value) = parse_quoted_object_key(input) {
+        if is_valid_object_key(value) {
+            return Ok(value.to_string());
+        }
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    }
+
+    if is_valid_object_key(input) {
+        return Ok(input.to_string());
+    }
+
+    Err(AxBackendParseError::InvalidQueryClause { line })
+}
+
+fn parse_quoted_object_key(input: &str) -> Option<&str> {
+    if input.len() < 2 {
+        return None;
+    }
+    let quote = input.as_bytes()[0] as char;
+    if quote != '"' && quote != '\'' {
+        return None;
+    }
+    if !input.ends_with(quote) {
+        return None;
+    }
+
+    Some(&input[1..input.len() - 1])
+}
+
+fn is_valid_object_key(input: &str) -> bool {
+    let mut chars = input.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 fn parse_u32_arg(input: &str, line: usize) -> Result<u32, AxBackendParseError> {
@@ -1506,6 +1552,52 @@ query loadPosts() -> Post[]
                 .limit(6)
             )
         );
+    }
+
+    #[test]
+    fn parses_fluent_db_query_with_quoted_object_keys() {
+        let input = r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.where({ "status": "published" }).order({ "created_at": "desc" }).all()
+  return posts
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected data statement");
+        };
+
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "status",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::string("published"),
+                ))
+                .order(AxQueryOrder::new("created_at", AxQueryOrderDirection::Desc))
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_fluent_db_query_with_invalid_quoted_object_key() {
+        let input = r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.where({ "bad-key": "published" }).all()
+  return posts
+"#;
+
+        let error = parse_backend_ax(input).expect_err("invalid key should fail before lowering");
+
+        assert_eq!(error, AxBackendParseError::InvalidQueryClause { line: 3 });
     }
 
     #[test]
