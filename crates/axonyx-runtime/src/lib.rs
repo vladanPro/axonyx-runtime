@@ -5,8 +5,8 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use axonyx_core::ax_ast_prelude::{
-    AxBody, AxComponent, AxDocument, AxExpr, AxHead, AxHeadTag, AxPipeline, AxPipelineStage,
-    AxProp, AxStatement,
+    AxBinaryOp, AxBody, AxComponent, AxDocument, AxExpr, AxHead, AxHeadTag, AxPipeline,
+    AxPipelineStage, AxProp, AxStatement, AxUnaryOp,
 };
 use axonyx_core::ax_backend_lowering::AxBackendLowerError;
 use axonyx_core::ax_backend_lowering_prelude::{
@@ -3118,6 +3118,19 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
         AxExpr::Number(value) => value.to_string(),
         AxExpr::Bool(value) => value.to_string(),
         AxExpr::Identifier(value) => value.clone(),
+        AxExpr::Unary { op, expr } => {
+            format!(
+                "{}{}",
+                head_unary_op_to_string(*op),
+                head_expr_to_string(expr)
+            )
+        }
+        AxExpr::Binary { op, left, right } => format!(
+            "{} {} {}",
+            head_expr_to_string(left),
+            head_binary_op_to_string(*op),
+            head_expr_to_string(right)
+        ),
         AxExpr::Member { object, property } => {
             format!("{}.{}", head_expr_to_string(object), property)
         }
@@ -3132,6 +3145,32 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
                 .join(", ");
             format!("{}({args})", path.join("."))
         }
+    }
+}
+
+fn head_unary_op_to_string(op: AxUnaryOp) -> &'static str {
+    match op {
+        AxUnaryOp::Not => "!",
+        AxUnaryOp::Neg => "-",
+    }
+}
+
+fn head_binary_op_to_string(op: AxBinaryOp) -> &'static str {
+    match op {
+        AxBinaryOp::Add => "+",
+        AxBinaryOp::Sub => "-",
+        AxBinaryOp::Mul => "*",
+        AxBinaryOp::Div => "/",
+        AxBinaryOp::Rem => "%",
+        AxBinaryOp::Eq => "==",
+        AxBinaryOp::Ne => "!=",
+        AxBinaryOp::Gt => ">",
+        AxBinaryOp::Ge => ">=",
+        AxBinaryOp::Lt => "<",
+        AxBinaryOp::Le => "<=",
+        AxBinaryOp::And => "&&",
+        AxBinaryOp::Or => "||",
+        AxBinaryOp::Fallback => "??",
     }
 }
 

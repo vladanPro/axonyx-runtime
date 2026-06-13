@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::ax_ast::prelude::{
-    AxBody, AxComponent, AxDocument, AxExpr, AxPipelineStage, AxStatement,
+    AxBinaryOp, AxBody, AxComponent, AxDocument, AxExpr, AxPipelineStage, AxStatement, AxUnaryOp,
 };
 use crate::ax_ast_v2::prelude::AxFileV2;
 
@@ -152,6 +152,57 @@ impl AxDataContext {
                 .get(name)
                 .cloned()
                 .ok_or_else(|| AxTypeError::UnknownBinding { name: name.clone() }),
+            AxExpr::Unary { op, expr } => {
+                let ty = self.resolve_expr_type(expr)?;
+                match op {
+                    AxUnaryOp::Not => Ok(AxType::Bool),
+                    AxUnaryOp::Neg => match ty {
+                        AxType::Number | AxType::Unknown => Ok(ty),
+                        other => Err(AxTypeError::ExpectedNumber {
+                            found: other.display_name(),
+                        }),
+                    },
+                }
+            }
+            AxExpr::Binary { op, left, right } => {
+                let left_type = self.resolve_expr_type(left)?;
+                let right_type = self.resolve_expr_type(right)?;
+                match op {
+                    AxBinaryOp::Add => match (&left_type, &right_type) {
+                        (AxType::Number, AxType::Number) => Ok(AxType::Number),
+                        (AxType::Unknown, _) | (_, AxType::Unknown) => Ok(AxType::Unknown),
+                        _ => Ok(AxType::String),
+                    },
+                    AxBinaryOp::Sub | AxBinaryOp::Mul | AxBinaryOp::Div | AxBinaryOp::Rem => {
+                        if matches!(left_type, AxType::Number | AxType::Unknown)
+                            && matches!(right_type, AxType::Number | AxType::Unknown)
+                        {
+                            Ok(AxType::Number)
+                        } else {
+                            Err(AxTypeError::ExpectedNumber {
+                                found: format!(
+                                    "{} and {}",
+                                    left_type.display_name(),
+                                    right_type.display_name()
+                                ),
+                            })
+                        }
+                    }
+                    AxBinaryOp::Eq
+                    | AxBinaryOp::Ne
+                    | AxBinaryOp::Gt
+                    | AxBinaryOp::Ge
+                    | AxBinaryOp::Lt
+                    | AxBinaryOp::Le
+                    | AxBinaryOp::And
+                    | AxBinaryOp::Or => Ok(AxType::Bool),
+                    AxBinaryOp::Fallback => match left_type {
+                        AxType::Optional(item) => Ok(*item),
+                        AxType::Unknown => Ok(right_type),
+                        other => Ok(other),
+                    },
+                }
+            }
             AxExpr::Member { object, property } => {
                 let object_type = self.resolve_expr_type(object)?;
                 self.resolve_member_type(&object_type, property)
@@ -326,6 +377,8 @@ pub enum AxTypeError {
     CannotAccessField { ty: String, field: String },
     #[error("cannot iterate value; expected List<T>, found {found}")]
     ExpectedList { found: String },
+    #[error("expected Number, found {found}")]
+    ExpectedNumber { found: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -517,6 +570,13 @@ fn format_expr(expr: &AxExpr) -> String {
         AxExpr::Number(value) => value.to_string(),
         AxExpr::Bool(value) => value.to_string(),
         AxExpr::Identifier(name) => name.clone(),
+        AxExpr::Unary { op, expr } => format!("{}{}", format_unary_op(*op), format_expr(expr)),
+        AxExpr::Binary { op, left, right } => format!(
+            "{} {} {}",
+            format_expr(left),
+            format_binary_op(*op),
+            format_expr(right)
+        ),
         AxExpr::Member { object, property } => format!("{}.{}", format_expr(object), property),
         AxExpr::OptionalMember { object, property } => {
             format!("{}?.{}", format_expr(object), property)
@@ -525,6 +585,32 @@ fn format_expr(expr: &AxExpr) -> String {
             let args = args.iter().map(format_expr).collect::<Vec<_>>().join(", ");
             format!("{}({args})", path.join("."))
         }
+    }
+}
+
+fn format_unary_op(op: AxUnaryOp) -> &'static str {
+    match op {
+        AxUnaryOp::Not => "!",
+        AxUnaryOp::Neg => "-",
+    }
+}
+
+fn format_binary_op(op: AxBinaryOp) -> &'static str {
+    match op {
+        AxBinaryOp::Add => "+",
+        AxBinaryOp::Sub => "-",
+        AxBinaryOp::Mul => "*",
+        AxBinaryOp::Div => "/",
+        AxBinaryOp::Rem => "%",
+        AxBinaryOp::Eq => "==",
+        AxBinaryOp::Ne => "!=",
+        AxBinaryOp::Gt => ">",
+        AxBinaryOp::Ge => ">=",
+        AxBinaryOp::Lt => "<",
+        AxBinaryOp::Le => "<=",
+        AxBinaryOp::And => "&&",
+        AxBinaryOp::Or => "||",
+        AxBinaryOp::Fallback => "??",
     }
 }
 
