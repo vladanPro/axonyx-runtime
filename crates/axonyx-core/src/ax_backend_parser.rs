@@ -515,6 +515,11 @@ impl Parser {
             return Err(AxBackendParseError::InvalidDataBinding { line: line.line });
         }
 
+        if let Some(query) = parse_fluent_query_spec(expr, line.line)? {
+            self.pos += 1;
+            return Ok(AxBackendStmt::data(name, query));
+        }
+
         let expr = parse_expr(expr, line.line)?;
         self.pos += 1;
 
@@ -838,6 +843,185 @@ fn query_source_from_expr(expr: AxExpr, line: usize) -> Result<AxQuerySource, Ax
     }
 }
 
+fn parse_fluent_query_spec(
+    input: &str,
+    line: usize,
+) -> Result<Option<AxQuerySpec>, AxBackendParseError> {
+    let segments = split_top_level_query_segments(input);
+    if segments.len() < 4 {
+        return Ok(None);
+    }
+    if segments[0] != "db" {
+        return Ok(None);
+    };
+    let collection = segments[1];
+    if collection.is_empty() {
+        return Ok(None);
+    }
+
+    let mut query = AxQuerySpec::new(AxQuerySource::Stream {
+        collection: collection.to_string(),
+    });
+    let mut terminal = false;
+
+    for segment in segments.into_iter().skip(2) {
+        let Some((method, args)) = parse_fluent_call(segment, line)? else {
+            return Ok(None);
+        };
+
+        match method {
+            "where" => {
+                for (field, value) in parse_object_fields(args, line)? {
+                    query = query.filter(AxQueryFilter::new(
+                        field,
+                        AxQueryFilterOp::Eq,
+                        parse_expr(value, line)?,
+                    ));
+                }
+            }
+            "order" => {
+                for (field, value) in parse_object_fields(args, line)? {
+                    let direction = match parse_expr(value, line)? {
+                        AxExpr::String(value) if value.eq_ignore_ascii_case("desc") => {
+                            AxQueryOrderDirection::Desc
+                        }
+                        AxExpr::String(value) if value.eq_ignore_ascii_case("asc") => {
+                            AxQueryOrderDirection::Asc
+                        }
+                        _ => return Err(AxBackendParseError::InvalidQueryClause { line }),
+                    };
+                    query = query.order(AxQueryOrder::new(field, direction));
+                }
+            }
+            "limit" => {
+                let value = parse_u32_arg(args, line)?;
+                query = query.limit(value);
+            }
+            "offset" => {
+                let value = parse_u32_arg(args, line)?;
+                query = query.offset(value);
+            }
+            "all" if args.trim().is_empty() => {
+                terminal = true;
+            }
+            _ => return Err(AxBackendParseError::InvalidQuerySource { line }),
+        }
+    }
+
+    if terminal {
+        Ok(Some(query))
+    } else {
+        Ok(None)
+    }
+}
+
+fn split_top_level_query_segments(input: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if ch == quote {
+                    in_string = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => in_string = Some(ch),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                '.' if depth == 0 => {
+                    result.push(input[start..index].trim());
+                    start = index + ch.len_utf8();
+                }
+                _ => {}
+            },
+        }
+    }
+
+    result.push(input[start..].trim());
+    result
+}
+
+fn parse_fluent_call<'a>(
+    input: &'a str,
+    line: usize,
+) -> Result<Option<(&'a str, &'a str)>, AxBackendParseError> {
+    let Some(open_index) = find_call_open(input) else {
+        return Ok(None);
+    };
+    if !input.ends_with(')') {
+        return Err(AxBackendParseError::InvalidQuerySource { line });
+    }
+
+    let method = input[..open_index].trim();
+    if method.is_empty() || method.contains('.') {
+        return Err(AxBackendParseError::InvalidQuerySource { line });
+    }
+
+    Ok(Some((
+        method,
+        input[open_index + 1..input.len() - 1].trim(),
+    )))
+}
+
+fn parse_object_fields<'a>(
+    input: &'a str,
+    line: usize,
+) -> Result<Vec<(&'a str, &'a str)>, AxBackendParseError> {
+    let input = input.trim();
+    let Some(inner) = input
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    };
+
+    let mut fields = Vec::new();
+    for part in split_top_level(inner, ',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        match split_top_level_once(part, ":") {
+            Some((field, value)) => {
+                let field = field.trim();
+                let value = value.trim();
+                if field.is_empty() || value.is_empty() {
+                    return Err(AxBackendParseError::InvalidQueryClause { line });
+                }
+                fields.push((field, value));
+            }
+            None => {
+                if part.contains(' ') {
+                    return Err(AxBackendParseError::InvalidQueryClause { line });
+                }
+                fields.push((part, part));
+            }
+        }
+    }
+
+    if fields.is_empty() {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    }
+
+    Ok(fields)
+}
+
+fn parse_u32_arg(input: &str, line: usize) -> Result<u32, AxBackendParseError> {
+    let parts = split_top_level(input, ',');
+    if parts.len() != 1 {
+        return Err(AxBackendParseError::InvalidQueryNumber { line });
+    }
+    parts[0]
+        .trim()
+        .parse::<u32>()
+        .map_err(|_| AxBackendParseError::InvalidQueryNumber { line })
+}
+
 fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxBackendParseError> {
     let input = input.trim();
     if input.is_empty() {
@@ -1029,8 +1213,8 @@ fn split_top_level(input: &str, delimiter: char) -> Vec<&str> {
             }
             None => match ch {
                 '"' | '\'' => in_string = Some(ch),
-                '(' | '[' => depth += 1,
-                ')' | ']' => depth = depth.saturating_sub(1),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
                 _ if ch == delimiter && depth == 0 => {
                     result.push(input[start..index].trim());
                     start = index + ch.len_utf8();
@@ -1057,8 +1241,8 @@ fn split_top_level_once<'a>(input: &'a str, delimiter: &str) -> Option<(&'a str,
             }
             None => match ch {
                 '"' | '\'' => in_string = Some(ch),
-                '(' | '[' => depth += 1,
-                ')' | ']' => depth = depth.saturating_sub(1),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
                 _ if depth == 0 && input[index..].starts_with(delimiter) => {
                     return Some((&input[..index], &input[index + delimiter.len()..]));
                 }
@@ -1287,6 +1471,73 @@ loader PostsList
             AxBackendValue::Query(AxQuerySpec::new(AxQuerySource::Stream {
                 collection: "posts".to_string(),
             }))
+        );
+    }
+
+    #[test]
+    fn parses_fluent_db_query_binding() {
+        let input = r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.where({ status: "published" }).order({ created_at: "desc" }).limit(6).all()
+  return posts
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected data statement");
+        };
+
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "status",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::string("published"),
+                ))
+                .order(AxQueryOrder::new("created_at", AxQueryOrderDirection::Desc))
+                .limit(6)
+            )
+        );
+    }
+
+    #[test]
+    fn parses_fluent_db_query_shorthand_filter_and_offset() {
+        let input = r#"
+query loadPost() -> Post[]
+  data posts = db.posts.where({ slug }).offset(10).all()
+  return posts
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected data statement");
+        };
+
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "slug",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::ident("slug"),
+                ))
+                .offset(10)
+            )
         );
     }
 
