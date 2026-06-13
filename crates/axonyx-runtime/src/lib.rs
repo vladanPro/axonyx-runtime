@@ -3139,6 +3139,13 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
             head_binary_op_to_string(*op),
             head_expr_to_string(right)
         ),
+        AxExpr::Index { object, index } => {
+            format!(
+                "{}[{}]",
+                head_expr_to_string(object),
+                head_expr_to_string(index)
+            )
+        }
         AxExpr::Member { object, property } => {
             format!("{}.{}", head_expr_to_string(object), property)
         }

@@ -533,6 +533,12 @@ fn parse_primary_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> 
         return parse_operator_expr(input, line);
     }
 
+    if let Some((object_source, index_source)) = split_trailing_index(input, line)? {
+        let object = parse_primary_expr(object_source, line)?;
+        let index = parse_expr(index_source, line)?;
+        return Ok(object.index(index));
+    }
+
     if let Some(value) = parse_quoted_string(input, line)? {
         return Ok(AxExpr::string(value));
     }
@@ -588,6 +594,101 @@ fn parse_primary_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> 
     }
 
     Ok(AxExpr::ident(input))
+}
+
+fn split_trailing_index(input: &str, line: usize) -> Result<Option<(&str, &str)>, AxParseError> {
+    let input = input.trim();
+    if !input.ends_with(']') {
+        return Ok(None);
+    }
+    if input.starts_with('[') && outer_brackets_wrap(input) {
+        return Ok(None);
+    }
+
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+
+    for (index, ch) in input.char_indices().rev() {
+        match in_string {
+            Some(quote) => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    in_string = None;
+                }
+                continue;
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    in_string = Some(ch);
+                    continue;
+                }
+                ']' => {
+                    depth += 1;
+                    continue;
+                }
+                '[' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let object = input[..index].trim();
+                        let index_expr = input[index + 1..input.len() - 1].trim();
+                        if object.is_empty() || index_expr.is_empty() {
+                            return Err(AxParseError::InvalidExpression {
+                                line,
+                                message: format!("invalid index expression `{input}`"),
+                            });
+                        }
+                        return Ok(Some((object, index_expr)));
+                    }
+                    continue;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    Ok(None)
+}
+
+fn outer_brackets_wrap(input: &str) -> bool {
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+    let last_index = input.len() - 1;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    in_string = None;
+                }
+                continue;
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    in_string = Some(ch);
+                    continue;
+                }
+                '[' => depth += 1,
+                ']' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 && index != last_index {
+                        return false;
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+
+    depth == 0
 }
 
 fn parse_list_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
@@ -1253,6 +1354,32 @@ page Home
                 AxBinaryOp::In,
                 AxExpr::ident("input").member("theme"),
                 AxExpr::list([AxExpr::string("silver"), AxExpr::string("gold")]),
+            )
+        );
+    }
+
+    #[test]
+    fn parses_index_expression() {
+        let params = parse_expr(r#"params["slug"]"#, 1).expect("params index should parse");
+        let posts = parse_expr("posts[0]", 1).expect("posts index should parse");
+
+        assert_eq!(
+            params,
+            AxExpr::ident("params").index(AxExpr::string("slug"))
+        );
+        assert_eq!(posts, AxExpr::ident("posts").index(AxExpr::number(0)));
+    }
+
+    #[test]
+    fn parses_index_expression_with_fallback() {
+        let expr = parse_expr(r#"params["slug"] ?? "home""#, 1).expect("expression should parse");
+
+        assert_eq!(
+            expr,
+            AxExpr::binary(
+                AxBinaryOp::Fallback,
+                AxExpr::ident("params").index(AxExpr::string("slug")),
+                AxExpr::string("home"),
             )
         );
     }
