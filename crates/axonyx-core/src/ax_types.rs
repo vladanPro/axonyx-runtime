@@ -617,9 +617,11 @@ fn format_expr(expr: &AxExpr) -> String {
             format_binary_op(*op),
             format_expr(right)
         ),
-        AxExpr::Index { object, index } => {
-            format!("{}[{}]", format_expr(object), format_expr(index))
-        }
+        AxExpr::Index { object, index } => format!(
+            "{}[{}]",
+            format_index_object_expr(object),
+            format_expr(index)
+        ),
         AxExpr::Member { object, property } => format!("{}.{}", format_expr(object), property),
         AxExpr::OptionalMember { object, property } => {
             format!("{}?.{}", format_expr(object), property)
@@ -629,6 +631,19 @@ fn format_expr(expr: &AxExpr) -> String {
             format!("{}({args})", path.join("."))
         }
     }
+}
+
+fn format_index_object_expr(expr: &AxExpr) -> String {
+    let value = format_expr(expr);
+    if index_object_needs_grouping(expr) {
+        format!("({value})")
+    } else {
+        value
+    }
+}
+
+fn index_object_needs_grouping(expr: &AxExpr) -> bool {
+    matches!(expr, AxExpr::Binary { .. } | AxExpr::Unary { .. })
 }
 
 fn format_unary_op(op: AxUnaryOp) -> &'static str {
@@ -731,6 +746,14 @@ mod tests {
 
         assert_eq!(list_item, AxType::String);
         assert_eq!(record_field, AxType::String);
+    }
+
+    #[test]
+    fn formats_index_expression_without_dropping_composite_grouping() {
+        let expr = AxExpr::binary(AxBinaryOp::Fallback, AxExpr::ident("a"), AxExpr::ident("b"))
+            .index(AxExpr::number(0));
+
+        assert_eq!(format_expr(&expr), "(a ?? b)[0]");
     }
 
     #[test]

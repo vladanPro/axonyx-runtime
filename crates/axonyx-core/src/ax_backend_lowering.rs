@@ -606,7 +606,11 @@ fn render_expr(expr: &AxExpr) -> String {
             )
         }
         AxExpr::Index { object, index } => {
-            format!("{}[{}]", render_expr(object), render_expr(index))
+            format!(
+                "{}[{}]",
+                render_index_object_expr(object),
+                render_expr(index)
+            )
         }
         AxExpr::Member { object, property } => format!("{}.{}", render_expr(object), property),
         AxExpr::OptionalMember { object, property } => {
@@ -622,6 +626,19 @@ fn render_expr(expr: &AxExpr) -> String {
             format!("{fn_name}({args})")
         }
     }
+}
+
+fn render_index_object_expr(expr: &AxExpr) -> String {
+    let value = render_expr(expr);
+    if index_object_needs_grouping(expr) {
+        format!("({value})")
+    } else {
+        value
+    }
+}
+
+fn index_object_needs_grouping(expr: &AxExpr) -> bool {
+    matches!(expr, AxExpr::Binary { .. } | AxExpr::Unary { .. })
 }
 
 fn render_unary_op(op: AxUnaryOp) -> &'static str {

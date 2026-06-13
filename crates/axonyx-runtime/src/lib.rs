@@ -3139,13 +3139,11 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
             head_binary_op_to_string(*op),
             head_expr_to_string(right)
         ),
-        AxExpr::Index { object, index } => {
-            format!(
-                "{}[{}]",
-                head_expr_to_string(object),
-                head_expr_to_string(index)
-            )
-        }
+        AxExpr::Index { object, index } => format!(
+            "{}[{}]",
+            head_index_object_expr_to_string(object),
+            head_expr_to_string(index)
+        ),
         AxExpr::Member { object, property } => {
             format!("{}.{}", head_expr_to_string(object), property)
         }
@@ -3161,6 +3159,19 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
             format!("{}({args})", path.join("."))
         }
     }
+}
+
+fn head_index_object_expr_to_string(expr: &AxExpr) -> String {
+    let value = head_expr_to_string(expr);
+    if head_index_object_needs_grouping(expr) {
+        format!("({value})")
+    } else {
+        value
+    }
+}
+
+fn head_index_object_needs_grouping(expr: &AxExpr) -> bool {
+    matches!(expr, AxExpr::Binary { .. } | AxExpr::Unary { .. })
 }
 
 fn head_unary_op_to_string(op: AxUnaryOp) -> &'static str {
