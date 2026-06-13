@@ -813,6 +813,12 @@ fn eval_binary_expr(
         AxBinaryOp::Ge => eval_compare_binary(left, right, |ordering| ordering.is_ge(), "`>=`"),
         AxBinaryOp::Lt => eval_compare_binary(left, right, |ordering| ordering.is_lt(), "`<`"),
         AxBinaryOp::Le => eval_compare_binary(left, right, |ordering| ordering.is_le(), "`<=`"),
+        AxBinaryOp::In => match right {
+            AxValue::List(items) => Ok(AxValue::Bool(items.iter().any(|item| item == &left))),
+            _ => Err(AxLowerError::UnsupportedExpression {
+                message: "`in` expects a list on the right side".to_string(),
+            }),
+        },
         AxBinaryOp::And | AxBinaryOp::Or | AxBinaryOp::Fallback => {
             unreachable!("short-circuit operators are evaluated before this point")
         }
@@ -1756,6 +1762,39 @@ page Home
         let mut scope = BTreeMap::new();
         scope.insert("status".to_string(), AxValue::from("published"));
         scope.insert("hidden".to_string(), AxValue::Bool(false));
+
+        let node =
+            lower_document_with_scope(&document, scope, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+
+        assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn in_operator_lowers_list_membership_condition() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::If(AxIfBlock::new(
+                AxExpr::binary(
+                    AxBinaryOp::In,
+                    AxExpr::ident("theme"),
+                    AxExpr::ident("themes"),
+                ),
+                [AxStatement::component(
+                    AxComponent::new("Copy").inline("Allowed"),
+                )],
+            ))],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert("theme".to_string(), AxValue::from("gold"));
+        scope.insert(
+            "themes".to_string(),
+            AxValue::list([AxValue::from("silver"), AxValue::from("gold")]),
+        );
 
         let node =
             lower_document_with_scope(&document, scope, &resolver).expect("document should lower");

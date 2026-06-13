@@ -519,6 +519,7 @@ pub enum AxBinaryOp {
     Ge,
     Lt,
     Le,
+    In,
     And,
     Or,
     Fallback,

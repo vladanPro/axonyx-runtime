@@ -591,6 +591,9 @@ fn render_expr(expr: &AxExpr) -> String {
             if *op == AxBinaryOp::Fallback {
                 return format!("({}).unwrap_or({})", render_expr(left), render_expr(right));
             }
+            if *op == AxBinaryOp::In {
+                return format!("({}).contains(&{})", render_expr(right), render_expr(left));
+            }
             format!(
                 "({} {} {})",
                 render_expr(left),
@@ -634,6 +637,7 @@ fn render_binary_op(op: AxBinaryOp) -> &'static str {
         AxBinaryOp::Ge => ">=",
         AxBinaryOp::Lt => "<",
         AxBinaryOp::Le => "<=",
+        AxBinaryOp::In => "in",
         AxBinaryOp::And => "&&",
         AxBinaryOp::Or => "||",
         AxBinaryOp::Fallback => "??",

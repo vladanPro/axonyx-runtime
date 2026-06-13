@@ -3168,6 +3168,7 @@ fn head_binary_op_to_string(op: AxBinaryOp) -> &'static str {
         AxBinaryOp::Ge => ">=",
         AxBinaryOp::Lt => "<",
         AxBinaryOp::Le => "<=",
+        AxBinaryOp::In => "in",
         AxBinaryOp::And => "&&",
         AxBinaryOp::Or => "||",
         AxBinaryOp::Fallback => "??",
