@@ -660,6 +660,7 @@ fn infer_state_type(value: &AxExpr) -> &'static str {
         AxExpr::String(_) => "String",
         AxExpr::Bool(_) => "Bool",
         AxExpr::Number(_) => "Number",
+        AxExpr::List(_) => "List",
         _ => "Unknown",
     }
 }

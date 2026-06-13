@@ -548,6 +548,10 @@ fn parse_primary_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> 
         return Ok(AxExpr::number(value));
     }
 
+    if input.starts_with('[') || input.ends_with(']') {
+        return parse_list_expr(input, line);
+    }
+
     if input.ends_with(')') {
         if let Some(open_index) = find_call_open(input) {
             let path = input[..open_index].trim();
@@ -584,6 +588,36 @@ fn parse_primary_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> 
     }
 
     Ok(AxExpr::ident(input))
+}
+
+fn parse_list_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
+    if !input.starts_with('[') || !input.ends_with(']') {
+        return Err(AxParseError::InvalidExpression {
+            line,
+            message: format!("invalid list literal `{input}`"),
+        });
+    }
+
+    let inner = input[1..input.len() - 1].trim();
+    if inner.is_empty() {
+        return Ok(AxExpr::list([]));
+    }
+
+    let items = split_top_level(inner, ',')
+        .into_iter()
+        .map(|part| {
+            if part.is_empty() {
+                Err(AxParseError::InvalidExpression {
+                    line,
+                    message: format!("empty item in list literal `{input}`"),
+                })
+            } else {
+                parse_expr(part, line)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(AxExpr::list(items))
 }
 
 fn find_lowest_precedence_operator(
@@ -916,8 +950,8 @@ fn split_top_level(input: &str, delimiter: char) -> Vec<&str> {
             }
             None => match ch {
                 '"' | '\'' => in_string = Some(ch),
-                '(' => depth += 1,
-                ')' => depth = depth.saturating_sub(1),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
                 _ if ch == delimiter && depth == 0 => {
                     result.push(input[start..index].trim());
                     start = index + ch.len_utf8();
@@ -1189,6 +1223,36 @@ page Home
                 AxBinaryOp::In,
                 AxExpr::ident("input").member("theme"),
                 AxExpr::ident("themes"),
+            )
+        );
+    }
+
+    #[test]
+    fn parses_list_literal_expression() {
+        let expr =
+            parse_expr(r#"["silver", "gold", input.theme]"#, 1).expect("expression should parse");
+
+        assert_eq!(
+            expr,
+            AxExpr::list([
+                AxExpr::string("silver"),
+                AxExpr::string("gold"),
+                AxExpr::ident("input").member("theme"),
+            ])
+        );
+    }
+
+    #[test]
+    fn parses_in_operator_with_inline_list_literal() {
+        let expr =
+            parse_expr(r#"input.theme in ["silver", "gold"]"#, 1).expect("expression should parse");
+
+        assert_eq!(
+            expr,
+            AxExpr::binary(
+                AxBinaryOp::In,
+                AxExpr::ident("input").member("theme"),
+                AxExpr::list([AxExpr::string("silver"), AxExpr::string("gold")]),
             )
         );
     }

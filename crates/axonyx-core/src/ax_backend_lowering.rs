@@ -585,6 +585,10 @@ fn render_expr(expr: &AxExpr) -> String {
         AxExpr::String(value) => format!("{value:?}.to_string()"),
         AxExpr::Number(value) => value.to_string(),
         AxExpr::Bool(value) => value.to_string(),
+        AxExpr::List(items) => {
+            let items = items.iter().map(render_expr).collect::<Vec<_>>().join(", ");
+            format!("vec![{items}]")
+        }
         AxExpr::Identifier(name) => name.clone(),
         AxExpr::Unary { op, expr } => format!("({}{})", render_unary_op(*op), render_expr(expr)),
         AxExpr::Binary { op, left, right } => {

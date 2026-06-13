@@ -147,6 +147,7 @@ impl AxDataContext {
             AxExpr::String(_) => Ok(AxType::String),
             AxExpr::Number(_) => Ok(AxType::Number),
             AxExpr::Bool(_) => Ok(AxType::Bool),
+            AxExpr::List(items) => self.resolve_list_type(items),
             AxExpr::Identifier(name) => self
                 .bindings
                 .get(name)
@@ -268,6 +269,22 @@ impl AxDataContext {
                 field: property.to_string(),
             }),
         }
+    }
+
+    fn resolve_list_type(&self, items: &[AxExpr]) -> Result<AxType, AxTypeError> {
+        let Some(first) = items.first() else {
+            return Ok(AxType::list(AxType::Unknown));
+        };
+
+        let first_type = self.resolve_expr_type(first)?;
+        for item in &items[1..] {
+            let item_type = self.resolve_expr_type(item)?;
+            if item_type != first_type {
+                return Ok(AxType::list(AxType::Unknown));
+            }
+        }
+
+        Ok(AxType::list(first_type))
     }
 }
 
@@ -570,6 +587,10 @@ fn format_expr(expr: &AxExpr) -> String {
         AxExpr::String(value) => format!("{value:?}"),
         AxExpr::Number(value) => value.to_string(),
         AxExpr::Bool(value) => value.to_string(),
+        AxExpr::List(items) => {
+            let items = items.iter().map(format_expr).collect::<Vec<_>>().join(", ");
+            format!("[{items}]")
+        }
         AxExpr::Identifier(name) => name.clone(),
         AxExpr::Unary { op, expr } => format!("{}{}", format_unary_op(*op), format_expr(expr)),
         AxExpr::Binary { op, left, right } => format!(
@@ -656,6 +677,24 @@ mod tests {
             .expect("post.title should resolve");
 
         assert_eq!(ty, AxType::String);
+    }
+
+    #[test]
+    fn resolves_list_literal_item_type() {
+        let context = AxDataContext::new();
+
+        let strings = context
+            .resolve_expr_type(&AxExpr::list([
+                AxExpr::string("silver"),
+                AxExpr::string("gold"),
+            ]))
+            .expect("list should resolve");
+        let mixed = context
+            .resolve_expr_type(&AxExpr::list([AxExpr::string("silver"), AxExpr::number(1)]))
+            .expect("mixed list should resolve");
+
+        assert_eq!(strings, AxType::list(AxType::String));
+        assert_eq!(mixed, AxType::list(AxType::Unknown));
     }
 
     #[test]
