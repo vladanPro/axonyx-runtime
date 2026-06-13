@@ -487,6 +487,10 @@ pub enum AxExpr {
         left: Box<AxExpr>,
         right: Box<AxExpr>,
     },
+    Index {
+        object: Box<AxExpr>,
+        index: Box<AxExpr>,
+    },
     Member {
         object: Box<AxExpr>,
         property: String,
@@ -559,6 +563,13 @@ impl AxExpr {
             op,
             left: Box::new(left),
             right: Box::new(right),
+        }
+    }
+
+    pub fn index(self, index: AxExpr) -> Self {
+        Self::Index {
+            object: Box::new(self),
+            index: Box::new(index),
         }
     }
 

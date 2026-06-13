@@ -735,6 +735,11 @@ fn eval_expr(
             let right = eval_expr(right, functions, scope, resolver)?;
             eval_binary_expr(*op, left, right)
         }
+        AxExpr::Index { object, index } => {
+            let object = eval_expr(object, functions, scope, resolver)?;
+            let index = eval_expr(index, functions, scope, resolver)?;
+            eval_index_expr(object, index)
+        }
         AxExpr::Member { object, property } => {
             let value = eval_expr(object, functions, scope, resolver)?;
             match value {
@@ -775,6 +780,23 @@ fn eval_expr(
                     path: path.join("."),
                 })
         }
+    }
+}
+
+fn eval_index_expr(object: AxValue, index: AxValue) -> Result<AxValue, AxLowerError> {
+    match (object, index) {
+        (AxValue::List(items), AxValue::Number(index)) => {
+            let Ok(index) = usize::try_from(index) else {
+                return Ok(AxValue::Null);
+            };
+            Ok(items.get(index).cloned().unwrap_or(AxValue::Null))
+        }
+        (AxValue::Record(fields), AxValue::String(key)) => {
+            Ok(fields.get(&key).cloned().unwrap_or(AxValue::Null))
+        }
+        _ => Err(AxLowerError::UnsupportedExpression {
+            message: "index access expects List[Number] or Record[String]".to_string(),
+        }),
     }
 }
 
@@ -1838,6 +1860,63 @@ page Home
         };
 
         assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn index_expression_lowers_list_item() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::component(
+                AxComponent::new("Copy").inline(AxExpr::ident("posts").index(AxExpr::number(0))),
+            )],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert(
+            "posts".to_string(),
+            AxValue::list([AxValue::from("Hello"), AxValue::from("World")]),
+        );
+
+        let node =
+            lower_document_with_scope(&document, scope, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { children, .. } = &children[0] else {
+            panic!("expected copy element");
+        };
+
+        assert_eq!(children, &[text("Hello")]);
+    }
+
+    #[test]
+    fn index_expression_lowers_record_lookup_with_fallback() {
+        let document = AxDocument::page(
+            "Home",
+            [AxStatement::component(AxComponent::new("Copy").inline(
+                AxExpr::binary(
+                    AxBinaryOp::Fallback,
+                    AxExpr::ident("params").index(AxExpr::string("slug")),
+                    AxExpr::string("home"),
+                ),
+            ))],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert("params".to_string(), AxValue::Record(BTreeMap::new()));
+
+        let node =
+            lower_document_with_scope(&document, scope, &resolver).expect("document should lower");
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { children, .. } = &children[0] else {
+            panic!("expected copy element");
+        };
+
+        assert_eq!(children, &[text("home")]);
     }
 
     #[test]

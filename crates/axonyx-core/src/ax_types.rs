@@ -205,6 +205,22 @@ impl AxDataContext {
                     },
                 }
             }
+            AxExpr::Index { object, index } => {
+                let object_type = self.resolve_expr_type(object)?;
+                match &object_type {
+                    AxType::List(item) => Ok((**item).clone()),
+                    AxType::Record(_) => match &**index {
+                        AxExpr::String(property) => {
+                            self.resolve_member_type(&object_type, property)
+                        }
+                        _ => Ok(AxType::Unknown),
+                    },
+                    AxType::Unknown => Ok(AxType::Unknown),
+                    other => Err(AxTypeError::CannotIndex {
+                        ty: other.display_name(),
+                    }),
+                }
+            }
             AxExpr::Member { object, property } => {
                 let object_type = self.resolve_expr_type(object)?;
                 self.resolve_member_type(&object_type, property)
@@ -397,6 +413,8 @@ pub enum AxTypeError {
     ExpectedList { found: String },
     #[error("expected Number, found {found}")]
     ExpectedNumber { found: String },
+    #[error("cannot index value of type {ty}")]
+    CannotIndex { ty: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -599,6 +617,9 @@ fn format_expr(expr: &AxExpr) -> String {
             format_binary_op(*op),
             format_expr(right)
         ),
+        AxExpr::Index { object, index } => {
+            format!("{}[{}]", format_expr(object), format_expr(index))
+        }
         AxExpr::Member { object, property } => format!("{}.{}", format_expr(object), property),
         AxExpr::OptionalMember { object, property } => {
             format!("{}?.{}", format_expr(object), property)
@@ -695,6 +716,21 @@ mod tests {
 
         assert_eq!(strings, AxType::list(AxType::String));
         assert_eq!(mixed, AxType::list(AxType::Unknown));
+    }
+
+    #[test]
+    fn resolves_index_expression_type() {
+        let context = post_context().with_binding("post", AxType::record("Post"));
+
+        let list_item = context
+            .resolve_expr_type(&AxExpr::list([AxExpr::string("hello")]).index(AxExpr::number(0)))
+            .expect("list index should resolve");
+        let record_field = context
+            .resolve_expr_type(&AxExpr::ident("post").index(AxExpr::string("title")))
+            .expect("record string index should resolve");
+
+        assert_eq!(list_item, AxType::String);
+        assert_eq!(record_field, AxType::String);
     }
 
     #[test]

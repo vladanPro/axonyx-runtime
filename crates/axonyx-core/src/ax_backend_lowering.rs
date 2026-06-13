@@ -605,6 +605,9 @@ fn render_expr(expr: &AxExpr) -> String {
                 render_expr(right)
             )
         }
+        AxExpr::Index { object, index } => {
+            format!("{}[{}]", render_expr(object), render_expr(index))
+        }
         AxExpr::Member { object, property } => format!("{}.{}", render_expr(object), property),
         AxExpr::OptionalMember { object, property } => {
             format!("{}.{}", render_expr(object), property)
