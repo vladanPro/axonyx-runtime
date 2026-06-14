@@ -70,6 +70,11 @@ impl AxQueryFilter {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxQueryFilterOp {
     Eq,
+    Ne,
+    In,
+    NotIn,
+    IsNull,
+    IsNotNull,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -8,7 +8,7 @@ use axonyx_core::ax_backend_lowering_prelude::{
 };
 use axonyx_core::ax_sql_prelude::{
     compile_delete_plan_to_sql, compile_insert_plan_to_sql, compile_query_plan_to_sql,
-    compile_update_plan_to_sql, AxSqlDialect,
+    compile_update_plan_to_sql, AxSqlDialect, AxSqlParam,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -299,6 +299,11 @@ pub struct AxQueryFilterRequest {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxQueryFilterOp {
     Eq,
+    Ne,
+    In,
+    NotIn,
+    IsNull,
+    IsNotNull,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1226,11 +1231,7 @@ fn direct_load_plan(
     let execution = AxDirectSqlPlan {
         dialect: dialect.name().to_string(),
         sql: plan.sql,
-        params: request
-            .filters
-            .iter()
-            .map(|filter| filter.value.clone())
-            .collect(),
+        params: sql_params_to_json(&plan.params),
         url: url.clone(),
     };
 
@@ -1310,7 +1311,7 @@ fn direct_insert_plan(
     let execution = AxDirectSqlPlan {
         dialect: dialect.name().to_string(),
         sql: plan.sql,
-        params: request.fields.values().cloned().collect(),
+        params: sql_params_to_json(&plan.params),
         url: url.clone(),
     };
 
@@ -1362,12 +1363,7 @@ fn direct_update_plan(
     let execution = AxDirectSqlPlan {
         dialect: dialect.name().to_string(),
         sql: plan.sql,
-        params: request
-            .fields
-            .values()
-            .cloned()
-            .chain(request.filters.iter().map(|filter| filter.value.clone()))
-            .collect(),
+        params: sql_params_to_json(&plan.params),
         url: url.clone(),
     };
 
@@ -1416,11 +1412,7 @@ fn direct_delete_plan(
     let execution = AxDirectSqlPlan {
         dialect: dialect.name().to_string(),
         sql: plan.sql,
-        params: request
-            .filters
-            .iter()
-            .map(|filter| filter.value.clone())
-            .collect(),
+        params: sql_params_to_json(&plan.params),
         url: url.clone(),
     };
 
@@ -1440,6 +1432,17 @@ fn direct_delete_plan(
         "action": "delete",
         "execution": execution,
     }))
+}
+
+fn sql_params_to_json(params: &[AxSqlParam]) -> Vec<Value> {
+    params
+        .iter()
+        .map(|param| rust_expr_code_to_json(&param.value.code))
+        .collect()
+}
+
+fn rust_expr_code_to_json(code: &str) -> Value {
+    serde_json::from_str(code.trim()).unwrap_or_else(|_| json!(code.trim()))
 }
 
 fn sqlite_execute_query(
@@ -1760,12 +1763,21 @@ fn query_filters_to_plan(filters: &[AxQueryFilterRequest]) -> Vec<AxQueryFilterP
         .iter()
         .map(|filter| AxQueryFilterPlan {
             field: filter.field.clone(),
-            op: match filter.op {
-                AxQueryFilterOp::Eq => AxQueryFilterOpPlan::Eq,
-            },
+            op: query_filter_op_to_plan(filter.op),
             value: json_value_to_expr(&filter.value),
         })
         .collect()
+}
+
+fn query_filter_op_to_plan(op: AxQueryFilterOp) -> AxQueryFilterOpPlan {
+    match op {
+        AxQueryFilterOp::Eq => AxQueryFilterOpPlan::Eq,
+        AxQueryFilterOp::Ne => AxQueryFilterOpPlan::Ne,
+        AxQueryFilterOp::In => AxQueryFilterOpPlan::In,
+        AxQueryFilterOp::NotIn => AxQueryFilterOpPlan::NotIn,
+        AxQueryFilterOp::IsNull => AxQueryFilterOpPlan::IsNull,
+        AxQueryFilterOp::IsNotNull => AxQueryFilterOpPlan::IsNotNull,
+    }
 }
 
 fn fields_to_assignment_plans(fields: &BTreeMap<String, Value>) -> Vec<AxAssignmentPlan> {
@@ -2196,6 +2208,54 @@ mod tests {
             r#"select * from "posts" where "status" = $1 order by "created_at" desc limit 12"#
         );
         assert_eq!(value["execution"]["params"][0], json!("published"));
+    }
+
+    #[test]
+    fn direct_transport_emits_extended_filter_sql_plan() {
+        let env = AxEnv::new()
+            .with_secret("db_dialect", "postgres")
+            .with_secret("db_url", "postgres://local/axonyx");
+        let runtime = runtime_from_env(env).expect("runtime should initialize");
+
+        let value = runtime
+            .load(&AxQueryRequest {
+                collection: "posts".to_string(),
+                filters: vec![
+                    AxQueryFilterRequest {
+                        field: "archived".to_string(),
+                        op: AxQueryFilterOp::Ne,
+                        value: json!(true),
+                    },
+                    AxQueryFilterRequest {
+                        field: "status".to_string(),
+                        op: AxQueryFilterOp::In,
+                        value: json!(["published", "featured"]),
+                    },
+                    AxQueryFilterRequest {
+                        field: "deleted_at".to_string(),
+                        op: AxQueryFilterOp::IsNull,
+                        value: json!(true),
+                    },
+                    AxQueryFilterRequest {
+                        field: "published_at".to_string(),
+                        op: AxQueryFilterOp::IsNotNull,
+                        value: json!(true),
+                    },
+                ],
+                orders: Vec::new(),
+                limit: None,
+                offset: None,
+            })
+            .expect("query should execute");
+
+        assert_eq!(
+            value["execution"]["sql"],
+            r#"select * from "posts" where "archived" != $1 and "status" in ($2, $3) and "deleted_at" is null and "published_at" is not null"#
+        );
+        assert_eq!(
+            value["execution"]["params"],
+            json!([true, "published", "featured"])
+        );
     }
 
     #[test]

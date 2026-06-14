@@ -85,22 +85,7 @@ pub fn compile_query_plan_to_sql(
         let mut clauses = Vec::with_capacity(query.filters.len());
 
         for filter in &query.filters {
-            validate_ident(&filter.field)?;
-            let placeholder = dialect.placeholder(params.len() + 1);
-            let op = match filter.op {
-                AxQueryFilterOpPlan::Eq => "=",
-            };
-
-            clauses.push(format!(
-                "{} {} {}",
-                dialect.quote_ident(&filter.field),
-                op,
-                placeholder
-            ));
-            params.push(AxSqlParam {
-                index: params.len() + 1,
-                value: filter.value.clone(),
-            });
+            clauses.push(compile_filter_clause(filter, dialect, &mut params)?);
         }
 
         sql.push_str(" where ");
@@ -202,22 +187,7 @@ pub fn compile_update_plan_to_sql(
         let mut clauses = Vec::with_capacity(filters.len());
 
         for filter in filters {
-            validate_ident(&filter.field)?;
-            let placeholder = dialect.placeholder(params.len() + 1);
-            let op = match filter.op {
-                AxQueryFilterOpPlan::Eq => "=",
-            };
-
-            clauses.push(format!(
-                "{} {} {}",
-                dialect.quote_ident(&filter.field),
-                op,
-                placeholder
-            ));
-            params.push(AxSqlParam {
-                index: params.len() + 1,
-                value: filter.value.clone(),
-            });
+            clauses.push(compile_filter_clause(filter, dialect, &mut params)?);
         }
 
         format!(" where {}", clauses.join(" and "))
@@ -248,22 +218,7 @@ pub fn compile_delete_plan_to_sql(
     let mut params = Vec::with_capacity(filters.len());
 
     for filter in filters {
-        validate_ident(&filter.field)?;
-        let placeholder = dialect.placeholder(params.len() + 1);
-        let op = match filter.op {
-            AxQueryFilterOpPlan::Eq => "=",
-        };
-
-        clauses.push(format!(
-            "{} {} {}",
-            dialect.quote_ident(&filter.field),
-            op,
-            placeholder
-        ));
-        params.push(AxSqlParam {
-            index: params.len() + 1,
-            value: filter.value.clone(),
-        });
+        clauses.push(compile_filter_clause(filter, dialect, &mut params)?);
     }
 
     Ok(AxSqlMutation {
@@ -274,6 +229,115 @@ pub fn compile_delete_plan_to_sql(
         ),
         params,
     })
+}
+
+fn compile_filter_clause(
+    filter: &AxQueryFilterPlan,
+    dialect: AxSqlDialect,
+    params: &mut Vec<AxSqlParam>,
+) -> Result<String, AxSqlCompileError> {
+    validate_ident(&filter.field)?;
+    let field = dialect.quote_ident(&filter.field);
+
+    match filter.op {
+        AxQueryFilterOpPlan::Eq | AxQueryFilterOpPlan::Ne => {
+            let placeholder = push_sql_param(params, filter.value.clone(), dialect);
+            let op = match filter.op {
+                AxQueryFilterOpPlan::Eq => "=",
+                AxQueryFilterOpPlan::Ne => "!=",
+                _ => unreachable!("matched equality filter above"),
+            };
+            Ok(format!("{field} {op} {placeholder}"))
+        }
+        AxQueryFilterOpPlan::In | AxQueryFilterOpPlan::NotIn => {
+            let values = filter_list_values(&filter.value);
+            if values.is_empty() {
+                return Ok(match filter.op {
+                    AxQueryFilterOpPlan::In => "1 = 0".to_string(),
+                    AxQueryFilterOpPlan::NotIn => "1 = 1".to_string(),
+                    _ => unreachable!("matched list filter above"),
+                });
+            }
+            let placeholders = values
+                .into_iter()
+                .map(|value| push_sql_param(params, value, dialect))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let op = match filter.op {
+                AxQueryFilterOpPlan::In => "in",
+                AxQueryFilterOpPlan::NotIn => "not in",
+                _ => unreachable!("matched list filter above"),
+            };
+            Ok(format!("{field} {op} ({placeholders})"))
+        }
+        AxQueryFilterOpPlan::IsNull => Ok(format!("{field} is null")),
+        AxQueryFilterOpPlan::IsNotNull => Ok(format!("{field} is not null")),
+    }
+}
+
+fn push_sql_param(
+    params: &mut Vec<AxSqlParam>,
+    value: AxRustExpr,
+    dialect: AxSqlDialect,
+) -> String {
+    let placeholder = dialect.placeholder(params.len() + 1);
+    params.push(AxSqlParam {
+        index: params.len() + 1,
+        value,
+    });
+    placeholder
+}
+
+fn filter_list_values(value: &AxRustExpr) -> Vec<AxRustExpr> {
+    let code = value.code.trim();
+    let inner = code
+        .strip_prefix("vec![")
+        .and_then(|value| value.strip_suffix(']'))
+        .or_else(|| {
+            code.strip_prefix('[')
+                .and_then(|value| value.strip_suffix(']'))
+        });
+    let Some(inner) = inner else {
+        return Vec::new();
+    };
+    if inner.trim().is_empty() {
+        return Vec::new();
+    }
+
+    split_top_level(inner, ',')
+        .into_iter()
+        .map(|value| AxRustExpr::new(value.trim()))
+        .collect()
+}
+
+fn split_top_level(input: &str, delimiter: char) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if ch == quote {
+                    in_string = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => in_string = Some(ch),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                _ if ch == delimiter && depth == 0 => {
+                    result.push(input[start..index].trim());
+                    start = index + ch.len_utf8();
+                }
+                _ => {}
+            },
+        }
+    }
+
+    result.push(input[start..].trim());
+    result
 }
 
 fn validate_ident(ident: &str) -> Result<(), AxSqlCompileError> {
@@ -388,6 +452,80 @@ mod tests {
         assert_eq!(sql.params.len(), 2);
         assert_eq!(sql.params[0].index, 1);
         assert_eq!(sql.params[1].index, 2);
+    }
+
+    #[test]
+    fn compiles_query_filter_ops_into_sql() {
+        let query = AxQueryPlan {
+            source: AxQuerySourcePlan::Stream {
+                collection: "posts".to_string(),
+            },
+            filters: vec![
+                AxQueryFilterPlan {
+                    field: "archived".to_string(),
+                    op: AxQueryFilterOpPlan::Ne,
+                    value: AxRustExpr::new("true"),
+                },
+                AxQueryFilterPlan {
+                    field: "status".to_string(),
+                    op: AxQueryFilterOpPlan::In,
+                    value: AxRustExpr::new(
+                        r#"vec!["published".to_string(), "featured".to_string()]"#,
+                    ),
+                },
+                AxQueryFilterPlan {
+                    field: "tag".to_string(),
+                    op: AxQueryFilterOpPlan::NotIn,
+                    value: AxRustExpr::new(r#"["blocked", "hidden"]"#),
+                },
+                AxQueryFilterPlan {
+                    field: "deleted_at".to_string(),
+                    op: AxQueryFilterOpPlan::IsNull,
+                    value: AxRustExpr::new("true"),
+                },
+                AxQueryFilterPlan {
+                    field: "published_at".to_string(),
+                    op: AxQueryFilterOpPlan::IsNotNull,
+                    value: AxRustExpr::new("true"),
+                },
+            ],
+            orders: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+
+        let sql = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)
+            .expect("query should compile");
+
+        assert_eq!(
+            sql.sql,
+            r#"select * from "posts" where "archived" != $1 and "status" in ($2, $3) and "tag" not in ($4, $5) and "deleted_at" is null and "published_at" is not null"#
+        );
+        assert_eq!(
+            sql.params,
+            vec![
+                AxSqlParam {
+                    index: 1,
+                    value: AxRustExpr::new("true"),
+                },
+                AxSqlParam {
+                    index: 2,
+                    value: AxRustExpr::new(r#""published".to_string()"#),
+                },
+                AxSqlParam {
+                    index: 3,
+                    value: AxRustExpr::new(r#""featured".to_string()"#),
+                },
+                AxSqlParam {
+                    index: 4,
+                    value: AxRustExpr::new(r#""blocked""#),
+                },
+                AxSqlParam {
+                    index: 5,
+                    value: AxRustExpr::new(r#""hidden""#),
+                },
+            ]
+        );
     }
 
     #[test]

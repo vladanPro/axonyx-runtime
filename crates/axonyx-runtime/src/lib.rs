@@ -1520,6 +1520,11 @@ fn preview_query_to_runtime_request(
 fn preview_filter_op_to_runtime(op: AxQueryFilterOpPlan) -> backend::AxQueryFilterOp {
     match op {
         AxQueryFilterOpPlan::Eq => backend::AxQueryFilterOp::Eq,
+        AxQueryFilterOpPlan::Ne => backend::AxQueryFilterOp::Ne,
+        AxQueryFilterOpPlan::In => backend::AxQueryFilterOp::In,
+        AxQueryFilterOpPlan::NotIn => backend::AxQueryFilterOp::NotIn,
+        AxQueryFilterOpPlan::IsNull => backend::AxQueryFilterOp::IsNull,
+        AxQueryFilterOpPlan::IsNotNull => backend::AxQueryFilterOp::IsNotNull,
     }
 }
 
@@ -1529,12 +1534,35 @@ fn preview_record_matches(
     op: AxQueryFilterOpPlan,
     expected: &AxValue,
 ) -> bool {
-    let Some(value) = preview_record_field(item, field) else {
-        return false;
-    };
-
     match op {
-        AxQueryFilterOpPlan::Eq => value == expected,
+        AxQueryFilterOpPlan::IsNull => {
+            matches!(
+                preview_record_field(item, field),
+                None | Some(AxValue::Null)
+            )
+        }
+        AxQueryFilterOpPlan::IsNotNull => !matches!(
+            preview_record_field(item, field),
+            None | Some(AxValue::Null)
+        ),
+        _ => {
+            let Some(value) = preview_record_field(item, field) else {
+                return false;
+            };
+            match op {
+                AxQueryFilterOpPlan::Eq => value == expected,
+                AxQueryFilterOpPlan::Ne => value != expected,
+                AxQueryFilterOpPlan::In => match expected {
+                    AxValue::List(items) => items.iter().any(|item| item == value),
+                    _ => false,
+                },
+                AxQueryFilterOpPlan::NotIn => match expected {
+                    AxValue::List(items) => !items.iter().any(|item| item == value),
+                    _ => false,
+                },
+                AxQueryFilterOpPlan::IsNull | AxQueryFilterOpPlan::IsNotNull => unreachable!(),
+            }
+        }
     }
 }
 

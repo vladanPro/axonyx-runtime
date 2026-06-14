@@ -625,6 +625,11 @@ fn denormalize_header_key(key: &str) -> String {
 fn render_filter_op(op: AxQueryFilterOpPlan) -> &'static str {
     match op {
         AxQueryFilterOpPlan::Eq => "AxQueryFilterOp::Eq",
+        AxQueryFilterOpPlan::Ne => "AxQueryFilterOp::Ne",
+        AxQueryFilterOpPlan::In => "AxQueryFilterOp::In",
+        AxQueryFilterOpPlan::NotIn => "AxQueryFilterOp::NotIn",
+        AxQueryFilterOpPlan::IsNull => "AxQueryFilterOp::IsNull",
+        AxQueryFilterOpPlan::IsNotNull => "AxQueryFilterOp::IsNotNull",
     }
 }
 
