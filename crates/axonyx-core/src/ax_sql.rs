@@ -65,6 +65,14 @@ pub enum AxSqlCompileError {
     EmptyMutationFields,
     #[error("delete mutation must contain at least one filter")]
     EmptyDeleteFilters,
+    #[error("list filters require a literal list value")]
+    NonLiteralListFilter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AxSqlFilterContext {
+    Query,
+    Mutation,
 }
 
 pub fn compile_query_plan_to_sql(
@@ -85,7 +93,12 @@ pub fn compile_query_plan_to_sql(
         let mut clauses = Vec::with_capacity(query.filters.len());
 
         for filter in &query.filters {
-            clauses.push(compile_filter_clause(filter, dialect, &mut params)?);
+            clauses.push(compile_filter_clause(
+                filter,
+                dialect,
+                &mut params,
+                AxSqlFilterContext::Query,
+            )?);
         }
 
         sql.push_str(" where ");
@@ -187,7 +200,12 @@ pub fn compile_update_plan_to_sql(
         let mut clauses = Vec::with_capacity(filters.len());
 
         for filter in filters {
-            clauses.push(compile_filter_clause(filter, dialect, &mut params)?);
+            clauses.push(compile_filter_clause(
+                filter,
+                dialect,
+                &mut params,
+                AxSqlFilterContext::Mutation,
+            )?);
         }
 
         format!(" where {}", clauses.join(" and "))
@@ -218,7 +236,12 @@ pub fn compile_delete_plan_to_sql(
     let mut params = Vec::with_capacity(filters.len());
 
     for filter in filters {
-        clauses.push(compile_filter_clause(filter, dialect, &mut params)?);
+        clauses.push(compile_filter_clause(
+            filter,
+            dialect,
+            &mut params,
+            AxSqlFilterContext::Mutation,
+        )?);
     }
 
     Ok(AxSqlMutation {
@@ -235,6 +258,7 @@ fn compile_filter_clause(
     filter: &AxQueryFilterPlan,
     dialect: AxSqlDialect,
     params: &mut Vec<AxSqlParam>,
+    context: AxSqlFilterContext,
 ) -> Result<String, AxSqlCompileError> {
     validate_ident(&filter.field)?;
     let field = dialect.quote_ident(&filter.field);
@@ -250,11 +274,16 @@ fn compile_filter_clause(
             Ok(format!("{field} {op} {placeholder}"))
         }
         AxQueryFilterOpPlan::In | AxQueryFilterOpPlan::NotIn => {
-            let values = filter_list_values(&filter.value);
+            let Some(values) = filter_list_values(&filter.value) else {
+                return Err(AxSqlCompileError::NonLiteralListFilter);
+            };
             if values.is_empty() {
                 return Ok(match filter.op {
                     AxQueryFilterOpPlan::In => "1 = 0".to_string(),
-                    AxQueryFilterOpPlan::NotIn => "1 = 1".to_string(),
+                    AxQueryFilterOpPlan::NotIn if context == AxSqlFilterContext::Query => {
+                        "1 = 1".to_string()
+                    }
+                    AxQueryFilterOpPlan::NotIn => "1 = 0".to_string(),
                     _ => unreachable!("matched list filter above"),
                 });
             }
@@ -288,7 +317,7 @@ fn push_sql_param(
     placeholder
 }
 
-fn filter_list_values(value: &AxRustExpr) -> Vec<AxRustExpr> {
+fn filter_list_values(value: &AxRustExpr) -> Option<Vec<AxRustExpr>> {
     let code = value.code.trim();
     let inner = code
         .strip_prefix("vec![")
@@ -297,17 +326,17 @@ fn filter_list_values(value: &AxRustExpr) -> Vec<AxRustExpr> {
             code.strip_prefix('[')
                 .and_then(|value| value.strip_suffix(']'))
         });
-    let Some(inner) = inner else {
-        return Vec::new();
-    };
+    let inner = inner?;
     if inner.trim().is_empty() {
-        return Vec::new();
+        return Some(Vec::new());
     }
 
-    split_top_level(inner, ',')
-        .into_iter()
-        .map(|value| AxRustExpr::new(value.trim()))
-        .collect()
+    Some(
+        split_top_level(inner, ',')
+            .into_iter()
+            .map(|value| AxRustExpr::new(value.trim()))
+            .collect(),
+    )
 }
 
 fn split_top_level(input: &str, delimiter: char) -> Vec<&str> {
@@ -315,16 +344,28 @@ fn split_top_level(input: &str, delimiter: char) -> Vec<&str> {
     let mut start = 0usize;
     let mut depth = 0usize;
     let mut in_string: Option<char> = None;
+    let mut escaped = false;
 
     for (index, ch) in input.char_indices() {
         match in_string {
             Some(quote) => {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                if ch == '\\' {
+                    escaped = true;
+                    continue;
+                }
                 if ch == quote {
                     in_string = None;
                 }
             }
             None => match ch {
-                '"' | '\'' => in_string = Some(ch),
+                '"' | '\'' => {
+                    in_string = Some(ch);
+                    escaped = false;
+                }
                 '(' | '[' | '{' => depth += 1,
                 ')' | ']' | '}' => depth = depth.saturating_sub(1),
                 _ if ch == delimiter && depth == 0 => {
@@ -526,6 +567,96 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn rejects_non_literal_list_filters() {
+        let query = AxQueryPlan {
+            source: AxQuerySourcePlan::Stream {
+                collection: "posts".to_string(),
+            },
+            filters: vec![AxQueryFilterPlan {
+                field: "status".to_string(),
+                op: AxQueryFilterOpPlan::In,
+                value: AxRustExpr::new("allowed_statuses"),
+            }],
+            orders: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+
+        let error = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)
+            .expect_err("dynamic list filters should be rejected until runtime binding exists");
+
+        assert_eq!(error, AxSqlCompileError::NonLiteralListFilter);
+    }
+
+    #[test]
+    fn preserves_escaped_quotes_when_splitting_list_filters() {
+        let query = AxQueryPlan {
+            source: AxQuerySourcePlan::Stream {
+                collection: "posts".to_string(),
+            },
+            filters: vec![AxQueryFilterPlan {
+                field: "slug".to_string(),
+                op: AxQueryFilterOpPlan::In,
+                value: AxRustExpr::new(r#"["a\"b", "c"]"#),
+            }],
+            orders: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+
+        let sql = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)
+            .expect("escaped string list should compile");
+
+        assert_eq!(sql.sql, r#"select * from "posts" where "slug" in ($1, $2)"#);
+        assert_eq!(
+            sql.params,
+            vec![
+                AxSqlParam {
+                    index: 1,
+                    value: AxRustExpr::new(r#""a\"b""#),
+                },
+                AxSqlParam {
+                    index: 2,
+                    value: AxRustExpr::new(r#""c""#),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn compiles_empty_not_in_as_noop_for_queries_and_noop_mutation_guard() {
+        let query = AxQueryPlan {
+            source: AxQuerySourcePlan::Stream {
+                collection: "posts".to_string(),
+            },
+            filters: vec![AxQueryFilterPlan {
+                field: "status".to_string(),
+                op: AxQueryFilterOpPlan::NotIn,
+                value: AxRustExpr::new("[]"),
+            }],
+            orders: Vec::new(),
+            limit: None,
+            offset: None,
+        };
+
+        let sql = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)
+            .expect("empty NOT IN query should compile as a true clause");
+        assert_eq!(sql.sql, r#"select * from "posts" where 1 = 1"#);
+
+        let delete = compile_delete_plan_to_sql(
+            "posts",
+            &[AxQueryFilterPlan {
+                field: "status".to_string(),
+                op: AxQueryFilterOpPlan::NotIn,
+                value: AxRustExpr::new("[]"),
+            }],
+            AxSqlDialect::Postgres,
+        )
+        .expect("empty NOT IN delete should compile as a no-op mutation");
+        assert_eq!(delete.sql, r#"delete from "posts" where 1 = 0"#);
     }
 
     #[test]
