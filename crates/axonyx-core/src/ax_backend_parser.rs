@@ -999,6 +999,9 @@ fn parse_object_fields<'a>(
                 if part.contains(' ') {
                     return Err(AxBackendParseError::InvalidQueryClause { line });
                 }
+                if is_quoted_object_key(part) {
+                    return Err(AxBackendParseError::InvalidQueryClause { line });
+                }
                 fields.push((parse_object_key(part, line)?, part));
             }
         }
@@ -1032,18 +1035,23 @@ fn parse_object_key(input: &str, line: usize) -> Result<String, AxBackendParseEr
 }
 
 fn parse_quoted_object_key(input: &str) -> Option<&str> {
-    if input.len() < 2 {
-        return None;
-    }
-    let quote = input.as_bytes()[0] as char;
-    if quote != '"' && quote != '\'' {
-        return None;
-    }
-    if !input.ends_with(quote) {
+    if !is_quoted_object_key(input) {
         return None;
     }
 
     Some(&input[1..input.len() - 1])
+}
+
+fn is_quoted_object_key(input: &str) -> bool {
+    if input.len() < 2 {
+        return false;
+    }
+    let quote = input.as_bytes()[0] as char;
+    if quote != '"' && quote != '\'' {
+        return false;
+    }
+
+    input.ends_with(quote)
 }
 
 fn is_valid_object_key(input: &str) -> bool {
@@ -1596,6 +1604,20 @@ query loadPosts() -> Post[]
 "#;
 
         let error = parse_backend_ax(input).expect_err("invalid key should fail before lowering");
+
+        assert_eq!(error, AxBackendParseError::InvalidQueryClause { line: 3 });
+    }
+
+    #[test]
+    fn rejects_fluent_db_query_with_quoted_shorthand_key() {
+        let input = r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.where({ "status" }).all()
+  return posts
+"#;
+
+        let error =
+            parse_backend_ax(input).expect_err("quoted shorthand key should fail before lowering");
 
         assert_eq!(error, AxBackendParseError::InvalidQueryClause { line: 3 });
     }
