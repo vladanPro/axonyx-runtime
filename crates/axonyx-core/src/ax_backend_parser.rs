@@ -870,14 +870,29 @@ fn parse_fluent_query_spec(
         };
 
         match method {
-            "where" => {
+            "where" | "whereNot" | "whereIn" | "whereNotIn" => {
+                let op = match method {
+                    "where" => AxQueryFilterOp::Eq,
+                    "whereNot" => AxQueryFilterOp::Ne,
+                    "whereIn" => AxQueryFilterOp::In,
+                    "whereNotIn" => AxQueryFilterOp::NotIn,
+                    _ => unreachable!("method matched above"),
+                };
                 for (field, value) in parse_object_fields(args, line)? {
-                    query = query.filter(AxQueryFilter::new(
-                        field,
-                        AxQueryFilterOp::Eq,
-                        parse_expr(value, line)?,
-                    ));
+                    query = query.filter(AxQueryFilter::new(field, op, parse_expr(value, line)?));
                 }
+            }
+            "whereNull" | "whereNotNull" => {
+                let op = match method {
+                    "whereNull" => AxQueryFilterOp::IsNull,
+                    "whereNotNull" => AxQueryFilterOp::IsNotNull,
+                    _ => unreachable!("method matched above"),
+                };
+                query = query.filter(AxQueryFilter::new(
+                    parse_string_arg(args, line)?,
+                    op,
+                    AxExpr::bool(true),
+                ));
             }
             "order" => {
                 for (field, value) in parse_object_fields(args, line)? {
@@ -1074,6 +1089,17 @@ fn parse_u32_arg(input: &str, line: usize) -> Result<u32, AxBackendParseError> {
         .trim()
         .parse::<u32>()
         .map_err(|_| AxBackendParseError::InvalidQueryNumber { line })
+}
+
+fn parse_string_arg(input: &str, line: usize) -> Result<String, AxBackendParseError> {
+    let parts = split_top_level(input, ',');
+    if parts.len() != 1 {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    }
+    match parse_expr(parts[0].trim(), line)? {
+        AxExpr::String(value) if is_valid_object_key(&value) => Ok(value),
+        _ => Err(AxBackendParseError::InvalidQueryClause { line }),
+    }
 }
 
 fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxBackendParseError> {
@@ -1591,6 +1617,66 @@ query loadPosts() -> Post[]
                     AxExpr::string("published"),
                 ))
                 .order(AxQueryOrder::new("created_at", AxQueryOrderDirection::Desc))
+            )
+        );
+    }
+
+    #[test]
+    fn parses_fluent_db_query_filter_ops() {
+        let input = r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.where({ published: true }).whereNot({ archived: true }).whereIn({ status: ["published", "featured"] }).whereNotIn({ tag: blockedTags }).whereNull("deleted_at").whereNotNull("published_at").all()
+  return posts
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected data statement");
+        };
+
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "published",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::bool(true),
+                ))
+                .filter(AxQueryFilter::new(
+                    "archived",
+                    AxQueryFilterOp::Ne,
+                    AxExpr::bool(true),
+                ))
+                .filter(AxQueryFilter::new(
+                    "status",
+                    AxQueryFilterOp::In,
+                    AxExpr::call(
+                        ["list"],
+                        [AxExpr::string("published"), AxExpr::string("featured")],
+                    ),
+                ))
+                .filter(AxQueryFilter::new(
+                    "tag",
+                    AxQueryFilterOp::NotIn,
+                    AxExpr::ident("blockedTags"),
+                ))
+                .filter(AxQueryFilter::new(
+                    "deleted_at",
+                    AxQueryFilterOp::IsNull,
+                    AxExpr::bool(true),
+                ))
+                .filter(AxQueryFilter::new(
+                    "published_at",
+                    AxQueryFilterOp::IsNotNull,
+                    AxExpr::bool(true),
+                ))
             )
         );
     }

@@ -195,6 +195,11 @@ pub struct AxQueryFilterPlan {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxQueryFilterOpPlan {
     Eq,
+    Ne,
+    In,
+    NotIn,
+    IsNull,
+    IsNotNull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -404,9 +409,7 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
                 .iter()
                 .map(|filter| AxQueryFilterPlan {
                     field: filter.field.clone(),
-                    op: match filter.op {
-                        AxQueryFilterOp::Eq => AxQueryFilterOpPlan::Eq,
-                    },
+                    op: lower_query_filter_op(filter.op),
                     value: lower_expr(&filter.value),
                 })
                 .collect(),
@@ -418,9 +421,7 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
                 .iter()
                 .map(|filter| AxQueryFilterPlan {
                     field: filter.field.clone(),
-                    op: match filter.op {
-                        AxQueryFilterOp::Eq => AxQueryFilterOpPlan::Eq,
-                    },
+                    op: lower_query_filter_op(filter.op),
                     value: lower_expr(&filter.value),
                 })
                 .collect(),
@@ -537,9 +538,7 @@ fn lower_query(query: &AxQuerySpec) -> AxQueryPlan {
             .iter()
             .map(|filter| AxQueryFilterPlan {
                 field: filter.field.clone(),
-                op: match filter.op {
-                    AxQueryFilterOp::Eq => AxQueryFilterOpPlan::Eq,
-                },
+                op: lower_query_filter_op(filter.op),
                 value: lower_expr(&filter.value),
             })
             .collect(),
@@ -556,6 +555,17 @@ fn lower_query(query: &AxQuerySpec) -> AxQueryPlan {
             .collect(),
         limit: query.limit,
         offset: query.offset,
+    }
+}
+
+fn lower_query_filter_op(op: AxQueryFilterOp) -> AxQueryFilterOpPlan {
+    match op {
+        AxQueryFilterOp::Eq => AxQueryFilterOpPlan::Eq,
+        AxQueryFilterOp::Ne => AxQueryFilterOpPlan::Ne,
+        AxQueryFilterOp::In => AxQueryFilterOpPlan::In,
+        AxQueryFilterOp::NotIn => AxQueryFilterOpPlan::NotIn,
+        AxQueryFilterOp::IsNull => AxQueryFilterOpPlan::IsNull,
+        AxQueryFilterOp::IsNotNull => AxQueryFilterOpPlan::IsNotNull,
     }
 }
 
