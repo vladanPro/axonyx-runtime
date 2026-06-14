@@ -983,6 +983,29 @@ page Home() {
     }
 
     #[test]
+    fn converts_page_return_type_asx_shorthand_into_document() {
+        let document = parse_ax_auto(
+            r#"
+page Home() -> ASX {
+  data title = "Hello Axonyx"
+
+  return {
+    <Copy>{title}</Copy>
+  }
+}
+"#,
+        )
+        .expect("ASX return type shorthand should convert");
+
+        assert_eq!(document.page.name, "Home");
+        assert_eq!(document.page.body.len(), 2);
+        assert_eq!(
+            document.page.body[0],
+            AxStatement::data("title", AxExpr::string("Hello Axonyx"))
+        );
+    }
+
+    #[test]
     fn converts_state_signal_binding_into_bridge_metadata() {
         let document = parse_ax_auto(
             r#"
