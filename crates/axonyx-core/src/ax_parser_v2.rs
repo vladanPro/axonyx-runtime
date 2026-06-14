@@ -92,7 +92,7 @@ impl<'a> Parser<'a> {
             self.skip_layout_whitespace();
         }
 
-        let (page, function_body) = self.parse_page_decl()?;
+        let (page, function_body, page_returns_asx) = self.parse_page_decl()?;
         self.skip_layout_whitespace();
 
         let mut types = Vec::new();
@@ -122,7 +122,7 @@ impl<'a> Parser<'a> {
         }
 
         let body = if function_body {
-            let body = self.parse_return_asx_body()?;
+            let body = self.parse_return_asx_body(page_returns_asx)?;
             self.skip_layout_whitespace();
             if self.peek_char() != Some('}') {
                 return Err(AxParseV2Error::InvalidPage { line: self.line });
@@ -230,7 +230,7 @@ impl<'a> Parser<'a> {
         Ok(AxImportDecl::new(bindings, source))
     }
 
-    fn parse_page_decl(&mut self) -> Result<(AxPageDecl, bool), AxParseV2Error> {
+    fn parse_page_decl(&mut self) -> Result<(AxPageDecl, bool, bool), AxParseV2Error> {
         let line = self.line;
         if self.page_seen {
             return Err(AxParseV2Error::DuplicatePage { line });
@@ -258,6 +258,20 @@ impl<'a> Parser<'a> {
             self.skip_spaces();
         }
 
+        let mut page_returns_asx = false;
+        if self.starts_with("->") {
+            self.bump_char();
+            self.bump_char();
+            self.skip_spaces();
+            if !self.starts_with_keyword("ASX") {
+                return Err(AxParseV2Error::InvalidPage { line });
+            }
+            self.expect_keyword("ASX")
+                .map_err(|_| AxParseV2Error::InvalidPage { line })?;
+            page_returns_asx = true;
+            self.skip_layout_whitespace();
+        }
+
         let function_body = if self.peek_char() == Some('{') {
             self.bump_char();
             true
@@ -269,10 +283,17 @@ impl<'a> Parser<'a> {
         };
         self.page_seen = true;
 
-        Ok((AxPageDecl::with_params(name, params), function_body))
+        Ok((
+            AxPageDecl::with_params(name, params),
+            function_body,
+            page_returns_asx,
+        ))
     }
 
-    fn parse_return_asx_body(&mut self) -> Result<Vec<AxNodeV2>, AxParseV2Error> {
+    fn parse_return_asx_body(
+        &mut self,
+        page_returns_asx: bool,
+    ) -> Result<Vec<AxNodeV2>, AxParseV2Error> {
         let line = self.line;
         if !self.starts_with_keyword("return") {
             return Err(AxParseV2Error::InvalidReturnAsx { line });
@@ -280,12 +301,21 @@ impl<'a> Parser<'a> {
         self.expect_keyword("return")
             .map_err(|_| AxParseV2Error::InvalidReturnAsx { line })?;
         self.skip_spaces();
-        if !self.starts_with_keyword("ASX") {
+
+        if page_returns_asx && self.peek_char() == Some('{') {
+            self.bump_char();
+            self.skip_layout_whitespace();
+            return self.parse_nodes_until_component_body_end();
+        }
+
+        if self.starts_with_keyword("ASX") {
+            self.expect_keyword("ASX")
+                .map_err(|_| AxParseV2Error::InvalidReturnAsx { line })?;
+            self.skip_layout_whitespace();
+        } else {
             return Err(AxParseV2Error::InvalidReturnAsx { line });
         }
-        self.expect_keyword("ASX")
-            .map_err(|_| AxParseV2Error::InvalidReturnAsx { line })?;
-        self.skip_layout_whitespace();
+
         if self.peek_char() != Some('{') {
             return Err(AxParseV2Error::InvalidReturnAsx { line });
         }
@@ -1514,6 +1544,43 @@ page Home()
 
         assert_eq!(file.page.name, "Home");
         assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn parses_page_return_type_asx_with_return_shorthand() {
+        let input = r#"
+page Home() -> ASX {
+  data title = "Hello Axonyx"
+
+  return {
+    <Copy>{title}</Copy>
+  }
+}
+"#;
+
+        let file = parse_ax_v2(input).expect("ASX return type shorthand should parse");
+
+        assert_eq!(file.page.name, "Home");
+        assert_eq!(
+            file.lets,
+            vec![AxLetDeclV2::new("title", "\"Hello Axonyx\"")]
+        );
+        assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn rejects_unknown_page_return_type() {
+        let input = r#"
+page Home() -> HTML {
+  return {
+    <Copy>Body</Copy>
+  }
+}
+"#;
+
+        let error = parse_ax_v2(input).expect_err("unknown page return type should fail");
+
+        assert!(matches!(error, AxParseV2Error::InvalidPage { .. }));
     }
 
     #[test]
