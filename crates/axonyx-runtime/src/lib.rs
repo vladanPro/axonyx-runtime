@@ -337,7 +337,24 @@ pub struct AxPreviewActionResult {
     pub redirect_to: Option<String>,
     pub value: AxValue,
     pub patches: Vec<AxPreviewStatePatch>,
+    pub invalidations: Vec<AxPreviewInvalidation>,
     pub error: Option<AxPreviewActionError>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxPreviewInvalidation {
+    pub target: String,
+    pub query_key: Vec<String>,
+}
+
+impl AxPreviewInvalidation {
+    pub fn new(target: impl Into<String>) -> Self {
+        let target = target.into();
+        Self {
+            query_key: vec![normalize_preview_invalidation_target(&target)],
+            target,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -354,6 +371,15 @@ impl AxPreviewActionError {
             status: 422,
             value,
         }
+    }
+}
+
+fn normalize_preview_invalidation_target(target: &str) -> String {
+    let target = target.trim().trim_matches('"').trim_matches('/');
+    if target.is_empty() {
+        "root".to_string()
+    } else {
+        target.replace('/', ".")
     }
 }
 
@@ -921,6 +947,7 @@ fn execute_preview_action(
     let mut redirect_to = None;
     let mut value = AxValue::record([("ok", AxValue::Bool(true))]);
     let mut patches = Vec::new();
+    let mut invalidations = Vec::new();
 
     for step in &action.steps {
         match step {
@@ -961,7 +988,11 @@ fn execute_preview_action(
                     .retain(|item| !preview_record_matches_all(item, &filters));
             }
             AxStepPlan::Revalidate { target } => {
-                redirect_to = Some(eval_preview_expr(target, &scope, env)?.as_string());
+                let target = eval_preview_revalidation_target(target, &scope, env)?;
+                if target.starts_with('/') {
+                    redirect_to = Some(target.clone());
+                }
+                invalidations.push(AxPreviewInvalidation::new(target));
             }
             AxStepPlan::Patch { signal, value } => {
                 let signal = eval_preview_expr(signal, &scope, env)?.as_string();
@@ -980,6 +1011,7 @@ fn execute_preview_action(
                     redirect_to,
                     value,
                     patches,
+                    invalidations,
                     error: Some(error),
                 });
             }
@@ -998,6 +1030,7 @@ fn execute_preview_action(
         redirect_to,
         value,
         patches,
+        invalidations,
         error: None,
     })
 }
@@ -1655,6 +1688,28 @@ fn eval_preview_expr(
     Err(PreviewError::Runtime {
         message: format!("preview loader expression `{code}` is not supported yet"),
     })
+}
+
+fn eval_preview_revalidation_target(
+    expr: &AxRustExpr,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+) -> Result<String, PreviewError> {
+    let code = expr.code.trim();
+    if is_preview_identifier(code) && !scope.contains_key(code) {
+        return Ok(code.to_string());
+    }
+
+    Ok(eval_preview_expr(expr, scope, env)?.as_string())
+}
+
+fn is_preview_identifier(code: &str) -> bool {
+    let mut chars = code.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn lookup_preview_scope(scope: &BTreeMap<String, AxValue>, code: &str) -> Option<AxValue> {
@@ -2561,11 +2616,12 @@ fn ax_action_script() -> &'static str {
 
   const applyPatchResponse = (payload, form) => {
     const patches = Array.isArray(payload?.patches) ? payload.patches : [];
+    const invalidations = Array.isArray(payload?.invalidations) ? payload.invalidations : [];
     const applyPatch = window.__axonyx?.state?.applyPatch;
     const canApplyPatches = typeof applyPatch === "function";
     if (canApplyPatches) patches.forEach((patch) => applyPatch(patch));
     window.dispatchEvent(new CustomEvent("axonyx:action-complete", {
-      detail: { form, payload, patches },
+      detail: { form, payload, patches, invalidations },
     }));
     if ((patches.length === 0 || !canApplyPatches) && payload?.redirect) {
       window.location.assign(payload.redirect);
@@ -4417,6 +4473,57 @@ action SetTheme
         assert_eq!(result.patches[0].signal, "root:theme:1");
         assert_eq!(result.patches[0].value, AxValue::String("gold".to_string()));
         assert_eq!(result.patches[0].source.as_deref(), Some("action"));
+    }
+
+    #[test]
+    fn preview_action_collects_query_invalidations() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action CreatePost
+  invalidate posts
+  return ok
+"#],
+            "CreatePost",
+            &BTreeMap::new(),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert_eq!(result.redirect_to, None);
+        assert!(result.patches.is_empty());
+        assert_eq!(
+            result.invalidations,
+            vec![AxPreviewInvalidation {
+                target: "posts".to_string(),
+                query_key: vec!["posts".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn preview_action_revalidate_route_keeps_redirect_and_invalidation() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action SavePost
+  revalidate "/posts"
+  return ok
+"#],
+            "SavePost",
+            &BTreeMap::new(),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert_eq!(result.redirect_to.as_deref(), Some("/posts"));
+        assert_eq!(
+            result.invalidations,
+            vec![AxPreviewInvalidation {
+                target: "/posts".to_string(),
+                query_key: vec!["posts".to_string()],
+            }]
+        );
     }
 
     #[test]
