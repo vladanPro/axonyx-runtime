@@ -361,6 +361,14 @@ impl Parser {
             )?));
         }
 
+        if let Some(value) = text.strip_prefix("invalidate ") {
+            self.pos += 1;
+            return Ok(AxBackendStmt::revalidate(parse_expr(
+                value.trim(),
+                line.line,
+            )?));
+        }
+
         if let Some(rest) = text.strip_prefix("patch ") {
             let Some((signal, value)) = rest.split_once('=') else {
                 return Err(AxBackendParseError::InvalidAssignment { line: line.line });
@@ -1821,6 +1829,26 @@ action CreatePost
         assert_eq!(action.name, "CreatePost");
         assert_eq!(action.input.len(), 2);
         assert_eq!(action.body.len(), 3);
+    }
+
+    #[test]
+    fn parses_invalidate_alias_as_revalidate_step() {
+        let input = r#"
+action CreatePost
+  invalidate posts
+  return ok
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+        let AxBackendStmt::Revalidate(target) = &action.body[0] else {
+            panic!("expected invalidate alias to lower to revalidate");
+        };
+
+        assert_eq!(*target, AxExpr::ident("posts"));
     }
 
     #[test]
