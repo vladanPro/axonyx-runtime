@@ -366,7 +366,7 @@ impl Parser {
 
         if let Some(value) = text.strip_prefix("invalidate ") {
             self.pos += 1;
-            return Ok(AxBackendStmt::revalidate(parse_expr(
+            return Ok(AxBackendStmt::invalidate(parse_expr(
                 value.trim(),
                 line.line,
             )?));
@@ -1324,6 +1324,7 @@ fn split_top_level_signature_params(input: &str) -> Vec<&str> {
     let mut start = 0usize;
     let mut group_depth = 0usize;
     let mut angle_depth = 0usize;
+    let mut in_default = false;
     let mut in_string: Option<char> = None;
 
     for (index, ch) in input.char_indices() {
@@ -1337,11 +1338,15 @@ fn split_top_level_signature_params(input: &str) -> Vec<&str> {
                 '"' | '\'' => in_string = Some(ch),
                 '(' | '[' | '{' => group_depth += 1,
                 ')' | ']' | '}' => group_depth = group_depth.saturating_sub(1),
-                '<' if group_depth == 0 => angle_depth += 1,
-                '>' if group_depth == 0 => angle_depth = angle_depth.saturating_sub(1),
+                '=' if group_depth == 0 && angle_depth == 0 => in_default = true,
+                '<' if group_depth == 0 && !in_default => angle_depth += 1,
+                '>' if group_depth == 0 && !in_default => {
+                    angle_depth = angle_depth.saturating_sub(1)
+                }
                 ',' if group_depth == 0 && angle_depth == 0 => {
                     result.push(input[start..index].trim());
                     start = index + ch.len_utf8();
+                    in_default = false;
                 }
                 _ => {}
             },
@@ -1947,11 +1952,12 @@ action CreatePost
         let AxBackendBlock::Action(action) = &document.blocks[0] else {
             panic!("expected action block");
         };
-        let AxBackendStmt::Revalidate(target) = &action.body[0] else {
+        let AxBackendStmt::Revalidate(revalidate) = &action.body[0] else {
             panic!("expected invalidate alias to lower to revalidate");
         };
 
-        assert_eq!(*target, AxExpr::ident("posts"));
+        assert_eq!(revalidate.target, AxExpr::ident("posts"));
+        assert!(revalidate.literal);
     }
 
     #[test]
@@ -2034,6 +2040,27 @@ action saveLabel(label: string = "draft -> live") -> Label {
                 AxExpr::string("draft -> live")
             )]
         );
+    }
+
+    #[test]
+    fn parses_function_shaped_action_less_than_defaults_before_next_param() {
+        let input = r#"
+action saveFlag(enabled: bool = 1 < limit, title: string) {
+  return input
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(action.input.len(), 2);
+        assert_eq!(action.input[0].name, "enabled");
+        assert_eq!(action.input[0].ty, "bool");
+        assert!(action.input[0].default.is_some());
+        assert_eq!(action.input[1], AxField::new("title", "string"));
     }
 
     #[test]

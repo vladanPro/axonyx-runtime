@@ -990,8 +990,8 @@ fn execute_preview_action(
                     .retain(|item| !preview_record_matches_all(item, &filters));
                 push_preview_auto_invalidation(&mut invalidations, collection.clone());
             }
-            AxStepPlan::Revalidate { target } => {
-                let target = eval_preview_revalidation_target(target, &scope, env)?;
+            AxStepPlan::Revalidate { target, literal } => {
+                let target = eval_preview_revalidation_target(target, *literal, &scope, env)?;
                 if target.starts_with('/') {
                     redirect_to = Some(target.clone());
                 }
@@ -1695,11 +1695,12 @@ fn eval_preview_expr(
 
 fn eval_preview_revalidation_target(
     expr: &AxRustExpr,
+    literal: bool,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
 ) -> Result<String, PreviewError> {
     let code = expr.code.trim();
-    if is_preview_identifier(code) {
+    if literal && is_preview_identifier(code) {
         return Ok(code.to_string());
     }
 
@@ -4644,6 +4645,32 @@ action SavePost
             &[r#"
 action SavePost
   revalidate "/posts"
+  return ok
+"#],
+            "SavePost",
+            &BTreeMap::new(),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert_eq!(result.redirect_to.as_deref(), Some("/posts"));
+        assert_eq!(
+            result.invalidations,
+            vec![AxPreviewInvalidation {
+                target: "/posts".to_string(),
+                query_key: vec!["posts".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn preview_action_revalidate_evaluates_bound_targets() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action SavePost
+  data target = "/posts"
+  revalidate target
   return ok
 "#],
             "SavePost",

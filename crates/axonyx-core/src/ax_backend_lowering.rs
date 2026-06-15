@@ -101,6 +101,7 @@ pub enum AxStepPlan {
     },
     Revalidate {
         target: AxRustExpr,
+        literal: bool,
     },
     Patch {
         signal: AxRustExpr,
@@ -426,8 +427,9 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
                 })
                 .collect(),
         },
-        AxBackendStmt::Revalidate(expr) => AxStepPlan::Revalidate {
-            target: lower_expr(expr),
+        AxBackendStmt::Revalidate(revalidate) => AxStepPlan::Revalidate {
+            target: lower_expr(&revalidate.target),
+            literal: revalidate.literal,
         },
         AxBackendStmt::Patch(patch) => AxStepPlan::Patch {
             signal: lower_patch_signal(&patch.signal),
@@ -952,6 +954,7 @@ action CreatePost
             handler.steps[1],
             AxStepPlan::Revalidate {
                 target: AxRustExpr::new(r#""/posts".to_string()"#),
+                literal: false,
             }
         );
         assert_eq!(handler.steps[2], AxStepPlan::Return(AxReturnPlan::Ok));
