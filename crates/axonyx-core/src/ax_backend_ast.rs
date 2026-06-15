@@ -157,7 +157,7 @@ pub enum AxBackendStmt {
     Cookie(AxResponseCookie),
     ClearCookie(AxExpr),
     Require(AxRequirement),
-    Revalidate(AxExpr),
+    Revalidate(AxRevalidate),
     Return(AxReturn),
     Send(AxSend),
 }
@@ -194,7 +194,11 @@ impl AxBackendStmt {
     }
 
     pub fn revalidate(value: impl Into<AxExpr>) -> Self {
-        Self::Revalidate(value.into())
+        Self::Revalidate(AxRevalidate::expression(value))
+    }
+
+    pub fn invalidate(value: impl Into<AxExpr>) -> Self {
+        Self::Revalidate(AxRevalidate::literal(value))
     }
 
     pub fn patch(signal: impl Into<AxExpr>, value: impl Into<AxExpr>) -> Self {
@@ -235,6 +239,28 @@ impl AxBackendStmt {
 
     pub fn send(target: impl Into<String>, payload: impl Into<AxExpr>) -> Self {
         Self::Send(AxSend::new(target, payload))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxRevalidate {
+    pub target: AxExpr,
+    pub literal: bool,
+}
+
+impl AxRevalidate {
+    pub fn expression(value: impl Into<AxExpr>) -> Self {
+        Self {
+            target: value.into(),
+            literal: false,
+        }
+    }
+
+    pub fn literal(value: impl Into<AxExpr>) -> Self {
+        Self {
+            target: value.into(),
+            literal: true,
+        }
     }
 }
 

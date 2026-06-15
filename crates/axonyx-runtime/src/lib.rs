@@ -964,7 +964,7 @@ fn execute_preview_action(
                 store
                     .ensure_collection(collection)
                     .push(AxValue::Record(record));
-                push_preview_invalidation(&mut invalidations, collection.clone());
+                push_preview_auto_invalidation(&mut invalidations, collection.clone());
             }
             AxStepPlan::Update {
                 collection,
@@ -978,7 +978,7 @@ fn execute_preview_action(
                         apply_preview_fields(item, &fields);
                     }
                 }
-                push_preview_invalidation(&mut invalidations, collection.clone());
+                push_preview_auto_invalidation(&mut invalidations, collection.clone());
             }
             AxStepPlan::Delete {
                 collection,
@@ -988,14 +988,14 @@ fn execute_preview_action(
                 store
                     .ensure_collection(collection)
                     .retain(|item| !preview_record_matches_all(item, &filters));
-                push_preview_invalidation(&mut invalidations, collection.clone());
+                push_preview_auto_invalidation(&mut invalidations, collection.clone());
             }
-            AxStepPlan::Revalidate { target } => {
-                let target = eval_preview_revalidation_target(target, &scope, env)?;
+            AxStepPlan::Revalidate { target, literal } => {
+                let target = eval_preview_revalidation_target(target, *literal, &scope, env)?;
                 if target.starts_with('/') {
                     redirect_to = Some(target.clone());
                 }
-                push_preview_invalidation(&mut invalidations, target);
+                push_preview_explicit_invalidation(&mut invalidations, target);
             }
             AxStepPlan::Patch { signal, value } => {
                 let signal = eval_preview_expr(signal, &scope, env)?.as_string();
@@ -1695,18 +1695,19 @@ fn eval_preview_expr(
 
 fn eval_preview_revalidation_target(
     expr: &AxRustExpr,
+    literal: bool,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
 ) -> Result<String, PreviewError> {
     let code = expr.code.trim();
-    if is_preview_identifier(code) && !scope.contains_key(code) {
+    if literal && is_preview_identifier(code) {
         return Ok(code.to_string());
     }
 
     Ok(eval_preview_expr(expr, scope, env)?.as_string())
 }
 
-fn push_preview_invalidation(
+fn push_preview_auto_invalidation(
     invalidations: &mut Vec<AxPreviewInvalidation>,
     target: impl Into<String>,
 ) {
@@ -1715,6 +1716,21 @@ fn push_preview_invalidation(
         .iter()
         .any(|existing| existing.query_key == invalidation.query_key)
     {
+        return;
+    }
+    invalidations.push(invalidation);
+}
+
+fn push_preview_explicit_invalidation(
+    invalidations: &mut Vec<AxPreviewInvalidation>,
+    target: impl Into<String>,
+) {
+    let invalidation = AxPreviewInvalidation::new(target);
+    if let Some(existing) = invalidations
+        .iter_mut()
+        .find(|existing| existing.query_key == invalidation.query_key)
+    {
+        *existing = invalidation;
         return;
     }
     invalidations.push(invalidation);
@@ -4570,12 +4586,91 @@ action CreatePost
     }
 
     #[test]
+    fn preview_action_bare_invalidate_ignores_shadowing_bindings() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action CreatePost
+  data posts = db.posts.all()
+  invalidate posts
+  return ok
+"#],
+            "CreatePost",
+            &BTreeMap::new(),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert_eq!(
+            result.invalidations,
+            vec![AxPreviewInvalidation {
+                target: "posts".to_string(),
+                query_key: vec!["posts".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn preview_action_explicit_route_revalidation_wins_over_auto_invalidation() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action SavePost
+  insert posts
+    title: "Hello"
+
+  revalidate "/posts"
+  return ok
+"#],
+            "SavePost",
+            &BTreeMap::new(),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert_eq!(result.redirect_to.as_deref(), Some("/posts"));
+        assert_eq!(
+            result.invalidations,
+            vec![AxPreviewInvalidation {
+                target: "/posts".to_string(),
+                query_key: vec!["posts".to_string()],
+            }]
+        );
+    }
+
+    #[test]
     fn preview_action_revalidate_route_keeps_redirect_and_invalidation() {
         let mut store = AxPreviewStore::default();
         let result = execute_preview_action_sources(
             &[r#"
 action SavePost
   revalidate "/posts"
+  return ok
+"#],
+            "SavePost",
+            &BTreeMap::new(),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert_eq!(result.redirect_to.as_deref(), Some("/posts"));
+        assert_eq!(
+            result.invalidations,
+            vec![AxPreviewInvalidation {
+                target: "/posts".to_string(),
+                query_key: vec!["posts".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn preview_action_revalidate_evaluates_bound_targets() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action SavePost
+  data target = "/posts"
+  revalidate target
   return ok
 "#],
             "SavePost",

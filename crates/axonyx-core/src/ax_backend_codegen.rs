@@ -289,8 +289,13 @@ fn render_step(step: &AxStepPlan, route_response: bool) -> String {
             collection,
             render_query_filters(filters)
         ),
-        AxStepPlan::Revalidate { target } => {
-            format!("    runtime.revalidate({})?;\n", render_borrowed_expr(target))
+        AxStepPlan::Revalidate { target, literal } => {
+            let target = if *literal {
+                render_literal_revalidation_target(target)
+            } else {
+                render_borrowed_expr(target)
+            };
+            format!("    runtime.revalidate({target})?;\n")
         }
         AxStepPlan::Patch { signal, value } => {
             format!("    // patch {} = {}\n", signal.code, value.code)
@@ -501,6 +506,17 @@ fn render_borrowed_expr(expr: &AxRustExpr) -> String {
     } else {
         format!("&{}", expr.code)
     }
+}
+
+fn render_literal_revalidation_target(expr: &AxRustExpr) -> String {
+    let target = expr
+        .code
+        .trim()
+        .trim_end_matches(".to_string()")
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    format!("{target:?}")
 }
 
 fn render_owned_expr(expr: &AxRustExpr) -> String {

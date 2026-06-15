@@ -366,7 +366,7 @@ impl Parser {
 
         if let Some(value) = text.strip_prefix("invalidate ") {
             self.pos += 1;
-            return Ok(AxBackendStmt::revalidate(parse_expr(
+            return Ok(AxBackendStmt::invalidate(parse_expr(
                 value.trim(),
                 line.line,
             )?));
@@ -1319,6 +1319,44 @@ fn split_top_level(input: &str, delimiter: char) -> Vec<&str> {
     result
 }
 
+fn split_top_level_signature_params(input: &str) -> Vec<&str> {
+    let mut result = Vec::new();
+    let mut start = 0usize;
+    let mut group_depth = 0usize;
+    let mut angle_depth = 0usize;
+    let mut in_default = false;
+    let mut in_string: Option<char> = None;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if ch == quote {
+                    in_string = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => in_string = Some(ch),
+                '(' | '[' | '{' => group_depth += 1,
+                ')' | ']' | '}' => group_depth = group_depth.saturating_sub(1),
+                '=' if group_depth == 0 && angle_depth == 0 => in_default = true,
+                '<' if group_depth == 0 && !in_default => angle_depth += 1,
+                '>' if group_depth == 0 && !in_default => {
+                    angle_depth = angle_depth.saturating_sub(1)
+                }
+                ',' if group_depth == 0 && angle_depth == 0 => {
+                    result.push(input[start..index].trim());
+                    start = index + ch.len_utf8();
+                    in_default = false;
+                }
+                _ => {}
+            },
+        }
+    }
+
+    result.push(input[start..].trim());
+    result
+}
+
 fn split_top_level_once<'a>(input: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> {
     let mut depth = 0usize;
     let mut in_string: Option<char> = None;
@@ -1354,7 +1392,7 @@ fn trim_quotes(input: &str) -> String {
 }
 
 fn split_return_contract(input: &str) -> (&str, Option<String>) {
-    match input.split_once("->") {
+    match split_top_level_once(input, "->") {
         Some((head, returns)) => {
             let returns = returns.trim();
             if returns.is_empty() {
@@ -1405,7 +1443,7 @@ fn parse_backend_callable_signature(
         return Ok((name.to_string(), Vec::new()));
     }
 
-    let fields = split_top_level(params, ',')
+    let fields = split_top_level_signature_params(params)
         .into_iter()
         .map(|param| parse_backend_signature_param(param, line))
         .collect::<Result<Vec<_>, _>>()?;
@@ -1914,11 +1952,12 @@ action CreatePost
         let AxBackendBlock::Action(action) = &document.blocks[0] else {
             panic!("expected action block");
         };
-        let AxBackendStmt::Revalidate(target) = &action.body[0] else {
+        let AxBackendStmt::Revalidate(revalidate) = &action.body[0] else {
             panic!("expected invalidate alias to lower to revalidate");
         };
 
-        assert_eq!(*target, AxExpr::ident("posts"));
+        assert_eq!(revalidate.target, AxExpr::ident("posts"));
+        assert!(revalidate.literal);
     }
 
     #[test]
@@ -1975,6 +2014,77 @@ action createPost(title: string, featured?: bool = false) -> Post {
             ]
         );
         assert_eq!(action.body.len(), 2);
+    }
+
+    #[test]
+    fn parses_function_shaped_action_defaults_with_return_arrow_text() {
+        let input = r#"
+action saveLabel(label: string = "draft -> live") -> Label {
+  return input
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(action.name, "saveLabel");
+        assert_eq!(action.returns.as_deref(), Some("Label"));
+        assert_eq!(
+            action.input,
+            vec![AxField::with_default(
+                "label",
+                "string",
+                AxExpr::string("draft -> live")
+            )]
+        );
+    }
+
+    #[test]
+    fn parses_function_shaped_action_less_than_defaults_before_next_param() {
+        let input = r#"
+action saveFlag(enabled: bool = 1 < limit, title: string) {
+  return input
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(action.input.len(), 2);
+        assert_eq!(action.input[0].name, "enabled");
+        assert_eq!(action.input[0].ty, "bool");
+        assert!(action.input[0].default.is_some());
+        assert_eq!(action.input[1], AxField::new("title", "string"));
+    }
+
+    #[test]
+    fn parses_function_shaped_action_generic_parameter_types() {
+        let input = r#"
+action saveMetadata(metadata: std::collections::HashMap<String, String>) {
+  return input
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(action.name, "saveMetadata");
+        assert_eq!(
+            action.input,
+            vec![AxField::new(
+                "metadata",
+                "std::collections::HashMap<String, String>"
+            )]
+        );
     }
 
     #[test]
