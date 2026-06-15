@@ -964,6 +964,7 @@ fn execute_preview_action(
                 store
                     .ensure_collection(collection)
                     .push(AxValue::Record(record));
+                push_preview_invalidation(&mut invalidations, collection.clone());
             }
             AxStepPlan::Update {
                 collection,
@@ -977,6 +978,7 @@ fn execute_preview_action(
                         apply_preview_fields(item, &fields);
                     }
                 }
+                push_preview_invalidation(&mut invalidations, collection.clone());
             }
             AxStepPlan::Delete {
                 collection,
@@ -986,13 +988,14 @@ fn execute_preview_action(
                 store
                     .ensure_collection(collection)
                     .retain(|item| !preview_record_matches_all(item, &filters));
+                push_preview_invalidation(&mut invalidations, collection.clone());
             }
             AxStepPlan::Revalidate { target } => {
                 let target = eval_preview_revalidation_target(target, &scope, env)?;
                 if target.starts_with('/') {
                     redirect_to = Some(target.clone());
                 }
-                invalidations.push(AxPreviewInvalidation::new(target));
+                push_preview_invalidation(&mut invalidations, target);
             }
             AxStepPlan::Patch { signal, value } => {
                 let signal = eval_preview_expr(signal, &scope, env)?.as_string();
@@ -1701,6 +1704,20 @@ fn eval_preview_revalidation_target(
     }
 
     Ok(eval_preview_expr(expr, scope, env)?.as_string())
+}
+
+fn push_preview_invalidation(
+    invalidations: &mut Vec<AxPreviewInvalidation>,
+    target: impl Into<String>,
+) {
+    let invalidation = AxPreviewInvalidation::new(target);
+    if invalidations
+        .iter()
+        .any(|existing| existing.query_key == invalidation.query_key)
+    {
+        return;
+    }
+    invalidations.push(invalidation);
 }
 
 fn is_preview_identifier(code: &str) -> bool {
@@ -4499,6 +4516,57 @@ action CreatePost
                 query_key: vec!["posts".to_string()],
             }]
         );
+    }
+
+    #[test]
+    fn preview_action_auto_invalidates_mutated_collection() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action CreatePost
+  input:
+    title: string
+
+  insert posts
+    title: input.title
+
+  return ok
+"#],
+            "CreatePost",
+            &BTreeMap::from([("title".to_string(), "Hello".to_string())]),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert_eq!(
+            result.invalidations,
+            vec![AxPreviewInvalidation {
+                target: "posts".to_string(),
+                query_key: vec!["posts".to_string()],
+            }]
+        );
+    }
+
+    #[test]
+    fn preview_action_dedupes_manual_and_auto_invalidations() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+action CreatePost
+  insert posts
+    title: "Hello"
+
+  invalidate posts
+  return ok
+"#],
+            "CreatePost",
+            &BTreeMap::new(),
+            &mut store,
+        )
+        .expect("action should execute");
+
+        assert_eq!(result.invalidations.len(), 1);
+        assert_eq!(result.invalidations[0].query_key, vec!["posts".to_string()]);
     }
 
     #[test]
