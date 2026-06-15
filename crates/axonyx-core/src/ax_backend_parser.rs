@@ -155,13 +155,16 @@ impl Parser {
         if let Some(name) = text.strip_prefix("action ") {
             let (name, braced) = split_block_brace(name);
             let (name, returns) = split_return_contract(name.trim());
+            let (name, signature_input) = parse_backend_callable_signature(name, line.line)?;
             if name.is_empty() {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
             }
 
             self.pos += 1;
-            let (input, body) = self.parse_input_sections(2)?;
+            let (section_input, body) = self.parse_input_sections(2)?;
             self.consume_block_brace(braced, 0)?;
+            let mut input = signature_input;
+            input.extend(section_input);
             let mut action = AxAction::new(name).input(input).body(body);
             if let Some(returns) = returns {
                 action = action.returns(returns);
@@ -1381,6 +1384,73 @@ fn parse_backend_callable_name(input: &str) -> &str {
     input
 }
 
+fn parse_backend_callable_signature(
+    input: &str,
+    line: usize,
+) -> Result<(String, Vec<AxField>), AxBackendParseError> {
+    let input = input.trim();
+    let Some(open) = input.find('(') else {
+        return Ok((input.to_string(), Vec::new()));
+    };
+    if !input.ends_with(')') {
+        return Err(AxBackendParseError::InvalidBlock { line });
+    }
+
+    let name = input[..open].trim();
+    let params = input[open + 1..input.len() - 1].trim();
+    if name.is_empty() {
+        return Err(AxBackendParseError::InvalidBlock { line });
+    }
+    if params.is_empty() {
+        return Ok((name.to_string(), Vec::new()));
+    }
+
+    let fields = split_top_level(params, ',')
+        .into_iter()
+        .map(|param| parse_backend_signature_param(param, line))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((name.to_string(), fields))
+}
+
+fn parse_backend_signature_param(input: &str, line: usize) -> Result<AxField, AxBackendParseError> {
+    let input = input.trim();
+    let Some((name, ty)) = split_top_level_once(input, ":") else {
+        return Err(AxBackendParseError::InvalidField { line });
+    };
+
+    let raw_name = name.trim();
+    let optional = raw_name.ends_with('?');
+    let name = raw_name.trim_end_matches('?').trim();
+    if name.is_empty() {
+        return Err(AxBackendParseError::InvalidField { line });
+    }
+
+    let (ty, default) = match split_top_level_once(ty, "=") {
+        Some((ty, default)) => {
+            let ty = ty.trim();
+            let default = default.trim();
+            if ty.is_empty() || default.is_empty() {
+                return Err(AxBackendParseError::InvalidField { line });
+            }
+            (ty, Some(parse_expr(default, line)?))
+        }
+        None => {
+            let ty = ty.trim();
+            if ty.is_empty() {
+                return Err(AxBackendParseError::InvalidField { line });
+            }
+            (ty, None)
+        }
+    };
+
+    Ok(match (optional, default) {
+        (true, Some(default)) => AxField::optional_with_default(name, ty, default),
+        (true, None) => AxField::optional(name, ty),
+        (false, Some(default)) => AxField::with_default(name, ty, default),
+        (false, None) => AxField::new(name, ty),
+    })
+}
+
 pub mod prelude {
     pub use super::parse_backend_ax;
     pub use super::AxBackendParseError;
@@ -1875,6 +1945,55 @@ action CreatePost -> Post {
         assert_eq!(action.returns.as_deref(), Some("Post"));
         assert_eq!(action.input.len(), 1);
         assert_eq!(action.body.len(), 2);
+    }
+
+    #[test]
+    fn parses_function_shaped_action_signature_inputs() {
+        let input = r#"
+action createPost(title: string, featured?: bool = false) -> Post {
+  insert posts
+    title: input.title
+    featured: input.featured
+
+  return created
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(action.name, "createPost");
+        assert_eq!(action.returns.as_deref(), Some("Post"));
+        assert_eq!(
+            action.input,
+            vec![
+                AxField::new("title", "string"),
+                AxField::optional_with_default("featured", "bool", AxExpr::bool(false)),
+            ]
+        );
+        assert_eq!(action.body.len(), 2);
+    }
+
+    #[test]
+    fn parses_empty_function_shaped_action_signature() {
+        let input = r#"
+action clearTheme() {
+  return ok
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(action.name, "clearTheme");
+        assert!(action.input.is_empty());
+        assert_eq!(action.body.len(), 1);
     }
 
     #[test]
