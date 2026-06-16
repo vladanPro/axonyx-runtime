@@ -2650,11 +2650,22 @@ fn ax_action_script() -> &'static str {
   const applyPatchResponse = (payload, form) => {
     const patches = Array.isArray(payload?.patches) ? payload.patches : [];
     const invalidations = Array.isArray(payload?.invalidations) ? payload.invalidations : [];
+    const refreshes = Array.isArray(payload?.refreshes) ? payload.refreshes : [];
     const applyPatch = window.__axonyx?.state?.applyPatch;
     const canApplyPatches = typeof applyPatch === "function";
     if (canApplyPatches) patches.forEach((patch) => applyPatch(patch));
+    if (invalidations.length || refreshes.length) {
+      window.dispatchEvent(new CustomEvent("axonyx:query-refresh", {
+        detail: { form, payload, invalidations, refreshes },
+      }));
+      invalidations.forEach((invalidation) => {
+        window.dispatchEvent(new CustomEvent("axonyx:query-invalidate", {
+          detail: { form, payload, invalidation, refreshes },
+        }));
+      });
+    }
     window.dispatchEvent(new CustomEvent("axonyx:action-complete", {
-      detail: { form, payload, patches, invalidations },
+      detail: { form, payload, patches, invalidations, refreshes },
     }));
     if ((patches.length === 0 || !canApplyPatches) && payload?.redirect) {
       window.location.assign(payload.redirect);
@@ -4368,6 +4379,9 @@ page Posts
         assert!(html.contains("setActionState"));
         assert!(html.contains("status.hidden = !active"));
         assert!(html.contains("aria-live"));
+        assert!(html.contains("refreshes"));
+        assert!(html.contains("axonyx:query-refresh"));
+        assert!(html.contains("axonyx:query-invalidate"));
         assert!(html.contains("application/ax-error+json"));
         assert!(html.contains("setActionState(form, \"error\")"));
     }
