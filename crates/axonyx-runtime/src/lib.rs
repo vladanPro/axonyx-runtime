@@ -2647,6 +2647,47 @@ fn ax_action_script() -> &'static str {
     });
   };
 
+  const actionRoutePath = (payload) => {
+    const redirect = typeof payload?.redirect === "string" && payload.redirect ? payload.redirect : window.location.pathname;
+    try {
+      return new URL(redirect, window.location.href).pathname;
+    } catch (_error) {
+      return window.location.pathname;
+    }
+  };
+
+  const refreshDataBindings = (payload, form, refreshes) => {
+    if (!refreshes.length || typeof fetch !== "function") return;
+    const routePath = actionRoutePath(payload);
+    refreshes.forEach(async (refresh) => {
+      if (!refresh || typeof refresh.name !== "string" || !refresh.name) return;
+      const url = new URL("/__axonyx/data", window.location.href);
+      url.searchParams.set("path", routePath);
+      url.searchParams.set("name", refresh.name);
+      try {
+        const response = await fetch(url, {
+          headers: {
+            Accept: "application/ax-data+json",
+            "X-Axonyx-State-Protocol": "ax-state/1",
+            "X-Axonyx-Tab": getTabId(),
+          },
+          cache: "no-store",
+        });
+        const contentType = response.headers.get("content-type") || "";
+        const data = contentType.includes("application/ax-data+json")
+          ? await response.json()
+          : { ok: false, status: response.status };
+        window.dispatchEvent(new CustomEvent("axonyx:data-refresh", {
+          detail: { form, payload, refresh, data },
+        }));
+      } catch (error) {
+        window.dispatchEvent(new CustomEvent("axonyx:data-refresh-error", {
+          detail: { form, payload, refresh, error },
+        }));
+      }
+    });
+  };
+
   const applyPatchResponse = (payload, form) => {
     const patches = Array.isArray(payload?.patches) ? payload.patches : [];
     const invalidations = Array.isArray(payload?.invalidations) ? payload.invalidations : [];
@@ -2664,6 +2705,7 @@ fn ax_action_script() -> &'static str {
         }));
       });
     }
+    refreshDataBindings(payload, form, refreshes);
     window.dispatchEvent(new CustomEvent("axonyx:action-complete", {
       detail: { form, payload, patches, invalidations, refreshes },
     }));
@@ -4380,8 +4422,12 @@ page Posts
         assert!(html.contains("status.hidden = !active"));
         assert!(html.contains("aria-live"));
         assert!(html.contains("refreshes"));
+        assert!(html.contains("/__axonyx/data"));
+        assert!(html.contains("application/ax-data+json"));
         assert!(html.contains("axonyx:query-refresh"));
         assert!(html.contains("axonyx:query-invalidate"));
+        assert!(html.contains("axonyx:data-refresh"));
+        assert!(html.contains("axonyx:data-refresh-error"));
         assert!(html.contains("application/ax-error+json"));
         assert!(html.contains("setActionState(form, \"error\")"));
     }
