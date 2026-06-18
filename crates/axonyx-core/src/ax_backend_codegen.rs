@@ -127,9 +127,14 @@ fn render_handler_fn(
             handler.rust_fn,
             input_struct_name(&handler.rust_fn)
         ),
-        AxHandlerKind::Loader { .. } => format!(
+        AxHandlerKind::Loader { input, .. } if input.is_empty() => format!(
             "pub fn {}(runtime: &impl AxBackendRuntime, context: &AxLoaderContext) -> AxRuntimeResult<Value>",
             handler.rust_fn
+        ),
+        AxHandlerKind::Loader { .. } => format!(
+            "pub fn {}(runtime: &impl AxBackendRuntime, context: &AxLoaderContext, input: &{}) -> AxRuntimeResult<Value>",
+            handler.rust_fn,
+            input_struct_name(&handler.rust_fn)
         ),
         AxHandlerKind::Route { .. } => format!(
             "pub fn {}(runtime: &impl AxBackendRuntime, request: &AxHttpRequest) -> AxRuntimeResult<AxHttpResponse>",
@@ -188,7 +193,9 @@ fn render_handler_fn(
 
 fn handler_input_fields(handler: &AxHandlerPlan) -> Option<&[AxFieldPlan]> {
     match &handler.kind {
-        AxHandlerKind::Action { input, .. } | AxHandlerKind::Route { input, .. }
+        AxHandlerKind::Action { input, .. }
+        | AxHandlerKind::Route { input, .. }
+        | AxHandlerKind::Loader { input, .. }
             if !input.is_empty() =>
         {
             Some(input)
@@ -777,6 +784,24 @@ loader PostsList
         ));
         assert!(module.contains("field: \"status\".to_string()"));
         assert!(module.contains("limit: Some(12)"));
+    }
+
+    #[test]
+    fn compiles_query_function_inputs_into_loader_input_struct() {
+        let module = compile_backend_ax_to_module(
+            r#"
+query loadPosts(status: String) -> Post[]
+  data posts = db.posts.all()
+    where status = input.status
+  return posts
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("pub struct HandlerLoaderLoadPostsInput"));
+        assert!(module.contains("pub status: String"));
+        assert!(module.contains("pub fn loader_load_posts(runtime: &impl AxBackendRuntime, context: &AxLoaderContext, input: &HandlerLoaderLoadPostsInput)"));
+        assert!(module.contains("value: json!(&input.status)"));
     }
 
     #[test]

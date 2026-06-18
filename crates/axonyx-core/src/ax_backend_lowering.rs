@@ -64,6 +64,7 @@ pub enum AxHandlerKind {
     },
     Loader {
         returns: Option<String>,
+        input: Vec<AxFieldPlan>,
     },
     Action {
         returns: Option<String>,
@@ -314,11 +315,18 @@ fn lower_loader(loader: &AxLoader) -> Result<AxHandlerPlan, AxBackendLowerError>
         return Err(AxBackendLowerError::EmptyHandlerName);
     }
 
+    let input = loader
+        .input
+        .iter()
+        .map(lower_input_field)
+        .collect::<Result<Vec<_>, _>>()?;
+
     Ok(AxHandlerPlan {
         name: loader.name.clone(),
         rust_fn: format!("loader_{}", normalize_ident(name)),
         kind: AxHandlerKind::Loader {
             returns: loader.returns.clone(),
+            input,
         },
         steps: lower_steps(&loader.body),
     })
@@ -828,7 +836,13 @@ loader PostsList
         let handler = &plan.handlers[0];
         assert_eq!(handler.name, "PostsList");
         assert_eq!(handler.rust_fn, "loader_posts_list");
-        assert_eq!(handler.kind, AxHandlerKind::Loader { returns: None });
+        assert_eq!(
+            handler.kind,
+            AxHandlerKind::Loader {
+                returns: None,
+                input: Vec::new(),
+            }
+        );
 
         let AxStepPlan::Let { binding, value } = &handler.steps[0] else {
             panic!("expected let step");
@@ -1129,6 +1143,7 @@ action CreatePost -> Post
             plan.handlers[0].kind,
             AxHandlerKind::Loader {
                 returns: Some("Post[]".to_string()),
+                input: Vec::new(),
             }
         );
         assert_eq!(
@@ -1150,6 +1165,42 @@ action CreatePost -> Post
                     optional: false,
                     default: None,
                 }],
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_query_function_inputs_into_loader_plan() {
+        let document = parse_backend_ax(
+            r#"
+query loadPosts(status: String, limit: i64 = 6) -> Post[]
+  data posts = db.posts.all()
+    where status = input.status
+  return posts
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert_eq!(
+            plan.handlers[0].kind,
+            AxHandlerKind::Loader {
+                returns: Some("Post[]".to_string()),
+                input: vec![
+                    AxFieldPlan {
+                        name: "status".to_string(),
+                        rust_ty: "String".to_string(),
+                        optional: false,
+                        default: None,
+                    },
+                    AxFieldPlan {
+                        name: "limit".to_string(),
+                        rust_ty: "i64".to_string(),
+                        optional: false,
+                        default: Some(AxRustExpr::new("6")),
+                    },
+                ],
             }
         );
     }
