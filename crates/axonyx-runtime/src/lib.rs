@@ -812,7 +812,8 @@ fn preview_resolve_call(
             });
         };
 
-        if let Some(cached) = cache.borrow().get(loader_name).cloned() {
+        let cache_key = preview_loader_cache_key(loader_name, &[]);
+        if let Some(cached) = cache.borrow().get(&cache_key).cloned() {
             return Ok(Some(cached));
         }
 
@@ -822,24 +823,21 @@ fn preview_resolve_call(
             .ok_or_else(|| PreviewError::Runtime {
                 message: format!("loader `{loader_name}` was not found for this route"),
             })?;
-        let value = execute_preview_loader(loader, route_scope, env, runtime, store)?;
-        cache
-            .borrow_mut()
-            .insert(loader_name.clone(), value.clone());
+        let value = execute_preview_loader(loader, &[], route_scope, env, runtime, store)?;
+        cache.borrow_mut().insert(cache_key, value.clone());
         return Ok(Some(value));
     }
 
-    if path.len() == 1 && args.is_empty() {
+    if path.len() == 1 {
         let loader_name = &path[0];
-        if let Some(cached) = cache.borrow().get(loader_name).cloned() {
+        let cache_key = preview_loader_cache_key(loader_name, args);
+        if let Some(cached) = cache.borrow().get(&cache_key).cloned() {
             return Ok(Some(cached));
         }
 
         if let Some(loader) = handlers.loaders.get(loader_name) {
-            let value = execute_preview_loader(loader, route_scope, env, runtime, store)?;
-            cache
-                .borrow_mut()
-                .insert(loader_name.clone(), value.clone());
+            let value = execute_preview_loader(loader, args, route_scope, env, runtime, store)?;
+            cache.borrow_mut().insert(cache_key, value.clone());
             return Ok(Some(value));
         }
     }
@@ -886,14 +884,74 @@ fn preview_resolve_call(
     Ok(None)
 }
 
+fn preview_loader_cache_key(loader_name: &str, args: &[AxValue]) -> String {
+    if args.is_empty() {
+        return loader_name.to_string();
+    }
+
+    let args = args
+        .iter()
+        .map(preview_value_cache_key)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{loader_name}({args})")
+}
+
+fn preview_value_cache_key(value: &AxValue) -> String {
+    match value {
+        AxValue::Null => "null".to_string(),
+        AxValue::String(value) => format!("s:{value:?}"),
+        AxValue::Number(value) => format!("n:{value}"),
+        AxValue::Bool(value) => format!("b:{value}"),
+        AxValue::Record(fields) => {
+            let fields = fields
+                .iter()
+                .map(|(key, value)| format!("{key}:{}", preview_value_cache_key(value)))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("r:{{{fields}}}")
+        }
+        AxValue::List(items) => {
+            let items = items
+                .iter()
+                .map(preview_value_cache_key)
+                .collect::<Vec<_>>()
+                .join(",");
+            format!("l:[{items}]")
+        }
+    }
+}
+
 fn execute_preview_loader(
     loader: &AxHandlerPlan,
+    args: &[AxValue],
     initial_scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
     runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &AxPreviewStore,
 ) -> Result<AxValue, PreviewError> {
     let mut scope = initial_scope.clone();
+    let AxHandlerKind::Loader { input, .. } = &loader.kind else {
+        return Err(PreviewError::Runtime {
+            message: format!("handler `{}` is not a loader", loader.name),
+        });
+    };
+    if args.len() > input.len() {
+        return Err(PreviewError::Runtime {
+            message: format!(
+                "loader `{}` expected {} argument(s) but received {}",
+                loader.name,
+                input.len(),
+                args.len()
+            ),
+        });
+    }
+    if !input.is_empty() {
+        scope.insert(
+            "input".to_string(),
+            build_preview_loader_input_record(input, args)?,
+        );
+    }
 
     for step in &loader.steps {
         match step {
@@ -1919,6 +1977,40 @@ fn build_preview_input_record(
     Ok(AxValue::Record(record))
 }
 
+fn build_preview_loader_input_record(
+    fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
+    args: &[AxValue],
+) -> Result<AxValue, PreviewError> {
+    let mut record = BTreeMap::new();
+    for (index, field) in fields.iter().enumerate() {
+        let Some(value) = args.get(index).cloned() else {
+            if let Some(default) = &field.default {
+                record.insert(
+                    field.name.clone(),
+                    coerce_preview_default_input_value(&field.name, &field.rust_ty, default)?,
+                );
+                continue;
+            }
+            if field.optional {
+                record.insert(field.name.clone(), AxValue::Null);
+                continue;
+            }
+            if field.rust_ty == "bool" {
+                record.insert(field.name.clone(), AxValue::Bool(false));
+                continue;
+            }
+            return Err(PreviewError::Runtime {
+                message: format!("missing required loader input `{}`", field.name),
+            });
+        };
+        record.insert(
+            field.name.clone(),
+            coerce_preview_loader_input_value(&field.name, &field.rust_ty, value)?,
+        );
+    }
+    Ok(AxValue::Record(record))
+}
+
 fn build_preview_route_input_record(
     fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
     request: &server::AxHttpRequest,
@@ -1934,6 +2026,29 @@ fn build_preview_route_input_record(
         .collect::<BTreeMap<_, _>>();
 
     build_preview_input_record(fields, &input_fields)
+}
+
+fn coerce_preview_loader_input_value(
+    field_name: &str,
+    rust_ty: &str,
+    value: AxValue,
+) -> Result<AxValue, PreviewError> {
+    match (rust_ty, value) {
+        ("String", AxValue::String(value)) => Ok(AxValue::String(value)),
+        ("String", value @ (AxValue::Number(_) | AxValue::Bool(_))) => {
+            Ok(AxValue::String(value.as_string()))
+        }
+        ("bool", AxValue::Bool(value)) => Ok(AxValue::Bool(value)),
+        ("i64" | "u64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        ("f64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        (_, AxValue::Null) => Ok(AxValue::Null),
+        (_, value) => Err(PreviewError::Runtime {
+            message: format!(
+                "loader input `{field_name}` expected {rust_ty} but received {}",
+                preview_value_type_name(&value)
+            ),
+        }),
+    }
 }
 
 fn coerce_preview_default_input_value(
@@ -4315,6 +4430,34 @@ page Posts
         assert!(html.contains("Hello Axonyx"));
         assert!(html.contains("Docs Without Bloat"));
         assert!(!html.contains("Draft Preview"));
+    }
+
+    #[test]
+    fn previews_query_function_with_call_arguments() {
+        let html = preview_ax_route_with_loaders(
+            &[],
+            &[r#"
+query loadPosts(status: String) -> Post[]
+  data posts = db.posts.all()
+    where status = input.status
+    order created_at desc
+  return posts
+"#],
+            r#"
+page Posts
+  data status = "draft"
+  data posts = loadPosts(status)
+  Grid cols: 2
+    each post in posts
+      Card title: post.title
+        Copy -> post.excerpt
+"#,
+        )
+        .expect("query function with arguments should render");
+
+        assert!(html.contains("Draft Preview"));
+        assert!(!html.contains("Hello Axonyx"));
+        assert!(!html.contains("Docs Without Bloat"));
     }
 
     #[test]

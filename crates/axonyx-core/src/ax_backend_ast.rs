@@ -77,6 +77,7 @@ impl AxRoute {
 pub struct AxLoader {
     pub name: String,
     pub returns: Option<String>,
+    pub input: Vec<AxField>,
     pub body: Vec<AxBackendStmt>,
 }
 
@@ -85,12 +86,18 @@ impl AxLoader {
         Self {
             name: name.into(),
             returns: None,
+            input: Vec::new(),
             body: body.into_iter().collect(),
         }
     }
 
     pub fn returns(mut self, ty: impl Into<String>) -> Self {
         self.returns = Some(ty.into());
+        self
+    }
+
+    pub fn input(mut self, fields: impl IntoIterator<Item = AxField>) -> Self {
+        self.input = fields.into_iter().collect();
         self
     }
 }

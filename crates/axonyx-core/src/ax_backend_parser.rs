@@ -119,7 +119,7 @@ impl Parser {
         if let Some(name) = text.strip_prefix("loader ") {
             let (name, braced) = split_block_brace(name);
             let (name, returns) = split_return_contract(name.trim());
-            let name = parse_backend_callable_name(name);
+            let (name, signature_input) = parse_backend_callable_signature(name, line.line)?;
             if name.is_empty() {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
             }
@@ -127,7 +127,7 @@ impl Parser {
             self.pos += 1;
             let body = self.parse_body(2)?;
             self.consume_block_brace(braced, 0)?;
-            let mut loader = AxLoader::new(name, body);
+            let mut loader = AxLoader::new(name, body).input(signature_input);
             if let Some(returns) = returns {
                 loader = loader.returns(returns);
             }
@@ -137,7 +137,7 @@ impl Parser {
         if let Some(name) = text.strip_prefix("query ") {
             let (name, braced) = split_block_brace(name);
             let (name, returns) = split_return_contract(name.trim());
-            let name = parse_backend_callable_name(name);
+            let (name, signature_input) = parse_backend_callable_signature(name, line.line)?;
             if name.is_empty() {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
             }
@@ -145,7 +145,7 @@ impl Parser {
             self.pos += 1;
             let body = self.parse_body(2)?;
             self.consume_block_brace(braced, 0)?;
-            let mut loader = AxLoader::new(name, body);
+            let mut loader = AxLoader::new(name, body).input(signature_input);
             if let Some(returns) = returns {
                 loader = loader.returns(returns);
             }
@@ -1414,14 +1414,6 @@ fn split_block_brace(input: &str) -> (&str, bool) {
     }
 }
 
-fn parse_backend_callable_name(input: &str) -> &str {
-    let input = input.trim();
-    if let Some(name) = input.strip_suffix("()") {
-        return name.trim();
-    }
-    input
-}
-
 fn parse_backend_callable_signature(
     input: &str,
     line: usize,
@@ -1602,6 +1594,7 @@ query loadPosts() -> Post[]
 
         assert_eq!(loader.name, "loadPosts");
         assert_eq!(loader.returns.as_deref(), Some("Post[]"));
+        assert!(loader.input.is_empty());
         let AxBackendStmt::Data(posts) = &loader.body[0] else {
             panic!("expected data statement");
         };
@@ -1642,7 +1635,33 @@ query loadPosts() -> Post[] {
 
         assert_eq!(loader.name, "loadPosts");
         assert_eq!(loader.returns.as_deref(), Some("Post[]"));
+        assert!(loader.input.is_empty());
         assert_eq!(loader.body.len(), 2);
+    }
+
+    #[test]
+    fn parses_query_function_signature_inputs() {
+        let input = r#"
+query loadPosts(status: String, limit: i64 = 6) -> Post[] {
+  data posts = db.posts.all()
+    where status = input.status
+    limit 6
+  return posts
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+
+        assert_eq!(loader.name, "loadPosts");
+        assert_eq!(loader.input.len(), 2);
+        assert_eq!(loader.input[0], AxField::new("status", "String"));
+        assert_eq!(loader.input[1].name, "limit");
+        assert_eq!(loader.input[1].ty, "i64");
+        assert!(loader.input[1].default.is_some());
     }
 
     #[test]
