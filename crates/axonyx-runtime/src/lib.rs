@@ -2656,11 +2656,11 @@ fn ax_action_script() -> &'static str {
     }
   };
 
-  const refreshDataBindings = (payload, form, refreshes) => {
-    if (!refreshes.length || typeof fetch !== "function") return;
+  const refreshDataBindings = async (payload, form, refreshes) => {
+    if (!refreshes.length || typeof fetch !== "function") return false;
     const routePath = actionRoutePath(payload);
-    refreshes.forEach(async (refresh) => {
-      if (!refresh || typeof refresh.name !== "string" || !refresh.name) return;
+    const results = await Promise.all(refreshes.map(async (refresh) => {
+      if (!refresh || typeof refresh.name !== "string" || !refresh.name) return false;
       const url = new URL("/__axonyx/data", window.location.href);
       url.searchParams.set("path", routePath);
       url.searchParams.set("name", refresh.name);
@@ -2677,33 +2677,37 @@ fn ax_action_script() -> &'static str {
         const data = contentType.includes("application/ax-data+json")
           ? await response.json()
           : { ok: false, status: response.status };
-        applyDataRefresh(data);
+        const applied = applyDataRefresh(data);
         window.dispatchEvent(new CustomEvent("axonyx:data-refresh", {
           detail: { form, payload, refresh, data },
         }));
+        return applied;
       } catch (error) {
         window.dispatchEvent(new CustomEvent("axonyx:data-refresh-error", {
           detail: { form, payload, refresh, error },
         }));
+        return false;
       }
-    });
+    }));
+    return results.some(Boolean);
   };
 
   const applyDataRefresh = (data) => {
-    if (!data?.ok || typeof data.html !== "string" || !data.html.trim()) return;
+    if (!data?.ok || typeof data.html !== "string" || !data.html.trim()) return false;
     const template = document.createElement("template");
     template.innerHTML = data.html.trim();
     const nextRoot = template.content.querySelector('[data-ax-root="page"]');
     const currentRoot = document.querySelector('[data-ax-root="page"]');
-    if (!nextRoot || !currentRoot) return;
+    if (!nextRoot || !currentRoot) return false;
     currentRoot.replaceWith(nextRoot);
     initActionForms();
     window.dispatchEvent(new CustomEvent("axonyx:dom-refresh", {
       detail: { data },
     }));
+    return true;
   };
 
-  const applyPatchResponse = (payload, form) => {
+  const applyPatchResponse = async (payload, form) => {
     const patches = Array.isArray(payload?.patches) ? payload.patches : [];
     const invalidations = Array.isArray(payload?.invalidations) ? payload.invalidations : [];
     const refreshes = Array.isArray(payload?.refreshes) ? payload.refreshes : [];
@@ -2720,11 +2724,11 @@ fn ax_action_script() -> &'static str {
         }));
       });
     }
-    refreshDataBindings(payload, form, refreshes);
+    const refreshed = await refreshDataBindings(payload, form, refreshes);
     window.dispatchEvent(new CustomEvent("axonyx:action-complete", {
       detail: { form, payload, patches, invalidations, refreshes },
     }));
-    if (refreshes.length === 0 && (patches.length === 0 || !canApplyPatches) && payload?.redirect) {
+    if (!refreshed && (patches.length === 0 || !canApplyPatches) && payload?.redirect) {
       window.location.assign(payload.redirect);
     }
   };
@@ -2775,7 +2779,7 @@ fn ax_action_script() -> &'static str {
       });
       const contentType = response.headers.get("content-type") || "";
       if (contentType.includes("application/ax-patch+json")) {
-        applyPatchResponse(await response.json(), form);
+        await applyPatchResponse(await response.json(), form);
         setActionState(form, "complete");
         return;
       }
@@ -4440,12 +4444,16 @@ page Posts
         assert!(html.contains("/__axonyx/data"));
         assert!(html.contains("application/ax-data+json"));
         assert!(html.contains("applyDataRefresh"));
+        assert!(html.contains("const refreshed = await refreshDataBindings"));
         assert!(html.contains("axonyx:query-refresh"));
         assert!(html.contains("axonyx:query-invalidate"));
         assert!(html.contains("axonyx:data-refresh"));
         assert!(html.contains("axonyx:data-refresh-error"));
         assert!(html.contains("axonyx:dom-refresh"));
-        assert!(html.contains("refreshes.length === 0"));
+        assert!(html.contains(
+            "if (!refreshed && (patches.length === 0 || !canApplyPatches) && payload?.redirect)"
+        ));
+        assert!(!html.contains("if (refreshes.length === 0 &&"));
         assert!(html.contains("application/ax-error+json"));
         assert!(html.contains("setActionState(form, \"error\")"));
     }
