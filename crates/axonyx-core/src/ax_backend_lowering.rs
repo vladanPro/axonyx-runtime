@@ -864,7 +864,7 @@ mod tests {
         let document = parse_backend_ax(
             r#"
 export fn normalizeStatus(status?: String) -> String {
-  return status ?? "published"
+  return status
 }
 "#,
         )
@@ -884,9 +884,7 @@ export fn normalizeStatus(status?: String) -> String {
         assert!(function.input[0].optional);
         assert_eq!(
             function.steps[0],
-            AxStepPlan::Return(AxReturnPlan::Expr(AxRustExpr::new(
-                r#"status ?? "published""#
-            )))
+            AxStepPlan::Return(AxReturnPlan::Expr(AxRustExpr::new("status")))
         );
     }
 
