@@ -8,6 +8,12 @@ use crate::ax_query_ast::prelude::*;
 pub enum AxBackendParseError {
     #[error("document is empty")]
     EmptyDocument,
+    #[error("invalid import syntax at line {line}")]
+    InvalidImport { line: usize },
+    #[error("missing `from` in import at line {line}")]
+    MissingImportFrom { line: usize },
+    #[error("empty import list at line {line}")]
+    EmptyImportList { line: usize },
     #[error("tabs are not supported in indentation at line {line}")]
     TabsNotSupported { line: usize },
     #[error("indentation must use multiples of two spaces at line {line}")]
@@ -74,7 +80,18 @@ struct Parser {
 
 impl Parser {
     fn parse_document(&mut self) -> Result<AxBackendDocument, AxBackendParseError> {
+        let mut imports = Vec::new();
         let mut blocks = Vec::new();
+
+        while let Some(line) = self.current() {
+            if line.indent != 0 {
+                return Err(AxBackendParseError::UnexpectedIndentation { line: line.line });
+            }
+            if !line.text.starts_with("import ") {
+                break;
+            }
+            imports.push(self.parse_import()?);
+        }
 
         while self.current().is_some() {
             let line = self.current().expect("checked");
@@ -84,7 +101,56 @@ impl Parser {
             blocks.push(self.parse_block()?);
         }
 
-        Ok(AxBackendDocument::new(blocks))
+        Ok(AxBackendDocument::with_imports(imports, blocks))
+    }
+
+    fn parse_import(&mut self) -> Result<AxBackendImport, AxBackendParseError> {
+        let line = self.current().expect("import line exists").clone();
+        let Some(rest) = line.text.strip_prefix("import ") else {
+            return Err(AxBackendParseError::InvalidImport { line: line.line });
+        };
+        let Some((bindings, source)) = split_top_level_once(rest.trim(), " from ") else {
+            return Err(AxBackendParseError::MissingImportFrom { line: line.line });
+        };
+        let bindings = bindings.trim();
+        if !bindings.starts_with('{') || !bindings.ends_with('}') {
+            return Err(AxBackendParseError::InvalidImport { line: line.line });
+        }
+
+        let inner = bindings
+            .trim_start_matches('{')
+            .trim_end_matches('}')
+            .trim();
+        if inner.is_empty() {
+            return Err(AxBackendParseError::EmptyImportList { line: line.line });
+        }
+
+        let mut parsed_bindings = Vec::new();
+        for binding in split_top_level_commas(inner) {
+            let binding = binding.trim();
+            if binding.is_empty() {
+                return Err(AxBackendParseError::InvalidImport { line: line.line });
+            }
+
+            let (imported, local) =
+                if let Some((imported, local)) = split_top_level_once(binding, " as ") {
+                    (imported.trim(), local.trim())
+                } else {
+                    (binding, binding)
+                };
+            if !is_backend_identifier(imported) || !is_backend_identifier(local) {
+                return Err(AxBackendParseError::InvalidImport { line: line.line });
+            }
+            parsed_bindings.push(AxBackendImportBinding::new(imported, local));
+        }
+
+        let source = trim_quotes(source.trim());
+        if source.is_empty() {
+            return Err(AxBackendParseError::InvalidImport { line: line.line });
+        }
+
+        self.pos += 1;
+        Ok(AxBackendImport::new(parsed_bindings, source))
     }
 
     fn parse_block(&mut self) -> Result<AxBackendBlock, AxBackendParseError> {
@@ -136,7 +202,9 @@ impl Parser {
             self.pos += 1;
             let body = self.parse_body(2)?;
             self.consume_block_brace(braced, 0)?;
-            let mut loader = AxLoader::new(name, body).input(signature_input);
+            let mut loader = AxLoader::new(name, body)
+                .input(signature_input)
+                .exported(exported);
             if let Some(returns) = returns {
                 loader = loader.returns(returns);
             }
@@ -154,7 +222,9 @@ impl Parser {
             self.pos += 1;
             let body = self.parse_body(2)?;
             self.consume_block_brace(braced, 0)?;
-            let mut loader = AxLoader::new(name, body).input(signature_input);
+            let mut loader = AxLoader::new(name, body)
+                .input(signature_input)
+                .exported(exported);
             if let Some(returns) = returns {
                 loader = loader.returns(returns);
             }
@@ -174,7 +244,10 @@ impl Parser {
             self.consume_block_brace(braced, 0)?;
             let mut input = signature_input;
             input.extend(section_input);
-            let mut action = AxAction::new(name).input(input).body(body);
+            let mut action = AxAction::new(name)
+                .input(input)
+                .body(body)
+                .exported(exported);
             if let Some(returns) = returns {
                 action = action.returns(returns);
             }
@@ -1351,6 +1424,21 @@ fn split_top_level(input: &str, delimiter: char) -> Vec<&str> {
     result
 }
 
+fn split_top_level_commas(input: &str) -> Vec<&str> {
+    split_top_level(input, ',')
+}
+
+fn is_backend_identifier(input: &str) -> bool {
+    let mut chars = input.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first == '_' || first.is_ascii_alphabetic()) {
+        return false;
+    }
+    chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
 fn split_top_level_signature_params(input: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut start = 0usize;
@@ -1521,6 +1609,63 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_backend_imports_before_blocks() {
+        let input = r#"
+import { normalizeStatus, slugify as makeSlug } from "./domain.ax"
+
+export query loadPosts(status?: String) -> Post[] {
+  data posts = db.posts.all()
+  return posts
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        assert_eq!(document.imports.len(), 1);
+        assert_eq!(document.imports[0].source, "./domain.ax");
+        assert_eq!(document.imports[0].bindings.len(), 2);
+        assert_eq!(document.imports[0].bindings[0].imported, "normalizeStatus");
+        assert_eq!(document.imports[0].bindings[0].local, "normalizeStatus");
+        assert_eq!(document.imports[0].bindings[1].imported, "slugify");
+        assert_eq!(document.imports[0].bindings[1].local, "makeSlug");
+        assert_eq!(document.blocks.len(), 1);
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query loader block");
+        };
+        assert!(loader.exported);
+    }
+
+    #[test]
+    fn rejects_empty_backend_import_list() {
+        let input = r#"
+import { } from "./domain.ax"
+
+query loadPosts() -> Post[] {
+  return posts
+}
+"#;
+
+        let error = parse_backend_ax(input).expect_err("empty import list should fail");
+
+        assert_eq!(error, AxBackendParseError::EmptyImportList { line: 2 });
+    }
+
+    #[test]
+    fn rejects_invalid_backend_import_binding() {
+        let input = r#"
+import { 123bad } from "./domain.ax"
+
+query loadPosts() -> Post[] {
+  return posts
+}
+"#;
+
+        let error = parse_backend_ax(input).expect_err("invalid import should fail");
+
+        assert_eq!(error, AxBackendParseError::InvalidImport { line: 2 });
+    }
 
     #[test]
     fn parses_loader_and_route_blocks() {

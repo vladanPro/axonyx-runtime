@@ -5,13 +5,66 @@ use crate::ax_query_ast::prelude::{AxQueryFilter, AxQuerySpec};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxBackendDocument {
+    pub imports: Vec<AxBackendImport>,
     pub blocks: Vec<AxBackendBlock>,
 }
 
 impl AxBackendDocument {
     pub fn new(blocks: impl IntoIterator<Item = AxBackendBlock>) -> Self {
         Self {
+            imports: Vec::new(),
             blocks: blocks.into_iter().collect(),
+        }
+    }
+
+    pub fn with_imports(
+        imports: impl IntoIterator<Item = AxBackendImport>,
+        blocks: impl IntoIterator<Item = AxBackendBlock>,
+    ) -> Self {
+        Self {
+            imports: imports.into_iter().collect(),
+            blocks: blocks.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxBackendImport {
+    pub bindings: Vec<AxBackendImportBinding>,
+    pub source: String,
+}
+
+impl AxBackendImport {
+    pub fn new(
+        bindings: impl IntoIterator<Item = AxBackendImportBinding>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            bindings: bindings.into_iter().collect(),
+            source: source.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxBackendImportBinding {
+    pub imported: String,
+    pub local: String,
+}
+
+impl AxBackendImportBinding {
+    pub fn new(imported: impl Into<String>, local: impl Into<String>) -> Self {
+        Self {
+            imported: imported.into(),
+            local: local.into(),
+        }
+    }
+
+    pub fn named(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            imported: name.clone(),
+            local: name,
         }
     }
 }
@@ -80,6 +133,7 @@ pub struct AxLoader {
     pub returns: Option<String>,
     pub input: Vec<AxField>,
     pub body: Vec<AxBackendStmt>,
+    pub exported: bool,
 }
 
 impl AxLoader {
@@ -89,6 +143,7 @@ impl AxLoader {
             returns: None,
             input: Vec::new(),
             body: body.into_iter().collect(),
+            exported: false,
         }
     }
 
@@ -101,6 +156,11 @@ impl AxLoader {
         self.input = fields.into_iter().collect();
         self
     }
+
+    pub fn exported(mut self, exported: bool) -> Self {
+        self.exported = exported;
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -109,6 +169,7 @@ pub struct AxAction {
     pub returns: Option<String>,
     pub input: Vec<AxField>,
     pub body: Vec<AxBackendStmt>,
+    pub exported: bool,
 }
 
 impl AxAction {
@@ -118,6 +179,7 @@ impl AxAction {
             returns: None,
             input: Vec::new(),
             body: Vec::new(),
+            exported: false,
         }
     }
 
@@ -133,6 +195,11 @@ impl AxAction {
 
     pub fn body(mut self, body: impl IntoIterator<Item = AxBackendStmt>) -> Self {
         self.body = body.into_iter().collect();
+        self
+    }
+
+    pub fn exported(mut self, exported: bool) -> Self {
+        self.exported = exported;
         self
     }
 }
@@ -601,6 +668,8 @@ pub mod prelude {
     pub use super::AxBackendEnv;
     pub use super::AxBackendEnvVisibility;
     pub use super::AxBackendFunction;
+    pub use super::AxBackendImport;
+    pub use super::AxBackendImportBinding;
     pub use super::AxBackendRoot;
     pub use super::AxBackendStmt;
     pub use super::AxBackendValue;
