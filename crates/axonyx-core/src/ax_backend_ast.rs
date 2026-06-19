@@ -22,6 +22,7 @@ pub enum AxBackendBlock {
     Route(AxRoute),
     Loader(AxLoader),
     Action(AxAction),
+    Function(AxBackendFunction),
     Job(AxJob),
 }
 
@@ -132,6 +133,42 @@ impl AxAction {
 
     pub fn body(mut self, body: impl IntoIterator<Item = AxBackendStmt>) -> Self {
         self.body = body.into_iter().collect();
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxBackendFunction {
+    pub name: String,
+    pub returns: Option<String>,
+    pub input: Vec<AxField>,
+    pub body: Vec<AxBackendStmt>,
+    pub exported: bool,
+}
+
+impl AxBackendFunction {
+    pub fn new(name: impl Into<String>, body: impl IntoIterator<Item = AxBackendStmt>) -> Self {
+        Self {
+            name: name.into(),
+            returns: None,
+            input: Vec::new(),
+            body: body.into_iter().collect(),
+            exported: false,
+        }
+    }
+
+    pub fn returns(mut self, ty: impl Into<String>) -> Self {
+        self.returns = Some(ty.into());
+        self
+    }
+
+    pub fn input(mut self, fields: impl IntoIterator<Item = AxField>) -> Self {
+        self.input = fields.into_iter().collect();
+        self
+    }
+
+    pub fn exported(mut self, exported: bool) -> Self {
+        self.exported = exported;
         self
     }
 }
@@ -563,6 +600,7 @@ pub mod prelude {
     pub use super::AxBackendDocument;
     pub use super::AxBackendEnv;
     pub use super::AxBackendEnvVisibility;
+    pub use super::AxBackendFunction;
     pub use super::AxBackendRoot;
     pub use super::AxBackendStmt;
     pub use super::AxBackendValue;

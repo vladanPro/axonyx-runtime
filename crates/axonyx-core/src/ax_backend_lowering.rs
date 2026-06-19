@@ -8,6 +8,7 @@ use crate::ax_query_ast::prelude::*;
 pub struct AxBackendPlan {
     pub envs: Vec<AxEnvPlan>,
     pub globals: Vec<AxStepPlan>,
+    pub functions: Vec<AxFunctionPlan>,
     pub handlers: Vec<AxHandlerPlan>,
 }
 
@@ -16,6 +17,7 @@ impl AxBackendPlan {
         Self {
             envs: Vec::new(),
             globals: Vec::new(),
+            functions: Vec::new(),
             handlers: handlers.into_iter().collect(),
         }
     }
@@ -23,11 +25,13 @@ impl AxBackendPlan {
     pub fn with_globals(
         envs: impl IntoIterator<Item = AxEnvPlan>,
         globals: impl IntoIterator<Item = AxStepPlan>,
+        functions: impl IntoIterator<Item = AxFunctionPlan>,
         handlers: impl IntoIterator<Item = AxHandlerPlan>,
     ) -> Self {
         Self {
             envs: envs.into_iter().collect(),
             globals: globals.into_iter().collect(),
+            functions: functions.into_iter().collect(),
             handlers: handlers.into_iter().collect(),
         }
     }
@@ -44,6 +48,16 @@ pub struct AxEnvPlan {
 pub enum AxEnvVisibilityPlan {
     Public,
     Secret,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxFunctionPlan {
+    pub name: String,
+    pub rust_fn: String,
+    pub returns: Option<String>,
+    pub input: Vec<AxFieldPlan>,
+    pub steps: Vec<AxStepPlan>,
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -246,6 +260,7 @@ pub fn lower_backend_document(
 ) -> Result<AxBackendPlan, AxBackendLowerError> {
     let mut envs = Vec::new();
     let mut globals = Vec::new();
+    let mut functions = Vec::new();
     let mut handlers = Vec::new();
 
     for block in &document.blocks {
@@ -258,11 +273,14 @@ pub fn lower_backend_document(
                     }
                 }
             }
+            AxBackendBlock::Function(function) => functions.push(lower_function(function)?),
             _ => handlers.push(lower_backend_block(block)?),
         }
     }
 
-    Ok(AxBackendPlan::with_globals(envs, globals, handlers))
+    Ok(AxBackendPlan::with_globals(
+        envs, globals, functions, handlers,
+    ))
 }
 
 fn lower_backend_block(block: &AxBackendBlock) -> Result<AxHandlerPlan, AxBackendLowerError> {
@@ -271,8 +289,33 @@ fn lower_backend_block(block: &AxBackendBlock) -> Result<AxHandlerPlan, AxBacken
         AxBackendBlock::Route(route) => lower_route(route),
         AxBackendBlock::Loader(loader) => lower_loader(loader),
         AxBackendBlock::Action(action) => lower_action(action),
+        AxBackendBlock::Function(_) => {
+            unreachable!("domain functions are lowered at document level")
+        }
         AxBackendBlock::Job(job) => lower_job(job),
     }
+}
+
+fn lower_function(function: &AxBackendFunction) -> Result<AxFunctionPlan, AxBackendLowerError> {
+    let name = function.name.trim();
+    if name.is_empty() {
+        return Err(AxBackendLowerError::EmptyHandlerName);
+    }
+
+    let input = function
+        .input
+        .iter()
+        .map(lower_input_field)
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(AxFunctionPlan {
+        name: function.name.clone(),
+        rust_fn: format!("fn_{}", normalize_ident(name)),
+        returns: function.returns.clone(),
+        input,
+        steps: lower_steps(&function.body),
+        exported: function.exported,
+    })
 }
 
 fn lower_route(route: &AxRoute) -> Result<AxHandlerPlan, AxBackendLowerError> {
@@ -795,6 +838,7 @@ pub mod prelude {
     pub use super::AxEnvPlan;
     pub use super::AxEnvVisibilityPlan;
     pub use super::AxFieldPlan;
+    pub use super::AxFunctionPlan;
     pub use super::AxHandlerKind;
     pub use super::AxHandlerPlan;
     pub use super::AxHookPhasePlan;
@@ -814,6 +858,37 @@ pub mod prelude {
 mod tests {
     use super::*;
     use crate::ax_backend_parser::parse_backend_ax;
+
+    #[test]
+    fn lowers_exported_domain_function_into_function_plan() {
+        let document = parse_backend_ax(
+            r#"
+export fn normalizeStatus(status?: String) -> String {
+  return status ?? "published"
+}
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert!(plan.handlers.is_empty());
+        assert_eq!(plan.functions.len(), 1);
+        let function = &plan.functions[0];
+        assert_eq!(function.name, "normalizeStatus");
+        assert_eq!(function.rust_fn, "fn_normalize_status");
+        assert_eq!(function.returns.as_deref(), Some("String"));
+        assert!(function.exported);
+        assert_eq!(function.input.len(), 1);
+        assert_eq!(function.input[0].name, "status");
+        assert!(function.input[0].optional);
+        assert_eq!(
+            function.steps[0],
+            AxStepPlan::Return(AxReturnPlan::Expr(AxRustExpr::new(
+                r#"status ?? "published""#
+            )))
+        );
+    }
 
     #[test]
     fn lowers_loader_query_into_backend_plan() {

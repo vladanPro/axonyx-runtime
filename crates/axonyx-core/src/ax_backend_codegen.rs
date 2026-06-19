@@ -76,6 +76,7 @@ pub fn compile_backend_sources_to_module(
 ) -> Result<String, AxBackendBundleError> {
     let mut globals = Vec::new();
     let mut envs = Vec::new();
+    let mut functions = Vec::new();
     let mut handlers = Vec::new();
 
     for (name, input) in sources {
@@ -90,15 +91,17 @@ pub fn compile_backend_sources_to_module(
             })?;
         envs.extend(plan.envs);
         globals.extend(plan.globals);
+        functions.extend(plan.functions);
         handlers.extend(plan.handlers);
     }
 
-    generate_backend_module(&AxBackendPlan::with_globals(envs, globals, handlers)).map_err(
-        |source| AxBackendBundleError::Source {
-            name: "bundle".to_string(),
-            source: AxBackendCompileError::Codegen(source),
-        },
-    )
+    generate_backend_module(&AxBackendPlan::with_globals(
+        envs, globals, functions, handlers,
+    ))
+    .map_err(|source| AxBackendBundleError::Source {
+        name: "bundle".to_string(),
+        source: AxBackendCompileError::Codegen(source),
+    })
 }
 
 fn render_input_struct(handler: &AxHandlerPlan, input: &[AxFieldPlan]) -> String {

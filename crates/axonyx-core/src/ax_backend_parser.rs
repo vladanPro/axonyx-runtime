@@ -89,9 +89,18 @@ impl Parser {
 
     fn parse_block(&mut self) -> Result<AxBackendBlock, AxBackendParseError> {
         let line = self.current().expect("block line exists").clone();
-        let text = line.text.as_str();
+        let mut text = line.text.as_str();
+        let exported = if let Some(rest) = text.strip_prefix("export ") {
+            text = rest.trim_start();
+            true
+        } else {
+            false
+        };
 
         if text == "backend" {
+            if exported {
+                return Err(AxBackendParseError::InvalidBlock { line: line.line });
+            }
             self.pos += 1;
             return Ok(AxBackendBlock::Backend(AxBackendRoot::new(
                 self.parse_backend_root_body(2)?,
@@ -172,7 +181,30 @@ impl Parser {
             return Ok(AxBackendBlock::Action(action));
         }
 
+        if let Some(name) = text.strip_prefix("fn ") {
+            let (name, braced) = split_block_brace(name);
+            let (name, returns) = split_return_contract(name.trim());
+            let (name, signature_input) = parse_backend_callable_signature(name, line.line)?;
+            if name.is_empty() {
+                return Err(AxBackendParseError::InvalidBlock { line: line.line });
+            }
+
+            self.pos += 1;
+            let body = self.parse_body(2)?;
+            self.consume_block_brace(braced, 0)?;
+            let mut function = AxBackendFunction::new(name, body)
+                .input(signature_input)
+                .exported(exported);
+            if let Some(returns) = returns {
+                function = function.returns(returns);
+            }
+            return Ok(AxBackendBlock::Function(function));
+        }
+
         if let Some(name) = text.strip_prefix("job ") {
+            if exported {
+                return Err(AxBackendParseError::InvalidBlock { line: line.line });
+            }
             let (name, braced) = split_block_brace(name);
             let name = name.trim();
             if name.is_empty() {
@@ -1637,6 +1669,54 @@ query loadPosts() -> Post[] {
         assert_eq!(loader.returns.as_deref(), Some("Post[]"));
         assert!(loader.input.is_empty());
         assert_eq!(loader.body.len(), 2);
+    }
+
+    #[test]
+    fn parses_exported_query_function_as_loader_block() {
+        let input = r#"
+export query loadPosts(status: String = "published") -> Post[] {
+  data posts = db.posts.all()
+    where status = input.status
+  return posts
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected exported query function to lower as loader block");
+        };
+
+        assert_eq!(loader.name, "loadPosts");
+        assert_eq!(loader.returns.as_deref(), Some("Post[]"));
+        assert_eq!(loader.input.len(), 1);
+        assert_eq!(loader.input[0].name, "status");
+        assert_eq!(loader.input[0].ty, "String");
+        assert_eq!(loader.input[0].default, Some(AxExpr::string("published")));
+    }
+
+    #[test]
+    fn parses_exported_domain_function_block() {
+        let input = r#"
+export fn normalizeStatus(status?: String) -> String {
+  return status ?? "published"
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Function(function) = &document.blocks[0] else {
+            panic!("expected function block");
+        };
+
+        assert_eq!(function.name, "normalizeStatus");
+        assert_eq!(function.returns.as_deref(), Some("String"));
+        assert!(function.exported);
+        assert_eq!(function.input.len(), 1);
+        assert_eq!(function.input[0].name, "status");
+        assert!(function.input[0].optional);
+        assert_eq!(function.input[0].ty, "String");
+        assert_eq!(function.body.len(), 1);
     }
 
     #[test]
