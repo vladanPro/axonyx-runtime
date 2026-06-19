@@ -92,10 +92,7 @@ fn render_function_fn(function: &AxFunctionPlan) -> String {
         .iter()
         .any(|step| matches!(step, AxStepPlan::Return(_)))
     {
-        out.push_str(&format!(
-            "    {}\n",
-            default_function_return_expr(&returns)
-        ));
+        out.push_str(&format!("    {}\n", default_function_return_expr(&returns)));
     }
     out.push_str("}\n");
     out
@@ -104,7 +101,10 @@ fn render_function_fn(function: &AxFunctionPlan) -> String {
 fn render_function_step(step: &AxStepPlan, returns: &str) -> String {
     match step {
         AxStepPlan::Let { binding, value } => {
-            format!("    let {binding} = {};\n", render_function_value_plan(value))
+            format!(
+                "    let {binding} = {};\n",
+                render_function_value_plan(value)
+            )
         }
         AxStepPlan::Return(value) => render_function_return(value, returns),
         other => format!("    // unsupported domain fn step: {other:?}\n"),
@@ -124,7 +124,9 @@ fn render_function_return(value: &AxReturnPlan, returns: &str) -> String {
             format!("    return {};\n", coerce_return_expr(expr, returns))
         }
         AxReturnPlan::Ok => format!("    return {};\n", default_function_return_expr(returns)),
-        AxReturnPlan::NoContent => format!("    return {};\n", default_function_return_expr(returns)),
+        AxReturnPlan::NoContent => {
+            format!("    return {};\n", default_function_return_expr(returns))
+        }
         AxReturnPlan::Redirect { .. } => {
             format!("    return {};\n", default_function_return_expr(returns))
         }
@@ -928,7 +930,9 @@ loader PostsList
 
         assert!(module.contains("pub fn normalizeStatus(status: String) -> String"));
         assert!(module.contains("return (status).to_string();"));
-        assert!(module.contains(r#"let status = json!(&normalizeStatus("published".to_string()));"#));
+        assert!(
+            module.contains(r#"let status = json!(&normalizeStatus("published".to_string()));"#)
+        );
     }
 
     #[test]
