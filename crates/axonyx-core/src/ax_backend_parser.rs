@@ -474,9 +474,13 @@ impl Parser {
             if call.is_empty() {
                 return Err(AxBackendParseError::InvalidScopeRender { line: line.line });
             }
+            let call = parse_expr(call, line.line)?;
+            if !matches!(&call, AxExpr::Call { path, .. } if path.as_slice() != ["list"]) {
+                return Err(AxBackendParseError::InvalidScopeRender { line: line.line });
+            }
 
             self.pos += 1;
-            return Ok(AxScopeStmt::render(parse_expr(call, line.line)?));
+            return Ok(AxScopeStmt::render(call));
         }
         if text == "render" {
             return Err(AxBackendParseError::InvalidScopeRender { line: line.line });
@@ -1920,6 +1924,32 @@ scope Layout {
 "#;
 
         let error = parse_backend_ax(input).expect_err("empty scope render should fail");
+
+        assert_eq!(error, AxBackendParseError::InvalidScopeRender { line: 3 });
+    }
+
+    #[test]
+    fn rejects_scope_render_without_call_expression() {
+        let input = r#"
+scope Layout {
+  render RenderLayout
+}
+"#;
+
+        let error = parse_backend_ax(input).expect_err("non-call scope render should fail");
+
+        assert_eq!(error, AxBackendParseError::InvalidScopeRender { line: 3 });
+    }
+
+    #[test]
+    fn rejects_scope_render_list_literal() {
+        let input = r#"
+scope Layout {
+  render [RenderLayout]
+}
+"#;
+
+        let error = parse_backend_ax(input).expect_err("list literal render should fail");
 
         assert_eq!(error, AxBackendParseError::InvalidScopeRender { line: 3 });
     }
