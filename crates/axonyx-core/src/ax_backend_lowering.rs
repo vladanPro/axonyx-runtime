@@ -274,6 +274,7 @@ pub fn lower_backend_document(
                 }
             }
             AxBackendBlock::Function(function) => functions.push(lower_function(function)?),
+            AxBackendBlock::Scope(_) => {}
             _ => handlers.push(lower_backend_block(block)?),
         }
     }
@@ -293,6 +294,7 @@ fn lower_backend_block(block: &AxBackendBlock) -> Result<AxHandlerPlan, AxBacken
             unreachable!("domain functions are lowered at document level")
         }
         AxBackendBlock::Job(job) => lower_job(job),
+        AxBackendBlock::Scope(_) => unreachable!("scopes are graph metadata only in V0"),
     }
 }
 

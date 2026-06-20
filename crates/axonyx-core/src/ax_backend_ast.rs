@@ -77,6 +77,7 @@ pub enum AxBackendBlock {
     Action(AxAction),
     Function(AxBackendFunction),
     Job(AxJob),
+    Scope(AxScope),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -252,6 +253,83 @@ impl AxJob {
             name: name.into(),
             body: body.into_iter().collect(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxScope {
+    pub name: String,
+    pub members: Vec<String>,
+    pub body: Vec<AxScopeStmt>,
+}
+
+impl AxScope {
+    pub fn new<S>(
+        name: impl Into<String>,
+        members: impl IntoIterator<Item = S>,
+        body: impl IntoIterator<Item = AxScopeStmt>,
+    ) -> Self
+    where
+        S: Into<String>,
+    {
+        Self {
+            name: name.into(),
+            members: members.into_iter().map(Into::into).collect(),
+            body: body.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxScopeStmt {
+    State(AxScopeState),
+    Render(AxScopeRender),
+}
+
+impl AxScopeStmt {
+    pub fn state(
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        default: impl Into<AxExpr>,
+    ) -> Self {
+        Self::State(AxScopeState::new(name, ty).default(default))
+    }
+
+    pub fn render(call: impl Into<AxExpr>) -> Self {
+        Self::Render(AxScopeRender::new(call))
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxScopeState {
+    pub name: String,
+    pub ty: String,
+    pub default: Option<AxExpr>,
+}
+
+impl AxScopeState {
+    pub fn new(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            default: None,
+        }
+    }
+
+    pub fn default(mut self, default: impl Into<AxExpr>) -> Self {
+        self.default = Some(default.into());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxScopeRender {
+    pub call: AxExpr,
+}
+
+impl AxScopeRender {
+    pub fn new(call: impl Into<AxExpr>) -> Self {
+        Self { call: call.into() }
     }
 }
 
@@ -685,6 +763,10 @@ pub mod prelude {
     pub use super::AxResponseHeader;
     pub use super::AxReturn;
     pub use super::AxRoute;
+    pub use super::AxScope;
+    pub use super::AxScopeRender;
+    pub use super::AxScopeState;
+    pub use super::AxScopeStmt;
     pub use super::AxSend;
 }
 
@@ -747,9 +829,17 @@ mod tests {
                     AxBackendStmt::r#return(AxExpr::ident("posts")),
                 ],
             )),
+            AxBackendBlock::Scope(AxScope::new(
+                "Layout",
+                ["RenderLayout", "setTheme"],
+                [
+                    AxScopeStmt::state("theme", "String", AxExpr::string("silver")),
+                    AxScopeStmt::render(AxExpr::call(["RenderLayout"], [])),
+                ],
+            )),
         ]);
 
-        assert_eq!(document.blocks.len(), 3);
+        assert_eq!(document.blocks.len(), 4);
 
         let AxBackendBlock::Action(action) = &document.blocks[1] else {
             panic!("expected action block");
@@ -758,6 +848,13 @@ mod tests {
         assert_eq!(action.name, "CreatePost");
         assert_eq!(action.input.len(), 2);
         assert_eq!(action.body.len(), 3);
+
+        let AxBackendBlock::Scope(scope) = &document.blocks[3] else {
+            panic!("expected scope block");
+        };
+        assert_eq!(scope.name, "Layout");
+        assert_eq!(scope.members, vec!["RenderLayout", "setTheme"]);
+        assert_eq!(scope.body.len(), 2);
     }
 
     #[test]
