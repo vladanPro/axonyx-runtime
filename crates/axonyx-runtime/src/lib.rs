@@ -10,9 +10,9 @@ use axonyx_core::ax_ast_prelude::{
 };
 use axonyx_core::ax_backend_lowering::AxBackendLowerError;
 use axonyx_core::ax_backend_lowering_prelude::{
-    lower_backend_document, AxHandlerKind, AxHandlerPlan, AxHookPhasePlan, AxQueryFilterOpPlan,
-    AxQueryOrderDirectionPlan, AxQueryPlan, AxQuerySourcePlan, AxReturnPlan, AxRustExpr,
-    AxStepPlan, AxValuePlan,
+    lower_backend_document, AxFieldPlan, AxFunctionPlan, AxHandlerKind, AxHandlerPlan,
+    AxHookPhasePlan, AxQueryFilterOpPlan, AxQueryOrderDirectionPlan, AxQueryPlan,
+    AxQuerySourcePlan, AxReturnPlan, AxRustExpr, AxStepPlan, AxValuePlan,
 };
 use axonyx_core::ax_backend_parser::AxBackendParseError;
 use axonyx_core::ax_backend_parser_prelude::parse_backend_ax;
@@ -416,6 +416,7 @@ struct PreviewHandlers {
     routes: Vec<AxHandlerPlan>,
     loaders: BTreeMap<String, AxHandlerPlan>,
     actions: BTreeMap<String, AxHandlerPlan>,
+    functions: BTreeMap<String, AxFunctionPlan>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -734,12 +735,14 @@ fn collect_preview_handlers(
     let mut routes = Vec::new();
     let mut loaders = BTreeMap::new();
     let mut actions = BTreeMap::new();
+    let mut functions = BTreeMap::new();
     let mut globals = Vec::new();
 
     for source in route_sources {
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
         globals.extend(plan.globals);
+        collect_preview_functions(plan.functions, &mut functions);
 
         for handler in plan.handlers {
             if !matches!(handler.kind, AxHandlerKind::Route { .. }) {
@@ -754,6 +757,7 @@ fn collect_preview_handlers(
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
         globals.extend(plan.globals);
+        collect_preview_functions(plan.functions, &mut functions);
 
         for handler in plan.handlers {
             if matches!(handler.kind, AxHandlerKind::Loader { .. }) {
@@ -766,6 +770,7 @@ fn collect_preview_handlers(
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
         globals.extend(plan.globals);
+        collect_preview_functions(plan.functions, &mut functions);
 
         for handler in plan.handlers {
             if matches!(handler.kind, AxHandlerKind::Action { .. }) {
@@ -791,7 +796,17 @@ fn collect_preview_handlers(
         routes,
         loaders,
         actions,
+        functions,
     })
+}
+
+fn collect_preview_functions(
+    functions: impl IntoIterator<Item = AxFunctionPlan>,
+    out: &mut BTreeMap<String, AxFunctionPlan>,
+) {
+    for function in functions {
+        out.insert(function.name.clone(), function);
+    }
 }
 
 fn preview_resolve_call(
@@ -823,7 +838,15 @@ fn preview_resolve_call(
             .ok_or_else(|| PreviewError::Runtime {
                 message: format!("loader `{loader_name}` was not found for this route"),
             })?;
-        let value = execute_preview_loader(loader, &[], route_scope, env, runtime, store)?;
+        let value = execute_preview_loader(
+            loader,
+            &[],
+            route_scope,
+            env,
+            runtime,
+            store,
+            &handlers.functions,
+        )?;
         cache.borrow_mut().insert(cache_key, value.clone());
         return Ok(Some(value));
     }
@@ -836,7 +859,22 @@ fn preview_resolve_call(
         }
 
         if let Some(loader) = handlers.loaders.get(loader_name) {
-            let value = execute_preview_loader(loader, args, route_scope, env, runtime, store)?;
+            let value = execute_preview_loader(
+                loader,
+                args,
+                route_scope,
+                env,
+                runtime,
+                store,
+                &handlers.functions,
+            )?;
+            cache.borrow_mut().insert(cache_key, value.clone());
+            return Ok(Some(value));
+        }
+
+        if let Some(function) = handlers.functions.get(loader_name) {
+            let value =
+                execute_preview_function(function, args, route_scope, env, &handlers.functions)?;
             cache.borrow_mut().insert(cache_key, value.clone());
             return Ok(Some(value));
         }
@@ -929,6 +967,7 @@ fn execute_preview_loader(
     env: &backend::AxEnv,
     runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &AxPreviewStore,
+    functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<AxValue, PreviewError> {
     let mut scope = initial_scope.clone();
     let AxHandlerKind::Loader { input, .. } = &loader.kind else {
@@ -956,10 +995,14 @@ fn execute_preview_loader(
     for step in &loader.steps {
         match step {
             AxStepPlan::Let { binding, value } => {
-                let value = eval_preview_value(value, &scope, env, runtime, store)?;
+                let value = eval_preview_value_with_functions(
+                    value, &scope, env, runtime, store, functions,
+                )?;
                 scope.insert(binding.clone(), value);
             }
-            AxStepPlan::Return(value) => return eval_preview_return(value, &scope, env),
+            AxStepPlan::Return(value) => {
+                return eval_preview_return_with_functions(value, &scope, env, functions)
+            }
             AxStepPlan::Insert { .. }
             | AxStepPlan::Update { .. }
             | AxStepPlan::Delete { .. }
@@ -975,6 +1018,100 @@ fn execute_preview_loader(
     }
 
     Ok(AxValue::Null)
+}
+
+fn execute_preview_function(
+    function: &AxFunctionPlan,
+    args: &[AxValue],
+    initial_scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
+) -> Result<AxValue, PreviewError> {
+    if args.len() > function.input.len() {
+        return Err(PreviewError::Runtime {
+            message: format!(
+                "function `{}` expected {} argument(s) but received {}",
+                function.name,
+                function.input.len(),
+                args.len()
+            ),
+        });
+    }
+
+    let mut scope = initial_scope.clone();
+    bind_preview_function_inputs(function, args, &mut scope)?;
+
+    for step in &function.steps {
+        match step {
+            AxStepPlan::Let { binding, value } => match value {
+                AxValuePlan::Expr(expr) => {
+                    let value = eval_preview_expr_with_functions(expr, &scope, env, functions)?;
+                    scope.insert(binding.clone(), value);
+                }
+                AxValuePlan::Query(_) => {
+                    return Err(PreviewError::Runtime {
+                        message: format!(
+                            "function `{}` cannot use query-backed data binding `{}` in preview yet",
+                            function.name, binding
+                        ),
+                    });
+                }
+            },
+            AxStepPlan::Return(value) => {
+                return eval_preview_return_with_functions(value, &scope, env, functions)
+            }
+            AxStepPlan::Insert { .. }
+            | AxStepPlan::Update { .. }
+            | AxStepPlan::Delete { .. }
+            | AxStepPlan::Revalidate { .. }
+            | AxStepPlan::Patch { .. }
+            | AxStepPlan::Hook { .. }
+            | AxStepPlan::Header { .. }
+            | AxStepPlan::Cookie { .. }
+            | AxStepPlan::ClearCookie { .. }
+            | AxStepPlan::Require { .. }
+            | AxStepPlan::Send { .. } => {
+                return Err(PreviewError::Runtime {
+                    message: format!(
+                        "function `{}` only supports data and return steps in preview",
+                        function.name
+                    ),
+                });
+            }
+        }
+    }
+
+    Ok(AxValue::Null)
+}
+
+fn bind_preview_function_inputs(
+    function: &AxFunctionPlan,
+    args: &[AxValue],
+    scope: &mut BTreeMap<String, AxValue>,
+) -> Result<(), PreviewError> {
+    for (index, field) in function.input.iter().enumerate() {
+        let Some(value) = args.get(index).cloned() else {
+            if let Some(default) = &field.default {
+                scope.insert(
+                    field.name.clone(),
+                    coerce_preview_default_input_value(&field.name, &field.rust_ty, default)?,
+                );
+                continue;
+            }
+            if field.optional {
+                scope.insert(field.name.clone(), AxValue::Null);
+                continue;
+            }
+            return Err(PreviewError::Runtime {
+                message: format!("missing required function input `{}`", field.name),
+            });
+        };
+        scope.insert(
+            field.name.clone(),
+            coerce_preview_function_input_value(field, value)?,
+        );
+    }
+    Ok(())
 }
 
 fn execute_preview_action(
@@ -1432,8 +1569,20 @@ fn eval_preview_value(
     runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &AxPreviewStore,
 ) -> Result<AxValue, PreviewError> {
+    let functions = BTreeMap::new();
+    eval_preview_value_with_functions(value, scope, env, runtime, store, &functions)
+}
+
+fn eval_preview_value_with_functions(
+    value: &AxValuePlan,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
+    store: &AxPreviewStore,
+    functions: &BTreeMap<String, AxFunctionPlan>,
+) -> Result<AxValue, PreviewError> {
     match value {
-        AxValuePlan::Expr(expr) => eval_preview_expr(expr, scope, env),
+        AxValuePlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
         AxValuePlan::Query(query) => eval_preview_query(query, scope, env, runtime, store),
     }
 }
@@ -1443,9 +1592,19 @@ fn eval_preview_return(
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
 ) -> Result<AxValue, PreviewError> {
+    let functions = BTreeMap::new();
+    eval_preview_return_with_functions(value, scope, env, &functions)
+}
+
+fn eval_preview_return_with_functions(
+    value: &AxReturnPlan,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
+) -> Result<AxValue, PreviewError> {
     match value {
-        AxReturnPlan::Expr(expr) => eval_preview_expr(expr, scope, env),
-        AxReturnPlan::Json(expr) => eval_preview_expr(expr, scope, env),
+        AxReturnPlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
+        AxReturnPlan::Json(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
         AxReturnPlan::Redirect { .. } | AxReturnPlan::NoContent => Err(PreviewError::Runtime {
             message: "HTTP response helpers are only supported in route blocks".to_string(),
         }),
@@ -1672,6 +1831,16 @@ fn eval_preview_expr(
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
 ) -> Result<AxValue, PreviewError> {
+    let functions = BTreeMap::new();
+    eval_preview_expr_with_functions(expr, scope, env, &functions)
+}
+
+fn eval_preview_expr_with_functions(
+    expr: &AxRustExpr,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
+) -> Result<AxValue, PreviewError> {
     let code = expr.code.trim();
 
     if let Some(value) = parse_preview_string(code) {
@@ -1705,7 +1874,9 @@ fn eval_preview_expr(
     if let Some(args) = parse_preview_call_args(code, "list") {
         let items = args
             .iter()
-            .map(|arg| eval_preview_expr(&AxRustExpr::new(arg), scope, env))
+            .map(|arg| {
+                eval_preview_expr_with_functions(&AxRustExpr::new(arg), scope, env, functions)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(AxValue::List(items));
     }
@@ -1713,7 +1884,9 @@ fn eval_preview_expr(
     if let Some(args) = parse_preview_vec_args(code) {
         let items = args
             .iter()
-            .map(|arg| eval_preview_expr(&AxRustExpr::new(arg), scope, env))
+            .map(|arg| {
+                eval_preview_expr_with_functions(&AxRustExpr::new(arg), scope, env, functions)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(AxValue::List(items));
     }
@@ -1724,8 +1897,10 @@ fn eval_preview_expr(
                 message: "contains(list, value) expects exactly two arguments".to_string(),
             });
         }
-        let options = eval_preview_expr(&AxRustExpr::new(&args[0]), scope, env)?;
-        let needle = eval_preview_expr(&AxRustExpr::new(&args[1]), scope, env)?;
+        let options =
+            eval_preview_expr_with_functions(&AxRustExpr::new(&args[0]), scope, env, functions)?;
+        let needle =
+            eval_preview_expr_with_functions(&AxRustExpr::new(&args[1]), scope, env, functions)?;
         let AxValue::List(items) = options else {
             return Ok(AxValue::Bool(false));
         };
@@ -1738,12 +1913,25 @@ fn eval_preview_expr(
                 message: "error(message) expects exactly one argument".to_string(),
             });
         }
-        let message = eval_preview_expr(&AxRustExpr::new(&args[0]), scope, env)?;
+        let message =
+            eval_preview_expr_with_functions(&AxRustExpr::new(&args[0]), scope, env, functions)?;
         return Ok(AxValue::record([("error", message)]));
     }
 
     if let Some(value) = lookup_preview_scope(scope, code) {
         return Ok(value);
+    }
+
+    if let Some((name, args)) = parse_preview_named_call(code) {
+        if let Some(function) = functions.get(&name) {
+            let args = args
+                .iter()
+                .map(|arg| {
+                    eval_preview_expr_with_functions(&AxRustExpr::new(arg), scope, env, functions)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            return execute_preview_function(function, &args, scope, env, functions);
+        }
     }
 
     Err(PreviewError::Runtime {
@@ -2045,6 +2233,30 @@ fn coerce_preview_loader_input_value(
         (_, value) => Err(PreviewError::Runtime {
             message: format!(
                 "loader input `{field_name}` expected {rust_ty} but received {}",
+                preview_value_type_name(&value)
+            ),
+        }),
+    }
+}
+
+fn coerce_preview_function_input_value(
+    field: &AxFieldPlan,
+    value: AxValue,
+) -> Result<AxValue, PreviewError> {
+    match (field.rust_ty.as_str(), value) {
+        ("String", AxValue::String(value)) => Ok(AxValue::String(value)),
+        ("String", value @ (AxValue::Number(_) | AxValue::Bool(_))) => {
+            Ok(AxValue::String(value.as_string()))
+        }
+        ("bool", AxValue::Bool(value)) => Ok(AxValue::Bool(value)),
+        ("i64" | "u64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        ("f64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        (_, AxValue::Null) if field.optional => Ok(AxValue::Null),
+        (_, value) => Err(PreviewError::Runtime {
+            message: format!(
+                "function input `{}` expected {} but received {}",
+                field.name,
+                field.rust_ty,
                 preview_value_type_name(&value)
             ),
         }),
@@ -2955,6 +3167,24 @@ fn parse_preview_vec_args(code: &str) -> Option<Vec<String>> {
             .map(str::to_string)
             .collect(),
     )
+}
+
+fn parse_preview_named_call(code: &str) -> Option<(String, Vec<String>)> {
+    let open = code.find('(')?;
+    let name = code[..open].trim();
+    if !is_preview_identifier(name) || !code.ends_with(')') {
+        return None;
+    }
+    let inner = &code[open + 1..code.len() - 1];
+    let args = if inner.trim().is_empty() {
+        Vec::new()
+    } else {
+        split_preview_args(inner)
+            .into_iter()
+            .map(str::to_string)
+            .collect()
+    };
+    Some((name.to_string(), args))
 }
 
 fn split_preview_args(input: &str) -> Vec<&str> {
@@ -4454,6 +4684,57 @@ page Posts
 "#,
         )
         .expect("query function with arguments should render");
+
+        assert!(html.contains("Draft Preview"));
+        assert!(!html.contains("Hello Axonyx"));
+        assert!(!html.contains("Docs Without Bloat"));
+    }
+
+    #[test]
+    fn previews_pure_backend_function_data_inside_page() {
+        let html = preview_ax_route_with_loaders(
+            &[],
+            &[r#"
+fn normalizeStatus(status: String) -> String
+  return status
+"#],
+            r#"
+page Status
+  data status = normalizeStatus("draft")
+  Copy -> status
+"#,
+        )
+        .expect("pure function preview should render");
+
+        assert!(html.contains("draft"));
+    }
+
+    #[test]
+    fn previews_query_function_with_pure_backend_helper() {
+        let html = preview_ax_route_with_loaders(
+            &[],
+            &[r#"
+fn normalizeStatus(status: String) -> String
+  data normalized = status
+  return normalized
+
+query loadPosts(status: String) -> Post[]
+  data normalized = normalizeStatus(input.status)
+  data posts = db.posts.all()
+    where status = normalized
+    order created_at desc
+  return posts
+"#],
+            r#"
+page Posts
+  data posts = loadPosts("draft")
+  Grid cols: 2
+    each post in posts
+      Card title: post.title
+        Copy -> post.excerpt
+"#,
+        )
+        .expect("query function with pure helper should render");
 
         assert!(html.contains("Draft Preview"));
         assert!(!html.contains("Hello Axonyx"));
