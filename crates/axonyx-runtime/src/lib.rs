@@ -5133,6 +5133,32 @@ action createPost(title: string, status: string) -> Post {
     }
 
     #[test]
+    fn preview_action_guard_can_use_pure_domain_helper() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+fn isSupportedTheme(theme: String) -> bool
+  data themes = ["silver", "bronze", "gold"]
+  return contains(themes, theme)
+
+action SetTheme(theme: string) {
+  guard(isSupportedTheme(input.theme), "Theme is not supported.")
+  patch theme = input.theme
+  return ok
+}
+"#],
+            "SetTheme",
+            &BTreeMap::from([("theme".to_string(), "gold".to_string())]),
+            &mut store,
+        )
+        .expect("guard action should execute");
+
+        assert!(result.error.is_none());
+        assert_eq!(result.patches.len(), 1);
+        assert_eq!(result.patches[0].value, AxValue::String("gold".to_string()));
+    }
+
+    #[test]
     fn preview_action_auto_invalidates_mutated_collection() {
         let mut store = AxPreviewStore::default();
         let result = execute_preview_action_sources(

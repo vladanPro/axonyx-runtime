@@ -584,6 +584,15 @@ impl Parser {
             };
         }
 
+        if text.starts_with("guard(") && text.ends_with(')') {
+            self.pos += 1;
+            let (value, message) = parse_guard_call(text, line.line)?;
+            return Ok(AxBackendStmt::require_with_fallback(
+                value,
+                AxExpr::call(["error"], [message]),
+            ));
+        }
+
         if let Some(value) = text.strip_prefix("return ") {
             self.pos += 1;
             let value = value.trim();
@@ -1346,6 +1355,27 @@ fn parse_requirement_fallback_expr(
     }
 
     parse_expr(input, line)
+}
+
+fn parse_guard_call(input: &str, line: usize) -> Result<(AxExpr, AxExpr), AxBackendParseError> {
+    let Some(inner) = input
+        .strip_prefix("guard(")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return Err(AxBackendParseError::InvalidRequirement { line });
+    };
+    let args = split_top_level(inner, ',');
+    let [condition, message] = args.as_slice() else {
+        return Err(AxBackendParseError::InvalidRequirement { line });
+    };
+    if condition.trim().is_empty() || message.trim().is_empty() {
+        return Err(AxBackendParseError::InvalidRequirement { line });
+    }
+
+    Ok((
+        parse_requirement_expr(condition.trim(), line)?,
+        parse_expr(message.trim(), line)?,
+    ))
 }
 
 fn parse_env_type(
@@ -2482,6 +2512,41 @@ action SetTheme
                     ),
                     AxExpr::ident("input").member("theme"),
                 ],
+            )
+        );
+        assert_eq!(
+            requirement.fallback,
+            Some(AxReturn::Expr(AxExpr::call(
+                ["error"],
+                [AxExpr::string("Theme is not supported.")]
+            )))
+        );
+    }
+
+    #[test]
+    fn parses_guard_call_as_requirement_with_error_fallback() {
+        let input = r#"
+action SetTheme(theme: string) {
+  guard(isSupportedTheme(input.theme), "Theme is not supported.")
+  patch theme = input.theme
+  return ok
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+        let AxBackendStmt::Require(requirement) = &action.body[0] else {
+            panic!("expected guard to lower into require statement");
+        };
+
+        assert_eq!(
+            requirement.value,
+            AxExpr::call(
+                ["isSupportedTheme"],
+                [AxExpr::ident("input").member("theme")]
             )
         );
         assert_eq!(
