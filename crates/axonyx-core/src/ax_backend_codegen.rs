@@ -698,10 +698,18 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool) -> String {
 
 fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     let response = match fallback {
-        Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => format!(
-            "AxHttpResponse::json(401, &json!({})).map_err(|error| AxRuntimeError::message(error.to_string()))?",
-            render_borrowed_expr(expr)
-        ),
+        Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
+            if let Some(message) = render_error_call_message(expr) {
+                format!(
+                    "AxHttpResponse::json(401, &json!({{\"error\": {message}}})).map_err(|error| AxRuntimeError::message(error.to_string()))?"
+                )
+            } else {
+                format!(
+                    "AxHttpResponse::json(401, &json!({})).map_err(|error| AxRuntimeError::message(error.to_string()))?",
+                    render_borrowed_expr(expr)
+                )
+            }
+        }
         Some(AxReturnPlan::Redirect { target, status }) => match status {
             Some(status) => format!(
                 "AxHttpResponse::redirect_with_status({status}, {})",
@@ -715,6 +723,15 @@ fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     };
 
     format!("        return Ok(__ax_finalize_response({response}, __ax_headers, __ax_cookies));\n")
+}
+
+fn render_error_call_message(expr: &AxRustExpr) -> Option<String> {
+    let code = expr.code.trim();
+    let inner = code.strip_prefix("error(")?.strip_suffix(')')?.trim();
+    if inner.is_empty() || inner.contains(',') {
+        return None;
+    }
+    Some(render_borrowed_expr(&AxRustExpr::new(inner)))
 }
 
 fn render_context_lookup(code: &str) -> Option<String> {
@@ -1205,6 +1222,21 @@ route GET "/api/admin"
             "if (request.cookie_value(\"session\").unwrap_or_default()).to_string().is_empty()"
         ));
         assert!(module.contains(r#"AxHttpResponse::redirect("/login".to_string())"#));
+    }
+
+    #[test]
+    fn compiles_guard_fallback_into_route_error_response() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route GET "/api/theme"
+  guard(request.query.theme, "Theme is required.")
+  return json("ok")
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains(r#"AxHttpResponse::json(401, &json!({"error":"#));
+        assert!(!module.contains("error("));
     }
 
     #[test]
