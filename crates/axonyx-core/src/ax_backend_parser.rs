@@ -46,6 +46,14 @@ pub enum AxBackendParseError {
     InvalidReturn { line: usize },
     #[error("invalid send statement at line {line}")]
     InvalidSend { line: usize },
+    #[error("invalid scope declaration at line {line}")]
+    InvalidScope { line: usize },
+    #[error("invalid scope member at line {line}")]
+    InvalidScopeMember { line: usize },
+    #[error("invalid scope state declaration at line {line}")]
+    InvalidScopeState { line: usize },
+    #[error("invalid scope render declaration at line {line}")]
+    InvalidScopeRender { line: usize },
     #[error("invalid query source at line {line}")]
     InvalidQuerySource { line: usize },
     #[error("invalid query clause at line {line}")]
@@ -290,6 +298,19 @@ impl Parser {
             return Ok(AxBackendBlock::Job(AxJob::new(name, body)));
         }
 
+        if let Some(rest) = text.strip_prefix("scope ") {
+            if exported {
+                return Err(AxBackendParseError::InvalidScope { line: line.line });
+            }
+            let (rest, braced) = split_block_brace(rest);
+            let (name, members) = parse_scope_header(rest, line.line)?;
+
+            self.pos += 1;
+            let body = self.parse_scope_body(2)?;
+            self.consume_block_brace(braced, 0)?;
+            return Ok(AxBackendBlock::Scope(AxScope::new(name, members, body)));
+        }
+
         Err(AxBackendParseError::InvalidBlock { line: line.line })
     }
 
@@ -389,6 +410,79 @@ impl Parser {
         }
 
         Ok(body)
+    }
+
+    fn parse_scope_body(&mut self, indent: usize) -> Result<Vec<AxScopeStmt>, AxBackendParseError> {
+        let mut body = Vec::new();
+
+        while let Some(line) = self.current() {
+            if line.indent < indent {
+                break;
+            }
+
+            if line.indent > indent {
+                return Err(AxBackendParseError::UnexpectedIndentation { line: line.line });
+            }
+
+            body.push(self.parse_scope_statement()?);
+        }
+
+        Ok(body)
+    }
+
+    fn parse_scope_statement(&mut self) -> Result<AxScopeStmt, AxBackendParseError> {
+        let line = self.current().expect("scope statement line exists").clone();
+        let text = line.text.as_str();
+
+        if let Some(rest) = text.strip_prefix("state ") {
+            let Some((name, ty)) = split_top_level_once(rest, ":") else {
+                return Err(AxBackendParseError::InvalidScopeState { line: line.line });
+            };
+            let name = name.trim();
+            if !is_backend_identifier(name) {
+                return Err(AxBackendParseError::InvalidScopeState { line: line.line });
+            }
+
+            let (ty, default) = match split_top_level_once(ty, "=") {
+                Some((ty, default)) => {
+                    let ty = ty.trim();
+                    let default = default.trim();
+                    if ty.is_empty() || default.is_empty() {
+                        return Err(AxBackendParseError::InvalidScopeState { line: line.line });
+                    }
+                    (ty, Some(parse_expr(default, line.line)?))
+                }
+                None => {
+                    let ty = ty.trim();
+                    if ty.is_empty() {
+                        return Err(AxBackendParseError::InvalidScopeState { line: line.line });
+                    }
+                    (ty, None)
+                }
+            };
+
+            self.pos += 1;
+            let mut state = AxScopeState::new(name, ty);
+            if let Some(default) = default {
+                state = state.default(default);
+            }
+            return Ok(AxScopeStmt::State(state));
+        }
+
+        if let Some(call) = text.strip_prefix("render ") {
+            let call = call.trim();
+            if call.is_empty() {
+                return Err(AxBackendParseError::InvalidScopeRender { line: line.line });
+            }
+
+            self.pos += 1;
+            return Ok(AxScopeStmt::render(parse_expr(call, line.line)?));
+        }
+        if text == "render" {
+            return Err(AxBackendParseError::InvalidScopeRender { line: line.line });
+        }
+
+        Err(AxBackendParseError::InvalidScope { line: line.line })
     }
 
     fn consume_block_brace(
@@ -1564,6 +1658,45 @@ fn split_block_brace(input: &str) -> (&str, bool) {
     }
 }
 
+fn parse_scope_header(
+    input: &str,
+    line: usize,
+) -> Result<(String, Vec<String>), AxBackendParseError> {
+    let input = input.trim();
+    let Some(open) = input.find('<') else {
+        if is_backend_identifier(input) {
+            return Ok((input.to_string(), Vec::new()));
+        }
+        return Err(AxBackendParseError::InvalidScope { line });
+    };
+    if !input.ends_with('>') {
+        return Err(AxBackendParseError::InvalidScope { line });
+    }
+
+    let name = input[..open].trim();
+    if !is_backend_identifier(name) {
+        return Err(AxBackendParseError::InvalidScope { line });
+    }
+
+    let members = input[open + 1..input.len() - 1].trim();
+    if members.is_empty() {
+        return Err(AxBackendParseError::InvalidScopeMember { line });
+    }
+
+    let members = split_top_level_commas(members)
+        .into_iter()
+        .map(|member| {
+            let member = member.trim();
+            if !is_backend_identifier(member) {
+                return Err(AxBackendParseError::InvalidScopeMember { line });
+            }
+            Ok(member.to_string())
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok((name.to_string(), members))
+}
+
 fn parse_backend_callable_signature(
     input: &str,
     line: usize,
@@ -1695,6 +1828,100 @@ query loadPosts() -> Post[] {
         let error = parse_backend_ax(input).expect_err("invalid import should fail");
 
         assert_eq!(error, AxBackendParseError::InvalidImport { line: 2 });
+    }
+
+    #[test]
+    fn parses_scope_block_as_ast_only_metadata() {
+        let input = r#"
+import { RenderLayout } from "./page.ax"
+import { setTheme } from "./actions.ax"
+import { isTheme } from "./domain.ax"
+
+scope Layout <RenderLayout, setTheme, isTheme> {
+  state theme: String = "silver"
+  render RenderLayout()
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("scope document should parse");
+
+        assert_eq!(document.imports.len(), 3);
+        assert_eq!(document.blocks.len(), 1);
+        let AxBackendBlock::Scope(scope) = &document.blocks[0] else {
+            panic!("expected scope block");
+        };
+
+        assert_eq!(scope.name, "Layout");
+        assert_eq!(scope.members, vec!["RenderLayout", "setTheme", "isTheme"]);
+        assert_eq!(scope.body.len(), 2);
+
+        let AxScopeStmt::State(state) = &scope.body[0] else {
+            panic!("expected scope state");
+        };
+        assert_eq!(state.name, "theme");
+        assert_eq!(state.ty, "String");
+        assert_eq!(state.default, Some(AxExpr::string("silver")));
+
+        let AxScopeStmt::Render(render) = &scope.body[1] else {
+            panic!("expected scope render");
+        };
+        assert_eq!(render.call, AxExpr::call(["RenderLayout"], []));
+    }
+
+    #[test]
+    fn parses_scope_without_members() {
+        let input = r#"
+scope Layout {
+  render RenderLayout()
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("scope document should parse");
+
+        let AxBackendBlock::Scope(scope) = &document.blocks[0] else {
+            panic!("expected scope block");
+        };
+        assert_eq!(scope.name, "Layout");
+        assert!(scope.members.is_empty());
+    }
+
+    #[test]
+    fn rejects_invalid_scope_member() {
+        let input = r#"
+scope Layout <RenderLayout, 123bad> {
+  render RenderLayout()
+}
+"#;
+
+        let error = parse_backend_ax(input).expect_err("invalid scope member should fail");
+
+        assert_eq!(error, AxBackendParseError::InvalidScopeMember { line: 2 });
+    }
+
+    #[test]
+    fn rejects_invalid_scope_state() {
+        let input = r#"
+scope Layout {
+  state theme String = "silver"
+}
+"#;
+
+        let error = parse_backend_ax(input).expect_err("invalid scope state should fail");
+
+        assert_eq!(error, AxBackendParseError::InvalidScopeState { line: 3 });
+    }
+
+    #[test]
+    fn rejects_empty_scope_render() {
+        let input = r#"
+scope Layout {
+  render
+}
+"#;
+
+        let error = parse_backend_ax(input).expect_err("empty scope render should fail");
+
+        assert_eq!(error, AxBackendParseError::InvalidScopeRender { line: 3 });
     }
 
     #[test]
