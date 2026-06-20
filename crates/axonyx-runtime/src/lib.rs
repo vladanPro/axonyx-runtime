@@ -665,7 +665,14 @@ pub fn execute_preview_action_sources(
 ) -> Result<AxPreviewActionResult, PreviewError> {
     let handlers = collect_preview_handlers(&[], action_sources, &[])?;
     let env = backend::AxEnv::from_env();
-    execute_preview_action(&handlers.actions, action_name, input_fields, &env, store)
+    execute_preview_action(
+        &handlers.actions,
+        &handlers.functions,
+        action_name,
+        input_fields,
+        &env,
+        store,
+    )
 }
 
 pub fn execute_preview_route_sources(
@@ -1116,6 +1123,7 @@ fn bind_preview_function_inputs(
 
 fn execute_preview_action(
     actions: &BTreeMap<String, AxHandlerPlan>,
+    functions: &BTreeMap<String, AxFunctionPlan>,
     action_name: &str,
     input_fields: &BTreeMap<String, String>,
     env: &backend::AxEnv,
@@ -1150,11 +1158,13 @@ fn execute_preview_action(
                 binding,
                 value: plan,
             } => {
-                let evaluated = eval_preview_value(plan, &scope, env, None, store)?;
+                let evaluated =
+                    eval_preview_value_with_functions(plan, &scope, env, None, store, functions)?;
                 scope.insert(binding.clone(), evaluated);
             }
             AxStepPlan::Insert { collection, fields } => {
-                let mut record = eval_preview_fields(fields, &scope, env)?;
+                let mut record =
+                    eval_preview_fields_with_functions(fields, &scope, env, functions)?;
                 assign_preview_id(&mut record, store.collection_items(collection).len());
                 store
                     .ensure_collection(collection)
@@ -1166,8 +1176,8 @@ fn execute_preview_action(
                 fields,
                 filters,
             } => {
-                let fields = eval_preview_fields(fields, &scope, env)?;
-                let filters = eval_preview_filters(filters, &scope, env)?;
+                let fields = eval_preview_fields_with_functions(fields, &scope, env, functions)?;
+                let filters = eval_preview_filters_with_functions(filters, &scope, env, functions)?;
                 for item in store.ensure_collection(collection).iter_mut() {
                     if preview_record_matches_all(item, &filters) {
                         apply_preview_fields(item, &fields);
@@ -1179,32 +1189,45 @@ fn execute_preview_action(
                 collection,
                 filters,
             } => {
-                let filters = eval_preview_filters(filters, &scope, env)?;
+                let filters = eval_preview_filters_with_functions(filters, &scope, env, functions)?;
                 store
                     .ensure_collection(collection)
                     .retain(|item| !preview_record_matches_all(item, &filters));
                 push_preview_auto_invalidation(&mut invalidations, collection.clone());
             }
             AxStepPlan::Revalidate { target, literal } => {
-                let target = eval_preview_revalidation_target(target, *literal, &scope, env)?;
+                let target = eval_preview_revalidation_target_with_functions(
+                    target, *literal, &scope, env, functions,
+                )?;
                 if target.starts_with('/') {
                     redirect_to = Some(target.clone());
                 }
                 push_preview_explicit_invalidation(&mut invalidations, target);
             }
             AxStepPlan::Patch { signal, value } => {
-                let signal = eval_preview_expr(signal, &scope, env)?.as_string();
-                let value = eval_preview_expr(value, &scope, env)?;
+                let signal =
+                    eval_preview_expr_with_functions(signal, &scope, env, functions)?.as_string();
+                let value = eval_preview_expr_with_functions(value, &scope, env, functions)?;
                 patches.push(AxPreviewStatePatch::set(signal, value));
             }
             AxStepPlan::Require {
                 value: requirement,
                 fallback,
             } => {
-                if preview_require_passes(&eval_preview_require_expr(requirement, &scope, env)?) {
+                if preview_require_passes(&eval_preview_require_expr_with_functions(
+                    requirement,
+                    &scope,
+                    env,
+                    functions,
+                )?) {
                     continue;
                 }
-                let error = eval_preview_action_error_fallback(fallback.as_ref(), &scope, env)?;
+                let error = eval_preview_action_error_fallback_with_functions(
+                    fallback.as_ref(),
+                    &scope,
+                    env,
+                    functions,
+                )?;
                 return Ok(AxPreviewActionResult {
                     redirect_to,
                     value,
@@ -1214,7 +1237,7 @@ fn execute_preview_action(
                 });
             }
             AxStepPlan::Return(result) => {
-                value = eval_preview_return(result, &scope, env)?;
+                value = eval_preview_return_with_functions(result, &scope, env, functions)?;
             }
             AxStepPlan::Header { .. }
             | AxStepPlan::Hook { .. }
@@ -1514,7 +1537,17 @@ fn eval_preview_require_expr(
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
 ) -> Result<AxValue, PreviewError> {
-    match eval_preview_expr(expr, scope, env) {
+    let functions = BTreeMap::new();
+    eval_preview_require_expr_with_functions(expr, scope, env, &functions)
+}
+
+fn eval_preview_require_expr_with_functions(
+    expr: &AxRustExpr,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
+) -> Result<AxValue, PreviewError> {
+    match eval_preview_expr_with_functions(expr, scope, env, functions) {
         Ok(value) => Ok(value),
         Err(_error) if expr.code.trim().starts_with("request.") => {
             Ok(AxValue::String(String::new()))
@@ -1534,18 +1567,19 @@ fn preview_require_passes(value: &AxValue) -> bool {
     }
 }
 
-fn eval_preview_action_error_fallback(
+fn eval_preview_action_error_fallback_with_functions(
     fallback: Option<&AxReturnPlan>,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<AxPreviewActionError, PreviewError> {
     let value = match fallback {
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
-            eval_preview_expr(expr, scope, env)?
+            eval_preview_expr_with_functions(expr, scope, env, functions)?
         }
-        Some(AxReturnPlan::Redirect { target, .. }) => {
-            AxValue::String(eval_preview_expr(target, scope, env)?.as_string())
-        }
+        Some(AxReturnPlan::Redirect { target, .. }) => AxValue::String(
+            eval_preview_expr_with_functions(target, scope, env, functions)?.as_string(),
+        ),
         Some(AxReturnPlan::Ok) | Some(AxReturnPlan::NoContent) | None => {
             AxValue::String("Action requirement failed.".to_string())
         }
@@ -1585,15 +1619,6 @@ fn eval_preview_value_with_functions(
         AxValuePlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
         AxValuePlan::Query(query) => eval_preview_query(query, scope, env, runtime, store),
     }
-}
-
-fn eval_preview_return(
-    value: &AxReturnPlan,
-    scope: &BTreeMap<String, AxValue>,
-    env: &backend::AxEnv,
-) -> Result<AxValue, PreviewError> {
-    let functions = BTreeMap::new();
-    eval_preview_return_with_functions(value, scope, env, &functions)
 }
 
 fn eval_preview_return_with_functions(
@@ -1939,18 +1964,19 @@ fn eval_preview_expr_with_functions(
     })
 }
 
-fn eval_preview_revalidation_target(
+fn eval_preview_revalidation_target_with_functions(
     expr: &AxRustExpr,
     literal: bool,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<String, PreviewError> {
     let code = expr.code.trim();
     if literal && is_preview_identifier(code) {
         return Ok(code.to_string());
     }
 
-    Ok(eval_preview_expr(expr, scope, env)?.as_string())
+    Ok(eval_preview_expr_with_functions(expr, scope, env, functions)?.as_string())
 }
 
 fn push_preview_auto_invalidation(
@@ -2102,12 +2128,22 @@ fn eval_preview_fields(
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
 ) -> Result<BTreeMap<String, AxValue>, PreviewError> {
+    let functions = BTreeMap::new();
+    eval_preview_fields_with_functions(fields, scope, env, &functions)
+}
+
+fn eval_preview_fields_with_functions(
+    fields: &[axonyx_core::ax_backend_lowering_prelude::AxAssignmentPlan],
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
+) -> Result<BTreeMap<String, AxValue>, PreviewError> {
     let mut map = BTreeMap::new();
 
     for field in fields {
         map.insert(
             field.name.clone(),
-            eval_preview_expr(&field.value, scope, env)?,
+            eval_preview_expr_with_functions(&field.value, scope, env, functions)?,
         );
     }
 
@@ -2119,13 +2155,23 @@ fn eval_preview_filters(
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
 ) -> Result<Vec<PreviewFilter>, PreviewError> {
+    let functions = BTreeMap::new();
+    eval_preview_filters_with_functions(filters, scope, env, &functions)
+}
+
+fn eval_preview_filters_with_functions(
+    filters: &[axonyx_core::ax_backend_lowering_prelude::AxQueryFilterPlan],
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
+) -> Result<Vec<PreviewFilter>, PreviewError> {
     filters
         .iter()
         .map(|filter| {
             Ok(PreviewFilter {
                 field: filter.field.clone(),
                 op: filter.op,
-                value: eval_preview_expr(&filter.value, scope, env)?,
+                value: eval_preview_expr_with_functions(&filter.value, scope, env, functions)?,
             })
         })
         .collect()
@@ -5042,6 +5088,48 @@ action CreatePost
                 query_key: vec!["posts".to_string()],
             }]
         );
+    }
+
+    #[test]
+    fn preview_action_can_use_pure_domain_helpers() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+fn normalizeTitle(title: String) -> String
+  return title
+
+fn isSupportedStatus(status: String) -> bool
+  data statuses = ["draft", "published"]
+  return contains(statuses, status)
+
+action createPost(title: string, status: string) -> Post {
+  data normalizedTitle = normalizeTitle(input.title)
+  require isSupportedStatus(input.status) else error "Status is not supported."
+
+  insert posts
+    title: normalizedTitle
+    status: input.status
+
+  revalidate "/posts"
+  return ok
+}
+"#],
+            "createPost",
+            &BTreeMap::from([
+                ("title".to_string(), "Domain Action".to_string()),
+                ("status".to_string(), "published".to_string()),
+            ]),
+            &mut store,
+        )
+        .expect("action should execute with domain helpers");
+
+        assert!(result.error.is_none());
+        assert_eq!(result.redirect_to.as_deref(), Some("/posts"));
+        let posts = store.collection_items("posts");
+        assert!(posts.iter().any(|post| {
+            preview_record_field(post, "title")
+                == Some(&AxValue::String("Domain Action".to_string()))
+        }));
     }
 
     #[test]
