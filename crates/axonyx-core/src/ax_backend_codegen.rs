@@ -7,6 +7,10 @@ use crate::ax_backend_parser::{parse_backend_ax, AxBackendParseError};
 pub enum AxBackendCodegenError {
     #[error("route path is required to generate a route handler")]
     MissingRoutePath,
+    #[error("domain helper `{function}` parameter `{field}` cannot be optional or defaulted yet")]
+    UnsupportedFunctionDefaultInput { function: String, field: String },
+    #[error("domain helper `{function}` cannot use query-backed data binding `{binding}` yet")]
+    UnsupportedFunctionQueryBinding { function: String, binding: String },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -53,7 +57,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("}\n\n");
 
     for function in &plan.functions {
-        out.push_str(&render_function_fn(function));
+        out.push_str(&render_function_fn(function)?);
         out.push('\n');
     }
 
@@ -70,7 +74,16 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     Ok(out)
 }
 
-fn render_function_fn(function: &AxFunctionPlan) -> String {
+fn render_function_fn(function: &AxFunctionPlan) -> Result<String, AxBackendCodegenError> {
+    for field in &function.input {
+        if field.optional || field.default.is_some() {
+            return Err(AxBackendCodegenError::UnsupportedFunctionDefaultInput {
+                function: function.name.clone(),
+                field: field.name.clone(),
+            });
+        }
+    }
+
     let params = function
         .input
         .iter()
@@ -85,7 +98,7 @@ fn render_function_fn(function: &AxFunctionPlan) -> String {
 
     let mut out = format!("pub fn {}({params}) -> {returns} {{\n", function.name);
     for step in &function.steps {
-        out.push_str(&render_function_step(step, &returns));
+        out.push_str(&render_function_step(step, &returns, &function.name)?);
     }
     if !function
         .steps
@@ -95,26 +108,35 @@ fn render_function_fn(function: &AxFunctionPlan) -> String {
         out.push_str(&format!("    {}\n", default_function_return_expr(&returns)));
     }
     out.push_str("}\n");
-    out
+    Ok(out)
 }
 
-fn render_function_step(step: &AxStepPlan, returns: &str) -> String {
+fn render_function_step(
+    step: &AxStepPlan,
+    returns: &str,
+    function: &str,
+) -> Result<String, AxBackendCodegenError> {
     match step {
-        AxStepPlan::Let { binding, value } => {
-            format!(
-                "    let {binding} = {};\n",
-                render_function_value_plan(value)
-            )
-        }
-        AxStepPlan::Return(value) => render_function_return(value, returns),
-        other => format!("    // unsupported domain fn step: {other:?}\n"),
+        AxStepPlan::Let { binding, value } => Ok(format!(
+            "    let {binding} = {};\n",
+            render_function_value_plan(value, function, binding)?
+        )),
+        AxStepPlan::Return(value) => Ok(render_function_return(value, returns)),
+        other => Ok(format!("    // unsupported domain fn step: {other:?}\n")),
     }
 }
 
-fn render_function_value_plan(value: &AxValuePlan) -> String {
+fn render_function_value_plan(
+    value: &AxValuePlan,
+    function: &str,
+    binding: &str,
+) -> Result<String, AxBackendCodegenError> {
     match value {
-        AxValuePlan::Expr(expr) => render_owned_expr(expr),
-        AxValuePlan::Query(_) => "Value::Null".to_string(),
+        AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
+        AxValuePlan::Query(_) => Err(AxBackendCodegenError::UnsupportedFunctionQueryBinding {
+            function: function.to_string(),
+            binding: binding.to_string(),
+        }),
     }
 }
 
@@ -932,6 +954,51 @@ loader PostsList
         assert!(module.contains("return (status).to_string();"));
         assert!(
             module.contains(r#"let status = json!(&normalizeStatus("published".to_string()));"#)
+        );
+    }
+
+    #[test]
+    fn rejects_optional_domain_function_params_until_default_call_lowering_exists() {
+        let error = compile_backend_ax_to_module(
+            r#"
+export fn normalizeStatus(status?: String) -> String {
+  return status
+}
+"#,
+        )
+        .expect_err("optional helper params should be rejected for now");
+
+        assert_eq!(
+            error,
+            AxBackendCompileError::Codegen(
+                AxBackendCodegenError::UnsupportedFunctionDefaultInput {
+                    function: "normalizeStatus".to_string(),
+                    field: "status".to_string(),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn rejects_query_backed_data_inside_domain_functions() {
+        let error = compile_backend_ax_to_module(
+            r#"
+export fn loadPublishedPosts() -> Value {
+  data posts = db.posts.all()
+  return posts
+}
+"#,
+        )
+        .expect_err("query-backed helper data should be rejected for now");
+
+        assert_eq!(
+            error,
+            AxBackendCompileError::Codegen(
+                AxBackendCodegenError::UnsupportedFunctionQueryBinding {
+                    function: "loadPublishedPosts".to_string(),
+                    binding: "posts".to_string(),
+                }
+            )
         );
     }
 
