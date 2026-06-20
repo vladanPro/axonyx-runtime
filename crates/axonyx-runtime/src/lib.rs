@@ -1617,7 +1617,9 @@ fn eval_preview_value_with_functions(
 ) -> Result<AxValue, PreviewError> {
     match value {
         AxValuePlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
-        AxValuePlan::Query(query) => eval_preview_query(query, scope, env, runtime, store),
+        AxValuePlan::Query(query) => {
+            eval_preview_query_with_functions(query, scope, env, runtime, store, functions)
+        }
     }
 }
 
@@ -1689,24 +1691,26 @@ fn apply_preview_response_metadata(
     response
 }
 
-fn eval_preview_query(
+fn eval_preview_query_with_functions(
     query: &AxQueryPlan,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
     runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &AxPreviewStore,
+    functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<AxValue, PreviewError> {
     if let Some(runtime) = runtime {
         match &query.source {
             AxQuerySourcePlan::Stream { collection } => {
-                let request = preview_query_to_runtime_request(collection, query, scope, env)?;
+                let request =
+                    preview_query_to_runtime_request(collection, query, scope, env, functions)?;
                 return Ok(preview_json_to_value(runtime.load(&request)?));
             }
             AxQuerySourcePlan::RawSql { sql, params } => {
                 let params = params
                     .iter()
                     .map(|param| {
-                        eval_preview_expr(param, scope, env)
+                        eval_preview_expr_with_functions(param, scope, env, functions)
                             .map(|value| preview_value_to_json(&value))
                     })
                     .collect::<Result<Vec<_>, _>>()?;
@@ -1729,7 +1733,7 @@ fn eval_preview_query(
     let mut items = store.collection_items(collection);
 
     for filter in &query.filters {
-        let expected = eval_preview_expr(&filter.value, scope, env)?;
+        let expected = eval_preview_expr_with_functions(&filter.value, scope, env, functions)?;
         items.retain(|item| preview_record_matches(item, &filter.field, filter.op, &expected));
     }
 
@@ -1765,6 +1769,7 @@ fn preview_query_to_runtime_request(
     query: &AxQueryPlan,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<backend::AxQueryRequest, PreviewError> {
     Ok(backend::AxQueryRequest {
         collection: collection.to_string(),
@@ -1775,7 +1780,12 @@ fn preview_query_to_runtime_request(
                 Ok(backend::AxQueryFilterRequest {
                     field: filter.field.clone(),
                     op: preview_filter_op_to_runtime(filter.op),
-                    value: preview_value_to_json(&eval_preview_expr(&filter.value, scope, env)?),
+                    value: preview_value_to_json(&eval_preview_expr_with_functions(
+                        &filter.value,
+                        scope,
+                        env,
+                        functions,
+                    )?),
                 })
             })
             .collect::<Result<Vec<_>, PreviewError>>()?,
@@ -5156,6 +5166,33 @@ action SetTheme(theme: string) {
         assert!(result.error.is_none());
         assert_eq!(result.patches.len(), 1);
         assert_eq!(result.patches[0].value, AxValue::String("gold".to_string()));
+    }
+
+    #[test]
+    fn preview_action_query_data_can_use_domain_helpers() {
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_sources(
+            &[r#"
+fn normalizeStatus(status: String) -> String
+  return status
+
+action LoadMatchingPosts(status: string) {
+  data posts = db.posts.all()
+    where status = normalizeStatus(input.status)
+
+  return posts
+}
+"#],
+            "LoadMatchingPosts",
+            &BTreeMap::from([("status".to_string(), "published".to_string())]),
+            &mut store,
+        )
+        .expect("query-backed action data should execute with domain helpers");
+
+        let AxValue::List(posts) = result.value else {
+            panic!("expected action to return posts");
+        };
+        assert_eq!(posts.len(), 2);
     }
 
     #[test]
