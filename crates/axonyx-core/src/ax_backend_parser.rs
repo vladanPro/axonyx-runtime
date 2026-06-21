@@ -121,36 +121,46 @@ impl Parser {
             return Err(AxBackendParseError::MissingImportFrom { line: line.line });
         };
         let bindings = bindings.trim();
-        if !bindings.starts_with('{') || !bindings.ends_with('}') {
-            return Err(AxBackendParseError::InvalidImport { line: line.line });
-        }
-
-        let inner = bindings
-            .trim_start_matches('{')
-            .trim_end_matches('}')
-            .trim();
-        if inner.is_empty() {
-            return Err(AxBackendParseError::EmptyImportList { line: line.line });
-        }
-
-        let mut parsed_bindings = Vec::new();
-        for binding in split_top_level_commas(inner) {
-            let binding = binding.trim();
-            if binding.is_empty() {
+        let parsed_bindings = if let Some(local) = bindings.strip_prefix("* as ") {
+            let local = local.trim();
+            if !is_backend_identifier(local) {
                 return Err(AxBackendParseError::InvalidImport { line: line.line });
             }
 
-            let (imported, local) =
-                if let Some((imported, local)) = split_top_level_once(binding, " as ") {
-                    (imported.trim(), local.trim())
-                } else {
-                    (binding, binding)
-                };
-            if !is_backend_identifier(imported) || !is_backend_identifier(local) {
+            vec![AxBackendImportBinding::namespace(local)]
+        } else {
+            if !bindings.starts_with('{') || !bindings.ends_with('}') {
                 return Err(AxBackendParseError::InvalidImport { line: line.line });
             }
-            parsed_bindings.push(AxBackendImportBinding::new(imported, local));
-        }
+
+            let inner = bindings
+                .trim_start_matches('{')
+                .trim_end_matches('}')
+                .trim();
+            if inner.is_empty() {
+                return Err(AxBackendParseError::EmptyImportList { line: line.line });
+            }
+
+            let mut parsed_bindings = Vec::new();
+            for binding in split_top_level_commas(inner) {
+                let binding = binding.trim();
+                if binding.is_empty() {
+                    return Err(AxBackendParseError::InvalidImport { line: line.line });
+                }
+
+                let (imported, local) =
+                    if let Some((imported, local)) = split_top_level_once(binding, " as ") {
+                        (imported.trim(), local.trim())
+                    } else {
+                        (binding, binding)
+                    };
+                if !is_backend_identifier(imported) || !is_backend_identifier(local) {
+                    return Err(AxBackendParseError::InvalidImport { line: line.line });
+                }
+                parsed_bindings.push(AxBackendImportBinding::new(imported, local));
+            }
+            parsed_bindings
+        };
 
         let source = trim_quotes(source.trim());
         if source.is_empty() {
@@ -1802,6 +1812,25 @@ export query loadPosts(status?: String) -> Post[] {
             panic!("expected query loader block");
         };
         assert!(loader.exported);
+    }
+
+    #[test]
+    fn parses_backend_namespace_imports_before_blocks() {
+        let input = r#"
+import * as Domain from "./domain.ax"
+
+scope Blog <Domain> {
+  render BlogPage()
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("namespace import should parse");
+
+        assert_eq!(document.imports.len(), 1);
+        assert_eq!(document.imports[0].source, "./domain.ax");
+        assert_eq!(document.imports[0].bindings.len(), 1);
+        assert!(document.imports[0].bindings[0].is_namespace());
+        assert_eq!(document.imports[0].bindings[0].local, "Domain");
     }
 
     #[test]
