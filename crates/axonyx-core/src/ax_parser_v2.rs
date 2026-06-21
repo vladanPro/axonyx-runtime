@@ -174,6 +174,32 @@ impl<'a> Parser<'a> {
             .map_err(|_| AxParseV2Error::InvalidImport { line })?;
         self.skip_spaces();
 
+        if self.peek_char() == Some('*') {
+            self.bump_char();
+            self.skip_spaces();
+            self.expect_keyword("as")
+                .map_err(|_| AxParseV2Error::InvalidImport { line })?;
+            self.skip_spaces();
+            let local = self
+                .parse_identifier()
+                .map_err(|_| AxParseV2Error::InvalidImport { line })?;
+            self.skip_spaces();
+            if !self.starts_with_keyword("from") {
+                return Err(AxParseV2Error::MissingImportFrom { line });
+            }
+            self.expect_keyword("from")
+                .map_err(|_| AxParseV2Error::MissingImportFrom { line })?;
+            self.skip_spaces();
+
+            let source = self.parse_string_literal()?;
+            self.consume_until_line_end();
+
+            return Ok(AxImportDecl::new(
+                [AxImportBinding::namespace(local)],
+                source,
+            ));
+        }
+
         if self.peek_char() != Some('{') {
             return Err(AxParseV2Error::InvalidImport { line });
         }
@@ -1734,6 +1760,25 @@ page Home
 
         let error = parse_ax_v2(input).expect_err("parse should fail");
         assert_eq!(error, AxParseV2Error::MissingImportFrom { line: 2 });
+    }
+
+    #[test]
+    fn parses_namespace_imports() {
+        let input = r#"
+import * as Domain from "./domain.ax"
+
+page Home
+
+<Copy>Home</Copy>
+"#;
+
+        let file = parse_ax_v2(input).expect("namespace import should parse");
+
+        assert_eq!(file.imports.len(), 1);
+        assert_eq!(file.imports[0].source, "./domain.ax");
+        assert_eq!(file.imports[0].bindings.len(), 1);
+        assert!(file.imports[0].bindings[0].is_namespace());
+        assert_eq!(file.imports[0].bindings[0].local, "Domain");
     }
 
     #[test]

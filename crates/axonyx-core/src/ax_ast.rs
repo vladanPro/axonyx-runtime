@@ -53,12 +53,23 @@ impl AxImportBinding {
         }
     }
 
+    pub fn namespace(local: impl Into<String>) -> Self {
+        Self {
+            imported: "*".to_string(),
+            local: local.into(),
+        }
+    }
+
     pub fn named(name: impl Into<String>) -> Self {
         let name = name.into();
         Self {
             imported: name.clone(),
             local: name,
         }
+    }
+
+    pub fn is_namespace(&self) -> bool {
+        self.imported == "*"
     }
 }
 
