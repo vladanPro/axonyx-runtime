@@ -51,6 +51,8 @@ pub enum AxConvertV2Error {
     HeadValueInvalidChild { tag: String },
     #[error("`<{tag}>` inside `<Head>` only supports attributes for now")]
     HeadTagChildrenNotSupported { tag: String },
+    #[error("`{first}` and `{second}` both map to class; use only one class attribute")]
+    DuplicateClassAttr { first: String, second: String },
     #[error(
         "invalid state initializer `{expr_source}`; expected a literal value or `signal(...)`"
     )]
@@ -94,10 +96,11 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
     let state_bindings = collect_state_bindings(file)?;
 
     for binding in &file.lets {
-        body.push(AxStatement::data(
-            binding.name.clone(),
-            parse_v2_expr(&binding.value)?,
-        ));
+        let mut value = parse_v2_expr(&binding.value)?;
+        if let Some(source_field) = &binding.source_field {
+            value = value.member(source_field.clone());
+        }
+        body.push(AxStatement::data(binding.name.clone(), value));
     }
 
     for binding in &file.states {
@@ -308,13 +311,23 @@ fn convert_element(
     }
 
     let mut component = AxComponent::new(element.name.clone());
+    let mut class_attr_seen: Option<&str> = None;
 
     for attr in &element.attrs {
         match attr.name.as_str() {
             name if name.starts_with("bind:") => {
                 component = apply_state_binding_attr(component, attr, state_bindings)?;
             }
-            "class" => component = component.class(convert_attr_value(&attr.value)?),
+            "class" | "className" => {
+                if let Some(first) = class_attr_seen {
+                    return Err(AxConvertV2Error::DuplicateClassAttr {
+                        first: first.to_string(),
+                        second: attr.name.clone(),
+                    });
+                }
+                class_attr_seen = Some(attr.name.as_str());
+                component = component.class(convert_attr_value(&attr.value)?);
+            }
             "recipe" => component = component.recipe(convert_attr_value(&attr.value)?),
             _ => component = component.prop(attr.name.clone(), convert_attr_value(&attr.value)?),
         }
@@ -796,6 +809,55 @@ page Card(title = "Untitled")
     }
 
     #[test]
+    fn converts_class_name_attr_into_runtime_class_style() {
+        let document = parse_ax_auto(
+            r#"
+page Home()
+{
+  const heroClass = "hero-shell"
+
+  return ASX {
+    <section className={heroClass}>Hello</section>
+  }
+}
+"#,
+        )
+        .expect("className should convert");
+
+        let AxStatement::Component(section) = &document.page.body[1] else {
+            panic!("section should convert into component statement");
+        };
+
+        assert_eq!(section.name, "section");
+        assert_eq!(section.style.class, Some(AxExpr::ident("heroClass")));
+        assert!(section.props.iter().all(|prop| prop.name != "className"));
+    }
+
+    #[test]
+    fn rejects_mixed_class_and_class_name_attrs() {
+        let error = parse_ax_auto(
+            r#"
+page Home()
+{
+  return ASX {
+    <section class="hero" className="panel">Hello</section>
+  }
+}
+"#,
+        )
+        .expect_err("class and className should not be mixed");
+
+        let AxAutoParseError::Convert(AxConvertV2Error::DuplicateClassAttr { first, second }) =
+            error
+        else {
+            panic!("expected duplicate class attr error, got {error:?}");
+        };
+
+        assert_eq!(first, "class");
+        assert_eq!(second, "className");
+    }
+
+    #[test]
     fn converts_v2_head_block_into_document_head() {
         let document = parse_ax_auto(
             r#"
@@ -1002,6 +1064,68 @@ page Home() -> ASX {
         assert_eq!(
             document.page.body[0],
             AxStatement::data("title", AxExpr::string("Hello Axonyx"))
+        );
+    }
+
+    #[test]
+    fn converts_destructured_data_bindings_to_member_bindings() {
+        let document = parse_ax_auto(
+            r#"
+page Dashboard() {
+  data { posts, total: count } = loadDashboard("published")
+
+  return ASX {
+    <Copy>{count}</Copy>
+  }
+}
+"#,
+        )
+        .expect("destructured data should convert");
+
+        assert_eq!(
+            document.page.body[0],
+            AxStatement::data(
+                "posts",
+                AxExpr::call(["loadDashboard"], [AxExpr::string("published")]).member("posts"),
+            )
+        );
+        assert_eq!(
+            document.page.body[1],
+            AxStatement::data(
+                "count",
+                AxExpr::call(["loadDashboard"], [AxExpr::string("published")]).member("total"),
+            )
+        );
+    }
+
+    #[test]
+    fn converts_const_declarations_to_render_local_data_bindings() {
+        let document = parse_ax_auto(
+            r#"
+page Posts() {
+  data posts = loadPosts()
+  const hasPosts = posts.length > 0
+
+  return ASX {
+    <If when={hasPosts}>
+      <Copy>Ready</Copy>
+    </If>
+  }
+}
+"#,
+        )
+        .expect("const declaration should convert");
+
+        assert_eq!(
+            document.page.body[1],
+            AxStatement::data(
+                "hasPosts",
+                AxExpr::binary(
+                    AxBinaryOp::Gt,
+                    AxExpr::ident("posts").member("length"),
+                    AxExpr::number(0),
+                ),
+            )
         );
     }
 

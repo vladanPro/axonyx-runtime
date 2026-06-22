@@ -102,6 +102,7 @@ impl<'a> Parser<'a> {
         let mut components = Vec::new();
         while self.starts_with_keyword("type")
             || self.starts_with_keyword("let")
+            || self.starts_with_keyword("const")
             || self.starts_with_keyword("data")
             || self.is_state_decl_start()
             || self.starts_with_keyword("fn")
@@ -109,8 +110,11 @@ impl<'a> Parser<'a> {
         {
             if self.starts_with_keyword("type") {
                 types.push(self.parse_type_decl()?);
-            } else if self.starts_with_keyword("let") || self.starts_with_keyword("data") {
-                lets.push(self.parse_let_or_data_decl()?);
+            } else if self.starts_with_keyword("let")
+                || self.starts_with_keyword("const")
+                || self.starts_with_keyword("data")
+            {
+                lets.extend(self.parse_let_or_data_decls()?);
             } else if self.is_state_decl_start() {
                 states.push(self.parse_state_decl()?);
             } else if self.starts_with_keyword("fn") {
@@ -351,16 +355,23 @@ impl<'a> Parser<'a> {
         self.parse_nodes_until_component_body_end()
     }
 
-    fn parse_let_or_data_decl(&mut self) -> Result<AxLetDeclV2, AxParseV2Error> {
+    fn parse_let_or_data_decls(&mut self) -> Result<Vec<AxLetDeclV2>, AxParseV2Error> {
         let line = self.line;
         if self.starts_with_keyword("let") {
             self.expect_keyword("let")
+                .map_err(|_| AxParseV2Error::InvalidLet { line })?;
+        } else if self.starts_with_keyword("const") {
+            self.expect_keyword("const")
                 .map_err(|_| AxParseV2Error::InvalidLet { line })?;
         } else {
             self.expect_keyword("data")
                 .map_err(|_| AxParseV2Error::InvalidLet { line })?;
         }
         self.skip_spaces();
+
+        if self.peek_char() == Some('{') {
+            return self.parse_destructured_data_decl(line);
+        }
 
         let name = self.parse_identifier()?;
         self.skip_spaces();
@@ -394,10 +405,93 @@ impl<'a> Parser<'a> {
             return Err(AxParseV2Error::InvalidLet { line });
         }
 
-        Ok(match ty {
+        Ok(vec![match ty {
             Some(ty) => AxLetDeclV2::typed(name, ty, value),
             None => AxLetDeclV2::new(name, value),
-        })
+        }])
+    }
+
+    fn parse_destructured_data_decl(
+        &mut self,
+        line: usize,
+    ) -> Result<Vec<AxLetDeclV2>, AxParseV2Error> {
+        let pattern = self.read_balanced_braced_pattern(line)?;
+        self.skip_spaces();
+
+        if self.peek_char() != Some('=') {
+            return Err(AxParseV2Error::InvalidLet { line });
+        }
+        self.bump_char();
+        self.skip_spaces();
+
+        let value = self
+            .read_until_line_end()
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        if value.is_empty() {
+            return Err(AxParseV2Error::InvalidLet { line });
+        }
+
+        let fields = parse_destructured_fields(&pattern, line)?;
+        if fields.is_empty() {
+            return Err(AxParseV2Error::InvalidLet { line });
+        }
+
+        Ok(fields
+            .into_iter()
+            .map(|(name, field)| AxLetDeclV2::destructured(name, field, value.clone()))
+            .collect())
+    }
+
+    fn read_balanced_braced_pattern(&mut self, line: usize) -> Result<String, AxParseV2Error> {
+        if self.peek_char() != Some('{') {
+            return Err(AxParseV2Error::InvalidLet { line });
+        }
+
+        self.bump_char();
+        let start = self.pos;
+        let mut depth = 1usize;
+        let mut string_quote = None;
+
+        while let Some(ch) = self.peek_char() {
+            if let Some(quote) = string_quote {
+                self.bump_char();
+                if ch == '\\' {
+                    self.bump_char();
+                } else if ch == quote {
+                    string_quote = None;
+                }
+                continue;
+            }
+
+            match ch {
+                '"' | '\'' => {
+                    string_quote = Some(ch);
+                    self.bump_char();
+                }
+                '{' => {
+                    depth += 1;
+                    self.bump_char();
+                }
+                '}' => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        let value = self.input[start..self.pos].to_string();
+                        self.bump_char();
+                        return Ok(value);
+                    }
+                    self.bump_char();
+                }
+                '\n' | '\r' => return Err(AxParseV2Error::InvalidLet { line }),
+                _ => {
+                    self.bump_char();
+                }
+            }
+        }
+
+        Err(AxParseV2Error::InvalidLet { line })
     }
 
     fn parse_state_decl(&mut self) -> Result<AxStateDeclV2, AxParseV2Error> {
@@ -1239,6 +1333,93 @@ fn normalize_text(raw: &str) -> Option<String> {
     }
 }
 
+fn parse_destructured_fields(
+    pattern: &str,
+    line: usize,
+) -> Result<Vec<(String, String)>, AxParseV2Error> {
+    split_destructure_parts(pattern, ',', line)?
+        .into_iter()
+        .map(|part| {
+            let segments = split_destructure_parts(part, ':', line)?;
+            match segments.as_slice() {
+                [field] => {
+                    let field = field.trim();
+                    if !is_ax_identifier(field) {
+                        return Err(AxParseV2Error::InvalidLet { line });
+                    }
+                    Ok((field.to_string(), field.to_string()))
+                }
+                [field, local] => {
+                    let field = field.trim();
+                    let local = local.trim();
+                    if !is_ax_identifier(field) || !is_ax_identifier(local) {
+                        return Err(AxParseV2Error::InvalidLet { line });
+                    }
+                    Ok((local.to_string(), field.to_string()))
+                }
+                _ => Err(AxParseV2Error::InvalidLet { line }),
+            }
+        })
+        .collect()
+}
+
+fn split_destructure_parts(
+    input: &str,
+    separator: char,
+    line: usize,
+) -> Result<Vec<&str>, AxParseV2Error> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut string_quote = None;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    for (index, ch) in input.char_indices() {
+        if let Some(quote) = string_quote {
+            if ch == quote {
+                string_quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => string_quote = Some(ch),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ch if ch == separator && paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                let part = input[start..index].trim();
+                if part.is_empty() {
+                    return Err(AxParseV2Error::InvalidLet { line });
+                }
+                parts.push(part);
+                start = index + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    let part = input[start..].trim();
+    if part.is_empty() {
+        return Err(AxParseV2Error::InvalidLet { line });
+    }
+    parts.push(part);
+    Ok(parts)
+}
+
+fn is_ax_identifier(input: &str) -> bool {
+    let mut chars = input.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+}
+
 pub mod prelude {
     pub use super::parse_ax_v2;
     pub use super::AxParseV2Error;
@@ -1515,6 +1696,77 @@ data posts: List<Post> = loadPosts()
             file.lets[0],
             AxLetDeclV2::typed("posts", "List<Post>", "loadPosts()")
         );
+    }
+
+    #[test]
+    fn parses_const_declarations_before_asx_return() {
+        let input = r#"
+page Posts() {
+  data posts = loadPosts()
+  const hasPosts = posts.length > 0
+  const title: String = "Posts"
+
+  return ASX {
+    <If when={hasPosts}>
+      <Copy>{title}</Copy>
+    </If>
+  }
+}
+"#;
+
+        let file = parse_ax_v2(input).expect("const declarations should parse");
+
+        assert_eq!(file.lets[0], AxLetDeclV2::new("posts", "loadPosts()"));
+        assert_eq!(
+            file.lets[1],
+            AxLetDeclV2::new("hasPosts", "posts.length > 0")
+        );
+        assert_eq!(
+            file.lets[2],
+            AxLetDeclV2::typed("title", "String", r#""Posts""#)
+        );
+    }
+
+    #[test]
+    fn parses_destructured_data_declarations() {
+        let input = r#"
+page Dashboard()
+{
+  data { posts, total: count } = loadDashboard("published")
+
+  return ASX {
+    <Copy>{count}</Copy>
+  }
+}
+"#;
+
+        let file = parse_ax_v2(input).expect("destructured data declaration should parse");
+
+        assert_eq!(
+            file.lets,
+            vec![
+                AxLetDeclV2::destructured("posts", "posts", r#"loadDashboard("published")"#),
+                AxLetDeclV2::destructured("count", "total", r#"loadDashboard("published")"#),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_nested_destructured_data_declarations_for_now() {
+        let input = r#"
+page Dashboard()
+{
+  data { author: { name } } = loadDashboard()
+
+  return ASX {
+    <Copy>{name}</Copy>
+  }
+}
+"#;
+
+        let error = parse_ax_v2(input).expect_err("nested destructuring is not supported yet");
+
+        assert!(matches!(error, AxParseV2Error::InvalidLet { .. }));
     }
 
     #[test]
