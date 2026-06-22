@@ -128,6 +128,7 @@ pub struct AxLetDeclV2 {
     pub name: String,
     pub ty: Option<String>,
     pub value: String,
+    pub source_field: Option<String>,
 }
 
 impl AxLetDeclV2 {
@@ -136,6 +137,7 @@ impl AxLetDeclV2 {
             name: name.into(),
             ty: None,
             value: value.into(),
+            source_field: None,
         }
     }
 
@@ -144,6 +146,20 @@ impl AxLetDeclV2 {
             name: name.into(),
             ty: Some(ty.into()),
             value: value.into(),
+            source_field: None,
+        }
+    }
+
+    pub fn destructured(
+        name: impl Into<String>,
+        source_field: impl Into<String>,
+        value: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            ty: None,
+            value: value.into(),
+            source_field: Some(source_field.into()),
         }
     }
 }

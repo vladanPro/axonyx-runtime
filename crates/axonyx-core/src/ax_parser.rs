@@ -918,9 +918,8 @@ fn outer_parens_wrap(input: &str) -> bool {
 
 fn parse_member_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
     let mut cursor = input.trim();
-    let first_end = cursor
-        .find(['.', '?'])
-        .ok_or_else(|| AxParseError::InvalidExpression {
+    let first_end =
+        find_top_level_member_separator(cursor).ok_or_else(|| AxParseError::InvalidExpression {
             line,
             message: format!("invalid member expression `{input}`"),
         })?;
@@ -932,7 +931,7 @@ fn parse_member_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
         });
     }
 
-    let mut expr = AxExpr::ident(first);
+    let mut expr = parse_primary_expr(first, line)?;
     cursor = &cursor[first_end..];
 
     while !cursor.is_empty() {
@@ -949,7 +948,7 @@ fn parse_member_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
             });
         };
 
-        let next_separator = cursor.find(['.', '?']).unwrap_or(cursor.len());
+        let next_separator = find_top_level_member_separator(cursor).unwrap_or(cursor.len());
         let property = cursor[..next_separator].trim();
         if property.is_empty() {
             return Err(AxParseError::InvalidExpression {
@@ -967,6 +966,46 @@ fn parse_member_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
     }
 
     Ok(expr)
+}
+
+fn find_top_level_member_separator(input: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+    let mut escaped = false;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
+                    in_string = None;
+                }
+                continue;
+            }
+            None => match ch {
+                '"' | '\'' => {
+                    in_string = Some(ch);
+                    continue;
+                }
+                '(' | '[' | '{' => {
+                    depth += 1;
+                    continue;
+                }
+                ')' | ']' | '}' => {
+                    depth = depth.saturating_sub(1);
+                    continue;
+                }
+                '.' if depth == 0 => return Some(index),
+                '?' if depth == 0 && input[index..].starts_with("?.") => return Some(index),
+                _ => {}
+            },
+        }
+    }
+
+    None
 }
 
 fn parse_quoted_string(input: &str, line: usize) -> Result<Option<String>, AxParseError> {
@@ -1382,6 +1421,13 @@ page Home
                 AxExpr::string("home"),
             )
         );
+    }
+
+    #[test]
+    fn parses_call_member_expression() {
+        let expr = parse_expr("loadDashboard().posts", 1).expect("call member should parse");
+
+        assert_eq!(expr, AxExpr::call(["loadDashboard"], []).member("posts"));
     }
 
     #[test]
