@@ -315,7 +315,7 @@ fn convert_element(
             name if name.starts_with("bind:") => {
                 component = apply_state_binding_attr(component, attr, state_bindings)?;
             }
-            "class" => component = component.class(convert_attr_value(&attr.value)?),
+            "class" | "className" => component = component.class(convert_attr_value(&attr.value)?),
             "recipe" => component = component.recipe(convert_attr_value(&attr.value)?),
             _ => component = component.prop(attr.name.clone(), convert_attr_value(&attr.value)?),
         }
@@ -794,6 +794,31 @@ page Card(title = "Untitled")
                 AxExpr::string("Untitled")
             )]
         );
+    }
+
+    #[test]
+    fn converts_class_name_attr_into_runtime_class_style() {
+        let document = parse_ax_auto(
+            r#"
+page Home()
+{
+  const heroClass = "hero-shell"
+
+  return ASX {
+    <section className={heroClass}>Hello</section>
+  }
+}
+"#,
+        )
+        .expect("className should convert");
+
+        let AxStatement::Component(section) = &document.page.body[1] else {
+            panic!("section should convert into component statement");
+        };
+
+        assert_eq!(section.name, "section");
+        assert_eq!(section.style.class, Some(AxExpr::ident("heroClass")));
+        assert!(section.props.iter().all(|prop| prop.name != "className"));
     }
 
     #[test]
