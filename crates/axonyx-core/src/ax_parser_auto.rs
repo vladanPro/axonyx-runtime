@@ -94,10 +94,11 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
     let state_bindings = collect_state_bindings(file)?;
 
     for binding in &file.lets {
-        body.push(AxStatement::data(
-            binding.name.clone(),
-            parse_v2_expr(&binding.value)?,
-        ));
+        let mut value = parse_v2_expr(&binding.value)?;
+        if let Some(source_field) = &binding.source_field {
+            value = value.member(source_field.clone());
+        }
+        body.push(AxStatement::data(binding.name.clone(), value));
     }
 
     for binding in &file.states {
@@ -1002,6 +1003,37 @@ page Home() -> ASX {
         assert_eq!(
             document.page.body[0],
             AxStatement::data("title", AxExpr::string("Hello Axonyx"))
+        );
+    }
+
+    #[test]
+    fn converts_destructured_data_bindings_to_member_bindings() {
+        let document = parse_ax_auto(
+            r#"
+page Dashboard() {
+  data { posts, total: count } = loadDashboard("published")
+
+  return ASX {
+    <Copy>{count}</Copy>
+  }
+}
+"#,
+        )
+        .expect("destructured data should convert");
+
+        assert_eq!(
+            document.page.body[0],
+            AxStatement::data(
+                "posts",
+                AxExpr::call(["loadDashboard"], [AxExpr::string("published")]).member("posts"),
+            )
+        );
+        assert_eq!(
+            document.page.body[1],
+            AxStatement::data(
+                "count",
+                AxExpr::call(["loadDashboard"], [AxExpr::string("published")]).member("total"),
+            )
         );
     }
 
