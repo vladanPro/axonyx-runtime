@@ -1038,6 +1038,37 @@ page Dashboard() {
     }
 
     #[test]
+    fn converts_const_declarations_to_render_local_data_bindings() {
+        let document = parse_ax_auto(
+            r#"
+page Posts() {
+  data posts = loadPosts()
+  const hasPosts = posts.length > 0
+
+  return ASX {
+    <If when={hasPosts}>
+      <Copy>Ready</Copy>
+    </If>
+  }
+}
+"#,
+        )
+        .expect("const declaration should convert");
+
+        assert_eq!(
+            document.page.body[1],
+            AxStatement::data(
+                "hasPosts",
+                AxExpr::binary(
+                    AxBinaryOp::Gt,
+                    AxExpr::ident("posts").member("length"),
+                    AxExpr::number(0),
+                ),
+            )
+        );
+    }
+
+    #[test]
     fn converts_state_signal_binding_into_bridge_metadata() {
         let document = parse_ax_auto(
             r#"

@@ -102,6 +102,7 @@ impl<'a> Parser<'a> {
         let mut components = Vec::new();
         while self.starts_with_keyword("type")
             || self.starts_with_keyword("let")
+            || self.starts_with_keyword("const")
             || self.starts_with_keyword("data")
             || self.is_state_decl_start()
             || self.starts_with_keyword("fn")
@@ -109,7 +110,10 @@ impl<'a> Parser<'a> {
         {
             if self.starts_with_keyword("type") {
                 types.push(self.parse_type_decl()?);
-            } else if self.starts_with_keyword("let") || self.starts_with_keyword("data") {
+            } else if self.starts_with_keyword("let")
+                || self.starts_with_keyword("const")
+                || self.starts_with_keyword("data")
+            {
                 lets.extend(self.parse_let_or_data_decls()?);
             } else if self.is_state_decl_start() {
                 states.push(self.parse_state_decl()?);
@@ -355,6 +359,9 @@ impl<'a> Parser<'a> {
         let line = self.line;
         if self.starts_with_keyword("let") {
             self.expect_keyword("let")
+                .map_err(|_| AxParseV2Error::InvalidLet { line })?;
+        } else if self.starts_with_keyword("const") {
+            self.expect_keyword("const")
                 .map_err(|_| AxParseV2Error::InvalidLet { line })?;
         } else {
             self.expect_keyword("data")
@@ -1688,6 +1695,35 @@ data posts: List<Post> = loadPosts()
         assert_eq!(
             file.lets[0],
             AxLetDeclV2::typed("posts", "List<Post>", "loadPosts()")
+        );
+    }
+
+    #[test]
+    fn parses_const_declarations_before_asx_return() {
+        let input = r#"
+page Posts() {
+  data posts = loadPosts()
+  const hasPosts = posts.length > 0
+  const title: String = "Posts"
+
+  return ASX {
+    <If when={hasPosts}>
+      <Copy>{title}</Copy>
+    </If>
+  }
+}
+"#;
+
+        let file = parse_ax_v2(input).expect("const declarations should parse");
+
+        assert_eq!(file.lets[0], AxLetDeclV2::new("posts", "loadPosts()"));
+        assert_eq!(
+            file.lets[1],
+            AxLetDeclV2::new("hasPosts", "posts.length > 0")
+        );
+        assert_eq!(
+            file.lets[2],
+            AxLetDeclV2::typed("title", "String", r#""Posts""#)
         );
     }
 
