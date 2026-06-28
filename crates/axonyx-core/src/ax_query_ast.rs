@@ -9,6 +9,7 @@ pub struct AxQuerySpec {
     pub orders: Vec<AxQueryOrder>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    pub mode: AxQueryMode,
 }
 
 impl AxQuerySpec {
@@ -19,6 +20,7 @@ impl AxQuerySpec {
             orders: Vec::new(),
             limit: None,
             offset: None,
+            mode: AxQueryMode::Many,
         }
     }
 
@@ -41,6 +43,12 @@ impl AxQuerySpec {
         self.offset = Some(value);
         self
     }
+
+    pub fn first(mut self) -> Self {
+        self.mode = AxQueryMode::First;
+        self.limit.get_or_insert(1);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -48,6 +56,12 @@ pub enum AxQuerySource {
     Stream { collection: String },
     ContentCollection { collection: String },
     RawSql { sql: String, params: Vec<AxExpr> },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxQueryMode {
+    Many,
+    First,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -101,6 +115,7 @@ pub enum AxQueryOrderDirection {
 pub mod prelude {
     pub use super::AxQueryFilter;
     pub use super::AxQueryFilterOp;
+    pub use super::AxQueryMode;
     pub use super::AxQueryOrder;
     pub use super::AxQueryOrderDirection;
     pub use super::AxQuerySource;
@@ -142,6 +157,7 @@ mod tests {
                 }],
                 limit: Some(20),
                 offset: Some(40),
+                mode: AxQueryMode::Many,
             }
         );
     }
@@ -160,6 +176,17 @@ mod tests {
             }
         );
         assert_eq!(query.orders.len(), 1);
+    }
+
+    #[test]
+    fn query_spec_can_model_first_result_mode() {
+        let query = AxQuerySpec::new(AxQuerySource::Stream {
+            collection: "posts".to_string(),
+        })
+        .first();
+
+        assert_eq!(query.mode, AxQueryMode::First);
+        assert_eq!(query.limit, Some(1));
     }
 
     #[test]

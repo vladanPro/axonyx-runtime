@@ -185,6 +185,13 @@ pub struct AxQueryPlan {
     pub orders: Vec<AxQueryOrderPlan>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    pub mode: AxQueryModePlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxQueryModePlan {
+    Many,
+    First,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -610,6 +617,10 @@ fn lower_query(query: &AxQuerySpec) -> AxQueryPlan {
             .collect(),
         limit: query.limit,
         offset: query.offset,
+        mode: match query.mode {
+            AxQueryMode::Many => AxQueryModePlan::Many,
+            AxQueryMode::First => AxQueryModePlan::First,
+        },
     }
 }
 
@@ -846,6 +857,7 @@ pub mod prelude {
     pub use super::AxHookPhasePlan;
     pub use super::AxQueryFilterOpPlan;
     pub use super::AxQueryFilterPlan;
+    pub use super::AxQueryModePlan;
     pub use super::AxQueryOrderDirectionPlan;
     pub use super::AxQueryOrderPlan;
     pub use super::AxQueryPlan;
@@ -940,6 +952,7 @@ loader PostsList
                 }],
                 limit: Some(20),
                 offset: Some(40),
+                mode: AxQueryModePlan::Many,
             })
         );
 
@@ -976,6 +989,7 @@ loader PostsList
                 orders: Vec::new(),
                 limit: None,
                 offset: None,
+                mode: AxQueryModePlan::Many,
             })
         );
     }

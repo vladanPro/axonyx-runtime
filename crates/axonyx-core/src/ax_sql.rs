@@ -439,6 +439,7 @@ mod tests {
             }],
             limit: Some(20),
             offset: Some(40),
+            mode: AxQueryModePlan::Many,
         };
 
         let sql = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)
@@ -481,6 +482,7 @@ mod tests {
             }],
             limit: Some(12),
             offset: None,
+            mode: AxQueryModePlan::Many,
         };
 
         let sql =
@@ -533,6 +535,7 @@ mod tests {
             orders: Vec::new(),
             limit: None,
             offset: None,
+            mode: AxQueryModePlan::Many,
         };
 
         let sql = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)
@@ -583,6 +586,7 @@ mod tests {
             orders: Vec::new(),
             limit: None,
             offset: None,
+            mode: AxQueryModePlan::Many,
         };
 
         let error = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)
@@ -605,6 +609,7 @@ mod tests {
             orders: Vec::new(),
             limit: None,
             offset: None,
+            mode: AxQueryModePlan::Many,
         };
 
         let sql = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)
@@ -640,6 +645,7 @@ mod tests {
             orders: Vec::new(),
             limit: None,
             offset: None,
+            mode: AxQueryModePlan::Many,
         };
 
         let sql = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)
@@ -672,6 +678,7 @@ mod tests {
             }],
             limit: Some(5),
             offset: Some(10),
+            mode: AxQueryModePlan::Many,
         };
 
         let sql =
@@ -694,6 +701,7 @@ mod tests {
             orders: Vec::new(),
             limit: None,
             offset: None,
+            mode: AxQueryModePlan::Many,
         };
 
         let error = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)

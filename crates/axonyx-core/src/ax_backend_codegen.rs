@@ -562,10 +562,18 @@ fn render_query_plan(query: &AxQueryPlan) -> String {
     };
 
     format!(
-        "AxQueryRequest {{ collection: {source}, filters: {filters}, orders: {orders}, limit: {}, offset: {} }}",
+        "AxQueryRequest {{ collection: {source}, filters: {filters}, orders: {orders}, limit: {}, offset: {}, mode: {} }}",
         render_option_u32(query.limit),
-        render_option_u32(query.offset)
+        render_option_u32(query.offset),
+        render_query_mode(query.mode)
     )
+}
+
+fn render_query_mode(mode: AxQueryModePlan) -> &'static str {
+    match mode {
+        AxQueryModePlan::Many => "AxQueryMode::Many",
+        AxQueryModePlan::First => "AxQueryMode::First",
+    }
 }
 
 fn render_raw_sql_query_plan(query: &AxQueryPlan) -> String {

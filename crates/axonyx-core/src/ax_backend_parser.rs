@@ -801,10 +801,10 @@ impl Parser {
             }
         }
 
-        if let Ok(source) = query_source_from_expr(expr.clone(), line.line) {
+        if let Ok(query) = query_spec_from_expr(expr.clone(), line.line) {
             let binding = self.next_synthetic_return_binding();
             return Ok(vec![
-                AxBackendStmt::data(binding.clone(), AxQuerySpec::new(source)),
+                AxBackendStmt::data(binding.clone(), query),
                 AxBackendStmt::r#return(AxExpr::ident(binding)),
             ]);
         }
@@ -851,8 +851,8 @@ impl Parser {
             }
         }
 
-        if let Ok(source) = query_source_from_expr(expr.clone(), line.line) {
-            return Ok(AxBackendStmt::data(name, AxQuerySpec::new(source)));
+        if let Ok(query) = query_spec_from_expr(expr.clone(), line.line) {
+            return Ok(AxBackendStmt::data(name, query));
         }
 
         Ok(AxBackendStmt::data(name, expr))
@@ -1164,6 +1164,23 @@ fn query_source_from_expr(expr: AxExpr, line: usize) -> Result<AxQuerySource, Ax
     }
 }
 
+fn query_spec_from_expr(expr: AxExpr, line: usize) -> Result<AxQuerySpec, AxBackendParseError> {
+    match expr {
+        AxExpr::Call { path, args }
+            if path.len() == 3
+                && path[0] == "db"
+                && matches!(path[2].as_str(), "first" | "one")
+                && args.is_empty() =>
+        {
+            Ok(AxQuerySpec::new(AxQuerySource::Stream {
+                collection: path[1].clone(),
+            })
+            .first())
+        }
+        other => query_source_from_expr(other, line).map(AxQuerySpec::new),
+    }
+}
+
 fn parse_fluent_query_spec(
     input: &str,
     line: usize,
@@ -1238,6 +1255,10 @@ fn parse_fluent_query_spec(
                 query = query.offset(value);
             }
             "all" if args.trim().is_empty() => {
+                terminal = true;
+            }
+            "first" | "one" if args.trim().is_empty() => {
+                query = query.first();
                 terminal = true;
             }
             _ => return Err(AxBackendParseError::InvalidQuerySource { line }),
@@ -2505,6 +2526,39 @@ query loadPosts() -> Post[]
     }
 
     #[test]
+    fn parses_fluent_db_first_query_binding() {
+        let input = r#"
+query loadPost(slug: String) -> Post?
+  data post = db.posts.where({ slug: input.slug }).first()
+  return post
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(post) = &loader.body[0] else {
+            panic!("expected data statement");
+        };
+
+        assert_eq!(
+            post.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "slug",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::ident("input").member("slug"),
+                ))
+                .first()
+            )
+        );
+    }
+
+    #[test]
     fn parses_const_and_let_backend_bindings_as_data_steps() {
         let input = r#"
 export fn normalizeStatus(status?: String) -> String {
@@ -2629,6 +2683,38 @@ query loadFeaturedPosts() -> Post[] {
         assert_eq!(
             raw.body[1],
             AxBackendStmt::r#return(AxExpr::ident("__ax_return_2"))
+        );
+    }
+
+    #[test]
+    fn parses_direct_one_query_return_as_synthetic_data_step() {
+        let input = r#"
+query loadPost() -> Post? {
+  return db.posts.one()
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(post) = &loader.body[0] else {
+            panic!("expected synthetic query data step");
+        };
+        assert_eq!(post.name, "__ax_return_1");
+        assert_eq!(
+            post.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .first()
+            )
+        );
+        assert_eq!(
+            loader.body[1],
+            AxBackendStmt::r#return(AxExpr::ident("__ax_return_1"))
         );
     }
 

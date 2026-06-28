@@ -11,7 +11,7 @@ use axonyx_core::ax_ast_prelude::{
 use axonyx_core::ax_backend_lowering::AxBackendLowerError;
 use axonyx_core::ax_backend_lowering_prelude::{
     lower_backend_document, AxFieldPlan, AxFunctionPlan, AxHandlerKind, AxHandlerPlan,
-    AxHookPhasePlan, AxQueryFilterOpPlan, AxQueryOrderDirectionPlan, AxQueryPlan,
+    AxHookPhasePlan, AxQueryFilterOpPlan, AxQueryModePlan, AxQueryOrderDirectionPlan, AxQueryPlan,
     AxQuerySourcePlan, AxReturnPlan, AxRustExpr, AxStepPlan, AxValuePlan,
 };
 use axonyx_core::ax_backend_parser::AxBackendParseError;
@@ -1761,7 +1761,14 @@ fn eval_preview_query_with_functions(
         items.truncate(limit as usize);
     }
 
-    Ok(AxValue::List(items))
+    Ok(apply_preview_query_mode(query.mode, items))
+}
+
+fn apply_preview_query_mode(mode: AxQueryModePlan, items: Vec<AxValue>) -> AxValue {
+    match mode {
+        AxQueryModePlan::Many => AxValue::List(items),
+        AxQueryModePlan::First => items.into_iter().next().unwrap_or(AxValue::Null),
+    }
 }
 
 fn preview_query_to_runtime_request(
@@ -1802,6 +1809,10 @@ fn preview_query_to_runtime_request(
             .collect(),
         limit: query.limit,
         offset: query.offset,
+        mode: match query.mode {
+            AxQueryModePlan::Many => backend::AxQueryMode::Many,
+            AxQueryModePlan::First => backend::AxQueryMode::First,
+        },
     })
 }
 

@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use axonyx_core::ax_backend_lowering_prelude::{
-    AxAssignmentPlan, AxQueryFilterOpPlan, AxQueryFilterPlan, AxQueryOrderDirectionPlan,
-    AxQueryOrderPlan, AxQueryPlan, AxQuerySourcePlan, AxRustExpr,
+    AxAssignmentPlan, AxQueryFilterOpPlan, AxQueryFilterPlan, AxQueryModePlan,
+    AxQueryOrderDirectionPlan, AxQueryOrderPlan, AxQueryPlan, AxQuerySourcePlan, AxRustExpr,
 };
 use axonyx_core::ax_sql_prelude::{
     compile_delete_plan_to_sql, compile_insert_plan_to_sql, compile_query_plan_to_sql,
@@ -281,6 +281,13 @@ pub struct AxQueryRequest {
     pub orders: Vec<AxQueryOrderRequest>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    pub mode: AxQueryMode,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxQueryMode {
+    Many,
+    First,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1205,18 +1212,21 @@ fn direct_load_plan(
     request: &AxQueryRequest,
 ) -> AxRuntimeResult<Value> {
     let Some(dialect) = driver.sql_dialect() else {
-        return Ok(adapter_payload(
-            driver,
-            AxDataTransport::Direct,
-            url,
-            &None,
-            request.collection.clone(),
-            json!({
-                "filters": request.filters,
-                "orders": request.orders,
-                "limit": request.limit,
-                "offset": request.offset,
-            }),
+        return Ok(apply_query_mode(
+            request.mode,
+            adapter_payload(
+                driver,
+                AxDataTransport::Direct,
+                url,
+                &None,
+                request.collection.clone(),
+                json!({
+                    "filters": request.filters,
+                    "orders": request.orders,
+                    "limit": request.limit,
+                    "offset": request.offset,
+                }),
+            ),
         ));
     };
 
@@ -1236,14 +1246,18 @@ fn direct_load_plan(
     };
 
     if driver == AxDatabaseDriver::Sqlite {
-        return sqlite_execute_query(url, &request.collection, &execution.sql, &execution.params);
+        return sqlite_execute_query(url, &request.collection, &execution.sql, &execution.params)
+            .map(|value| apply_query_mode(request.mode, value));
     }
 
-    Ok(json!({
-        "driver": driver.as_str(),
-        "transport": "direct",
-        "execution": execution,
-    }))
+    Ok(apply_query_mode(
+        request.mode,
+        json!({
+            "driver": driver.as_str(),
+            "transport": "direct",
+            "execution": execution,
+        }),
+    ))
 }
 
 fn direct_raw_query_plan(
@@ -1280,6 +1294,16 @@ fn direct_raw_query_plan(
         "action": "query",
         "execution": execution,
     }))
+}
+
+fn apply_query_mode(mode: AxQueryMode, value: Value) -> Value {
+    match mode {
+        AxQueryMode::Many => value,
+        AxQueryMode::First => match value {
+            Value::Array(items) => items.into_iter().next().unwrap_or(Value::Null),
+            other => other,
+        },
+    }
 }
 
 fn direct_insert_plan(
@@ -1642,6 +1666,7 @@ fn api_load_plan(
             "orders": request.orders,
             "limit": request.limit,
             "offset": request.offset,
+            "mode": request.mode,
         }),
     };
 
@@ -1755,6 +1780,10 @@ fn query_request_to_plan(request: &AxQueryRequest) -> AxQueryPlan {
             .collect(),
         limit: request.limit,
         offset: request.offset,
+        mode: match request.mode {
+            AxQueryMode::Many => AxQueryModePlan::Many,
+            AxQueryMode::First => AxQueryModePlan::First,
+        },
     }
 }
 
@@ -1819,6 +1848,7 @@ pub mod prelude {
     pub use super::AxQueryExecutor;
     pub use super::AxQueryFilterOp;
     pub use super::AxQueryFilterRequest;
+    pub use super::AxQueryMode;
     pub use super::AxQueryOrderDirection;
     pub use super::AxQueryOrderRequest;
     pub use super::AxQueryRequest;
@@ -1924,6 +1954,7 @@ mod tests {
                 }],
                 limit: Some(20),
                 offset: None,
+                mode: AxQueryMode::Many,
             })
             .expect("query should execute");
 
@@ -2165,6 +2196,7 @@ mod tests {
                 orders: Vec::new(),
                 limit: Some(10),
                 offset: None,
+                mode: AxQueryMode::Many,
             })
             .expect("query should execute");
 
@@ -2198,6 +2230,7 @@ mod tests {
                 }],
                 limit: Some(12),
                 offset: None,
+                mode: AxQueryMode::Many,
             })
             .expect("query should execute");
 
@@ -2245,6 +2278,7 @@ mod tests {
                 orders: Vec::new(),
                 limit: None,
                 offset: None,
+                mode: AxQueryMode::Many,
             })
             .expect("query should execute");
 
@@ -2361,6 +2395,7 @@ mod tests {
                 }],
                 limit: Some(10),
                 offset: None,
+                mode: AxQueryMode::Many,
             })
             .expect("sqlite query should execute");
 
@@ -2374,6 +2409,46 @@ mod tests {
                     "status": "published"
                 }
             ])
+        );
+    }
+
+    #[test]
+    fn sqlite_direct_first_load_reads_single_row_from_database() {
+        let (_path, url) = temp_sqlite_database("first_load");
+        seed_sqlite_posts(&url);
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+
+        let value = runtime
+            .load(&AxQueryRequest {
+                collection: "posts".to_string(),
+                filters: vec![AxQueryFilterRequest {
+                    field: "status".to_string(),
+                    op: AxQueryFilterOp::Eq,
+                    value: json!("published"),
+                }],
+                orders: vec![AxQueryOrderRequest {
+                    field: "id".to_string(),
+                    direction: AxQueryOrderDirection::Asc,
+                }],
+                limit: Some(10),
+                offset: None,
+                mode: AxQueryMode::First,
+            })
+            .expect("sqlite first query should execute");
+
+        assert_eq!(
+            value,
+            json!({
+                "id": 1,
+                "title": "Hello",
+                "slug": "hello",
+                "status": "published"
+            })
         );
     }
 
