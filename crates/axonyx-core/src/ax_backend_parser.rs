@@ -542,7 +542,7 @@ impl Parser {
             if line.text.starts_with("env ") {
                 body.push(self.parse_env()?);
             } else {
-                body.push(self.parse_data()?);
+                body.push(self.parse_data_binding()?);
             }
         }
 
@@ -553,8 +553,8 @@ impl Parser {
         let line = self.current().expect("statement line exists").clone();
         let text = line.text.as_str();
 
-        if text.starts_with("data ") {
-            return self.parse_data();
+        if is_data_binding_statement(text) {
+            return self.parse_data_binding();
         }
 
         if text.starts_with("insert ") {
@@ -744,9 +744,11 @@ impl Parser {
         Err(AxBackendParseError::InvalidBlock { line: line.line })
     }
 
-    fn parse_data(&mut self) -> Result<AxBackendStmt, AxBackendParseError> {
-        let line = self.current().expect("data line exists").clone();
-        let body = line.text["data ".len()..].trim();
+    fn parse_data_binding(&mut self) -> Result<AxBackendStmt, AxBackendParseError> {
+        let line = self.current().expect("data binding line exists").clone();
+        let Some((_, body)) = split_data_binding_prefix(&line.text) else {
+            return Err(AxBackendParseError::InvalidDataBinding { line: line.line });
+        };
         let Some((name, expr)) = body.split_once('=') else {
             return Err(AxBackendParseError::InvalidDataBinding { line: line.line });
         };
@@ -1250,6 +1252,22 @@ fn parse_fluent_mutation_stmt(
     }
 
     Ok(None)
+}
+
+fn is_data_binding_statement(input: &str) -> bool {
+    split_data_binding_prefix(input).is_some()
+}
+
+fn split_data_binding_prefix(input: &str) -> Option<(&'static str, &str)> {
+    for prefix in ["data", "const", "let"] {
+        if let Some(rest) = input.strip_prefix(prefix) {
+            if rest.starts_with(char::is_whitespace) {
+                return Some((prefix, rest.trim_start()));
+            }
+        }
+    }
+
+    None
 }
 
 fn parse_function_call_stmt(
@@ -2408,6 +2426,53 @@ query loadPosts() -> Post[]
                     AxExpr::string("published"),
                 ))
                 .order(AxQueryOrder::new("created_at", AxQueryOrderDirection::Desc))
+                .limit(6)
+            )
+        );
+    }
+
+    #[test]
+    fn parses_const_and_let_backend_bindings_as_data_steps() {
+        let input = r#"
+export fn normalizeStatus(status?: String) -> String {
+  let resolved = input.status ?? "published"
+  return resolved
+}
+
+query loadPosts(status: String = "published") -> Post[] {
+  const posts = db.posts.where({ status: input.status }).limit(6).all()
+  return posts
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Function(function) = &document.blocks[0] else {
+            panic!("expected function block");
+        };
+        let AxBackendStmt::Data(resolved) = &function.body[0] else {
+            panic!("expected let to lower as data step");
+        };
+        assert_eq!(resolved.name, "resolved");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[1] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected const to lower as data step");
+        };
+        assert_eq!(posts.name, "posts");
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "status",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::ident("input").member("status"),
+                ))
                 .limit(6)
             )
         );
