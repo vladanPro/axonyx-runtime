@@ -4764,7 +4764,8 @@ page Posts
             &[],
             &[r#"
 query loadPost(slug: String) -> Post? {
-  return db.posts.where({ slug: input.slug }).first()
+  return db.posts.first()
+    .where({ slug: input.slug })
 }
 "#],
             &[],

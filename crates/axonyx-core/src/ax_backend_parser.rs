@@ -1014,6 +1014,15 @@ impl Parser {
             }
 
             let text = clause_line.text.as_str();
+            let method_text = text.strip_prefix('.').unwrap_or(text);
+            if is_method_query_clause(method_text) {
+                if let Some((method, args)) = parse_fluent_call(method_text, clause_line.line)? {
+                    query = apply_method_query_clause(query, method, args, clause_line.line)?;
+                    self.pos += 1;
+                    continue;
+                }
+            }
+
             if let Some(rest) = text.strip_prefix("where ") {
                 let Some((field, value)) = rest.split_once('=') else {
                     return Err(AxBackendParseError::InvalidQueryClause {
@@ -1125,10 +1134,20 @@ fn preprocess(input: &str) -> Result<Vec<BackendLine>, AxBackendParseError> {
 }
 
 fn is_query_clause(text: &str) -> bool {
+    let text = text.strip_prefix('.').unwrap_or(text);
     text.starts_with("where ")
         || text.starts_with("order ")
         || text.starts_with("limit ")
         || text.starts_with("offset ")
+        || text.starts_with("where(")
+        || text.starts_with("whereNot(")
+        || text.starts_with("whereIn(")
+        || text.starts_with("whereNotIn(")
+        || text.starts_with("whereNull(")
+        || text.starts_with("whereNotNull(")
+        || text.starts_with("order(")
+        || text.starts_with("limit(")
+        || text.starts_with("offset(")
 }
 
 fn query_source_from_expr(expr: AxExpr, line: usize) -> Result<AxQuerySource, AxBackendParseError> {
@@ -1269,6 +1288,77 @@ fn parse_fluent_query_spec(
     } else {
         Ok(None)
     }
+}
+
+fn apply_method_query_clause(
+    mut query: AxQuerySpec,
+    method: &str,
+    args: &str,
+    line: usize,
+) -> Result<AxQuerySpec, AxBackendParseError> {
+    match method {
+        "where" | "whereNot" | "whereIn" | "whereNotIn" => {
+            let op = match method {
+                "where" => AxQueryFilterOp::Eq,
+                "whereNot" => AxQueryFilterOp::Ne,
+                "whereIn" => AxQueryFilterOp::In,
+                "whereNotIn" => AxQueryFilterOp::NotIn,
+                _ => unreachable!("method matched above"),
+            };
+            for (field, value) in parse_object_fields(args, line)? {
+                query = query.filter(AxQueryFilter::new(field, op, parse_expr(value, line)?));
+            }
+            Ok(query)
+        }
+        "whereNull" | "whereNotNull" => {
+            let op = match method {
+                "whereNull" => AxQueryFilterOp::IsNull,
+                "whereNotNull" => AxQueryFilterOp::IsNotNull,
+                _ => unreachable!("method matched above"),
+            };
+            Ok(query.filter(AxQueryFilter::new(
+                parse_string_arg(args, line)?,
+                op,
+                AxExpr::bool(true),
+            )))
+        }
+        "order" => {
+            for (field, value) in parse_object_fields(args, line)? {
+                let direction = match parse_expr(value, line)? {
+                    AxExpr::String(value) if value.eq_ignore_ascii_case("desc") => {
+                        AxQueryOrderDirection::Desc
+                    }
+                    AxExpr::String(value) if value.eq_ignore_ascii_case("asc") => {
+                        AxQueryOrderDirection::Asc
+                    }
+                    _ => return Err(AxBackendParseError::InvalidQueryClause { line }),
+                };
+                query = query.order(AxQueryOrder::new(field, direction));
+            }
+            Ok(query)
+        }
+        "limit" => Ok(query.limit(parse_u32_arg(args, line)?)),
+        "offset" => Ok(query.offset(parse_u32_arg(args, line)?)),
+        _ => Err(AxBackendParseError::InvalidQueryClause { line }),
+    }
+}
+
+fn is_method_query_clause(text: &str) -> bool {
+    let Some(open_index) = find_call_open(text) else {
+        return false;
+    };
+    matches!(
+        text[..open_index].trim(),
+        "where"
+            | "whereNot"
+            | "whereIn"
+            | "whereNotIn"
+            | "whereNull"
+            | "whereNotNull"
+            | "order"
+            | "limit"
+            | "offset"
+    )
 }
 
 fn parse_fluent_mutation_stmt(
@@ -2648,8 +2738,8 @@ query loadPosts(status: String = "published") -> Post[] {
         let input = r#"
 query loadPublishedPosts() -> Post[] {
   return db.posts.all()
-    where status = "published"
-    limit 6
+    .where({ status: "published" })
+    .limit(6)
 }
 
 query loadFeaturedPosts() -> Post[] {
@@ -2722,7 +2812,7 @@ query loadPost() -> Post? {
         let input = r#"
 query loadPost(slug: String) -> Post? {
   return db.posts.first()
-    where slug = input.slug
+    .where({ slug: input.slug })
 }
 "#;
 
