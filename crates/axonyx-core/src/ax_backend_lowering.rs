@@ -175,6 +175,7 @@ pub enum AxReturnPlan {
         status: Option<u16>,
     },
     NoContent,
+    NotFound,
     Ok,
 }
 
@@ -575,6 +576,7 @@ fn lower_return_expr(expr: &AxExpr) -> AxReturnPlan {
             }
         }
         "noContent" | "no_content" if args.is_empty() => AxReturnPlan::NoContent,
+        "notFound" | "not_found" if args.is_empty() => AxReturnPlan::NotFound,
         _ => AxReturnPlan::Expr(lower_expr(expr)),
     }
 }
@@ -1337,6 +1339,9 @@ route GET "/go"
 
 route DELETE "/api/posts"
   return noContent()
+
+route GET "/missing"
+  return notFound()
 "#,
         )
         .expect("document should parse");
@@ -1357,6 +1362,10 @@ route DELETE "/api/posts"
         assert_eq!(
             plan.handlers[2].steps[0],
             AxStepPlan::Return(AxReturnPlan::NoContent)
+        );
+        assert_eq!(
+            plan.handlers[3].steps[0],
+            AxStepPlan::Return(AxReturnPlan::NotFound)
         );
     }
 

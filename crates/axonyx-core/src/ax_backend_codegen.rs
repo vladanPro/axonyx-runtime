@@ -149,6 +149,9 @@ fn render_function_return(value: &AxReturnPlan, returns: &str) -> String {
         AxReturnPlan::NoContent => {
             format!("    return {};\n", default_function_return_expr(returns))
         }
+        AxReturnPlan::NotFound => {
+            format!("    return {};\n", default_function_return_expr(returns))
+        }
         AxReturnPlan::Redirect { .. } => {
             format!("    return {};\n", default_function_return_expr(returns))
         }
@@ -688,6 +691,9 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool) -> String {
             AxReturnPlan::NoContent => {
                 "    Ok(__ax_finalize_response(AxHttpResponse::no_content(), __ax_headers, __ax_cookies))\n".to_string()
             }
+            AxReturnPlan::NotFound => {
+                "    Ok(__ax_finalize_response(AxHttpResponse::text(404, \"not found\"), __ax_headers, __ax_cookies))\n".to_string()
+            }
             AxReturnPlan::Ok => {
                 "    Ok(__ax_finalize_response(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies))\n".to_string()
             }
@@ -698,9 +704,10 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool) -> String {
         AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => {
             format!("    Ok(json!({}))\n", render_borrowed_expr(expr))
         }
-        AxReturnPlan::Ok | AxReturnPlan::NoContent | AxReturnPlan::Redirect { .. } => {
-            "    Ok(ok_payload())\n".to_string()
-        }
+        AxReturnPlan::Ok
+        | AxReturnPlan::NoContent
+        | AxReturnPlan::NotFound
+        | AxReturnPlan::Redirect { .. } => "    Ok(ok_payload())\n".to_string(),
     }
 }
 
@@ -726,6 +733,7 @@ fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
             None => format!("AxHttpResponse::redirect({})", render_owned_expr(target)),
         },
         Some(AxReturnPlan::NoContent) => "AxHttpResponse::no_content()".to_string(),
+        Some(AxReturnPlan::NotFound) => "AxHttpResponse::text(404, \"not found\")".to_string(),
         Some(AxReturnPlan::Ok) => "AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?".to_string(),
         None => "AxHttpResponse::json(401, &json!({\"error\":\"unauthorized\"})).map_err(|error| AxRuntimeError::message(error.to_string()))?".to_string(),
     };
@@ -1155,6 +1163,9 @@ route GET "/go"
 
 route DELETE "/api/posts"
   return noContent()
+
+route GET "/missing"
+  return notFound()
 "#,
         )
         .expect("source should compile");
@@ -1163,6 +1174,7 @@ route DELETE "/api/posts"
         assert!(module.contains("AxHttpResponse::json(200, &json!(&posts))"));
         assert!(module.contains(r#"AxHttpResponse::redirect("/next".to_string())"#));
         assert!(module.contains("AxHttpResponse::no_content()"));
+        assert!(module.contains("AxHttpResponse::text(404, \"not found\")"));
     }
 
     #[test]
@@ -1230,6 +1242,22 @@ route GET "/api/admin"
             "if (request.cookie_value(\"session\").unwrap_or_default()).to_string().is_empty()"
         ));
         assert!(module.contains(r#"AxHttpResponse::redirect("/login".to_string())"#));
+    }
+
+    #[test]
+    fn compiles_require_not_found_fallback_into_route_response() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route GET "/api/posts/:slug"
+  data post = db.posts.first()
+    .where({ slug: params.slug })
+  require post else notFound()
+  return json(post)
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("AxHttpResponse::text(404, \"not found\")"));
     }
 
     #[test]
