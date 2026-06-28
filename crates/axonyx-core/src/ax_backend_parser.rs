@@ -569,6 +569,16 @@ impl Parser {
             return self.parse_delete(indent);
         }
 
+        if let Some(statement) = parse_fluent_mutation_stmt(text, line.line)? {
+            self.pos += 1;
+            return Ok(statement);
+        }
+
+        if let Some(statement) = parse_function_call_stmt(text, line.line)? {
+            self.pos += 1;
+            return Ok(statement);
+        }
+
         if let Some(value) = text.strip_prefix("revalidate ") {
             self.pos += 1;
             return Ok(AxBackendStmt::revalidate(parse_expr(
@@ -708,6 +718,9 @@ impl Parser {
                 return Err(AxBackendParseError::InvalidReturn { line: line.line });
             }
             if value == "ok" {
+                return Ok(AxBackendStmt::r#return("ok"));
+            }
+            if value == "ok()" {
                 return Ok(AxBackendStmt::r#return("ok"));
             }
             return Ok(AxBackendStmt::r#return(parse_expr(value, line.line)?));
@@ -1163,6 +1176,116 @@ fn parse_fluent_query_spec(
     }
 }
 
+fn parse_fluent_mutation_stmt(
+    input: &str,
+    line: usize,
+) -> Result<Option<AxBackendStmt>, AxBackendParseError> {
+    let segments = split_top_level_query_segments(input);
+    if segments.len() < 3 || segments[0] != "db" {
+        return Ok(None);
+    }
+
+    let collection = segments[1];
+    if collection.is_empty() {
+        return Ok(None);
+    }
+
+    let mut filters = Vec::new();
+    for segment in segments.into_iter().skip(2) {
+        let Some((method, args)) = parse_fluent_call(segment, line)? else {
+            return Ok(None);
+        };
+
+        match method {
+            "where" | "whereNot" | "whereIn" | "whereNotIn" => {
+                let op = match method {
+                    "where" => AxQueryFilterOp::Eq,
+                    "whereNot" => AxQueryFilterOp::Ne,
+                    "whereIn" => AxQueryFilterOp::In,
+                    "whereNotIn" => AxQueryFilterOp::NotIn,
+                    _ => unreachable!("method matched above"),
+                };
+                for (field, value) in parse_object_fields(args, line)? {
+                    filters.push(AxQueryFilter::new(field, op, parse_expr(value, line)?));
+                }
+            }
+            "whereNull" | "whereNotNull" => {
+                let op = match method {
+                    "whereNull" => AxQueryFilterOp::IsNull,
+                    "whereNotNull" => AxQueryFilterOp::IsNotNull,
+                    _ => unreachable!("method matched above"),
+                };
+                filters.push(AxQueryFilter::new(
+                    parse_string_arg(args, line)?,
+                    op,
+                    AxExpr::bool(true),
+                ));
+            }
+            "insert" => {
+                if !filters.is_empty() {
+                    return Err(AxBackendParseError::InvalidMutation { line });
+                }
+                return Ok(Some(AxBackendStmt::Insert(AxMutation::new(
+                    collection,
+                    parse_object_assignments(args, line)?,
+                ))));
+            }
+            "update" => {
+                let mut mutation =
+                    AxMutation::new(collection, parse_object_assignments(args, line)?);
+                for filter in filters {
+                    mutation = mutation.filter(filter);
+                }
+                return Ok(Some(AxBackendStmt::Update(mutation)));
+            }
+            "delete" if args.trim().is_empty() => {
+                let mut mutation = AxMutation::new(collection, []);
+                for filter in filters {
+                    mutation = mutation.filter(filter);
+                }
+                return Ok(Some(AxBackendStmt::Delete(mutation)));
+            }
+            _ => return Err(AxBackendParseError::InvalidMutation { line }),
+        }
+    }
+
+    Ok(None)
+}
+
+fn parse_function_call_stmt(
+    input: &str,
+    line: usize,
+) -> Result<Option<AxBackendStmt>, AxBackendParseError> {
+    let Some(open_index) = find_call_open(input) else {
+        return Ok(None);
+    };
+    if !input.ends_with(')') {
+        return Ok(None);
+    }
+
+    let method = input[..open_index].trim();
+    if method.is_empty()
+        || method.contains('.')
+        || method.chars().any(char::is_whitespace)
+        || !is_valid_object_key(method)
+    {
+        return Ok(None);
+    }
+
+    let args = split_call_args(&input[open_index + 1..input.len() - 1], line)?;
+    match method {
+        "revalidate" if args.len() == 1 => Ok(Some(AxBackendStmt::revalidate(args[0].clone()))),
+        "invalidate" if args.len() == 1 => Ok(Some(AxBackendStmt::invalidate(args[0].clone()))),
+        "before" if args.len() == 1 => Ok(Some(AxBackendStmt::before(args[0].clone()))),
+        "after" if args.len() == 1 => Ok(Some(AxBackendStmt::after(args[0].clone()))),
+        "clearCookie" if args.len() == 1 => Ok(Some(AxBackendStmt::clear_cookie(args[0].clone()))),
+        "revalidate" | "invalidate" | "before" | "after" | "clearCookie" => {
+            Err(AxBackendParseError::InvalidBlock { line })
+        }
+        _ => Ok(None),
+    }
+}
+
 fn split_top_level_query_segments(input: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut start = 0usize;
@@ -1260,6 +1383,32 @@ fn parse_object_fields<'a>(
     }
 
     Ok(fields)
+}
+
+fn parse_object_assignments(
+    input: &str,
+    line: usize,
+) -> Result<Vec<AxAssignment>, AxBackendParseError> {
+    parse_object_fields(input, line).map(|fields| {
+        fields
+            .into_iter()
+            .map(|(field, value)| {
+                parse_expr(value, line).map(|value| AxAssignment::new(field, value))
+            })
+            .collect::<Result<Vec<_>, _>>()
+    })?
+}
+
+fn split_call_args(input: &str, line: usize) -> Result<Vec<AxExpr>, AxBackendParseError> {
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    split_top_level(input, ',')
+        .into_iter()
+        .map(|part| parse_expr(part.trim(), line))
+        .collect()
 }
 
 fn parse_object_key(input: &str, line: usize) -> Result<String, AxBackendParseError> {
@@ -2574,6 +2723,99 @@ action createPost(title: string, featured?: bool = false) -> Post {
             ]
         );
         assert_eq!(action.body.len(), 2);
+    }
+
+    #[test]
+    fn parses_function_style_action_mutation_calls() {
+        let input = r#"
+action CreatePost(title: string, excerpt: string) {
+  db.posts.insert({ title: input.title, excerpt: input.excerpt, status: "published" })
+  revalidate("/posts")
+  return ok()
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(action.input.len(), 2);
+        assert_eq!(action.body.len(), 3);
+        assert_eq!(
+            action.body[0],
+            AxBackendStmt::insert(
+                "posts",
+                [
+                    AxAssignment::new("title", AxExpr::ident("input").member("title")),
+                    AxAssignment::new("excerpt", AxExpr::ident("input").member("excerpt")),
+                    AxAssignment::new("status", AxExpr::string("published")),
+                ],
+            )
+        );
+        assert_eq!(
+            action.body[1],
+            AxBackendStmt::revalidate(AxExpr::string("/posts"))
+        );
+        assert_eq!(action.body[2], AxBackendStmt::r#return("ok"));
+    }
+
+    #[test]
+    fn parses_function_style_update_and_delete_calls() {
+        let input = r#"
+action PublishPost(id: string) {
+  db.posts.where({ id: input.id }).update({ status: "published" })
+  db.audit.where({ post_id: input.id }).delete()
+  invalidate(posts)
+  return ok(post)
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+
+        assert_eq!(action.body.len(), 4);
+        let AxBackendStmt::Update(update) = &action.body[0] else {
+            panic!("expected update mutation");
+        };
+        assert_eq!(update.collection, "posts");
+        assert_eq!(
+            update.fields,
+            vec![AxAssignment::new("status", AxExpr::string("published"))]
+        );
+        assert_eq!(
+            update.filters,
+            vec![AxQueryFilter::new(
+                "id",
+                AxQueryFilterOp::Eq,
+                AxExpr::ident("input").member("id")
+            )]
+        );
+
+        let AxBackendStmt::Delete(delete) = &action.body[1] else {
+            panic!("expected delete mutation");
+        };
+        assert_eq!(delete.collection, "audit");
+        assert_eq!(
+            delete.filters,
+            vec![AxQueryFilter::new(
+                "post_id",
+                AxQueryFilterOp::Eq,
+                AxExpr::ident("input").member("id")
+            )]
+        );
+        assert_eq!(
+            action.body[2],
+            AxBackendStmt::invalidate(AxExpr::ident("posts"))
+        );
+        assert_eq!(
+            action.body[3],
+            AxBackendStmt::r#return(AxExpr::call(["ok"], [AxExpr::ident("post")]))
+        );
     }
 
     #[test]
