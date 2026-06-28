@@ -4758,6 +4758,35 @@ page Posts
     }
 
     #[test]
+    fn previews_query_function_first_result_with_route_params() {
+        let store = AxPreviewStore::default();
+        let html = preview_ax_route_with_request_context(
+            &[],
+            &[r#"
+query loadPost(slug: String) -> Post? {
+  return db.posts.where({ slug: input.slug }).first()
+}
+"#],
+            &[],
+            r#"
+page Post
+  data post = loadPost(params.slug)
+  Copy -> post.title
+  Copy -> post.excerpt
+"#,
+            "/posts/hello-axonyx",
+            &BTreeMap::from([("slug".to_string(), "hello-axonyx".to_string())]),
+            &store,
+        )
+        .expect("single-record query function should render");
+
+        assert!(html.contains("Hello Axonyx"));
+        assert!(html.contains("A fast page rendered from .ax with almost no JavaScript."));
+        assert!(!html.contains("Docs Without Bloat"));
+        assert!(!html.contains("Draft Preview"));
+    }
+
+    #[test]
     fn previews_pure_backend_function_data_inside_page() {
         let html = preview_ax_route_with_loaders(
             &[],

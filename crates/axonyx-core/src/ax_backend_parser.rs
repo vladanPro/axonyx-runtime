@@ -1000,8 +1000,7 @@ impl Parser {
         line: usize,
         indent: usize,
     ) -> Result<AxQuerySpec, AxBackendParseError> {
-        let source = query_source_from_expr(expr, line)?;
-        let mut query = AxQuerySpec::new(source);
+        let mut query = query_spec_from_expr(expr, line)?;
 
         while let Some(clause_line) = self.current() {
             if clause_line.indent < indent {
@@ -2715,6 +2714,40 @@ query loadPost() -> Post? {
         assert_eq!(
             loader.body[1],
             AxBackendStmt::r#return(AxExpr::ident("__ax_return_1"))
+        );
+    }
+
+    #[test]
+    fn parses_multiline_first_query_return_as_synthetic_data_step() {
+        let input = r#"
+query loadPost(slug: String) -> Post? {
+  return db.posts.first()
+    where slug = input.slug
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(post) = &loader.body[0] else {
+            panic!("expected synthetic query data step");
+        };
+        assert_eq!(post.name, "__ax_return_1");
+        assert_eq!(
+            post.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .first()
+                .filter(AxQueryFilter::new(
+                    "slug",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::ident("input").member("slug"),
+                ))
+            )
         );
     }
 
