@@ -77,13 +77,18 @@ pub fn parse_backend_ax(input: &str) -> Result<AxBackendDocument, AxBackendParse
         return Err(AxBackendParseError::EmptyDocument);
     }
 
-    let mut parser = Parser { lines, pos: 0 };
+    let mut parser = Parser {
+        lines,
+        pos: 0,
+        synthetic_counter: 0,
+    };
     parser.parse_document()
 }
 
 struct Parser {
     lines: Vec<BackendLine>,
     pos: usize,
+    synthetic_counter: usize,
 }
 
 impl Parser {
@@ -344,7 +349,7 @@ impl Parser {
                 self.pos += 1;
                 input = self.parse_input_fields(indent + 2)?;
             } else {
-                body.push(self.parse_statement(indent)?);
+                body.extend(self.parse_statements(indent)?);
             }
         }
 
@@ -416,7 +421,7 @@ impl Parser {
                 return Err(AxBackendParseError::UnexpectedIndentation { line: line.line });
             }
 
-            body.push(self.parse_statement(indent)?);
+            body.extend(self.parse_statements(indent)?);
         }
 
         Ok(body)
@@ -547,6 +552,20 @@ impl Parser {
         }
 
         Ok(body)
+    }
+
+    fn parse_statements(
+        &mut self,
+        indent: usize,
+    ) -> Result<Vec<AxBackendStmt>, AxBackendParseError> {
+        let line = self.current().expect("statement line exists").clone();
+        let text = line.text.as_str();
+
+        if let Some(value) = text.strip_prefix("return ") {
+            return self.parse_return_statements(&value.to_string(), line, indent);
+        }
+
+        Ok(vec![self.parse_statement(indent)?])
     }
 
     fn parse_statement(&mut self, indent: usize) -> Result<AxBackendStmt, AxBackendParseError> {
@@ -742,6 +761,60 @@ impl Parser {
         }
 
         Err(AxBackendParseError::InvalidBlock { line: line.line })
+    }
+
+    fn parse_return_statements(
+        &mut self,
+        value: &str,
+        line: BackendLine,
+        indent: usize,
+    ) -> Result<Vec<AxBackendStmt>, AxBackendParseError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(AxBackendParseError::InvalidReturn { line: line.line });
+        }
+        if value == "ok" || value == "ok()" {
+            self.pos += 1;
+            return Ok(vec![AxBackendStmt::r#return("ok")]);
+        }
+
+        if let Some(query) = parse_fluent_query_spec(value, line.line)? {
+            self.pos += 1;
+            let binding = self.next_synthetic_return_binding();
+            return Ok(vec![
+                AxBackendStmt::data(binding.clone(), query),
+                AxBackendStmt::r#return(AxExpr::ident(binding)),
+            ]);
+        }
+
+        let expr = parse_expr(value, line.line)?;
+        self.pos += 1;
+
+        if let Some(next) = self.current() {
+            if next.indent == indent + 2 && is_query_clause(&next.text) {
+                let query = self.parse_query_spec(expr, line.line, indent + 2)?;
+                let binding = self.next_synthetic_return_binding();
+                return Ok(vec![
+                    AxBackendStmt::data(binding.clone(), query),
+                    AxBackendStmt::r#return(AxExpr::ident(binding)),
+                ]);
+            }
+        }
+
+        if let Ok(source) = query_source_from_expr(expr.clone(), line.line) {
+            let binding = self.next_synthetic_return_binding();
+            return Ok(vec![
+                AxBackendStmt::data(binding.clone(), AxQuerySpec::new(source)),
+                AxBackendStmt::r#return(AxExpr::ident(binding)),
+            ]);
+        }
+
+        Ok(vec![AxBackendStmt::r#return(expr)])
+    }
+
+    fn next_synthetic_return_binding(&mut self) -> String {
+        self.synthetic_counter += 1;
+        format!("__ax_return_{}", self.synthetic_counter)
     }
 
     fn parse_data_binding(&mut self) -> Result<AxBackendStmt, AxBackendParseError> {
@@ -2475,6 +2548,87 @@ query loadPosts(status: String = "published") -> Post[] {
                 ))
                 .limit(6)
             )
+        );
+    }
+
+    #[test]
+    fn parses_direct_query_return_as_synthetic_data_step() {
+        let input = r#"
+query loadPosts(status: String = "published") -> Post[] {
+  return db.posts.where({ status: input.status }).order({ created_at: "desc" }).limit(6).all()
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        assert_eq!(loader.body.len(), 2);
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected synthetic query data step");
+        };
+        assert_eq!(posts.name, "__ax_return_1");
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "status",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::ident("input").member("status"),
+                ))
+                .order(AxQueryOrder::new("created_at", AxQueryOrderDirection::Desc))
+                .limit(6)
+            )
+        );
+        assert_eq!(
+            loader.body[1],
+            AxBackendStmt::r#return(AxExpr::ident("__ax_return_1"))
+        );
+    }
+
+    #[test]
+    fn parses_direct_multiline_and_raw_query_returns() {
+        let input = r#"
+query loadPublishedPosts() -> Post[] {
+  return db.posts.all()
+    where status = "published"
+    limit 6
+}
+
+query loadFeaturedPosts() -> Post[] {
+  return db.query("select * from posts where featured = ?", true)
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(multiline) = &document.blocks[0] else {
+            panic!("expected multiline query function");
+        };
+        let AxBackendStmt::Data(posts) = &multiline.body[0] else {
+            panic!("expected synthetic query data step");
+        };
+        assert_eq!(posts.name, "__ax_return_1");
+        assert!(matches!(posts.value, AxBackendValue::Query(_)));
+        assert_eq!(
+            multiline.body[1],
+            AxBackendStmt::r#return(AxExpr::ident("__ax_return_1"))
+        );
+
+        let AxBackendBlock::Loader(raw) = &document.blocks[1] else {
+            panic!("expected raw query function");
+        };
+        let AxBackendStmt::Data(raw_posts) = &raw.body[0] else {
+            panic!("expected synthetic raw query data step");
+        };
+        assert_eq!(raw_posts.name, "__ax_return_2");
+        assert_eq!(
+            raw.body[1],
+            AxBackendStmt::r#return(AxExpr::ident("__ax_return_2"))
         );
     }
 
