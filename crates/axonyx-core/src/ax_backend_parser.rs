@@ -77,13 +77,18 @@ pub fn parse_backend_ax(input: &str) -> Result<AxBackendDocument, AxBackendParse
         return Err(AxBackendParseError::EmptyDocument);
     }
 
-    let mut parser = Parser { lines, pos: 0 };
+    let mut parser = Parser {
+        lines,
+        pos: 0,
+        synthetic_counter: 0,
+    };
     parser.parse_document()
 }
 
 struct Parser {
     lines: Vec<BackendLine>,
     pos: usize,
+    synthetic_counter: usize,
 }
 
 impl Parser {
@@ -344,7 +349,7 @@ impl Parser {
                 self.pos += 1;
                 input = self.parse_input_fields(indent + 2)?;
             } else {
-                body.push(self.parse_statement(indent)?);
+                body.extend(self.parse_statements(indent)?);
             }
         }
 
@@ -416,7 +421,7 @@ impl Parser {
                 return Err(AxBackendParseError::UnexpectedIndentation { line: line.line });
             }
 
-            body.push(self.parse_statement(indent)?);
+            body.extend(self.parse_statements(indent)?);
         }
 
         Ok(body)
@@ -542,19 +547,33 @@ impl Parser {
             if line.text.starts_with("env ") {
                 body.push(self.parse_env()?);
             } else {
-                body.push(self.parse_data()?);
+                body.push(self.parse_data_binding()?);
             }
         }
 
         Ok(body)
     }
 
+    fn parse_statements(
+        &mut self,
+        indent: usize,
+    ) -> Result<Vec<AxBackendStmt>, AxBackendParseError> {
+        let line = self.current().expect("statement line exists").clone();
+        let text = line.text.as_str();
+
+        if let Some(value) = text.strip_prefix("return ") {
+            return self.parse_return_statements(&value.to_string(), line, indent);
+        }
+
+        Ok(vec![self.parse_statement(indent)?])
+    }
+
     fn parse_statement(&mut self, indent: usize) -> Result<AxBackendStmt, AxBackendParseError> {
         let line = self.current().expect("statement line exists").clone();
         let text = line.text.as_str();
 
-        if text.starts_with("data ") {
-            return self.parse_data();
+        if is_data_binding_statement(text) {
+            return self.parse_data_binding();
         }
 
         if text.starts_with("insert ") {
@@ -744,9 +763,65 @@ impl Parser {
         Err(AxBackendParseError::InvalidBlock { line: line.line })
     }
 
-    fn parse_data(&mut self) -> Result<AxBackendStmt, AxBackendParseError> {
-        let line = self.current().expect("data line exists").clone();
-        let body = line.text["data ".len()..].trim();
+    fn parse_return_statements(
+        &mut self,
+        value: &str,
+        line: BackendLine,
+        indent: usize,
+    ) -> Result<Vec<AxBackendStmt>, AxBackendParseError> {
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(AxBackendParseError::InvalidReturn { line: line.line });
+        }
+        if value == "ok" || value == "ok()" {
+            self.pos += 1;
+            return Ok(vec![AxBackendStmt::r#return("ok")]);
+        }
+
+        if let Some(query) = parse_fluent_query_spec(value, line.line)? {
+            self.pos += 1;
+            let binding = self.next_synthetic_return_binding();
+            return Ok(vec![
+                AxBackendStmt::data(binding.clone(), query),
+                AxBackendStmt::r#return(AxExpr::ident(binding)),
+            ]);
+        }
+
+        let expr = parse_expr(value, line.line)?;
+        self.pos += 1;
+
+        if let Some(next) = self.current() {
+            if next.indent == indent + 2 && is_query_clause(&next.text) {
+                let query = self.parse_query_spec(expr, line.line, indent + 2)?;
+                let binding = self.next_synthetic_return_binding();
+                return Ok(vec![
+                    AxBackendStmt::data(binding.clone(), query),
+                    AxBackendStmt::r#return(AxExpr::ident(binding)),
+                ]);
+            }
+        }
+
+        if let Ok(query) = query_spec_from_expr(expr.clone(), line.line) {
+            let binding = self.next_synthetic_return_binding();
+            return Ok(vec![
+                AxBackendStmt::data(binding.clone(), query),
+                AxBackendStmt::r#return(AxExpr::ident(binding)),
+            ]);
+        }
+
+        Ok(vec![AxBackendStmt::r#return(expr)])
+    }
+
+    fn next_synthetic_return_binding(&mut self) -> String {
+        self.synthetic_counter += 1;
+        format!("__ax_return_{}", self.synthetic_counter)
+    }
+
+    fn parse_data_binding(&mut self) -> Result<AxBackendStmt, AxBackendParseError> {
+        let line = self.current().expect("data binding line exists").clone();
+        let Some((_, body)) = split_data_binding_prefix(&line.text) else {
+            return Err(AxBackendParseError::InvalidDataBinding { line: line.line });
+        };
         let Some((name, expr)) = body.split_once('=') else {
             return Err(AxBackendParseError::InvalidDataBinding { line: line.line });
         };
@@ -776,8 +851,8 @@ impl Parser {
             }
         }
 
-        if let Ok(source) = query_source_from_expr(expr.clone(), line.line) {
-            return Ok(AxBackendStmt::data(name, AxQuerySpec::new(source)));
+        if let Ok(query) = query_spec_from_expr(expr.clone(), line.line) {
+            return Ok(AxBackendStmt::data(name, query));
         }
 
         Ok(AxBackendStmt::data(name, expr))
@@ -925,8 +1000,7 @@ impl Parser {
         line: usize,
         indent: usize,
     ) -> Result<AxQuerySpec, AxBackendParseError> {
-        let source = query_source_from_expr(expr, line)?;
-        let mut query = AxQuerySpec::new(source);
+        let mut query = query_spec_from_expr(expr, line)?;
 
         while let Some(clause_line) = self.current() {
             if clause_line.indent < indent {
@@ -940,6 +1014,15 @@ impl Parser {
             }
 
             let text = clause_line.text.as_str();
+            let method_text = text.strip_prefix('.').unwrap_or(text);
+            if is_method_query_clause(method_text) {
+                if let Some((method, args)) = parse_fluent_call(method_text, clause_line.line)? {
+                    query = apply_method_query_clause(query, method, args, clause_line.line)?;
+                    self.pos += 1;
+                    continue;
+                }
+            }
+
             if let Some(rest) = text.strip_prefix("where ") {
                 let Some((field, value)) = rest.split_once('=') else {
                     return Err(AxBackendParseError::InvalidQueryClause {
@@ -1051,10 +1134,20 @@ fn preprocess(input: &str) -> Result<Vec<BackendLine>, AxBackendParseError> {
 }
 
 fn is_query_clause(text: &str) -> bool {
+    let text = text.strip_prefix('.').unwrap_or(text);
     text.starts_with("where ")
         || text.starts_with("order ")
         || text.starts_with("limit ")
         || text.starts_with("offset ")
+        || text.starts_with("where(")
+        || text.starts_with("whereNot(")
+        || text.starts_with("whereIn(")
+        || text.starts_with("whereNotIn(")
+        || text.starts_with("whereNull(")
+        || text.starts_with("whereNotNull(")
+        || text.starts_with("order(")
+        || text.starts_with("limit(")
+        || text.starts_with("offset(")
 }
 
 fn query_source_from_expr(expr: AxExpr, line: usize) -> Result<AxQuerySource, AxBackendParseError> {
@@ -1086,6 +1179,23 @@ fn query_source_from_expr(expr: AxExpr, line: usize) -> Result<AxQuerySource, Ax
             }
         }
         _ => Err(AxBackendParseError::InvalidQuerySource { line }),
+    }
+}
+
+fn query_spec_from_expr(expr: AxExpr, line: usize) -> Result<AxQuerySpec, AxBackendParseError> {
+    match expr {
+        AxExpr::Call { path, args }
+            if path.len() == 3
+                && path[0] == "db"
+                && matches!(path[2].as_str(), "first" | "one")
+                && args.is_empty() =>
+        {
+            Ok(AxQuerySpec::new(AxQuerySource::Stream {
+                collection: path[1].clone(),
+            })
+            .first())
+        }
+        other => query_source_from_expr(other, line).map(AxQuerySpec::new),
     }
 }
 
@@ -1165,6 +1275,10 @@ fn parse_fluent_query_spec(
             "all" if args.trim().is_empty() => {
                 terminal = true;
             }
+            "first" | "one" if args.trim().is_empty() => {
+                query = query.first();
+                terminal = true;
+            }
             _ => return Err(AxBackendParseError::InvalidQuerySource { line }),
         }
     }
@@ -1174,6 +1288,77 @@ fn parse_fluent_query_spec(
     } else {
         Ok(None)
     }
+}
+
+fn apply_method_query_clause(
+    mut query: AxQuerySpec,
+    method: &str,
+    args: &str,
+    line: usize,
+) -> Result<AxQuerySpec, AxBackendParseError> {
+    match method {
+        "where" | "whereNot" | "whereIn" | "whereNotIn" => {
+            let op = match method {
+                "where" => AxQueryFilterOp::Eq,
+                "whereNot" => AxQueryFilterOp::Ne,
+                "whereIn" => AxQueryFilterOp::In,
+                "whereNotIn" => AxQueryFilterOp::NotIn,
+                _ => unreachable!("method matched above"),
+            };
+            for (field, value) in parse_object_fields(args, line)? {
+                query = query.filter(AxQueryFilter::new(field, op, parse_expr(value, line)?));
+            }
+            Ok(query)
+        }
+        "whereNull" | "whereNotNull" => {
+            let op = match method {
+                "whereNull" => AxQueryFilterOp::IsNull,
+                "whereNotNull" => AxQueryFilterOp::IsNotNull,
+                _ => unreachable!("method matched above"),
+            };
+            Ok(query.filter(AxQueryFilter::new(
+                parse_string_arg(args, line)?,
+                op,
+                AxExpr::bool(true),
+            )))
+        }
+        "order" => {
+            for (field, value) in parse_object_fields(args, line)? {
+                let direction = match parse_expr(value, line)? {
+                    AxExpr::String(value) if value.eq_ignore_ascii_case("desc") => {
+                        AxQueryOrderDirection::Desc
+                    }
+                    AxExpr::String(value) if value.eq_ignore_ascii_case("asc") => {
+                        AxQueryOrderDirection::Asc
+                    }
+                    _ => return Err(AxBackendParseError::InvalidQueryClause { line }),
+                };
+                query = query.order(AxQueryOrder::new(field, direction));
+            }
+            Ok(query)
+        }
+        "limit" => Ok(query.limit(parse_u32_arg(args, line)?)),
+        "offset" => Ok(query.offset(parse_u32_arg(args, line)?)),
+        _ => Err(AxBackendParseError::InvalidQueryClause { line }),
+    }
+}
+
+fn is_method_query_clause(text: &str) -> bool {
+    let Some(open_index) = find_call_open(text) else {
+        return false;
+    };
+    matches!(
+        text[..open_index].trim(),
+        "where"
+            | "whereNot"
+            | "whereIn"
+            | "whereNotIn"
+            | "whereNull"
+            | "whereNotNull"
+            | "order"
+            | "limit"
+            | "offset"
+    )
 }
 
 fn parse_fluent_mutation_stmt(
@@ -1250,6 +1435,22 @@ fn parse_fluent_mutation_stmt(
     }
 
     Ok(None)
+}
+
+fn is_data_binding_statement(input: &str) -> bool {
+    split_data_binding_prefix(input).is_some()
+}
+
+fn split_data_binding_prefix(input: &str) -> Option<(&'static str, &str)> {
+    for prefix in ["data", "const", "let"] {
+        if let Some(rest) = input.strip_prefix(prefix) {
+            if rest.starts_with(char::is_whitespace) {
+                return Some((prefix, rest.trim_start()));
+            }
+        }
+    }
+
+    None
 }
 
 fn parse_function_call_stmt(
@@ -2409,6 +2610,233 @@ query loadPosts() -> Post[]
                 ))
                 .order(AxQueryOrder::new("created_at", AxQueryOrderDirection::Desc))
                 .limit(6)
+            )
+        );
+    }
+
+    #[test]
+    fn parses_fluent_db_first_query_binding() {
+        let input = r#"
+query loadPost(slug: String) -> Post?
+  data post = db.posts.where({ slug: input.slug }).first()
+  return post
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(post) = &loader.body[0] else {
+            panic!("expected data statement");
+        };
+
+        assert_eq!(
+            post.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "slug",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::ident("input").member("slug"),
+                ))
+                .first()
+            )
+        );
+    }
+
+    #[test]
+    fn parses_const_and_let_backend_bindings_as_data_steps() {
+        let input = r#"
+export fn normalizeStatus(status?: String) -> String {
+  let resolved = input.status ?? "published"
+  return resolved
+}
+
+query loadPosts(status: String = "published") -> Post[] {
+  const posts = db.posts.where({ status: input.status }).limit(6).all()
+  return posts
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Function(function) = &document.blocks[0] else {
+            panic!("expected function block");
+        };
+        let AxBackendStmt::Data(resolved) = &function.body[0] else {
+            panic!("expected let to lower as data step");
+        };
+        assert_eq!(resolved.name, "resolved");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[1] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected const to lower as data step");
+        };
+        assert_eq!(posts.name, "posts");
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "status",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::ident("input").member("status"),
+                ))
+                .limit(6)
+            )
+        );
+    }
+
+    #[test]
+    fn parses_direct_query_return_as_synthetic_data_step() {
+        let input = r#"
+query loadPosts(status: String = "published") -> Post[] {
+  return db.posts.where({ status: input.status }).order({ created_at: "desc" }).limit(6).all()
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        assert_eq!(loader.body.len(), 2);
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected synthetic query data step");
+        };
+        assert_eq!(posts.name, "__ax_return_1");
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .filter(AxQueryFilter::new(
+                    "status",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::ident("input").member("status"),
+                ))
+                .order(AxQueryOrder::new("created_at", AxQueryOrderDirection::Desc))
+                .limit(6)
+            )
+        );
+        assert_eq!(
+            loader.body[1],
+            AxBackendStmt::r#return(AxExpr::ident("__ax_return_1"))
+        );
+    }
+
+    #[test]
+    fn parses_direct_multiline_and_raw_query_returns() {
+        let input = r#"
+query loadPublishedPosts() -> Post[] {
+  return db.posts.all()
+    .where({ status: "published" })
+    .limit(6)
+}
+
+query loadFeaturedPosts() -> Post[] {
+  return db.query("select * from posts where featured = ?", true)
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(multiline) = &document.blocks[0] else {
+            panic!("expected multiline query function");
+        };
+        let AxBackendStmt::Data(posts) = &multiline.body[0] else {
+            panic!("expected synthetic query data step");
+        };
+        assert_eq!(posts.name, "__ax_return_1");
+        assert!(matches!(posts.value, AxBackendValue::Query(_)));
+        assert_eq!(
+            multiline.body[1],
+            AxBackendStmt::r#return(AxExpr::ident("__ax_return_1"))
+        );
+
+        let AxBackendBlock::Loader(raw) = &document.blocks[1] else {
+            panic!("expected raw query function");
+        };
+        let AxBackendStmt::Data(raw_posts) = &raw.body[0] else {
+            panic!("expected synthetic raw query data step");
+        };
+        assert_eq!(raw_posts.name, "__ax_return_2");
+        assert_eq!(
+            raw.body[1],
+            AxBackendStmt::r#return(AxExpr::ident("__ax_return_2"))
+        );
+    }
+
+    #[test]
+    fn parses_direct_one_query_return_as_synthetic_data_step() {
+        let input = r#"
+query loadPost() -> Post? {
+  return db.posts.one()
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(post) = &loader.body[0] else {
+            panic!("expected synthetic query data step");
+        };
+        assert_eq!(post.name, "__ax_return_1");
+        assert_eq!(
+            post.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .first()
+            )
+        );
+        assert_eq!(
+            loader.body[1],
+            AxBackendStmt::r#return(AxExpr::ident("__ax_return_1"))
+        );
+    }
+
+    #[test]
+    fn parses_multiline_first_query_return_as_synthetic_data_step() {
+        let input = r#"
+query loadPost(slug: String) -> Post? {
+  return db.posts.first()
+    .where({ slug: input.slug })
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(post) = &loader.body[0] else {
+            panic!("expected synthetic query data step");
+        };
+        assert_eq!(post.name, "__ax_return_1");
+        assert_eq!(
+            post.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .first()
+                .filter(AxQueryFilter::new(
+                    "slug",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::ident("input").member("slug"),
+                ))
             )
         );
     }

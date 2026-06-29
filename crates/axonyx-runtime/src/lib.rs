@@ -11,7 +11,7 @@ use axonyx_core::ax_ast_prelude::{
 use axonyx_core::ax_backend_lowering::AxBackendLowerError;
 use axonyx_core::ax_backend_lowering_prelude::{
     lower_backend_document, AxFieldPlan, AxFunctionPlan, AxHandlerKind, AxHandlerPlan,
-    AxHookPhasePlan, AxQueryFilterOpPlan, AxQueryOrderDirectionPlan, AxQueryPlan,
+    AxHookPhasePlan, AxQueryFilterOpPlan, AxQueryModePlan, AxQueryOrderDirectionPlan, AxQueryPlan,
     AxQuerySourcePlan, AxReturnPlan, AxRustExpr, AxStepPlan, AxValuePlan,
 };
 use axonyx_core::ax_backend_parser::AxBackendParseError;
@@ -1468,6 +1468,13 @@ fn render_preview_require_fallback(
             set_cookies: Vec::new(),
             body: Vec::new(),
         },
+        Some(AxReturnPlan::NotFound) => AxPreviewHttpResponse {
+            status: 404,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            headers: BTreeMap::new(),
+            set_cookies: Vec::new(),
+            body: b"not found".to_vec(),
+        },
         Some(AxReturnPlan::Ok) => {
             render_preview_json_response(&AxValue::record([("ok", AxValue::Bool(true))]))?
         }
@@ -1580,9 +1587,10 @@ fn eval_preview_action_error_fallback_with_functions(
         Some(AxReturnPlan::Redirect { target, .. }) => AxValue::String(
             eval_preview_expr_with_functions(target, scope, env, functions)?.as_string(),
         ),
-        Some(AxReturnPlan::Ok) | Some(AxReturnPlan::NoContent) | None => {
-            AxValue::String("Action requirement failed.".to_string())
-        }
+        Some(AxReturnPlan::Ok)
+        | Some(AxReturnPlan::NoContent)
+        | Some(AxReturnPlan::NotFound)
+        | None => AxValue::String("Action requirement failed.".to_string()),
     };
     let message = match &value {
         AxValue::Record(fields) => fields
@@ -1632,9 +1640,11 @@ fn eval_preview_return_with_functions(
     match value {
         AxReturnPlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
         AxReturnPlan::Json(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
-        AxReturnPlan::Redirect { .. } | AxReturnPlan::NoContent => Err(PreviewError::Runtime {
-            message: "HTTP response helpers are only supported in route blocks".to_string(),
-        }),
+        AxReturnPlan::Redirect { .. } | AxReturnPlan::NoContent | AxReturnPlan::NotFound => {
+            Err(PreviewError::Runtime {
+                message: "HTTP response helpers are only supported in route blocks".to_string(),
+            })
+        }
         AxReturnPlan::Ok => Ok(AxValue::record([("ok", AxValue::Bool(true))])),
     }
 }
@@ -1666,6 +1676,13 @@ fn render_preview_route_return(
             headers: BTreeMap::new(),
             set_cookies: Vec::new(),
             body: Vec::new(),
+        },
+        AxReturnPlan::NotFound => AxPreviewHttpResponse {
+            status: 404,
+            content_type: "text/plain; charset=utf-8".to_string(),
+            headers: BTreeMap::new(),
+            set_cookies: Vec::new(),
+            body: b"not found".to_vec(),
         },
         AxReturnPlan::Ok => {
             render_preview_json_response(&AxValue::record([("ok", AxValue::Bool(true))]))?
@@ -1761,7 +1778,14 @@ fn eval_preview_query_with_functions(
         items.truncate(limit as usize);
     }
 
-    Ok(AxValue::List(items))
+    Ok(apply_preview_query_mode(query.mode, items))
+}
+
+fn apply_preview_query_mode(mode: AxQueryModePlan, items: Vec<AxValue>) -> AxValue {
+    match mode {
+        AxQueryModePlan::Many => AxValue::List(items),
+        AxQueryModePlan::First => items.into_iter().next().unwrap_or(AxValue::Null),
+    }
 }
 
 fn preview_query_to_runtime_request(
@@ -1802,6 +1826,10 @@ fn preview_query_to_runtime_request(
             .collect(),
         limit: query.limit,
         offset: query.offset,
+        mode: match query.mode {
+            AxQueryModePlan::Many => backend::AxQueryMode::Many,
+            AxQueryModePlan::First => backend::AxQueryMode::First,
+        },
     })
 }
 
@@ -4747,6 +4775,36 @@ page Posts
     }
 
     #[test]
+    fn previews_query_function_first_result_with_route_params() {
+        let store = AxPreviewStore::default();
+        let html = preview_ax_route_with_request_context(
+            &[],
+            &[r#"
+query loadPost(slug: String) -> Post? {
+  return db.posts.first()
+    .where({ slug: input.slug })
+}
+"#],
+            &[],
+            r#"
+page Post
+  data post = loadPost(params.slug)
+  Copy -> post.title
+  Copy -> post.excerpt
+"#,
+            "/posts/hello-axonyx",
+            &BTreeMap::from([("slug".to_string(), "hello-axonyx".to_string())]),
+            &store,
+        )
+        .expect("single-record query function should render");
+
+        assert!(html.contains("Hello Axonyx"));
+        assert!(html.contains("A fast page rendered from .ax with almost no JavaScript."));
+        assert!(!html.contains("Docs Without Bloat"));
+        assert!(!html.contains("Draft Preview"));
+    }
+
+    #[test]
     fn previews_pure_backend_function_data_inside_page() {
         let html = preview_ax_route_with_loaders(
             &[],
@@ -5989,6 +6047,28 @@ route GET "/api/posts/:slug"
         let body = String::from_utf8(response.body).expect("json response should be utf-8");
         assert!(body.contains("Draft Preview"));
         assert!(!body.contains("Hello Axonyx"));
+    }
+
+    #[test]
+    fn preview_route_sources_can_return_not_found_fallback() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_sources(
+            &[r#"
+route GET "/api/posts/:slug"
+  data post = db.posts.first()
+    .where({ slug: params.slug })
+  require post else notFound()
+  return json(post)
+"#],
+            "GET",
+            "/api/posts/missing-post",
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 404);
+        assert_eq!(String::from_utf8(response.body).unwrap(), "not found");
     }
 
     #[test]

@@ -175,6 +175,7 @@ pub enum AxReturnPlan {
         status: Option<u16>,
     },
     NoContent,
+    NotFound,
     Ok,
 }
 
@@ -185,6 +186,13 @@ pub struct AxQueryPlan {
     pub orders: Vec<AxQueryOrderPlan>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
+    pub mode: AxQueryModePlan,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxQueryModePlan {
+    Many,
+    First,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -568,6 +576,7 @@ fn lower_return_expr(expr: &AxExpr) -> AxReturnPlan {
             }
         }
         "noContent" | "no_content" if args.is_empty() => AxReturnPlan::NoContent,
+        "notFound" | "not_found" if args.is_empty() => AxReturnPlan::NotFound,
         _ => AxReturnPlan::Expr(lower_expr(expr)),
     }
 }
@@ -610,6 +619,10 @@ fn lower_query(query: &AxQuerySpec) -> AxQueryPlan {
             .collect(),
         limit: query.limit,
         offset: query.offset,
+        mode: match query.mode {
+            AxQueryMode::Many => AxQueryModePlan::Many,
+            AxQueryMode::First => AxQueryModePlan::First,
+        },
     }
 }
 
@@ -846,6 +859,7 @@ pub mod prelude {
     pub use super::AxHookPhasePlan;
     pub use super::AxQueryFilterOpPlan;
     pub use super::AxQueryFilterPlan;
+    pub use super::AxQueryModePlan;
     pub use super::AxQueryOrderDirectionPlan;
     pub use super::AxQueryOrderPlan;
     pub use super::AxQueryPlan;
@@ -940,6 +954,7 @@ loader PostsList
                 }],
                 limit: Some(20),
                 offset: Some(40),
+                mode: AxQueryModePlan::Many,
             })
         );
 
@@ -976,6 +991,7 @@ loader PostsList
                 orders: Vec::new(),
                 limit: None,
                 offset: None,
+                mode: AxQueryModePlan::Many,
             })
         );
     }
@@ -1323,6 +1339,9 @@ route GET "/go"
 
 route DELETE "/api/posts"
   return noContent()
+
+route GET "/missing"
+  return notFound()
 "#,
         )
         .expect("document should parse");
@@ -1343,6 +1362,10 @@ route DELETE "/api/posts"
         assert_eq!(
             plan.handlers[2].steps[0],
             AxStepPlan::Return(AxReturnPlan::NoContent)
+        );
+        assert_eq!(
+            plan.handlers[3].steps[0],
+            AxStepPlan::Return(AxReturnPlan::NotFound)
         );
     }
 
