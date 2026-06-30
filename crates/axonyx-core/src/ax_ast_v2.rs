@@ -349,6 +349,7 @@ impl AxComponentRenderDeclV2 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxComponentParamDeclV2 {
     pub name: String,
+    pub ty: Option<String>,
     pub default: Option<String>,
 }
 
@@ -356,6 +357,7 @@ impl AxComponentParamDeclV2 {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            ty: None,
             default: None,
         }
     }
@@ -363,6 +365,27 @@ impl AxComponentParamDeclV2 {
     pub fn with_default(name: impl Into<String>, default: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            ty: None,
+            default: Some(default.into()),
+        }
+    }
+
+    pub fn with_type(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: Some(ty.into()),
+            default: None,
+        }
+    }
+
+    pub fn with_type_and_default(
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        default: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            ty: Some(ty.into()),
             default: Some(default.into()),
         }
     }

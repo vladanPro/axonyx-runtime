@@ -848,8 +848,24 @@ impl<'a> Parser<'a> {
         let name = self.parse_identifier()?;
         self.skip_spaces();
 
+        let ty = if self.peek_char() == Some(':') {
+            self.bump_char();
+            self.skip_spaces();
+            let ty = self.read_component_param_type().trim().to_string();
+            if ty.is_empty() {
+                return Err(AxParseV2Error::InvalidComponent { line });
+            }
+            self.skip_spaces();
+            Some(ty)
+        } else {
+            None
+        };
+
         if self.peek_char() != Some('=') {
-            return Ok(AxComponentParamDeclV2::new(name));
+            return Ok(match ty {
+                Some(ty) => AxComponentParamDeclV2::with_type(name, ty),
+                None => AxComponentParamDeclV2::new(name),
+            });
         }
 
         self.bump_char();
@@ -860,7 +876,10 @@ impl<'a> Parser<'a> {
             return Err(AxParseV2Error::InvalidComponent { line });
         }
 
-        Ok(AxComponentParamDeclV2::with_default(name, default))
+        Ok(match ty {
+            Some(ty) => AxComponentParamDeclV2::with_type_and_default(name, ty, default),
+            None => AxComponentParamDeclV2::with_default(name, default),
+        })
     }
 
     fn parse_nodes(&mut self, closing_tag: Option<&str>) -> Result<Vec<AxNodeV2>, AxParseV2Error> {
@@ -1445,6 +1464,50 @@ impl<'a> Parser<'a> {
         self.input[start..self.pos].to_string()
     }
 
+    fn read_component_param_type(&mut self) -> String {
+        let start = self.pos;
+        let mut angle_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut paren_depth = 0usize;
+
+        while let Some(ch) = self.peek_char() {
+            match ch {
+                '<' => {
+                    angle_depth += 1;
+                    self.bump_char();
+                }
+                '>' => {
+                    angle_depth = angle_depth.saturating_sub(1);
+                    self.bump_char();
+                }
+                '[' => {
+                    bracket_depth += 1;
+                    self.bump_char();
+                }
+                ']' => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    self.bump_char();
+                }
+                '(' => {
+                    paren_depth += 1;
+                    self.bump_char();
+                }
+                ')' if angle_depth == 0 && bracket_depth == 0 && paren_depth == 0 => break,
+                ')' => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    self.bump_char();
+                }
+                '=' | ',' if angle_depth == 0 && bracket_depth == 0 && paren_depth == 0 => break,
+                '\n' | '\r' => break,
+                _ => {
+                    self.bump_char();
+                }
+            }
+        }
+
+        self.input[start..self.pos].to_string()
+    }
+
     fn skip_layout_whitespace(&mut self) {
         while let Some(ch) = self.peek_char() {
             if ch.is_whitespace() {
@@ -1767,6 +1830,30 @@ component FeatureCard(title = "Hello", tone = defaultTone, count = 2) {
                 AxComponentParamDeclV2::with_default("title", "\"Hello\""),
                 AxComponentParamDeclV2::with_default("tone", "defaultTone"),
                 AxComponentParamDeclV2::with_default("count", "2")
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_typed_component_params_with_defaults() {
+        let input = r#"
+page Home
+
+component ThemeSwitcher(label: String = "Theme", storageKey: String, post: Optional<Post>) {
+  <Copy>{label}</Copy>
+}
+
+<ThemeSwitcher label="Choose theme" storageKey="site-theme" />
+"#;
+
+        let file = parse_ax_v2(input).expect("typed component params should parse");
+
+        assert_eq!(
+            file.components[0].params,
+            vec![
+                AxComponentParamDeclV2::with_type_and_default("label", "String", "\"Theme\""),
+                AxComponentParamDeclV2::with_type("storageKey", "String"),
+                AxComponentParamDeclV2::with_type("post", "Optional<Post>")
             ]
         );
     }
