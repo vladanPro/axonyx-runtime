@@ -332,6 +332,9 @@ fn lower_component_nodes(
             functions,
             imports,
             components,
+            functions,
+            imports,
+            components,
             scope,
             resolver,
             import_resolver,
@@ -1009,6 +1012,9 @@ fn lower_local_component_nodes(
     functions: &[AxFunctionDef],
     imports: &[AxImport],
     components: &[AxComponentDef],
+    slot_functions: &[AxFunctionDef],
+    slot_imports: &[AxImport],
+    slot_components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
@@ -1031,9 +1037,9 @@ fn lower_local_component_nodes(
     let slot_body = component_children_to_statements(component);
     let slot_context = SlotContext {
         body: &slot_body,
-        functions,
-        imports,
-        components,
+        functions: slot_functions,
+        imports: slot_imports,
+        components: slot_components,
         parent: slot_context,
     };
 
@@ -1067,6 +1073,9 @@ fn lower_imported_component_nodes(
             if let Some(nodes) = lower_imported_component_only_nodes(
                 component,
                 &import_decl,
+                functions,
+                imports,
+                components,
                 scope,
                 resolver,
                 import_resolver,
@@ -1092,6 +1101,9 @@ fn lower_imported_component_nodes(
             &document.functions,
             &document.imports,
             &document.components,
+            functions,
+            imports,
+            components,
             scope,
             resolver,
             import_resolver,
@@ -1147,6 +1159,9 @@ fn lower_imported_component_nodes(
 fn lower_imported_component_only_nodes(
     component: &AxComponent,
     import_decl: &ResolvedImport<'_>,
+    functions: &[AxFunctionDef],
+    imports: &[AxImport],
+    components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
@@ -1169,6 +1184,9 @@ fn lower_imported_component_only_nodes(
         &document.functions,
         &document.imports,
         &document.components,
+        functions,
+        imports,
+        components,
         scope,
         resolver,
         import_resolver,
@@ -2596,6 +2614,83 @@ component Button(href = "#") {
                     "a",
                     vec![attr("class", "ax-button"), attr("href", "/docs")],
                     vec![]
+                )],
+            )
+        );
+    }
+
+    #[test]
+    fn lowers_parent_imports_inside_imported_component_slot() {
+        let document = AxDocument {
+            imports: vec![
+                AxImport::new([AxImportBinding::named("Shell")], "@/components/Shell.ax"),
+                AxImport::new(
+                    [AxImportBinding::named("TextLink")],
+                    "@/components/TextLink.ax",
+                ),
+            ],
+            functions: Vec::new(),
+            components: Vec::new(),
+            head: AxHead::default(),
+            page: AxPage::new(
+                "Home",
+                [AxStatement::component(
+                    AxComponent::new("Shell").block([AxStatement::component(
+                        AxComponent::new("TextLink")
+                            .prop("href", "/docs")
+                            .inline("Docs"),
+                    )]),
+                )],
+            ),
+        };
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let import_resolver = |source: &str| -> Option<String> {
+            match source {
+                "@/components/Shell.ax" => Some(
+                    r#"
+component Shell {
+  <section class="shell">
+    <Slot />
+  </section>
+}
+"#
+                    .to_string(),
+                ),
+                "@/components/TextLink.ax" => Some(
+                    r##"
+component TextLink(href = "#") {
+  <a class="ax-link" href={href}>
+    <Slot />
+  </a>
+}
+"##
+                    .to_string(),
+                ),
+                _ => None,
+            }
+        };
+
+        let node = lower_document_with_scope_and_imports(
+            &document,
+            BTreeMap::new(),
+            &resolver,
+            &import_resolver,
+        )
+        .expect("slot children should keep parent imports");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "section",
+                    vec![attr("class", "shell")],
+                    vec![element_with_attrs(
+                        "a",
+                        vec![attr("class", "ax-link"), attr("href", "/docs")],
+                        vec![text("Docs")]
+                    )]
                 )],
             )
         );
