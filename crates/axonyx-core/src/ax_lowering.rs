@@ -1082,6 +1082,23 @@ fn lower_imported_component_nodes(
         }
     };
 
+    if let Some(component_def) =
+        resolve_component(&document.components, &import_decl.binding.imported)
+            .or_else(|| resolve_component(&document.components, &import_decl.binding.local))
+    {
+        return lower_local_component_nodes(
+            component,
+            component_def,
+            &document.functions,
+            &document.imports,
+            &document.components,
+            scope,
+            resolver,
+            import_resolver,
+            slot_context,
+        );
+    }
+
     let mut imported_scope = scope.clone();
     apply_params_to_scope(
         &document.page.params,
@@ -2523,6 +2540,62 @@ component ThemeSwitcher(label: String = "Theme") {
                     "label",
                     vec![attr("class", "ax-theme-switcher")],
                     vec![element("span", vec![text("Choose theme")])]
+                )],
+            )
+        );
+    }
+
+    #[test]
+    fn lowers_imported_component_only_untyped_default_prop_in_attribute() {
+        let document = AxDocument {
+            imports: vec![AxImport::new(
+                [AxImportBinding::named("Button")],
+                "@axonyx/ui/foundry/Button.ax",
+            )],
+            functions: Vec::new(),
+            components: Vec::new(),
+            head: AxHead::default(),
+            page: AxPage::new(
+                "Home",
+                [AxStatement::component(
+                    AxComponent::new("Button").prop("href", "/docs"),
+                )],
+            ),
+        };
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let import_resolver = |source: &str| -> Option<String> {
+            match source {
+                "@axonyx/ui/foundry/Button.ax" => Some(
+                    r##"
+component Button(href = "#") {
+  <a class="ax-button" href={href}>
+    <Slot />
+  </a>
+}
+"##
+                    .to_string(),
+                ),
+                _ => None,
+            }
+        };
+
+        let node = lower_document_with_scope_and_imports(
+            &document,
+            BTreeMap::new(),
+            &resolver,
+            &import_resolver,
+        )
+        .expect("component-only import should bind untyped default params");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "a",
+                    vec![attr("class", "ax-button"), attr("href", "/docs")],
+                    vec![]
                 )],
             )
         );
