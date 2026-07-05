@@ -669,9 +669,145 @@ impl<'a> Parser<'a> {
         }
         self.bump_char();
         self.skip_layout_whitespace();
+
+        if self.is_layered_component_body_start() {
+            return self.parse_layered_component_decl(name, params, line);
+        }
+
         let body = self.parse_nodes_until_component_body_end()?;
 
         Ok(AxComponentDeclV2::new(name, params, body))
+    }
+
+    fn is_layered_component_body_start(&self) -> bool {
+        self.starts_with_keyword("state")
+            || self.starts_with_keyword("client")
+            || self.starts_with_keyword("style")
+            || self.starts_with_keyword("render")
+    }
+
+    fn parse_layered_component_decl(
+        &mut self,
+        name: String,
+        params: Vec<AxComponentParamDeclV2>,
+        line: usize,
+    ) -> Result<AxComponentDeclV2, AxParseV2Error> {
+        let mut states = Vec::new();
+        let mut clients = Vec::new();
+        let mut style = None;
+        let mut render = None;
+
+        loop {
+            self.skip_layout_whitespace();
+            if self.peek_char() == Some('}') {
+                self.bump_char();
+                break;
+            }
+
+            if self.starts_with_keyword("state") {
+                states.push(self.parse_state_decl()?);
+                continue;
+            }
+
+            if self.starts_with_keyword("client") {
+                clients.push(self.parse_component_client_decl()?);
+                continue;
+            }
+
+            if self.starts_with_keyword("style") {
+                if style.is_some() {
+                    return Err(AxParseV2Error::InvalidComponent { line });
+                }
+                style = Some(self.parse_component_style_decl()?);
+                continue;
+            }
+
+            if self.starts_with_keyword("render") {
+                if render.is_some() {
+                    return Err(AxParseV2Error::InvalidComponent { line });
+                }
+                render = Some(self.parse_component_render_decl()?);
+                continue;
+            }
+
+            return Err(AxParseV2Error::InvalidComponent { line: self.line });
+        }
+
+        let Some(render) = render else {
+            return Err(AxParseV2Error::InvalidComponent { line });
+        };
+
+        Ok(AxComponentDeclV2::layered(
+            name, params, states, clients, style, render,
+        ))
+    }
+
+    fn parse_component_client_decl(&mut self) -> Result<AxComponentClientDeclV2, AxParseV2Error> {
+        let line = self.line;
+        self.expect_keyword("client")
+            .map_err(|_| AxParseV2Error::InvalidComponent { line })?;
+        self.skip_spaces();
+
+        let target = if self.starts_with_keyword("JS") {
+            self.expect_keyword("JS").ok();
+            AxComponentClientTargetV2::Js
+        } else if self.starts_with_keyword("WASM") {
+            self.expect_keyword("WASM").ok();
+            AxComponentClientTargetV2::Wasm
+        } else {
+            return Err(AxParseV2Error::InvalidComponent { line });
+        };
+        self.skip_spaces();
+
+        if self.starts_with_keyword("from") {
+            self.expect_keyword("from").ok();
+            self.skip_spaces();
+            let path = self.parse_string_literal()?;
+            self.consume_until_line_end();
+            return Ok(AxComponentClientDeclV2::file(target, path));
+        }
+
+        if self.peek_char() != Some('{') {
+            return Err(AxParseV2Error::InvalidComponent { line });
+        }
+
+        let body = self.read_raw_braced_block(line)?;
+        Ok(AxComponentClientDeclV2::inline(target, body))
+    }
+
+    fn parse_component_style_decl(&mut self) -> Result<AxComponentStyleDeclV2, AxParseV2Error> {
+        let line = self.line;
+        self.expect_keyword("style")
+            .map_err(|_| AxParseV2Error::InvalidComponent { line })?;
+        self.skip_spaces();
+
+        if self.peek_char() != Some('{') {
+            return Err(AxParseV2Error::InvalidComponent { line });
+        }
+
+        Ok(AxComponentStyleDeclV2::new(
+            self.read_raw_braced_block(line)?,
+        ))
+    }
+
+    fn parse_component_render_decl(&mut self) -> Result<AxComponentRenderDeclV2, AxParseV2Error> {
+        let line = self.line;
+        self.expect_keyword("render")
+            .map_err(|_| AxParseV2Error::InvalidComponent { line })?;
+        self.skip_spaces();
+        self.expect_keyword("ASX")
+            .map_err(|_| AxParseV2Error::InvalidComponent { line })?;
+        self.skip_layout_whitespace();
+
+        if self.peek_char() != Some('{') {
+            return Err(AxParseV2Error::InvalidComponent { line });
+        }
+        self.bump_char();
+        self.skip_layout_whitespace();
+
+        Ok(AxComponentRenderDeclV2::asx(
+            self.parse_nodes_until_component_body_end()?,
+        ))
     }
 
     fn parse_param_list(
@@ -712,8 +848,24 @@ impl<'a> Parser<'a> {
         let name = self.parse_identifier()?;
         self.skip_spaces();
 
+        let ty = if self.peek_char() == Some(':') {
+            self.bump_char();
+            self.skip_spaces();
+            let ty = self.read_component_param_type().trim().to_string();
+            if ty.is_empty() {
+                return Err(AxParseV2Error::InvalidComponent { line });
+            }
+            self.skip_spaces();
+            Some(ty)
+        } else {
+            None
+        };
+
         if self.peek_char() != Some('=') {
-            return Ok(AxComponentParamDeclV2::new(name));
+            return Ok(match ty {
+                Some(ty) => AxComponentParamDeclV2::with_type(name, ty),
+                None => AxComponentParamDeclV2::new(name),
+            });
         }
 
         self.bump_char();
@@ -724,7 +876,10 @@ impl<'a> Parser<'a> {
             return Err(AxParseV2Error::InvalidComponent { line });
         }
 
-        Ok(AxComponentParamDeclV2::with_default(name, default))
+        Ok(match ty {
+            Some(ty) => AxComponentParamDeclV2::with_type_and_default(name, ty, default),
+            None => AxComponentParamDeclV2::with_default(name, default),
+        })
     }
 
     fn parse_nodes(&mut self, closing_tag: Option<&str>) -> Result<Vec<AxNodeV2>, AxParseV2Error> {
@@ -968,6 +1123,57 @@ impl<'a> Parser<'a> {
                             let source = self.input[start..self.pos].trim().to_string();
                             self.bump_char();
                             return Ok(source);
+                        }
+                        self.bump_char();
+                    }
+                    _ => {
+                        self.bump_char();
+                    }
+                },
+            }
+        }
+
+        Err(AxParseV2Error::UnterminatedExpression { line })
+    }
+
+    fn read_raw_braced_block(&mut self, line: usize) -> Result<String, AxParseV2Error> {
+        if self.peek_char() != Some('{') {
+            return Err(AxParseV2Error::UnterminatedExpression { line });
+        }
+        self.bump_char();
+
+        let start = self.pos;
+        let mut depth = 1usize;
+        let mut in_string: Option<char> = None;
+
+        while let Some(ch) = self.peek_char() {
+            match in_string {
+                Some(quote) => {
+                    self.bump_char();
+                    if ch == '\\' {
+                        if self.peek_char().is_some() {
+                            self.bump_char();
+                        }
+                    } else if ch == quote {
+                        in_string = None;
+                    }
+                }
+                None => match ch {
+                    '"' | '\'' | '`' => {
+                        in_string = Some(ch);
+                        self.bump_char();
+                    }
+                    '{' => {
+                        depth += 1;
+                        self.bump_char();
+                    }
+                    '}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            let body = self.input[start..self.pos].trim().to_string();
+                            self.bump_char();
+                            self.consume_until_line_end();
+                            return Ok(body);
                         }
                         self.bump_char();
                     }
@@ -1249,6 +1455,50 @@ impl<'a> Parser<'a> {
                     self.bump_char();
                 }
                 ',' if paren_depth == 0 => break,
+                _ => {
+                    self.bump_char();
+                }
+            }
+        }
+
+        self.input[start..self.pos].to_string()
+    }
+
+    fn read_component_param_type(&mut self) -> String {
+        let start = self.pos;
+        let mut angle_depth = 0usize;
+        let mut bracket_depth = 0usize;
+        let mut paren_depth = 0usize;
+
+        while let Some(ch) = self.peek_char() {
+            match ch {
+                '<' => {
+                    angle_depth += 1;
+                    self.bump_char();
+                }
+                '>' => {
+                    angle_depth = angle_depth.saturating_sub(1);
+                    self.bump_char();
+                }
+                '[' => {
+                    bracket_depth += 1;
+                    self.bump_char();
+                }
+                ']' => {
+                    bracket_depth = bracket_depth.saturating_sub(1);
+                    self.bump_char();
+                }
+                '(' => {
+                    paren_depth += 1;
+                    self.bump_char();
+                }
+                ')' if angle_depth == 0 && bracket_depth == 0 && paren_depth == 0 => break,
+                ')' => {
+                    paren_depth = paren_depth.saturating_sub(1);
+                    self.bump_char();
+                }
+                '=' | ',' if angle_depth == 0 && bracket_depth == 0 && paren_depth == 0 => break,
+                '\n' | '\r' => break,
                 _ => {
                     self.bump_char();
                 }
@@ -1581,6 +1831,129 @@ component FeatureCard(title = "Hello", tone = defaultTone, count = 2) {
                 AxComponentParamDeclV2::with_default("tone", "defaultTone"),
                 AxComponentParamDeclV2::with_default("count", "2")
             ]
+        );
+    }
+
+    #[test]
+    fn parses_typed_component_params_with_defaults() {
+        let input = r#"
+page Home
+
+component ThemeSwitcher(label: String = "Theme", storageKey: String, post: Optional<Post>) {
+  <Copy>{label}</Copy>
+}
+
+<ThemeSwitcher label="Choose theme" storageKey="site-theme" />
+"#;
+
+        let file = parse_ax_v2(input).expect("typed component params should parse");
+
+        assert_eq!(
+            file.components[0].params,
+            vec![
+                AxComponentParamDeclV2::with_type_and_default("label", "String", "\"Theme\""),
+                AxComponentParamDeclV2::with_type("storageKey", "String"),
+                AxComponentParamDeclV2::with_type("post", "Optional<Post>")
+            ]
+        );
+    }
+
+    #[test]
+    fn parses_layered_component_with_client_style_and_render_asx() {
+        let input = r#"
+page Home
+
+component ThemeSwitcher(label = "Theme") {
+  state selected: String = "silver"
+
+  client JS {
+    on mount {
+      Ax.behavior("theme", (node) => {
+        node.addEventListener("change", () => {
+          document.documentElement.dataset.theme = node.value;
+        });
+      });
+    }
+  }
+
+  style {
+    recipe = "theme-switcher"
+  }
+
+  render ASX {
+    <label class="ax-theme-switcher">
+      <span>{label}</span>
+      <select data-ax-behavior="theme">
+        <option value="silver">Silver</option>
+      </select>
+    </label>
+  }
+}
+
+<ThemeSwitcher />
+"#;
+
+        let file = parse_ax_v2(input).expect("layered component should parse");
+        let component = &file.components[0];
+
+        assert_eq!(component.name, "ThemeSwitcher");
+        assert_eq!(
+            component.params,
+            vec![AxComponentParamDeclV2::with_default("label", "\"Theme\"")]
+        );
+        assert_eq!(component.states.len(), 1);
+        assert_eq!(component.states[0].name, "selected");
+        assert_eq!(component.clients.len(), 1);
+        assert_eq!(component.clients[0].target, AxComponentClientTargetV2::Js);
+        assert!(matches!(
+            &component.clients[0].source,
+            AxComponentClientSourceV2::Inline(source)
+                if source.contains("Ax.behavior(\"theme\"")
+        ));
+        assert_eq!(
+            component.style.as_ref().map(|style| style.body.as_str()),
+            Some("recipe = \"theme-switcher\"")
+        );
+        assert!(component.render.is_some());
+        assert_eq!(component.body.len(), 1);
+        assert_eq!(
+            component.render.as_ref().map(|render| render.body.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn parses_component_client_file_references() {
+        let input = r#"
+page Home
+
+component Accordion(single = true) {
+  client JS from "./accordion.client.js"
+  client WASM from "./accordion.client.wasm"
+
+  render ASX {
+    <div class="ax-accordion" data-single={single}>
+      <Slot />
+    </div>
+  }
+}
+
+<Accordion />
+"#;
+
+        let file = parse_ax_v2(input).expect("component client files should parse");
+        let component = &file.components[0];
+
+        assert_eq!(component.clients.len(), 2);
+        assert_eq!(component.clients[0].target, AxComponentClientTargetV2::Js);
+        assert_eq!(
+            component.clients[0].source,
+            AxComponentClientSourceV2::File("./accordion.client.js".to_string())
+        );
+        assert_eq!(component.clients[1].target, AxComponentClientTargetV2::Wasm);
+        assert_eq!(
+            component.clients[1].source,
+            AxComponentClientSourceV2::File("./accordion.client.wasm".to_string())
         );
     }
 

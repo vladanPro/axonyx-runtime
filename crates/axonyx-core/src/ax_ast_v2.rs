@@ -245,6 +245,10 @@ pub struct AxComponentDeclV2 {
     pub name: String,
     pub params: Vec<AxComponentParamDeclV2>,
     pub body: Vec<AxNodeV2>,
+    pub states: Vec<AxStateDeclV2>,
+    pub clients: Vec<AxComponentClientDeclV2>,
+    pub style: Option<AxComponentStyleDeclV2>,
+    pub render: Option<AxComponentRenderDeclV2>,
 }
 
 impl AxComponentDeclV2 {
@@ -257,6 +261,87 @@ impl AxComponentDeclV2 {
             name: name.into(),
             params: params.into_iter().collect(),
             body: body.into_iter().collect(),
+            states: Vec::new(),
+            clients: Vec::new(),
+            style: None,
+            render: None,
+        }
+    }
+
+    pub fn layered(
+        name: impl Into<String>,
+        params: impl IntoIterator<Item = AxComponentParamDeclV2>,
+        states: impl IntoIterator<Item = AxStateDeclV2>,
+        clients: impl IntoIterator<Item = AxComponentClientDeclV2>,
+        style: Option<AxComponentStyleDeclV2>,
+        render: AxComponentRenderDeclV2,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            params: params.into_iter().collect(),
+            body: render.body.clone(),
+            states: states.into_iter().collect(),
+            clients: clients.into_iter().collect(),
+            style,
+            render: Some(render),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxComponentClientDeclV2 {
+    pub target: AxComponentClientTargetV2,
+    pub source: AxComponentClientSourceV2,
+}
+
+impl AxComponentClientDeclV2 {
+    pub fn inline(target: AxComponentClientTargetV2, body: impl Into<String>) -> Self {
+        Self {
+            target,
+            source: AxComponentClientSourceV2::Inline(body.into()),
+        }
+    }
+
+    pub fn file(target: AxComponentClientTargetV2, path: impl Into<String>) -> Self {
+        Self {
+            target,
+            source: AxComponentClientSourceV2::File(path.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxComponentClientTargetV2 {
+    Js,
+    Wasm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxComponentClientSourceV2 {
+    Inline(String),
+    File(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxComponentStyleDeclV2 {
+    pub body: String,
+}
+
+impl AxComponentStyleDeclV2 {
+    pub fn new(body: impl Into<String>) -> Self {
+        Self { body: body.into() }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxComponentRenderDeclV2 {
+    pub body: Vec<AxNodeV2>,
+}
+
+impl AxComponentRenderDeclV2 {
+    pub fn asx(body: impl IntoIterator<Item = AxNodeV2>) -> Self {
+        Self {
+            body: body.into_iter().collect(),
         }
     }
 }
@@ -264,6 +349,7 @@ impl AxComponentDeclV2 {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxComponentParamDeclV2 {
     pub name: String,
+    pub ty: Option<String>,
     pub default: Option<String>,
 }
 
@@ -271,6 +357,7 @@ impl AxComponentParamDeclV2 {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            ty: None,
             default: None,
         }
     }
@@ -278,6 +365,27 @@ impl AxComponentParamDeclV2 {
     pub fn with_default(name: impl Into<String>, default: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            ty: None,
+            default: Some(default.into()),
+        }
+    }
+
+    pub fn with_type(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: Some(ty.into()),
+            default: None,
+        }
+    }
+
+    pub fn with_type_and_default(
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        default: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            ty: Some(ty.into()),
             default: Some(default.into()),
         }
     }
@@ -381,8 +489,13 @@ impl AxExprNode {
 pub mod prelude {
     pub use super::AxAttributeNode;
     pub use super::AxAttributeValue;
+    pub use super::AxComponentClientDeclV2;
+    pub use super::AxComponentClientSourceV2;
+    pub use super::AxComponentClientTargetV2;
     pub use super::AxComponentDeclV2;
     pub use super::AxComponentParamDeclV2;
+    pub use super::AxComponentRenderDeclV2;
+    pub use super::AxComponentStyleDeclV2;
     pub use super::AxElementNode;
     pub use super::AxExprNode;
     pub use super::AxFileV2;

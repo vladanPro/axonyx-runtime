@@ -332,6 +332,9 @@ fn lower_component_nodes(
             functions,
             imports,
             components,
+            functions,
+            imports,
+            components,
             scope,
             resolver,
             import_resolver,
@@ -1009,6 +1012,9 @@ fn lower_local_component_nodes(
     functions: &[AxFunctionDef],
     imports: &[AxImport],
     components: &[AxComponentDef],
+    slot_functions: &[AxFunctionDef],
+    slot_imports: &[AxImport],
+    slot_components: &[AxComponentDef],
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
@@ -1031,9 +1037,9 @@ fn lower_local_component_nodes(
     let slot_body = component_children_to_statements(component);
     let slot_context = SlotContext {
         body: &slot_body,
-        functions,
-        imports,
-        components,
+        functions: slot_functions,
+        imports: slot_imports,
+        components: slot_components,
         parent: slot_context,
     };
 
@@ -1061,11 +1067,49 @@ fn lower_imported_component_nodes(
     import_source: &str,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
-    let document =
-        parse_ax_auto(import_source).map_err(|error| AxLowerError::ImportedComponentParse {
-            import_path: import_decl.source.to_string(),
-            message: error.to_string(),
-        })?;
+    let document = match parse_ax_auto(import_source) {
+        Ok(document) => document,
+        Err(page_error) => {
+            if let Some(nodes) = lower_imported_component_only_nodes(
+                component,
+                &import_decl,
+                functions,
+                imports,
+                components,
+                scope,
+                resolver,
+                import_resolver,
+                import_source,
+                slot_context,
+            )? {
+                return Ok(nodes);
+            }
+            return Err(AxLowerError::ImportedComponentParse {
+                import_path: import_decl.source.to_string(),
+                message: page_error.to_string(),
+            });
+        }
+    };
+
+    if let Some(component_def) =
+        resolve_component(&document.components, &import_decl.binding.imported)
+            .or_else(|| resolve_component(&document.components, &import_decl.binding.local))
+    {
+        return lower_local_component_nodes(
+            component,
+            component_def,
+            &document.functions,
+            &document.imports,
+            &document.components,
+            functions,
+            imports,
+            components,
+            scope,
+            resolver,
+            import_resolver,
+            slot_context,
+        );
+    }
 
     let mut imported_scope = scope.clone();
     apply_params_to_scope(
@@ -1110,6 +1154,79 @@ fn lower_imported_component_nodes(
         import_resolver,
         Some(&slot_context),
     )
+}
+
+fn lower_imported_component_only_nodes(
+    component: &AxComponent,
+    import_decl: &ResolvedImport<'_>,
+    functions: &[AxFunctionDef],
+    imports: &[AxImport],
+    components: &[AxComponentDef],
+    scope: &mut BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+    import_resolver: &impl AxImportResolver,
+    import_source: &str,
+    slot_context: Option<&SlotContext<'_>>,
+) -> Result<Option<Vec<AxNode>>, AxLowerError> {
+    let Some(document) = parse_component_only_import_document(import_source) else {
+        return Ok(None);
+    };
+    let Some(component_def) =
+        resolve_component(&document.components, &import_decl.binding.imported)
+            .or_else(|| resolve_component(&document.components, &import_decl.binding.local))
+    else {
+        return Ok(None);
+    };
+
+    lower_local_component_nodes(
+        component,
+        component_def,
+        &document.functions,
+        &document.imports,
+        &document.components,
+        functions,
+        imports,
+        components,
+        scope,
+        resolver,
+        import_resolver,
+        slot_context,
+    )
+    .map(Some)
+}
+
+fn parse_component_only_import_document(import_source: &str) -> Option<AxDocument> {
+    if !import_source
+        .lines()
+        .any(|line| line.trim_start().starts_with("component "))
+    {
+        return None;
+    }
+
+    let mut prefix = Vec::new();
+    let mut body = Vec::new();
+    let mut in_prefix = true;
+    for line in import_source.lines() {
+        let trimmed = line.trim_start();
+        if in_prefix
+            && (trimmed.is_empty() || trimmed.starts_with("use ") || trimmed.starts_with("import "))
+        {
+            prefix.push(line);
+        } else {
+            in_prefix = false;
+            body.push(line);
+        }
+    }
+
+    let mut synthetic = String::new();
+    if !prefix.is_empty() {
+        synthetic.push_str(&prefix.join("\n"));
+        synthetic.push_str("\n\n");
+    }
+    synthetic.push_str("page ComponentModule\n\n");
+    synthetic.push_str(&body.join("\n"));
+
+    parse_ax_auto(&synthetic).ok()
 }
 
 fn apply_params_to_scope(
@@ -2386,6 +2503,195 @@ page SiteBadge(label = "Beta")
                     element_with_attrs("span", vec![attr("class", "badge")], vec![text("Beta")]),
                     element_with_attrs("span", vec![attr("class", "badge")], vec![text("Stable")],),
                 ],
+            )
+        );
+    }
+
+    #[test]
+    fn lowers_imported_component_only_file() {
+        let document = AxDocument {
+            imports: vec![AxImport::new(
+                [AxImportBinding::named("ThemeSwitcher")],
+                "@/components/theme-switcher.ax",
+            )],
+            functions: Vec::new(),
+            components: Vec::new(),
+            head: AxHead::default(),
+            page: AxPage::new(
+                "Home",
+                [AxStatement::component(
+                    AxComponent::new("ThemeSwitcher").prop("label", "Choose theme"),
+                )],
+            ),
+        };
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let import_resolver = |source: &str| -> Option<String> {
+            match source {
+                "@/components/theme-switcher.ax" => Some(
+                    r#"
+component ThemeSwitcher(label: String = "Theme") {
+  <label class="ax-theme-switcher">
+    <span>{label}</span>
+  </label>
+}
+"#
+                    .to_string(),
+                ),
+                _ => None,
+            }
+        };
+
+        let node = lower_document_with_scope_and_imports(
+            &document,
+            BTreeMap::new(),
+            &resolver,
+            &import_resolver,
+        )
+        .expect("component-only import should lower");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "label",
+                    vec![attr("class", "ax-theme-switcher")],
+                    vec![element("span", vec![text("Choose theme")])]
+                )],
+            )
+        );
+    }
+
+    #[test]
+    fn lowers_imported_component_only_untyped_default_prop_in_attribute() {
+        let document = AxDocument {
+            imports: vec![AxImport::new(
+                [AxImportBinding::named("Button")],
+                "@axonyx/ui/foundry/Button.ax",
+            )],
+            functions: Vec::new(),
+            components: Vec::new(),
+            head: AxHead::default(),
+            page: AxPage::new(
+                "Home",
+                [AxStatement::component(
+                    AxComponent::new("Button").prop("href", "/docs"),
+                )],
+            ),
+        };
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let import_resolver = |source: &str| -> Option<String> {
+            match source {
+                "@axonyx/ui/foundry/Button.ax" => Some(
+                    r##"
+component Button(href = "#") {
+  <a class="ax-button" href={href}>
+    <Slot />
+  </a>
+}
+"##
+                    .to_string(),
+                ),
+                _ => None,
+            }
+        };
+
+        let node = lower_document_with_scope_and_imports(
+            &document,
+            BTreeMap::new(),
+            &resolver,
+            &import_resolver,
+        )
+        .expect("component-only import should bind untyped default params");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "a",
+                    vec![attr("class", "ax-button"), attr("href", "/docs")],
+                    vec![]
+                )],
+            )
+        );
+    }
+
+    #[test]
+    fn lowers_parent_imports_inside_imported_component_slot() {
+        let document = AxDocument {
+            imports: vec![
+                AxImport::new([AxImportBinding::named("Shell")], "@/components/Shell.ax"),
+                AxImport::new(
+                    [AxImportBinding::named("TextLink")],
+                    "@/components/TextLink.ax",
+                ),
+            ],
+            functions: Vec::new(),
+            components: Vec::new(),
+            head: AxHead::default(),
+            page: AxPage::new(
+                "Home",
+                [AxStatement::component(
+                    AxComponent::new("Shell").block([AxStatement::component(
+                        AxComponent::new("TextLink")
+                            .prop("href", "/docs")
+                            .inline("Docs"),
+                    )]),
+                )],
+            ),
+        };
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let import_resolver = |source: &str| -> Option<String> {
+            match source {
+                "@/components/Shell.ax" => Some(
+                    r#"
+component Shell {
+  <section class="shell">
+    <Slot />
+  </section>
+}
+"#
+                    .to_string(),
+                ),
+                "@/components/TextLink.ax" => Some(
+                    r##"
+component TextLink(href = "#") {
+  <a class="ax-link" href={href}>
+    <Slot />
+  </a>
+}
+"##
+                    .to_string(),
+                ),
+                _ => None,
+            }
+        };
+
+        let node = lower_document_with_scope_and_imports(
+            &document,
+            BTreeMap::new(),
+            &resolver,
+            &import_resolver,
+        )
+        .expect("slot children should keep parent imports");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "section",
+                    vec![attr("class", "shell")],
+                    vec![element_with_attrs(
+                        "a",
+                        vec![attr("class", "ax-link"), attr("href", "/docs")],
+                        vec![text("Docs")]
+                    )]
+                )],
             )
         );
     }
