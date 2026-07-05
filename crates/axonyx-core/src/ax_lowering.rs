@@ -1061,11 +1061,26 @@ fn lower_imported_component_nodes(
     import_source: &str,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
-    let document =
-        parse_ax_auto(import_source).map_err(|error| AxLowerError::ImportedComponentParse {
-            import_path: import_decl.source.to_string(),
-            message: error.to_string(),
-        })?;
+    let document = match parse_ax_auto(import_source) {
+        Ok(document) => document,
+        Err(page_error) => {
+            if let Some(nodes) = lower_imported_component_only_nodes(
+                component,
+                &import_decl,
+                scope,
+                resolver,
+                import_resolver,
+                import_source,
+                slot_context,
+            )? {
+                return Ok(nodes);
+            }
+            return Err(AxLowerError::ImportedComponentParse {
+                import_path: import_decl.source.to_string(),
+                message: page_error.to_string(),
+            });
+        }
+    };
 
     let mut imported_scope = scope.clone();
     apply_params_to_scope(
@@ -1110,6 +1125,73 @@ fn lower_imported_component_nodes(
         import_resolver,
         Some(&slot_context),
     )
+}
+
+fn lower_imported_component_only_nodes(
+    component: &AxComponent,
+    import_decl: &ResolvedImport<'_>,
+    scope: &mut BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+    import_resolver: &impl AxImportResolver,
+    import_source: &str,
+    slot_context: Option<&SlotContext<'_>>,
+) -> Result<Option<Vec<AxNode>>, AxLowerError> {
+    let Some(document) = parse_component_only_import_document(import_source) else {
+        return Ok(None);
+    };
+    let Some(component_def) =
+        resolve_component(&document.components, &import_decl.binding.imported)
+            .or_else(|| resolve_component(&document.components, &import_decl.binding.local))
+    else {
+        return Ok(None);
+    };
+
+    lower_local_component_nodes(
+        component,
+        component_def,
+        &document.functions,
+        &document.imports,
+        &document.components,
+        scope,
+        resolver,
+        import_resolver,
+        slot_context,
+    )
+    .map(Some)
+}
+
+fn parse_component_only_import_document(import_source: &str) -> Option<AxDocument> {
+    if !import_source
+        .lines()
+        .any(|line| line.trim_start().starts_with("component "))
+    {
+        return None;
+    }
+
+    let mut prefix = Vec::new();
+    let mut body = Vec::new();
+    let mut in_prefix = true;
+    for line in import_source.lines() {
+        let trimmed = line.trim_start();
+        if in_prefix
+            && (trimmed.is_empty() || trimmed.starts_with("use ") || trimmed.starts_with("import "))
+        {
+            prefix.push(line);
+        } else {
+            in_prefix = false;
+            body.push(line);
+        }
+    }
+
+    let mut synthetic = String::new();
+    if !prefix.is_empty() {
+        synthetic.push_str(&prefix.join("\n"));
+        synthetic.push_str("\n\n");
+    }
+    synthetic.push_str("page ComponentModule\n\n");
+    synthetic.push_str(&body.join("\n"));
+
+    parse_ax_auto(&synthetic).ok()
 }
 
 fn apply_params_to_scope(
@@ -2386,6 +2468,62 @@ page SiteBadge(label = "Beta")
                     element_with_attrs("span", vec![attr("class", "badge")], vec![text("Beta")]),
                     element_with_attrs("span", vec![attr("class", "badge")], vec![text("Stable")],),
                 ],
+            )
+        );
+    }
+
+    #[test]
+    fn lowers_imported_component_only_file() {
+        let document = AxDocument {
+            imports: vec![AxImport::new(
+                [AxImportBinding::named("ThemeSwitcher")],
+                "@/components/theme-switcher.ax",
+            )],
+            functions: Vec::new(),
+            components: Vec::new(),
+            head: AxHead::default(),
+            page: AxPage::new(
+                "Home",
+                [AxStatement::component(
+                    AxComponent::new("ThemeSwitcher").prop("label", "Choose theme"),
+                )],
+            ),
+        };
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let import_resolver = |source: &str| -> Option<String> {
+            match source {
+                "@/components/theme-switcher.ax" => Some(
+                    r#"
+component ThemeSwitcher(label: String = "Theme") {
+  <label class="ax-theme-switcher">
+    <span>{label}</span>
+  </label>
+}
+"#
+                    .to_string(),
+                ),
+                _ => None,
+            }
+        };
+
+        let node = lower_document_with_scope_and_imports(
+            &document,
+            BTreeMap::new(),
+            &resolver,
+            &import_resolver,
+        )
+        .expect("component-only import should lower");
+
+        assert_eq!(
+            node,
+            element_with_attrs(
+                "main",
+                vec![attr("data-ax-page", "Home"), attr("data-ax-root", "page")],
+                vec![element_with_attrs(
+                    "label",
+                    vec![attr("class", "ax-theme-switcher")],
+                    vec![element("span", vec![text("Choose theme")])]
+                )],
             )
         );
     }
