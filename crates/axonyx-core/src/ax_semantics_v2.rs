@@ -18,6 +18,8 @@ pub enum AxSemanticV2Error {
     HeadTagOutsideHead { tag: String },
     #[error("`<Head>` is only valid at the top level of a page")]
     HeadOutsideTopLevel,
+    #[error("component `{component}` must load WASM from a file; inline `client WASM` is not supported in v1")]
+    InlineComponentWasm { component: String },
 }
 
 pub fn validate_ax_v2_semantics(file: &AxFileV2) -> Result<(), AxSemanticV2Error> {
@@ -25,6 +27,15 @@ pub fn validate_ax_v2_semantics(file: &AxFileV2) -> Result<(), AxSemanticV2Error
     validate_component_names(file)?;
 
     for component in &file.components {
+        for client in &component.clients {
+            if matches!(client.target, AxComponentClientTargetV2::Wasm)
+                && matches!(client.source, AxComponentClientSourceV2::Inline(_))
+            {
+                return Err(AxSemanticV2Error::InlineComponentWasm {
+                    component: component.name.clone(),
+                });
+            }
+        }
         for node in &component.body {
             validate_node(node, NodeContext::Body)?;
         }
@@ -271,5 +282,54 @@ component Feature() {
                 name: "Feature".to_string()
             }
         );
+    }
+
+    #[test]
+    fn rejects_inline_component_wasm_clients() {
+        let file = parse_ax_v2(
+            r#"
+page Home
+
+component Demo() {
+  client WASM {
+    export function boot() {}
+  }
+
+  render ASX {
+    <Copy>Demo</Copy>
+  }
+}
+"#,
+        )
+        .expect("source should parse");
+
+        let error = validate_ax_v2_semantics(&file).expect_err("inline wasm should fail");
+
+        assert_eq!(
+            error,
+            AxSemanticV2Error::InlineComponentWasm {
+                component: "Demo".to_string()
+            }
+        );
+    }
+
+    #[test]
+    fn allows_component_wasm_loaded_from_file() {
+        let file = parse_ax_v2(
+            r#"
+page Home
+
+component Demo() {
+  client WASM from "./demo.wasm"
+
+  render ASX {
+    <Copy>Demo</Copy>
+  }
+}
+"#,
+        )
+        .expect("source should parse");
+
+        validate_ax_v2_semantics(&file).expect("file wasm client should be valid");
     }
 }

@@ -57,6 +57,10 @@ pub enum AxConvertV2Error {
         "invalid state initializer `{expr_source}`; expected a literal value or `signal(...)`"
     )]
     InvalidStateInitializer { expr_source: String },
+    #[error(
+        "component state `{name}` uses unsupported v1 type `{ty}`; use String, Bool, or Number"
+    )]
+    UnsupportedComponentStateType { name: String, ty: String },
     #[error("`{attr}` must bind to a declared `state` signal")]
     UnknownStateBinding { attr: String },
     #[error("`{attr}` only supports expression bindings such as `{{theme}}`")]
@@ -176,14 +180,47 @@ fn convert_component_decl(
     component: &AxComponentDeclV2,
     state_bindings: &BTreeMap<String, StateBindingPlan>,
 ) -> Result<AxComponentDef, AxConvertV2Error> {
-    Ok(AxComponentDef::new(
+    let mut bindings = state_bindings.clone();
+    let mut states = Vec::new();
+    for (index, state) in component.states.iter().enumerate() {
+        let initializer = parse_state_initializer(&state.value)?;
+        let ty = state.ty.clone().unwrap_or(initializer.ty);
+        if !matches!(ty.as_str(), "String" | "Bool" | "Number") {
+            return Err(AxConvertV2Error::UnsupportedComponentStateType {
+                name: state.name.clone(),
+                ty,
+            });
+        }
+        let signal = format!(
+            "__ax_component_state__:{}:{}:{}",
+            component.name,
+            state.name,
+            index + 1
+        );
+        bindings.insert(
+            state.name.clone(),
+            StateBindingPlan {
+                signal_id: signal.clone(),
+                ty: ty.clone(),
+            },
+        );
+        states.push(AxComponentStateDef::new(
+            state.name.clone(),
+            ty,
+            initializer.value,
+            signal,
+        ));
+    }
+
+    Ok(AxComponentDef::with_states(
         component.name.clone(),
         component
             .params
             .iter()
             .map(convert_component_param_decl)
             .collect::<Result<Vec<_>, _>>()?,
-        convert_children(&component.body, state_bindings)?,
+        states,
+        convert_children(&component.body, &bindings)?,
     ))
 }
 
@@ -1186,6 +1223,72 @@ state count: Number = 0
         assert!(count_input
             .props
             .contains(&AxProp::new("data-ax-state-type", AxExpr::string("Number"))));
+    }
+
+    #[test]
+    fn converts_component_local_state_into_component_metadata_and_bindings() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+component ThemePicker() {
+  state theme: String = "silver"
+
+  render ASX {
+    <input bind:value={theme} />
+    <span bind:text={theme}>{theme}</span>
+  }
+}
+
+<ThemePicker />
+"#,
+        )
+        .expect("component state should convert");
+
+        assert_eq!(document.components.len(), 1);
+        let component = &document.components[0];
+        assert_eq!(component.states.len(), 1);
+        assert_eq!(component.states[0].name, "theme");
+        assert_eq!(component.states[0].ty, "String");
+        assert_eq!(component.states[0].initial, AxExpr::string("silver"));
+        assert_eq!(
+            component.states[0].signal,
+            "__ax_component_state__:ThemePicker:theme:1"
+        );
+
+        let AxStatement::Component(input) = &component.body[0] else {
+            panic!("input should convert into component");
+        };
+        assert!(input.props.contains(&AxProp::new(
+            "data-ax-signal",
+            AxExpr::string("__ax_component_state__:ThemePicker:theme:1")
+        )));
+        assert!(input
+            .props
+            .contains(&AxProp::new("data-ax-bind", AxExpr::string("value"))));
+    }
+
+    #[test]
+    fn rejects_unsupported_component_state_types_in_v1() {
+        let error = parse_ax_auto(
+            r#"
+page Home
+
+component Demo() {
+  state post: Post = "draft"
+
+  render ASX {
+    <Copy>Demo</Copy>
+  }
+}
+"#,
+        )
+        .expect_err("unsupported component state should fail");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::UnsupportedComponentStateType { .. })
+        ));
     }
 
     #[test]

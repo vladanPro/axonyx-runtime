@@ -98,6 +98,7 @@ impl AxFunctionDef {
 pub struct AxComponentDef {
     pub name: String,
     pub params: Vec<AxComponentParamDef>,
+    pub states: Vec<AxComponentStateDef>,
     pub body: Vec<AxStatement>,
 }
 
@@ -110,7 +111,46 @@ impl AxComponentDef {
         Self {
             name: name.into(),
             params: params.into_iter().collect(),
+            states: Vec::new(),
             body: body.into_iter().collect(),
+        }
+    }
+
+    pub fn with_states(
+        name: impl Into<String>,
+        params: impl IntoIterator<Item = AxComponentParamDef>,
+        states: impl IntoIterator<Item = AxComponentStateDef>,
+        body: impl IntoIterator<Item = AxStatement>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            params: params.into_iter().collect(),
+            states: states.into_iter().collect(),
+            body: body.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxComponentStateDef {
+    pub name: String,
+    pub ty: String,
+    pub initial: AxExpr,
+    pub signal: String,
+}
+
+impl AxComponentStateDef {
+    pub fn new(
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        initial: AxExpr,
+        signal: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
+            initial,
+            signal: signal.into(),
         }
     }
 }
@@ -639,6 +679,7 @@ pub mod prelude {
     pub use super::AxComponent;
     pub use super::AxComponentDef;
     pub use super::AxComponentParamDef;
+    pub use super::AxComponentStateDef;
     pub use super::AxDataBinding;
     pub use super::AxDocument;
     pub use super::AxEachBlock;

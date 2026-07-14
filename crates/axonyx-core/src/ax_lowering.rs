@@ -6,6 +6,9 @@ use crate::ax_ast::prelude::*;
 use crate::ax_parser_auto::prelude::parse_ax_auto;
 use crate::prelude::*;
 
+const AX_RENDER_PATH: &str = "__ax_render_path";
+const AX_COMPONENT_INSTANCE_PATH: &str = "__ax_component_instance_path";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxValue {
     Null,
@@ -133,6 +136,7 @@ pub fn lower_document_with_scope_and_imports(
     import_resolver: &impl AxImportResolver,
 ) -> Result<AxNode, AxLowerError> {
     let mut scope = initial_scope;
+    scope.insert(AX_RENDER_PATH.to_string(), AxValue::String("0".to_string()));
     apply_params_to_scope(
         &document.page.params,
         &mut scope,
@@ -180,7 +184,13 @@ fn lower_statements(
 ) -> Result<Vec<AxNode>, AxLowerError> {
     let mut nodes = Vec::new();
 
-    for statement in statements {
+    let parent_render_path = render_path(scope);
+    for (statement_index, statement) in statements.iter().enumerate() {
+        let statement_render_path = format!("{parent_render_path}.{statement_index}");
+        scope.insert(
+            AX_RENDER_PATH.to_string(),
+            AxValue::String(statement_render_path.clone()),
+        );
         match statement {
             AxStatement::Data(binding) => {
                 let value = eval_expr(&binding.value, functions, scope, resolver)?;
@@ -205,9 +215,13 @@ fn lower_statements(
                         slot_context,
                     )?);
                 } else {
-                    for item in items {
+                    for (item_index, item) in items.into_iter().enumerate() {
                         let mut nested = scope.clone();
                         nested.insert(block.binding.clone(), item);
+                        nested.insert(
+                            AX_RENDER_PATH.to_string(),
+                            AxValue::String(format!("{statement_render_path}.each{item_index}")),
+                        );
                         nodes.extend(lower_statements(
                             &block.body,
                             functions,
@@ -230,6 +244,13 @@ fn lower_statements(
                 };
                 if !body.is_empty() {
                     let mut nested = scope.clone();
+                    nested.insert(
+                        AX_RENDER_PATH.to_string(),
+                        AxValue::String(format!(
+                            "{statement_render_path}.if{}",
+                            if is_truthy(&condition) { 1 } else { 0 }
+                        )),
+                    );
                     nodes.extend(lower_statements(
                         body,
                         functions,
@@ -273,6 +294,11 @@ fn lower_statements(
             }
         }
     }
+
+    scope.insert(
+        AX_RENDER_PATH.to_string(),
+        AxValue::String(parent_render_path),
+    );
 
     Ok(nodes)
 }
@@ -643,12 +669,51 @@ fn eval_props(
 ) -> Result<BTreeMap<String, AxValue>, AxLowerError> {
     let mut props = BTreeMap::new();
     for prop in &component.props {
+        let value = eval_expr(&prop.value, functions, scope, resolver)?;
         props.insert(
             prop.name.clone(),
-            eval_expr(&prop.value, functions, scope, resolver)?,
+            materialize_component_state_signal(value, scope),
         );
     }
     Ok(props)
+}
+
+fn render_path(scope: &BTreeMap<String, AxValue>) -> String {
+    scope
+        .get(AX_RENDER_PATH)
+        .map(AxValue::as_string)
+        .filter(|path| !path.is_empty())
+        .unwrap_or_else(|| "0".to_string())
+}
+
+fn materialize_component_state_signal(
+    value: AxValue,
+    scope: &BTreeMap<String, AxValue>,
+) -> AxValue {
+    let AxValue::String(signal) = value else {
+        return value;
+    };
+    let Some(rest) = signal.strip_prefix("__ax_component_state__:") else {
+        return AxValue::String(signal);
+    };
+    let mut parts = rest.split(':');
+    let (Some(component), Some(state), Some(index), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return AxValue::String(signal);
+    };
+
+    AxValue::String(format!(
+        "component:{component}:{}:{state}:{index}",
+        component_instance_path(scope).unwrap_or_else(|| render_path(scope))
+    ))
+}
+
+fn component_instance_path(scope: &BTreeMap<String, AxValue>) -> Option<String> {
+    scope
+        .get(AX_COMPONENT_INSTANCE_PATH)
+        .map(AxValue::as_string)
+        .filter(|path| !path.is_empty())
 }
 
 fn style_attrs(
@@ -1022,6 +1087,10 @@ fn lower_local_component_nodes(
 ) -> Result<Vec<AxNode>, AxLowerError> {
     let props = eval_props(component, functions, scope, resolver)?;
     let mut component_scope = scope.clone();
+    component_scope.insert(
+        AX_COMPONENT_INSTANCE_PATH.to_string(),
+        AxValue::String(render_path(scope)),
+    );
 
     for param in &component_def.params {
         let value = if let Some(value) = props.get(&param.name) {
@@ -1032,6 +1101,11 @@ fn lower_local_component_nodes(
             AxValue::Null
         };
         component_scope.insert(param.name.clone(), value);
+    }
+
+    for state in &component_def.states {
+        let value = eval_expr(&state.initial, functions, &component_scope, resolver)?;
+        component_scope.insert(state.name.clone(), value);
     }
 
     let slot_body = component_children_to_statements(component);
@@ -1723,6 +1797,43 @@ page Home
             .iter()
             .any(|attr| attr.name == "type" && attr.value == "button"));
         assert!(!attrs.iter().any(|attr| attr.name == "behavior"));
+    }
+
+    #[test]
+    fn component_state_signals_are_scoped_to_each_component_instance() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+component ThemePicker() {
+  state theme: String = "silver"
+
+  render ASX {
+    <input bind:value={theme} />
+    <span bind:text={theme}>{theme}</span>
+  }
+}
+
+<ThemePicker />
+<ThemePicker />
+"#,
+        )
+        .expect("document should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+        let mut signals = Vec::new();
+        collect_attr_values(&node, "data-ax-signal", &mut signals);
+
+        assert_eq!(
+            signals,
+            vec![
+                "component:ThemePicker:0.0:theme:1".to_string(),
+                "component:ThemePicker:0.0:theme:1".to_string(),
+                "component:ThemePicker:0.1:theme:1".to_string(),
+                "component:ThemePicker:0.1:theme:1".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -2694,5 +2805,24 @@ component TextLink(href = "#") {
                 )],
             )
         );
+    }
+
+    fn collect_attr_values(node: &AxNode, name: &str, values: &mut Vec<String>) {
+        match node {
+            AxNode::Element {
+                attrs, children, ..
+            } => {
+                values.extend(
+                    attrs
+                        .iter()
+                        .filter(|attr| attr.name == name)
+                        .map(|attr| attr.value.clone()),
+                );
+                for child in children {
+                    collect_attr_values(child, name, values);
+                }
+            }
+            AxNode::Text(_) | AxNode::RawHtml(_) => {}
+        }
     }
 }
