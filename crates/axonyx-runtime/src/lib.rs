@@ -598,6 +598,54 @@ pub fn preview_ax_route_with_request_context_and_imports(
     store: &AxPreviewStore,
     import_resolver: &impl AxImportResolver,
 ) -> Result<String, PreviewError> {
+    preview_ax_route_with_request_context_runtime_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        request_target,
+        route_params,
+        None,
+        store,
+        import_resolver,
+    )
+}
+
+pub fn preview_ax_route_with_request_context_and_runtime_and_imports(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    runtime: &dyn backend::AxBackendRuntime,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
+) -> Result<String, PreviewError> {
+    preview_ax_route_with_request_context_runtime_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        request_target,
+        route_params,
+        Some(runtime),
+        store,
+        import_resolver,
+    )
+}
+
+fn preview_ax_route_with_request_context_runtime_and_imports(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
+) -> Result<String, PreviewError> {
     let page_document = parse_ax_auto(page_source)?;
     let mut document = page_document;
 
@@ -608,7 +656,13 @@ pub fn preview_ax_route_with_request_context_and_imports(
 
     let handlers = collect_preview_handlers(loader_sources, action_sources, &[])?;
     let cache = RefCell::new(BTreeMap::new());
-    let env = backend::AxEnv::from_env();
+    let fallback_env;
+    let env = if let Some(runtime) = runtime {
+        runtime.env()
+    } else {
+        fallback_env = backend::AxEnv::from_env();
+        &fallback_env
+    };
     let route_scope =
         build_preview_route_scope(route_params, &parse_preview_query_fields(request_target));
     let resolver_error = RefCell::new(None);
@@ -616,8 +670,8 @@ pub fn preview_ax_route_with_request_context_and_imports(
         match preview_resolve_call(
             &handlers,
             &cache,
-            &env,
-            None,
+            env,
+            runtime,
             request_target,
             &route_scope,
             store,
@@ -671,6 +725,26 @@ pub fn execute_preview_action_sources(
         action_name,
         input_fields,
         &env,
+        None,
+        store,
+    )
+}
+
+pub fn execute_preview_action_sources_with_runtime(
+    action_sources: &[&str],
+    action_name: &str,
+    input_fields: &BTreeMap<String, String>,
+    runtime: &dyn backend::AxBackendRuntime,
+    store: &mut AxPreviewStore,
+) -> Result<AxPreviewActionResult, PreviewError> {
+    let handlers = collect_preview_handlers(&[], action_sources, &[])?;
+    execute_preview_action(
+        &handlers.actions,
+        &handlers.functions,
+        action_name,
+        input_fields,
+        runtime.env(),
+        Some(runtime),
         store,
     )
 }
@@ -1127,6 +1201,7 @@ fn execute_preview_action(
     action_name: &str,
     input_fields: &BTreeMap<String, String>,
     env: &backend::AxEnv,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &mut AxPreviewStore,
 ) -> Result<AxPreviewActionResult, PreviewError> {
     let action = actions
@@ -1158,17 +1233,28 @@ fn execute_preview_action(
                 binding,
                 value: plan,
             } => {
-                let evaluated =
-                    eval_preview_value_with_functions(plan, &scope, env, None, store, functions)?;
+                let evaluated = eval_preview_value_with_functions(
+                    plan, &scope, env, runtime, store, functions,
+                )?;
                 scope.insert(binding.clone(), evaluated);
             }
             AxStepPlan::Insert { collection, fields } => {
                 let mut record =
                     eval_preview_fields_with_functions(fields, &scope, env, functions)?;
-                assign_preview_id(&mut record, store.collection_items(collection).len());
-                store
-                    .ensure_collection(collection)
-                    .push(AxValue::Record(record));
+                if let Some(runtime) = runtime {
+                    runtime.insert(&backend::AxInsertRequest {
+                        collection: collection.clone(),
+                        fields: record
+                            .into_iter()
+                            .map(|(key, value)| (key, preview_value_to_json(&value)))
+                            .collect(),
+                    })?;
+                } else {
+                    assign_preview_id(&mut record, store.collection_items(collection).len());
+                    store
+                        .ensure_collection(collection)
+                        .push(AxValue::Record(record));
+                }
                 push_preview_auto_invalidation(&mut invalidations, collection.clone());
             }
             AxStepPlan::Update {
@@ -1178,9 +1264,27 @@ fn execute_preview_action(
             } => {
                 let fields = eval_preview_fields_with_functions(fields, &scope, env, functions)?;
                 let filters = eval_preview_filters_with_functions(filters, &scope, env, functions)?;
-                for item in store.ensure_collection(collection).iter_mut() {
-                    if preview_record_matches_all(item, &filters) {
-                        apply_preview_fields(item, &fields);
+                if let Some(runtime) = runtime {
+                    runtime.update(&backend::AxUpdateRequest {
+                        collection: collection.clone(),
+                        fields: fields
+                            .into_iter()
+                            .map(|(key, value)| (key, preview_value_to_json(&value)))
+                            .collect(),
+                        filters: filters
+                            .into_iter()
+                            .map(|filter| backend::AxQueryFilterRequest {
+                                field: filter.field,
+                                op: preview_filter_op_to_runtime(filter.op),
+                                value: preview_value_to_json(&filter.value),
+                            })
+                            .collect(),
+                    })?;
+                } else {
+                    for item in store.ensure_collection(collection).iter_mut() {
+                        if preview_record_matches_all(item, &filters) {
+                            apply_preview_fields(item, &fields);
+                        }
                     }
                 }
                 push_preview_auto_invalidation(&mut invalidations, collection.clone());
@@ -1190,9 +1294,23 @@ fn execute_preview_action(
                 filters,
             } => {
                 let filters = eval_preview_filters_with_functions(filters, &scope, env, functions)?;
-                store
-                    .ensure_collection(collection)
-                    .retain(|item| !preview_record_matches_all(item, &filters));
+                if let Some(runtime) = runtime {
+                    runtime.delete(&backend::AxDeleteRequest {
+                        collection: collection.clone(),
+                        filters: filters
+                            .into_iter()
+                            .map(|filter| backend::AxQueryFilterRequest {
+                                field: filter.field,
+                                op: preview_filter_op_to_runtime(filter.op),
+                                value: preview_value_to_json(&filter.value),
+                            })
+                            .collect(),
+                    })?;
+                } else {
+                    store
+                        .ensure_collection(collection)
+                        .retain(|item| !preview_record_matches_all(item, &filters));
+                }
                 push_preview_auto_invalidation(&mut invalidations, collection.clone());
             }
             AxStepPlan::Revalidate { target, literal } => {
@@ -1201,6 +1319,9 @@ fn execute_preview_action(
                 )?;
                 if target.starts_with('/') {
                     redirect_to = Some(target.clone());
+                }
+                if let Some(runtime) = runtime {
+                    runtime.revalidate(&target)?;
                 }
                 push_preview_explicit_invalidation(&mut invalidations, target);
             }
@@ -5104,6 +5225,60 @@ page Posts
         .expect("page should render with mutated store");
 
         assert!(html.contains("Axonyx Forms"));
+    }
+
+    #[test]
+    fn production_action_runtime_writes_to_sqlite_instead_of_preview_store() {
+        let path = std::env::temp_dir().join(format!(
+            "axonyx-action-runtime-{}-{}.sqlite",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time should move forward")
+                .as_nanos()
+        ));
+        let connection = rusqlite::Connection::open(&path).expect("sqlite database should open");
+        connection
+            .execute(
+                "create table posts (id integer primary key, title text not null)",
+                [],
+            )
+            .expect("posts table should create");
+        drop(connection);
+
+        let env = backend::AxEnv::new()
+            .with_secret("db_dialect", "sqlite")
+            .with_secret("db_url", path.to_string_lossy());
+        let runtime = backend::runtime_from_env(env).expect("database runtime should initialize");
+        let mut store = AxPreviewStore::default();
+        let preview_count = store.collection_items("posts").len();
+
+        execute_preview_action_sources_with_runtime(
+            &[r#"
+action CreatePost
+  input:
+    title: string
+
+  insert posts
+    title: input.title
+  return ok
+"#],
+            "CreatePost",
+            &BTreeMap::from([("title".to_string(), "Stored in SQLite".to_string())]),
+            &runtime,
+            &mut store,
+        )
+        .expect("production action should execute");
+
+        let connection = rusqlite::Connection::open(&path).expect("sqlite database should reopen");
+        let title: String = connection
+            .query_row("select title from posts", [], |row| row.get(0))
+            .expect("inserted post should exist");
+        assert_eq!(title, "Stored in SQLite");
+        assert_eq!(store.collection_items("posts").len(), preview_count);
+
+        drop(connection);
+        std::fs::remove_file(path).expect("sqlite database should clean up");
     }
 
     #[test]
