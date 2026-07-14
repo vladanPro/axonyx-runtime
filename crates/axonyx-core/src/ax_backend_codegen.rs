@@ -71,6 +71,8 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
         out.push('\n');
     }
 
+    out.push_str(&render_compiled_dispatchers(&plan.handlers));
+
     Ok(out)
 }
 
@@ -249,6 +251,10 @@ fn render_handler_fn(
     globals: &[AxStepPlan],
 ) -> Result<String, AxBackendCodegenError> {
     let signature = match &handler.kind {
+        AxHandlerKind::Action { input, .. } if input.is_empty() => format!(
+            "pub fn {}(runtime: &impl AxBackendRuntime) -> AxRuntimeResult<Value>",
+            handler.rust_fn
+        ),
         AxHandlerKind::Action { .. } => format!(
             "pub fn {}(runtime: &impl AxBackendRuntime, input: &{}) -> AxRuntimeResult<Value>",
             handler.rust_fn,
@@ -288,6 +294,9 @@ fn render_handler_fn(
             return Err(AxBackendCodegenError::MissingRoutePath);
         }
         out.push_str(&format!("    // route {method} {path}\n"));
+        out.push_str(&format!(
+            "    let context = __ax_loader_context({path:?}, request)?;\n"
+        ));
         if !input.is_empty() {
             out.push_str(&render_route_input_binding(handler, input));
         }
@@ -316,6 +325,91 @@ fn render_handler_fn(
 
     out.push_str("}\n");
     Ok(out)
+}
+
+fn render_compiled_dispatchers(handlers: &[AxHandlerPlan]) -> String {
+    let mut out = String::from(
+        r#"fn __ax_request_path(target: &str) -> &str {
+    target.split_once('?').map_or(target, |(path, _)| path)
+}
+
+fn __ax_route_params(pattern: &str, target: &str) -> Option<BTreeMap<String, String>> {
+    let pattern = pattern.trim_matches('/').split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    let target = __ax_request_path(target).trim_matches('/').split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>();
+    if pattern.len() != target.len() { return None; }
+    let mut params = BTreeMap::new();
+    for (expected, actual) in pattern.into_iter().zip(target) {
+        if let Some(name) = expected.strip_prefix(':') {
+            params.insert(name.to_string(), actual.to_string());
+        } else if expected != actual {
+            return None;
+        }
+    }
+    Some(params)
+}
+
+fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResult<AxLoaderContext> {
+    let params = __ax_route_params(pattern, &request.target)
+        .ok_or_else(|| AxRuntimeError::message("compiled route did not match request"))?;
+    let mut context = AxLoaderContext::new();
+    for (name, value) in params { context = context.with_param(name, value); }
+    if let Some((_, query)) = request.target.split_once('?') {
+        for pair in query.split('&').filter(|pair| !pair.is_empty()) {
+            let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+            context = context.with_query(name.to_string(), value.to_string());
+        }
+    }
+    Ok(context)
+}
+
+"#,
+    );
+
+    out.push_str("pub fn dispatch_api_route(runtime: &impl AxBackendRuntime, request: &AxHttpRequest) -> AxRuntimeResult<Option<AxHttpResponse>> {\n");
+    for handler in handlers {
+        let AxHandlerKind::Route { method, path, .. } = &handler.kind else {
+            continue;
+        };
+        out.push_str(&format!(
+            "    if request.method.eq_ignore_ascii_case({method:?}) && __ax_route_params({path:?}, &request.target).is_some() {{ return {}(runtime, request).map(Some); }}\n",
+            handler.rust_fn
+        ));
+    }
+    out.push_str("    Ok(None)\n}\n\n");
+
+    out.push_str("pub fn dispatch_action(runtime: &impl AxBackendRuntime, name: &str, request: &AxHttpRequest) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
+    for handler in handlers {
+        let AxHandlerKind::Action { input, .. } = &handler.kind else {
+            continue;
+        };
+        out.push_str(&format!("        {:?} => {{\n", handler.name));
+        if input.is_empty() {
+            out.push_str(&format!(
+                "            {}(runtime).map(Some)\n",
+                handler.rust_fn
+            ));
+        } else {
+            out.push_str(&format!(
+                "            let input = {} {{\n",
+                input_struct_name(&handler.rust_fn)
+            ));
+            for field in input {
+                out.push_str(&format!(
+                    "                {}: {},\n",
+                    field.name,
+                    render_route_input_field(field)
+                ));
+            }
+            out.push_str("            };\n");
+            out.push_str(&format!(
+                "            {}(runtime, &input).map(Some)\n",
+                handler.rust_fn
+            ));
+        }
+        out.push_str("        }\n");
+    }
+    out.push_str("        _ => Ok(None),\n    }\n}\n");
+    out
 }
 
 fn handler_input_fields(handler: &AxHandlerPlan) -> Option<&[AxFieldPlan]> {
@@ -1346,5 +1440,39 @@ action RemovePost
         assert!(module.contains("runtime.delete(&AxDeleteRequest"));
         assert!(module.contains("filters: vec![AxQueryFilterRequest"));
         assert!(module.contains("field: \"id\".to_string()"));
+    }
+
+    #[test]
+    fn generates_compiled_api_and_action_dispatchers() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route GET "/api/posts/:slug"
+  data slug = params.slug
+  return json(slug)
+
+action PublishPost(id: i64) {
+  update posts
+    status: "published"
+    where id = input.id
+  return ok
+}
+
+action Refresh {
+  return ok
+}
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("pub fn dispatch_api_route"));
+        assert!(module.contains("__ax_route_params(\"/api/posts/:slug\""));
+        assert!(
+            module.contains("let context = __ax_loader_context(\"/api/posts/:slug\", request)?")
+        );
+        assert!(module.contains("pub fn dispatch_action"));
+        assert!(module.contains("\"PublishPost\" =>"));
+        assert!(module.contains("let input = ActionPublishPostInput"));
+        assert!(module.contains("\"Refresh\" =>"));
+        assert!(module.contains("action_refresh(runtime).map(Some)"));
     }
 }

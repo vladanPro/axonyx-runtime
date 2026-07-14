@@ -1085,6 +1085,14 @@ pub fn runtime_from_env(
     Ok(AxDatabaseRuntime::new(env, adapter))
 }
 
+pub fn lazy_runtime_from_env(
+    env: AxEnv,
+) -> AxRuntimeResult<AxDatabaseRuntime<Box<dyn AxDatabaseAdapter>>> {
+    let config = env.database_config()?;
+    let adapter = adapter_from_config(&config);
+    Ok(AxDatabaseRuntime::new(env, adapter))
+}
+
 pub fn ok_payload() -> Value {
     json!({ "ok": true })
 }
@@ -1631,9 +1639,18 @@ fn sqlite_runtime_error(resource: &str, error: rusqlite::Error) -> AxRuntimeErro
 
 fn validate_raw_select_sql(driver: &AxDatabaseDriver, sql: &str) -> AxRuntimeResult<()> {
     let trimmed = sql.trim();
-    let normalized = trimmed.to_ascii_lowercase();
-    let is_select = normalized.starts_with("select ") || normalized.starts_with("with ");
-    let has_multiple_statements = trimmed.trim_end_matches(';').contains(';');
+    let analysis = analyze_raw_sql(trimmed);
+    let is_select = analysis
+        .top_level_words
+        .iter()
+        .find(|word| {
+            matches!(
+                word.as_str(),
+                "select" | "insert" | "update" | "delete" | "replace"
+            )
+        })
+        .is_some_and(|word| word == "select");
+    let has_multiple_statements = analysis.statement_separators > 0;
 
     if !is_select || has_multiple_statements {
         return Err(AxRuntimeError::database(
@@ -1645,6 +1662,91 @@ fn validate_raw_select_sql(driver: &AxDatabaseDriver, sql: &str) -> AxRuntimeRes
     }
 
     Ok(())
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RawSqlAnalysis {
+    top_level_words: Vec<String>,
+    statement_separators: usize,
+}
+
+fn analyze_raw_sql(sql: &str) -> RawSqlAnalysis {
+    let chars = sql.chars().collect::<Vec<_>>();
+    let mut analysis = RawSqlAnalysis::default();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+
+    while index < chars.len() {
+        match chars[index] {
+            '\'' | '"' | '`' => {
+                let quote = chars[index];
+                index += 1;
+                while index < chars.len() {
+                    if chars[index] == quote {
+                        if index + 1 < chars.len() && chars[index + 1] == quote {
+                            index += 2;
+                            continue;
+                        }
+                        index += 1;
+                        break;
+                    }
+                    if chars[index] == '\\' && index + 1 < chars.len() {
+                        index += 2;
+                    } else {
+                        index += 1;
+                    }
+                }
+            }
+            '-' if chars.get(index + 1) == Some(&'-') => {
+                index += 2;
+                while index < chars.len() && chars[index] != '\n' {
+                    index += 1;
+                }
+            }
+            '/' if chars.get(index + 1) == Some(&'*') => {
+                index += 2;
+                while index + 1 < chars.len() && !(chars[index] == '*' && chars[index + 1] == '/') {
+                    index += 1;
+                }
+                index = (index + 2).min(chars.len());
+            }
+            '(' => {
+                depth += 1;
+                index += 1;
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                index += 1;
+            }
+            ';' if depth == 0 => {
+                if chars[index + 1..]
+                    .iter()
+                    .any(|ch| !ch.is_whitespace() && *ch != ';')
+                {
+                    analysis.statement_separators += 1;
+                }
+                index += 1;
+            }
+            ch if depth == 0 && (ch.is_ascii_alphabetic() || ch == '_') => {
+                let start = index;
+                index += 1;
+                while index < chars.len()
+                    && (chars[index].is_ascii_alphanumeric() || chars[index] == '_')
+                {
+                    index += 1;
+                }
+                analysis.top_level_words.push(
+                    chars[start..index]
+                        .iter()
+                        .collect::<String>()
+                        .to_ascii_lowercase(),
+                );
+            }
+            _ => index += 1,
+        }
+    }
+
+    analysis
 }
 
 fn api_load_plan(
@@ -1829,6 +1931,7 @@ fn request_filters_payload(filters: &[AxQueryFilterRequest]) -> Value {
 
 pub mod prelude {
     pub use super::adapter_from_config;
+    pub use super::lazy_runtime_from_env;
     pub use super::ok_payload;
     pub use super::runtime_from_env;
     pub use super::AxBackendRuntime;
@@ -2496,6 +2599,39 @@ mod tests {
     }
 
     #[test]
+    fn raw_query_rejects_mutating_ctes() {
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", ":memory:"),
+        )
+        .expect("runtime should initialize");
+
+        for sql in [
+            "with selected as (select 1) delete from posts returning id",
+            "with selected as (select 1) update posts set title = 'Changed' returning id",
+            "with selected as (select 1) insert into posts(title) values ('Injected') returning id",
+        ] {
+            let error = runtime
+                .query(&AxRawSqlRequest {
+                    sql: sql.to_string(),
+                    params: vec![],
+                })
+                .expect_err("mutating CTE should be rejected");
+            assert!(matches!(error, AxRuntimeError::Database { .. }));
+        }
+    }
+
+    #[test]
+    fn raw_query_allows_read_only_ctes_and_semicolons_inside_strings() {
+        validate_raw_select_sql(
+            &AxDatabaseDriver::Sqlite,
+            "with selected as (select ';' as marker) select marker from selected;",
+        )
+        .expect("read-only CTE should be accepted");
+    }
+
+    #[test]
     fn sqlite_direct_mutations_write_to_database() {
         let (_path, url) = temp_sqlite_database("mutations");
         seed_sqlite_posts(&url);
@@ -2718,6 +2854,15 @@ mod tests {
             error,
             AxRuntimeError::message("missing AX_SECRET_DATA_API_KEY for api data transport")
         );
+    }
+
+    #[test]
+    fn lazy_runtime_allows_routes_without_database_configuration() {
+        let runtime = lazy_runtime_from_env(AxEnv::new())
+            .expect("non-database routes should be able to initialize a lazy runtime");
+
+        assert!(runtime.env().public.is_empty());
+        assert!(runtime.env().secret.is_empty());
     }
 
     fn temp_sqlite_database(name: &str) -> (std::path::PathBuf, String) {

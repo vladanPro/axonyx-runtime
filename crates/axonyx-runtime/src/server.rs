@@ -601,6 +601,60 @@ pub fn axum_router_from_table(table: AxRouteTable) -> axum::Router {
 }
 
 #[cfg(feature = "axum")]
+pub type AxCompiledHandler =
+    std::sync::Arc<dyn Fn(AxHttpRequest) -> AxHttpResponse + Send + Sync + 'static>;
+
+#[cfg(feature = "axum")]
+#[derive(Clone)]
+struct AxCompiledHandlerState {
+    handler: AxCompiledHandler,
+    body_limit: usize,
+}
+
+#[cfg(feature = "axum")]
+pub fn axum_router_from_compiled_handler(
+    handler: AxCompiledHandler,
+    body_limit: usize,
+) -> axum::Router {
+    axum::Router::new()
+        .fallback(axum::routing::any(axum_compiled_handler))
+        .with_state(AxCompiledHandlerState {
+            handler,
+            body_limit,
+        })
+}
+
+#[cfg(feature = "axum")]
+pub fn serve_compiled_axum(
+    bind_addr: impl Into<String>,
+    body_limit: usize,
+    handler: AxCompiledHandler,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let bind_addr = bind_addr.into();
+    let router = axum_router_from_compiled_handler(handler, body_limit);
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_io()
+        .build()?;
+
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
+        axum::serve(listener, router).await?;
+        Ok::<(), Box<dyn Error + Send + Sync>>(())
+    })
+}
+
+#[cfg(feature = "axum")]
+async fn axum_compiled_handler(
+    axum::extract::State(state): axum::extract::State<AxCompiledHandlerState>,
+    request: axum::http::Request<axum::body::Body>,
+) -> axum::response::Response {
+    match axum_request_to_axonyx_with_limit(request, state.body_limit).await {
+        Ok(request) => axonyx_response_to_axum((state.handler)(request)),
+        Err(error) => axonyx_response_to_axum(AxHttpResponse::text(400, error.to_string())),
+    }
+}
+
+#[cfg(feature = "axum")]
 #[derive(Debug, Clone)]
 pub struct AxAxumRouter {
     pub table: AxRouteTable,
@@ -1354,8 +1408,9 @@ pub mod prelude {
     #[cfg(feature = "axum")]
     pub use super::{
         ax_body_to_axum_body, axonyx_response_to_axum, axum_request_to_axonyx,
-        axum_request_to_axonyx_with_limit, axum_router_from_table,
-        axum_router_from_table_with_limit, AxAxumRouter, AxAxumServerAdapter,
+        axum_request_to_axonyx_with_limit, axum_router_from_compiled_handler,
+        axum_router_from_table, axum_router_from_table_with_limit, serve_compiled_axum,
+        AxAxumRouter, AxAxumServerAdapter, AxCompiledHandler,
     };
 }
 
@@ -1902,5 +1957,13 @@ mod tests {
         assert_eq!(adapter.body_limit, 2048);
         let _router = adapter.router();
         let _server_config = config;
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn axum_adapter_can_build_router_from_compiled_handler() {
+        let handler: AxCompiledHandler =
+            std::sync::Arc::new(|request| AxHttpResponse::text(200, request.target));
+        let _router = axum_router_from_compiled_handler(handler, 4096);
     }
 }
