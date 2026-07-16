@@ -200,6 +200,7 @@ impl Parser {
             let mut parts = rest.splitn(2, ' ');
             let method = parts.next().unwrap_or_default().trim();
             let path = parts.next().unwrap_or_default().trim();
+            let (path, braced) = split_block_brace(path);
             let (path, returns) = split_return_contract(path);
             if method.is_empty() || path.is_empty() {
                 return Err(AxBackendParseError::InvalidBlock { line: line.line });
@@ -207,6 +208,7 @@ impl Parser {
 
             self.pos += 1;
             let (input, body) = self.parse_input_sections(2)?;
+            self.consume_block_brace(braced, 0)?;
             let mut route = AxRoute::new(method, trim_quotes(path), body).input(input);
             if let Some(returns) = returns {
                 route = route.returns(returns);
@@ -348,6 +350,10 @@ impl Parser {
             if line.text == "input:" {
                 self.pos += 1;
                 input = self.parse_input_fields(indent + 2)?;
+            } else if line.text == "input {" {
+                self.pos += 1;
+                input = self.parse_input_fields(indent + 2)?;
+                self.consume_block_brace(true, indent)?;
             } else {
                 body.extend(self.parse_statements(indent)?);
             }
@@ -2416,6 +2422,37 @@ action CreatePost -> Post
         };
         assert_eq!(action.name, "CreatePost");
         assert_eq!(action.returns.as_deref(), Some("Post"));
+    }
+
+    #[test]
+    fn parses_function_shaped_route_and_input_blocks() {
+        let input = r#"
+route POST "/api/posts" -> Post {
+  input {
+    title: String
+    summary?: String = ""
+    featured?: Bool = false
+  }
+
+  return json(input.title)
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        let AxBackendBlock::Route(route) = &document.blocks[0] else {
+            panic!("expected route block");
+        };
+        assert_eq!(route.method, "POST");
+        assert_eq!(route.path, "/api/posts");
+        assert_eq!(route.returns.as_deref(), Some("Post"));
+        assert_eq!(route.input.len(), 3);
+        assert_eq!(route.input[0].name, "title");
+        assert_eq!(route.input[1].name, "summary");
+        assert!(route.input[1].optional);
+        assert_eq!(route.input[2].name, "featured");
+        assert!(route.input[2].optional);
+        assert_eq!(route.body.len(), 1);
     }
 
     #[test]
