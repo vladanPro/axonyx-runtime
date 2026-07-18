@@ -19,7 +19,7 @@ thiserror.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 rusqlite.workspace = true
-axonyx-core = { version = "0.1.47", path = "../axonyx-core" }
+axonyx-core = { version = "0.1.48", path = "../axonyx-core" }
 axum = { workspace = true, optional = true }
 bytes = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
