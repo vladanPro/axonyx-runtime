@@ -111,6 +111,10 @@ impl Parser {
             if line.indent != 0 {
                 return Err(AxBackendParseError::UnexpectedIndentation { line: line.line });
             }
+            if line.text.starts_with("type ") || line.text.starts_with("export type ") {
+                self.skip_type_block()?;
+                continue;
+            }
             blocks.push(self.parse_block()?);
         }
 
@@ -326,6 +330,33 @@ impl Parser {
             let body = self.parse_scope_body(2)?;
             self.consume_block_brace(braced, 0)?;
             return Ok(AxBackendBlock::Scope(AxScope::new(name, members, body)));
+        }
+
+        Err(AxBackendParseError::InvalidBlock { line: line.line })
+    }
+
+    fn skip_type_block(&mut self) -> Result<(), AxBackendParseError> {
+        let line = self.current().expect("type line exists").clone();
+        let rest = line
+            .text
+            .strip_prefix("export type ")
+            .or_else(|| line.text.strip_prefix("type "))
+            .ok_or(AxBackendParseError::InvalidBlock { line: line.line })?;
+        let (name, braced) = split_block_brace(rest);
+        if !braced || !is_backend_identifier(name.trim()) {
+            return Err(AxBackendParseError::InvalidBlock { line: line.line });
+        }
+
+        self.pos += 1;
+        while let Some(current) = self.current() {
+            if current.indent == 0 && current.text == "}" {
+                self.pos += 1;
+                return Ok(());
+            }
+            if current.indent == 0 {
+                return Err(AxBackendParseError::InvalidBlock { line: line.line });
+            }
+            self.pos += 1;
         }
 
         Err(AxBackendParseError::InvalidBlock { line: line.line })
@@ -2517,6 +2548,30 @@ query loadPosts() -> Post[] {
         assert_eq!(loader.returns.as_deref(), Some("Post[]"));
         assert!(loader.input.is_empty());
         assert_eq!(loader.body.len(), 2);
+    }
+
+    #[test]
+    fn parses_backend_type_contract_before_query_function() {
+        let input = r#"
+export type Post {
+  title: String
+  summary?: String
+}
+
+query loadPosts() -> Post[] {
+  return posts
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+
+        assert_eq!(document.blocks.len(), 1);
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+
+        assert_eq!(loader.name, "loadPosts");
+        assert_eq!(loader.returns.as_deref(), Some("Post[]"));
     }
 
     #[test]
