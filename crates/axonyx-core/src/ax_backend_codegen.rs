@@ -50,6 +50,13 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("    }\n");
     out.push_str("    response\n");
     out.push_str("}\n\n");
+    out.push_str("fn __ax_action_payload(mut payload: Value, patches: Vec<Value>) -> Value {\n");
+    out.push_str("    if patches.is_empty() { return payload; }\n");
+    out.push_str("    match &mut payload {\n");
+    out.push_str("        Value::Object(fields) => { fields.insert(\"patches\".to_string(), Value::Array(patches)); payload }\n");
+    out.push_str("        _ => json!({ \"value\": payload, \"patches\": patches }),\n");
+    out.push_str("    }\n");
+    out.push_str("}\n\n");
     out.push_str(
         "fn __ax_request_input_field(request: &AxHttpRequest, name: &str) -> Option<String> {\n",
     );
@@ -303,12 +310,16 @@ fn render_handler_fn(
     }
 
     let route_response = matches!(&handler.kind, AxHandlerKind::Route { .. });
+    let action_response = matches!(&handler.kind, AxHandlerKind::Action { .. });
     if route_response {
         out.push_str("    let mut __ax_headers: BTreeMap<String, String> = BTreeMap::new();\n");
         out.push_str("    let mut __ax_cookies: Vec<AxCookie> = Vec::new();\n");
     }
+    if action_response {
+        out.push_str("    let mut __ax_patches: Vec<Value> = Vec::new();\n");
+    }
     for step in globals.iter().chain(handler.steps.iter()) {
-        out.push_str(&render_step(step, route_response));
+        out.push_str(&render_step(step, route_response, action_response));
     }
 
     if !handler
@@ -318,6 +329,8 @@ fn render_handler_fn(
     {
         if route_response {
             out.push_str("    Ok(__ax_finalize_response(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies))\n");
+        } else if action_response {
+            out.push_str("    Ok(__ax_action_payload(ok_payload(), __ax_patches))\n");
         } else {
             out.push_str("    Ok(ok_payload())\n");
         }
@@ -492,7 +505,7 @@ fn default_value_for_rust_type(rust_ty: &str) -> String {
     }
 }
 
-fn render_step(step: &AxStepPlan, route_response: bool) -> String {
+fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -> String {
     match step {
         AxStepPlan::Let { binding, value } => {
             format!("    let {binding} = {};\n", render_value_plan(value))
@@ -526,7 +539,15 @@ fn render_step(step: &AxStepPlan, route_response: bool) -> String {
             format!("    runtime.revalidate({target})?;\n")
         }
         AxStepPlan::Patch { signal, value } => {
-            format!("    // patch {} = {}\n", signal.code, value.code)
+            if action_response {
+                format!(
+                    "    __ax_patches.push(json!({{\"op\":\"set\",\"signal\":{},\"value\":{},\"source\":\"action\"}}));\n",
+                    render_string_expr(signal),
+                    render_borrowed_expr(value)
+                )
+            } else {
+                format!("    // patch {} = {}\n", signal.code, value.code)
+            }
         }
         AxStepPlan::Hook { phase, value } if route_response => {
             render_route_hook_step(*phase, value)
@@ -565,7 +586,7 @@ fn render_step(step: &AxStepPlan, route_response: bool) -> String {
             render_require_fallback(fallback.as_ref())
         ),
         AxStepPlan::Require { value, .. } => format!("    // require {}\n", value.code),
-        AxStepPlan::Return(value) => render_return_step(value, route_response),
+        AxStepPlan::Return(value) => render_return_step(value, route_response, action_response),
         AxStepPlan::Send { target, payload } => format!(
             "    runtime.send(&AxSendRequest {{\n        target: {:?}.to_string(),\n        payload: json!({}),\n    }})?;\n",
             target,
@@ -765,7 +786,7 @@ fn render_string_expr(expr: &AxRustExpr) -> String {
     format!("({}).to_string()", render_owned_expr(expr))
 }
 
-fn render_return_step(value: &AxReturnPlan, route_response: bool) -> String {
+fn render_return_step(value: &AxReturnPlan, route_response: bool, action_response: bool) -> String {
     if route_response {
         return match value {
             AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => format!(
@@ -790,6 +811,21 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool) -> String {
             }
             AxReturnPlan::Ok => {
                 "    Ok(__ax_finalize_response(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies))\n".to_string()
+            }
+        };
+    }
+
+    if action_response {
+        return match value {
+            AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => format!(
+                "    Ok(__ax_action_payload(json!({}), __ax_patches))\n",
+                render_borrowed_expr(expr)
+            ),
+            AxReturnPlan::Ok
+            | AxReturnPlan::NoContent
+            | AxReturnPlan::NotFound
+            | AxReturnPlan::Redirect { .. } => {
+                "    Ok(__ax_action_payload(ok_payload(), __ax_patches))\n".to_string()
             }
         };
     }
@@ -1014,7 +1050,7 @@ mod tests {
         assert!(module.contains("pub struct ActionCreatePostInput"));
         assert!(module.contains("pub fn action_create_post(runtime: &impl AxBackendRuntime, input: &ActionCreatePostInput)"));
         assert!(module.contains("runtime.insert(&AxInsertRequest"));
-        assert!(module.contains("Ok(ok_payload())"));
+        assert!(module.contains("Ok(__ax_action_payload(ok_payload(), __ax_patches))"));
     }
 
     #[test]
@@ -1035,6 +1071,26 @@ loader PostsList
         ));
         assert!(module.contains("field: \"status\".to_string()"));
         assert!(module.contains("limit: Some(12)"));
+    }
+
+    #[test]
+    fn compiles_action_patch_steps_into_payload_patches() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action SetTheme(theme: string) {
+  patch ThemeSwitch.theme = input.theme
+  return ok()
+}
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("let mut __ax_patches: Vec<Value> = Vec::new();"));
+        assert!(module.contains("__ax_patches.push(json!({\"op\":\"set\""));
+        assert!(module.contains("\"signal\":(\"ThemeSwitch.theme\".to_string()).to_string()"));
+        assert!(module.contains("\"value\":&input.theme"));
+        assert!(module.contains("Ok(__ax_action_payload(ok_payload(), __ax_patches))"));
+        assert!(!module.contains("// patch"));
     }
 
     #[test]

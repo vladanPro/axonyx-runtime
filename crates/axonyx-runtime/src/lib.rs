@@ -3503,7 +3503,17 @@ fn ax_state_bridge_script() -> &'static str {
     window.dispatchEvent(new CustomEvent("axonyx:state-patch", { detail }));
   };
 
-  const canonicalSignal = (signal) => aliases.get(signal) || signal;
+  const componentSignalAlias = (signal) => {
+    if (!signal || !signal.startsWith("component:")) return undefined;
+    const parts = signal.split(":");
+    if (parts.length < 5) return undefined;
+    const component = parts[1];
+    const name = parts[parts.length - 2];
+    const index = parts[parts.length - 1] || "1";
+    return aliases.get(`${component}.${name}`) || aliases.get(`__ax_component_state__:${component}:${name}:${index}`);
+  };
+
+  const canonicalSignal = (signal) => aliases.get(signal) || componentSignalAlias(signal) || signal;
 
   const bindAlias = (alias, signal) => {
     if (!alias || !signal) return;
@@ -3622,6 +3632,8 @@ fn ax_state_bridge_script() -> &'static str {
         if (meta.ty && !types.has(signal.key)) types.set(signal.key, meta.ty);
         bindAlias(signal.key, signal.key);
         bindAlias(meta.name, signal.key);
+        const component = meta.owner.startsWith("component:") ? meta.owner.slice("component:".length) : "";
+        if (component && meta.name) bindAlias(`${component}.${meta.name}`, signal.key);
         const keyParts = String(signal.key).split(":");
         const index = keyParts[keyParts.length - 1] || "1";
         bindAlias(`root:${meta.name}:${index}`, signal.key);
@@ -4526,7 +4538,10 @@ page Home
         assert!(state_html.contains("/_ax/state/snapshot.json"));
         assert!(state_html.contains("axonyx:state-snapshot"));
         assert!(state_html.contains("canonicalSignal"));
+        assert!(state_html.contains("componentSignalAlias"));
+        assert!(state_html.contains("aliases.get(`${component}.${name}`)"));
         assert!(state_html.contains("rebindAliasedSignals"));
+        assert!(state_html.contains("bindAlias(`${component}.${meta.name}`, signal.key)"));
         assert!(state_html.contains("bindAlias(`root:${meta.name}:${index}`, signal.key)"));
         assert!(state_html.contains("meta: (signal) => metadata.get(canonicalSignal(signal))"));
         assert!(state_html.contains("manifest: () => Array.from(metadata.values())"));
