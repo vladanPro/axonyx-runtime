@@ -707,13 +707,6 @@ fn render_expr(expr: &AxExpr) -> String {
                 let args = args.iter().map(render_expr).collect::<Vec<_>>().join(", ");
                 return format!("vec![{args}]");
             }
-            if path.as_slice() == ["contains"] && args.len() == 2 {
-                return format!(
-                    "({}).contains(&{})",
-                    render_expr(&args[0]),
-                    render_expr(&args[1])
-                );
-            }
             let fn_name = path.join("::");
             let args = args.iter().map(render_expr).collect::<Vec<_>>().join(", ");
             format!("{fn_name}({args})")

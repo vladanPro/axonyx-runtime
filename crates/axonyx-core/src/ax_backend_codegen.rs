@@ -812,7 +812,7 @@ fn render_borrowed_expr(expr: &AxRustExpr) -> String {
     if let Some(context_expr) = render_context_lookup(&expr.code) {
         context_expr
     } else {
-        format!("&{}", expr.code)
+        format!("&{}", render_codegen_expr(&expr.code))
     }
 }
 
@@ -830,7 +830,55 @@ fn render_literal_revalidation_target(expr: &AxRustExpr) -> String {
 fn render_owned_expr(expr: &AxRustExpr) -> String {
     render_context_lookup(&expr.code)
         .map(|value| value.trim_start_matches('&').to_string())
-        .unwrap_or_else(|| expr.code.clone())
+        .unwrap_or_else(|| render_codegen_expr(&expr.code))
+}
+
+fn render_codegen_expr(code: &str) -> String {
+    let code = code.trim();
+    let Some(inner) = code
+        .strip_prefix("contains(")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return code.to_string();
+    };
+    let Some((items, value)) = split_codegen_binary_args(inner) else {
+        return code.to_string();
+    };
+    format!(
+        "({}).contains(&{})",
+        render_codegen_expr(items),
+        render_codegen_expr(value)
+    )
+}
+
+fn split_codegen_binary_args(input: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in input.char_indices() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let left = input[..index].trim();
+                let right = input[index + ch.len_utf8()..].trim();
+                return (!left.is_empty() && !right.is_empty()).then_some((left, right));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn render_string_expr(expr: &AxRustExpr) -> String {
