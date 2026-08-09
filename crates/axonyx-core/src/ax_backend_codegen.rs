@@ -50,12 +50,20 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("    }\n");
     out.push_str("    response\n");
     out.push_str("}\n\n");
-    out.push_str("fn __ax_action_payload(mut payload: Value, patches: Vec<Value>) -> Value {\n");
-    out.push_str("    if patches.is_empty() { return payload; }\n");
-    out.push_str("    match &mut payload {\n");
-    out.push_str("        Value::Object(fields) => { fields.insert(\"patches\".to_string(), Value::Array(patches)); payload }\n");
-    out.push_str("        _ => json!({ \"value\": payload, \"patches\": patches }),\n");
-    out.push_str("    }\n");
+    out.push_str("fn __ax_action_payload(payload: Value, patches: Vec<Value>, invalidations: Vec<Value>, redirect: Option<String>) -> Value {\n");
+    out.push_str("    json!({ \"ok\": true, \"redirect\": redirect, \"value\": payload, \"patches\": patches, \"invalidations\": invalidations, \"refreshes\": [] })\n");
+    out.push_str("}\n\n");
+    out.push_str("fn __ax_action_error_payload(message: String, value: Value, status: u16, redirect: Option<String>) -> Value {\n");
+    out.push_str("    json!({ \"ok\": false, \"redirect\": redirect, \"error\": { \"message\": message, \"status\": status, \"value\": value }, \"patches\": [], \"invalidations\": [], \"refreshes\": [] })\n");
+    out.push_str("}\n\n");
+    out.push_str("fn __ax_truthy(value: &Value) -> bool {\n");
+    out.push_str("    match value { Value::Null => false, Value::Bool(value) => *value, Value::Number(_) => true, Value::String(value) => !value.is_empty(), Value::Array(items) => !items.is_empty(), Value::Object(fields) => !fields.is_empty() }\n");
+    out.push_str("}\n\n");
+    out.push_str("fn __ax_push_invalidation(invalidations: &mut Vec<Value>, target: String, explicit: bool) {\n");
+    out.push_str("    let normalized = { let value = target.trim().trim_matches('\\\"').trim_matches('/'); if value.is_empty() { \"root\".to_string() } else { value.replace('/', \".\") } };\n");
+    out.push_str("    let value = json!({ \"target\": target, \"queryKey\": [normalized] });\n");
+    out.push_str("    let position = invalidations.iter().position(|item| item.get(\"queryKey\") == value.get(\"queryKey\"));\n");
+    out.push_str("    match (position, explicit) { (Some(index), true) => invalidations[index] = value, (None, _) => invalidations.push(value), _ => {} }\n");
     out.push_str("}\n\n");
     out.push_str(
         "fn __ax_request_input_field(request: &AxHttpRequest, name: &str) -> Option<String> {\n",
@@ -317,6 +325,8 @@ fn render_handler_fn(
     }
     if action_response {
         out.push_str("    let mut __ax_patches: Vec<Value> = Vec::new();\n");
+        out.push_str("    let mut __ax_invalidations: Vec<Value> = Vec::new();\n");
+        out.push_str("    let mut __ax_redirect: Option<String> = None;\n");
     }
     for step in globals.iter().chain(handler.steps.iter()) {
         out.push_str(&render_step(step, route_response, action_response));
@@ -330,7 +340,7 @@ fn render_handler_fn(
         if route_response {
             out.push_str("    Ok(__ax_finalize_response(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies))\n");
         } else if action_response {
-            out.push_str("    Ok(__ax_action_payload(ok_payload(), __ax_patches))\n");
+            out.push_str("    Ok(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect))\n");
         } else {
             out.push_str("    Ok(ok_payload())\n");
         }
@@ -510,33 +520,69 @@ fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -
         AxStepPlan::Let { binding, value } => {
             format!("    let {binding} = {};\n", render_value_plan(value))
         }
-        AxStepPlan::Insert { collection, fields } => format!(
-            "    runtime.insert(&AxInsertRequest {{\n        collection: {:?}.to_string(),\n        fields: {},\n    }})?;\n",
-            collection,
-            render_fields_map(fields)
-        ),
+        AxStepPlan::Insert { collection, fields } => {
+            let invalidation = if action_response {
+                format!(
+                    "    __ax_push_invalidation(&mut __ax_invalidations, {:?}.to_string(), false);\n",
+                    collection
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "    runtime.insert(&AxInsertRequest {{\n        collection: {:?}.to_string(),\n        fields: {},\n    }})?;\n{invalidation}",
+                collection,
+                render_fields_map(fields)
+            )
+        }
         AxStepPlan::Update {
             collection,
             fields,
             filters,
-        } => format!(
-            "    runtime.update(&AxUpdateRequest {{\n        collection: {:?}.to_string(),\n        fields: {},\n        filters: {},\n    }})?;\n",
-            collection,
-            render_fields_map(fields),
-            render_query_filters(filters)
-        ),
-        AxStepPlan::Delete { collection, filters } => format!(
-            "    runtime.delete(&AxDeleteRequest {{\n        collection: {:?}.to_string(),\n        filters: {},\n    }})?;\n",
-            collection,
-            render_query_filters(filters)
-        ),
+        } => {
+            let invalidation = if action_response {
+                format!(
+                    "    __ax_push_invalidation(&mut __ax_invalidations, {:?}.to_string(), false);\n",
+                    collection
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "    runtime.update(&AxUpdateRequest {{\n        collection: {:?}.to_string(),\n        fields: {},\n        filters: {},\n    }})?;\n{invalidation}",
+                collection,
+                render_fields_map(fields),
+                render_query_filters(filters)
+            )
+        }
+        AxStepPlan::Delete { collection, filters } => {
+            let invalidation = if action_response {
+                format!(
+                    "    __ax_push_invalidation(&mut __ax_invalidations, {:?}.to_string(), false);\n",
+                    collection
+                )
+            } else {
+                String::new()
+            };
+            format!(
+                "    runtime.delete(&AxDeleteRequest {{\n        collection: {:?}.to_string(),\n        filters: {},\n    }})?;\n{invalidation}",
+                collection,
+                render_query_filters(filters)
+            )
+        }
         AxStepPlan::Revalidate { target, literal } => {
             let target = if *literal {
                 render_literal_revalidation_target(target)
             } else {
                 render_borrowed_expr(target)
             };
-            format!("    runtime.revalidate({target})?;\n")
+            if action_response {
+                format!(
+                    "    let __ax_revalidate_target = ({target}).to_string();\n    runtime.revalidate(&__ax_revalidate_target)?;\n    if __ax_revalidate_target.starts_with('/') {{ __ax_redirect = Some(__ax_revalidate_target.clone()); }}\n    __ax_push_invalidation(&mut __ax_invalidations, __ax_revalidate_target, true);\n"
+                )
+            } else {
+                format!("    runtime.revalidate({target})?;\n")
+            }
         }
         AxStepPlan::Patch { signal, value } => {
             if action_response {
@@ -584,6 +630,11 @@ fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -
             "    if {}.is_empty() {{\n{}    }}\n",
             render_string_expr(value),
             render_require_fallback(fallback.as_ref())
+        ),
+        AxStepPlan::Require { value, fallback } if action_response => format!(
+            "    if !__ax_truthy(&json!({})) {{\n{}    }}\n",
+            render_borrowed_expr(value),
+            render_action_require_fallback(fallback.as_ref())
         ),
         AxStepPlan::Require { value, .. } => format!("    // require {}\n", value.code),
         AxStepPlan::Return(value) => render_return_step(value, route_response, action_response),
@@ -761,7 +812,7 @@ fn render_borrowed_expr(expr: &AxRustExpr) -> String {
     if let Some(context_expr) = render_context_lookup(&expr.code) {
         context_expr
     } else {
-        format!("&{}", expr.code)
+        format!("&{}", render_codegen_expr(&expr.code))
     }
 }
 
@@ -779,7 +830,55 @@ fn render_literal_revalidation_target(expr: &AxRustExpr) -> String {
 fn render_owned_expr(expr: &AxRustExpr) -> String {
     render_context_lookup(&expr.code)
         .map(|value| value.trim_start_matches('&').to_string())
-        .unwrap_or_else(|| expr.code.clone())
+        .unwrap_or_else(|| render_codegen_expr(&expr.code))
+}
+
+fn render_codegen_expr(code: &str) -> String {
+    let code = code.trim();
+    let Some(inner) = code
+        .strip_prefix("contains(")
+        .and_then(|value| value.strip_suffix(')'))
+    else {
+        return code.to_string();
+    };
+    let Some((items, value)) = split_codegen_binary_args(inner) else {
+        return code.to_string();
+    };
+    format!(
+        "({}).contains(&{})",
+        render_codegen_expr(items),
+        render_codegen_expr(value)
+    )
+}
+
+fn split_codegen_binary_args(input: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, ch) in input.char_indices() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        match ch {
+            '\'' | '"' => quote = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                let left = input[..index].trim();
+                let right = input[index + ch.len_utf8()..].trim();
+                return (!left.is_empty() && !right.is_empty()).then_some((left, right));
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn render_string_expr(expr: &AxRustExpr) -> String {
@@ -818,14 +917,14 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
     if action_response {
         return match value {
             AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => format!(
-                "    Ok(__ax_action_payload(json!({}), __ax_patches))\n",
+                "    Ok(__ax_action_payload(json!({}), __ax_patches, __ax_invalidations, __ax_redirect))\n",
                 render_borrowed_expr(expr)
             ),
             AxReturnPlan::Ok
             | AxReturnPlan::NoContent
             | AxReturnPlan::NotFound
             | AxReturnPlan::Redirect { .. } => {
-                "    Ok(__ax_action_payload(ok_payload(), __ax_patches))\n".to_string()
+                "    Ok(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect))\n".to_string()
             }
         };
     }
@@ -838,6 +937,31 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
         | AxReturnPlan::NoContent
         | AxReturnPlan::NotFound
         | AxReturnPlan::Redirect { .. } => "    Ok(ok_payload())\n".to_string(),
+    }
+}
+
+fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
+    match fallback {
+        Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
+            if let Some(message) = render_error_call_message(expr) {
+                return format!(
+                    "        let __ax_error_message = ({message}).to_string();\n        let __ax_error_value = json!(&__ax_error_message);\n        return Ok(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect));\n"
+                );
+            } else {
+                let value = format!("json!({})", render_borrowed_expr(expr));
+                return format!(
+                    "        let __ax_error_value = {value};\n        let __ax_error_message = __ax_error_value.get(\"message\").or_else(|| __ax_error_value.get(\"error\")).and_then(Value::as_str).unwrap_or(\"Action requirement failed.\").to_string();\n        return Ok(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect));\n"
+                );
+            }
+        }
+        Some(AxReturnPlan::Redirect { target, .. }) => {
+            let value = render_string_expr(target);
+            format!(
+                "        let __ax_error_message = {value};\n        let __ax_error_value = json!(&__ax_error_message);\n        return Ok(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect));\n"
+            )
+        }
+        Some(AxReturnPlan::NotFound) => "        return Ok(__ax_action_error_payload(\"not found\".to_string(), json!(\"not found\"), 422, __ax_redirect));\n".to_string(),
+        Some(AxReturnPlan::Ok) | Some(AxReturnPlan::NoContent) | None => "        return Ok(__ax_action_error_payload(\"Action requirement failed.\".to_string(), json!(\"Action requirement failed.\"), 422, __ax_redirect));\n".to_string(),
     }
 }
 
@@ -1050,7 +1174,10 @@ mod tests {
         assert!(module.contains("pub struct ActionCreatePostInput"));
         assert!(module.contains("pub fn action_create_post(runtime: &impl AxBackendRuntime, input: &ActionCreatePostInput)"));
         assert!(module.contains("runtime.insert(&AxInsertRequest"));
-        assert!(module.contains("Ok(__ax_action_payload(ok_payload(), __ax_patches))"));
+        assert!(module.contains(
+            "__ax_push_invalidation(&mut __ax_invalidations, \"posts\".to_string(), false)"
+        ));
+        assert!(module.contains("Ok(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect))"));
     }
 
     #[test]
@@ -1089,8 +1216,38 @@ action SetTheme(theme: string) {
         assert!(module.contains("__ax_patches.push(json!({\"op\":\"set\""));
         assert!(module.contains("\"signal\":(\"ThemeSwitch.theme\".to_string()).to_string()"));
         assert!(module.contains("\"value\":&input.theme"));
-        assert!(module.contains("Ok(__ax_action_payload(ok_payload(), __ax_patches))"));
+        assert!(module.contains("Ok(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect))"));
         assert!(!module.contains("// patch"));
+    }
+
+    #[test]
+    fn compiles_action_invalidations_redirect_and_validation_envelope() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action SaveTheme(theme: string) {
+  require input.theme in ["silver", "bronze", "gold"] else error("Theme is required.")
+  update settings
+    theme: input.theme
+    where({ id: 1 })
+  revalidate "/settings"
+  return ok()
+}
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("let mut __ax_invalidations: Vec<Value> = Vec::new();"));
+        assert!(module.contains("let mut __ax_redirect: Option<String> = None;"));
+        assert!(module.contains("__ax_truthy(&json!(&(vec![\"silver\".to_string(), \"bronze\".to_string(), \"gold\".to_string()]).contains(&input.theme)))"));
+        assert!(module.contains("__ax_action_error_payload"));
+        assert!(module.contains(
+            "__ax_push_invalidation(&mut __ax_invalidations, \"settings\".to_string(), false)"
+        ));
+        assert!(module.contains("__ax_revalidate_target.starts_with('/')"));
+        assert!(module.contains(
+            "__ax_push_invalidation(&mut __ax_invalidations, __ax_revalidate_target, true)"
+        ));
+        assert!(module.contains("\"refreshes\": []"));
     }
 
     #[test]
