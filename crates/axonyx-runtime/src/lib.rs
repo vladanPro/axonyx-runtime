@@ -130,6 +130,38 @@ pub fn preview_ax_page(ax_source: &str) -> Result<String, PreviewError> {
     preview_ax_app(None, ax_source)
 }
 
+pub fn render_compiled_page_fragment(
+    document_json: &str,
+    import_sources: &[(&str, &str)],
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    loader_values: &BTreeMap<String, serde_json::Value>,
+) -> Result<String, PreviewError> {
+    let document = serde_json::from_str::<AxDocument>(document_json).map_err(|error| {
+        PreviewError::Runtime {
+            message: format!("failed to decode compiled page AST: {error}"),
+        }
+    })?;
+    let scope =
+        build_preview_route_scope(route_params, &parse_preview_query_fields(request_target));
+    let resolver = |path: &[String], _args: &[AxValue]| {
+        path.last()
+            .and_then(|name| loader_values.get(name))
+            .cloned()
+            .map(preview_json_to_value)
+    };
+    let import_resolver = |source: &str| {
+        import_sources
+            .iter()
+            .find_map(|(name, contents)| (*name == source).then(|| (*contents).to_string()))
+    };
+    let node =
+        lower_document_with_scope_and_imports(&document, scope, &resolver, &import_resolver)?;
+    let mut html = String::new();
+    render_node(&node, &mut html);
+    Ok(html)
+}
+
 pub fn preview_ax_page_stream_response(
     ax_source: &str,
 ) -> Result<server::AxHttpResponse, PreviewError> {
@@ -4220,6 +4252,39 @@ mod tests {
     use axonyx_core::compile_pipeline;
 
     use super::*;
+
+    #[test]
+    fn renders_compiled_page_ast_with_fresh_loader_values() {
+        let document = parse_ax_auto(
+            r#"page Posts() {
+data posts = loadPosts()
+return ASX {
+  <Each items={posts} as="post">
+    <article>{post.title}</article>
+  </Each>
+}
+}"#,
+        )
+        .expect("page should parse");
+        let document_json = serde_json::to_string(&document).expect("document should serialize");
+        let loader_values = BTreeMap::from([(
+            "loadPosts".to_string(),
+            json!([{ "title": "Fresh from compiled loader" }]),
+        )]);
+
+        let html = render_compiled_page_fragment(
+            &document_json,
+            &[],
+            "/posts",
+            &BTreeMap::new(),
+            &loader_values,
+        )
+        .expect("compiled page should render");
+
+        assert!(html.starts_with("<main"));
+        assert!(html.contains("data-ax-root=\"page\""));
+        assert!(html.contains("Fresh from compiled loader"));
+    }
 
     #[test]
     fn builds_render_plan_from_ir() {
