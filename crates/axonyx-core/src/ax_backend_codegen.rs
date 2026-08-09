@@ -432,6 +432,40 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
         out.push_str("        }\n");
     }
     out.push_str("        _ => Ok(None),\n    }\n}\n");
+
+    out.push_str("\npub fn dispatch_loader(runtime: &impl AxBackendRuntime, name: &str, pattern: &str, request: &AxHttpRequest) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
+    for handler in handlers {
+        let AxHandlerKind::Loader { input, .. } = &handler.kind else {
+            continue;
+        };
+        out.push_str(&format!("        {:?} => {{\n", handler.name));
+        out.push_str("            let context = __ax_loader_context(pattern, request)?;\n");
+        if input.is_empty() {
+            out.push_str(&format!(
+                "            {}(runtime, &context).map(Some)\n",
+                handler.rust_fn
+            ));
+        } else {
+            out.push_str(&format!(
+                "            let input = {} {{\n",
+                input_struct_name(&handler.rust_fn)
+            ));
+            for field in input {
+                out.push_str(&format!(
+                    "                {}: {},\n",
+                    field.name,
+                    render_route_input_field(field)
+                ));
+            }
+            out.push_str("            };\n");
+            out.push_str(&format!(
+                "            {}(runtime, &context, &input).map(Some)\n",
+                handler.rust_fn
+            ));
+        }
+        out.push_str("        }\n");
+    }
+    out.push_str("        _ => Ok(None),\n    }\n}\n");
     out
 }
 
@@ -1170,6 +1204,9 @@ mod tests {
         assert!(module.contains(
             "pub fn loader_posts_list(runtime: &impl AxBackendRuntime, context: &AxLoaderContext)"
         ));
+        assert!(module.contains("pub fn dispatch_loader(runtime: &impl AxBackendRuntime, name: &str, pattern: &str, request: &AxHttpRequest)"));
+        assert!(module.contains("\"PostsList\" =>"));
+        assert!(module.contains("loader_posts_list(runtime, &context).map(Some)"));
         assert!(module.contains("runtime.load(&AxQueryRequest"));
         assert!(module.contains("pub struct ActionCreatePostInput"));
         assert!(module.contains("pub fn action_create_post(runtime: &impl AxBackendRuntime, input: &ActionCreatePostInput)"));
