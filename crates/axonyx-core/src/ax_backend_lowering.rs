@@ -647,6 +647,14 @@ fn lower_patch_signal(expr: &AxExpr) -> AxRustExpr {
             let signal = format!("root:{name}:1");
             AxRustExpr::new(format!("{signal:?}.to_string()"))
         }
+        AxExpr::Member { object, property } => {
+            if let AxExpr::Identifier(owner) = object.as_ref() {
+                let signal = format!("{owner}.{property}");
+                return AxRustExpr::new(format!("{signal:?}.to_string()"));
+            }
+
+            lower_expr(expr)
+        }
         _ => lower_expr(expr),
     }
 }
@@ -1112,6 +1120,32 @@ action SetTheme
             handler.steps[0],
             AxStepPlan::Patch {
                 signal: AxRustExpr::new(r#""root:theme:2".to_string()"#),
+                value: AxRustExpr::new("input.theme"),
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_component_state_patch_alias_into_string_key() {
+        let document = parse_backend_ax(
+            r#"
+action SetTheme
+  input:
+    theme: string
+
+  patch ThemeSwitch.theme = input.theme
+  return ok
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+        let handler = &plan.handlers[0];
+
+        assert_eq!(
+            handler.steps[0],
+            AxStepPlan::Patch {
+                signal: AxRustExpr::new(r#""ThemeSwitch.theme".to_string()"#),
                 value: AxRustExpr::new("input.theme"),
             }
         );
