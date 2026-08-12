@@ -144,9 +144,11 @@ pub fn render_compiled_page_fragment(
     })?;
     let scope =
         build_preview_route_scope(route_params, &parse_preview_query_fields(request_target));
-    let resolver = |path: &[String], _args: &[AxValue]| {
+    let resolver = |path: &[String], args: &[AxValue]| {
+        let args = args.iter().map(preview_value_to_json).collect::<Vec<_>>();
         path.last()
-            .and_then(|name| loader_values.get(name))
+            .map(|name| compiled_loader_call_key(name, &args))
+            .and_then(|key| loader_values.get(&key))
             .cloned()
             .map(preview_json_to_value)
     };
@@ -160,6 +162,11 @@ pub fn render_compiled_page_fragment(
     let mut html = String::new();
     render_node(&node, &mut html);
     Ok(html)
+}
+
+pub fn compiled_loader_call_key(name: &str, args: &[serde_json::Value]) -> String {
+    let encoded = serde_json::to_string(args).unwrap_or_else(|_| "[]".to_string());
+    format!("{name}:{encoded}")
 }
 
 pub fn preview_ax_page_stream_response(
@@ -4268,7 +4275,7 @@ return ASX {
         .expect("page should parse");
         let document_json = serde_json::to_string(&document).expect("document should serialize");
         let loader_values = BTreeMap::from([(
-            "loadPosts".to_string(),
+            compiled_loader_call_key("loadPosts", &[]),
             json!([{ "title": "Fresh from compiled loader" }]),
         )]);
 
@@ -4284,6 +4291,41 @@ return ASX {
         assert!(html.starts_with("<main"));
         assert!(html.contains("data-ax-root=\"page\""));
         assert!(html.contains("Fresh from compiled loader"));
+    }
+
+    #[test]
+    fn renders_compiled_page_ast_with_distinct_parameterized_loader_calls() {
+        let document = parse_ax_auto(
+            r#"page Posts() {
+data first = loadPost(params.first)
+data second = loadPost("second")
+return ASX { <><Copy>{first.title}</Copy><Copy>{second.title}</Copy></> }
+}"#,
+        )
+        .expect("page should parse");
+        let document_json = serde_json::to_string(&document).expect("document should serialize");
+        let loader_values = BTreeMap::from([
+            (
+                compiled_loader_call_key("loadPost", &[json!("first")]),
+                json!({ "title": "First result" }),
+            ),
+            (
+                compiled_loader_call_key("loadPost", &[json!("second")]),
+                json!({ "title": "Second result" }),
+            ),
+        ]);
+
+        let html = render_compiled_page_fragment(
+            &document_json,
+            &[],
+            "/posts/first",
+            &BTreeMap::from([("first".to_string(), "first".to_string())]),
+            &loader_values,
+        )
+        .expect("compiled parameterized page should render");
+
+        assert!(html.contains("First result"));
+        assert!(html.contains("Second result"));
     }
 
     #[test]
