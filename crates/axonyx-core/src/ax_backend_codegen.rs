@@ -70,6 +70,9 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     );
     out.push_str("    request.form_value(name).or_else(|| request.json_field_string(name))\n");
     out.push_str("}\n\n");
+    out.push_str("fn __ax_loader_input_field(request: &AxHttpRequest, args: &[Value], index: usize, name: &str) -> Option<String> {\n");
+    out.push_str("    args.get(index).and_then(|value| match value { Value::Null => None, Value::String(value) => Some(value.clone()), Value::Bool(value) => Some(value.to_string()), Value::Number(value) => Some(value.to_string()), Value::Array(_) | Value::Object(_) => Some(value.to_string()) }).or_else(|| __ax_request_input_field(request, name))\n");
+    out.push_str("}\n\n");
 
     for function in &plan.functions {
         out.push_str(&render_function_fn(function)?);
@@ -433,7 +436,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
     }
     out.push_str("        _ => Ok(None),\n    }\n}\n");
 
-    out.push_str("\npub fn dispatch_loader(runtime: &impl AxBackendRuntime, name: &str, pattern: &str, request: &AxHttpRequest) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
+    out.push_str("\npub fn dispatch_loader(runtime: &impl AxBackendRuntime, name: &str, pattern: &str, request: &AxHttpRequest, args: &[Value]) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
     for handler in handlers {
         let AxHandlerKind::Loader { input, .. } = &handler.kind else {
             continue;
@@ -441,20 +444,25 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
         out.push_str(&format!("        {:?} => {{\n", handler.name));
         out.push_str("            let context = __ax_loader_context(pattern, request)?;\n");
         if input.is_empty() {
+            out.push_str("            if !args.is_empty() { return Err(AxRuntimeError::message(\"compiled loader expected 0 arguments\")); }\n");
             out.push_str(&format!(
                 "            {}(runtime, &context).map(Some)\n",
                 handler.rust_fn
             ));
         } else {
             out.push_str(&format!(
+                "            if args.len() > {} {{ return Err(AxRuntimeError::message(\"compiled loader received too many arguments\")); }}\n",
+                input.len()
+            ));
+            out.push_str(&format!(
                 "            let input = {} {{\n",
                 input_struct_name(&handler.rust_fn)
             ));
-            for field in input {
+            for (index, field) in input.iter().enumerate() {
                 out.push_str(&format!(
                     "                {}: {},\n",
                     field.name,
-                    render_route_input_field(field)
+                    render_loader_input_field(field, index)
                 ));
             }
             out.push_str("            };\n");
@@ -502,6 +510,18 @@ fn render_route_input_binding(handler: &AxHandlerPlan, input: &[AxFieldPlan]) ->
 
 fn render_route_input_field(field: &AxFieldPlan) -> String {
     let raw = format!("__ax_request_input_field(request, {:?})", field.name);
+    render_input_field(field, &raw)
+}
+
+fn render_loader_input_field(field: &AxFieldPlan, index: usize) -> String {
+    let raw = format!(
+        "__ax_loader_input_field(request, args, {index}, {:?})",
+        field.name
+    );
+    render_input_field(field, &raw)
+}
+
+fn render_input_field(field: &AxFieldPlan, raw: &str) -> String {
     let missing_error = format!("missing required input `{}`", field.name);
 
     if !field.optional && field.default.is_none() && field.rust_ty != "bool" {
@@ -1204,7 +1224,7 @@ mod tests {
         assert!(module.contains(
             "pub fn loader_posts_list(runtime: &impl AxBackendRuntime, context: &AxLoaderContext)"
         ));
-        assert!(module.contains("pub fn dispatch_loader(runtime: &impl AxBackendRuntime, name: &str, pattern: &str, request: &AxHttpRequest)"));
+        assert!(module.contains("pub fn dispatch_loader(runtime: &impl AxBackendRuntime, name: &str, pattern: &str, request: &AxHttpRequest, args: &[Value])"));
         assert!(module.contains("\"PostsList\" =>"));
         assert!(module.contains("loader_posts_list(runtime, &context).map(Some)"));
         assert!(module.contains("runtime.load(&AxQueryRequest"));
@@ -1303,6 +1323,8 @@ query loadPosts(status: String) -> Post[]
         assert!(module.contains("pub status: String"));
         assert!(module.contains("pub fn loader_load_posts(runtime: &impl AxBackendRuntime, context: &AxLoaderContext, input: &HandlerLoaderLoadPostsInput)"));
         assert!(module.contains("value: json!(&input.status)"));
+        assert!(module.contains("__ax_loader_input_field(request, args, 0, \"status\")"));
+        assert!(module.contains("if args.len() > 1"));
     }
 
     #[test]
