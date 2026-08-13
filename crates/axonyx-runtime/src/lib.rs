@@ -31,6 +31,12 @@ use thiserror::Error;
 pub use backend::prelude as backend_prelude;
 pub use server::prelude as server_prelude;
 
+pub const AX_STATE_WASM_PATH: &str = "/_ax/runtime/axonyx-state-v0.wasm";
+
+pub fn ax_state_wasm_bytes() -> &'static [u8] {
+    include_bytes!("../assets/axonyx-state-v0.wasm")
+}
+
 pub fn route_hooks_from_handler_plan(handler: &AxHandlerPlan) -> Vec<server::AxRouteHook> {
     handler
         .steps
@@ -3477,6 +3483,31 @@ fn ax_state_bridge_script() -> &'static str {
   const readBindings = new Map();
   const subscribers = new Map();
   const conditions = new Map();
+  let wasmExecutor;
+  let executorMode = "js-fallback";
+
+  const localOperationCode = Object.freeze({ set: 0, add: 1, sub: 2, toggle: 3 });
+
+  const loadWasmExecutor = async (url = "/_ax/runtime/axonyx-state-v0.wasm") => {
+    if (!window.WebAssembly || !window.fetch) return false;
+    try {
+      const response = await fetch(url, { cache: "force-cache" });
+      if (!response.ok) return false;
+      const module = await WebAssembly.instantiate(await response.arrayBuffer(), {});
+      const exports = module.instance?.exports;
+      if (!exports || exports.ax_state_abi_version?.() !== 1) return false;
+      if (typeof exports.ax_state_apply_number !== "function") return false;
+      if (typeof exports.ax_state_apply_bool !== "function") return false;
+      wasmExecutor = exports;
+      executorMode = "wasm";
+      window.dispatchEvent(new CustomEvent("axonyx:state-runtime", {
+        detail: { protocol: "ax-state/1", executor: executorMode, url },
+      }));
+      return true;
+    } catch (_) {
+      return false;
+    }
+  };
 
   const readValue = (node, target) => {
     if (target === "checked") return !!node.checked;
@@ -3694,6 +3725,26 @@ fn ax_state_bridge_script() -> &'static str {
     return writeSignal(signal, value, source, true);
   };
 
+  const applyLocalOperation = (op, type, current, operand) => {
+    const operation = localOperationCode[op];
+    if (wasmExecutor && operation !== undefined) {
+      if (type === "Number" && op !== "toggle") {
+        const next = wasmExecutor.ax_state_apply_number(operation, Number(current), Number(operand));
+        if (Number.isFinite(next)) return next;
+      }
+      if (type === "Bool" && (op === "set" || op === "toggle")) {
+        const next = wasmExecutor.ax_state_apply_bool(operation, current ? 1 : 0, operand ? 1 : 0);
+        if (next !== 0xffffffff) return next !== 0;
+      }
+    }
+
+    if (op === "set") return operand;
+    if (op === "add") return Number(current) + Number(operand);
+    if (op === "sub") return Number(current) - Number(operand);
+    if (op === "toggle") return !castValue(current, "Bool");
+    return undefined;
+  };
+
   const executeLocalEvent = (node, eventName, event) => {
     const prefix = `data-ax-on-${eventName}`;
     const rawSignal = node.getAttribute(`${prefix}-signal`);
@@ -3711,12 +3762,8 @@ fn ax_state_bridge_script() -> &'static str {
         ? event.target.value
         : node.getAttribute(`${prefix}-value`);
     const operand = castValue(rawOperand, type);
-    let next;
-    if (op === "set") next = operand;
-    else if (op === "add") next = Number(current) + Number(operand);
-    else if (op === "sub") next = Number(current) - Number(operand);
-    else if (op === "toggle") next = !castValue(current, "Bool");
-    else return false;
+    const next = applyLocalOperation(op, type, current, operand);
+    if (next === undefined) return false;
 
     if (!types.has(signal)) types.set(signal, type);
     setSignal(signal, next, `event:${eventName}`);
@@ -3880,6 +3927,8 @@ fn ax_state_bridge_script() -> &'static str {
     manifest: () => Array.from(metadata.values()),
     describe,
     snapshot: () => Object.fromEntries(state.entries()),
+    runtime: () => executorMode,
+    loadWasm: loadWasmExecutor,
   };
   window.__axonyx.applyPatch = applyPatch;
   window.__axonyxStateBridge = window.__axonyx.state;
@@ -3890,6 +3939,7 @@ fn ax_state_bridge_script() -> &'static str {
     init();
   }
   (async () => {
+    await loadWasmExecutor();
     await loadManifest();
     await loadSnapshot();
   })();
@@ -4742,6 +4792,18 @@ page Home
         assert!(state_html.contains("bindings: (bindings.get(signal) || []).length"));
         assert!(state_html.contains("subscribe"));
         assert!(state_html.contains("window.__axonyxStateBridge"));
+        assert!(state_html.contains(AX_STATE_WASM_PATH));
+        assert!(state_html.contains("ax_state_apply_number"));
+        assert!(state_html.contains("ax_state_apply_bool"));
+        assert!(state_html.contains("runtime: () => executorMode"));
+    }
+
+    #[test]
+    fn bundled_state_executor_is_a_wasm_v1_module() {
+        let bytes = ax_state_wasm_bytes();
+
+        assert!(bytes.starts_with(b"\0asm"));
+        assert_eq!(&bytes[4..8], &[1, 0, 0, 0]);
     }
 
     #[test]
