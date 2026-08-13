@@ -441,6 +441,35 @@ fn lower_component_node(
             push_remaining_props(&mut attrs, props);
             element_with_attrs("div", attrs, children)
         }
+        "__AxStateIf" => {
+            attrs.push(attr("style", "display: contents"));
+            push_remaining_props(&mut attrs, props);
+            element_with_attrs("ax-state-if", attrs, children)
+        }
+        "__AxStateIfThen" | "__AxStateIfElse" => {
+            let initially_hidden = prop_bool(&mut props, &["hidden"]).unwrap_or(false);
+            attrs.push(attr(
+                "data-ax-state-if-branch",
+                if component.name == "__AxStateIfThen" {
+                    "then"
+                } else {
+                    "else"
+                },
+            ));
+            attrs.push(attr(
+                "style",
+                if initially_hidden {
+                    "display: none"
+                } else {
+                    "display: contents"
+                },
+            ));
+            if initially_hidden {
+                attrs.push(attr("hidden", "true"));
+            }
+            push_native_props(&mut attrs, props);
+            element_with_attrs("ax-state-branch", attrs, children)
+        }
         "Container" => {
             prepend_class_attr(&mut attrs, "ax-container");
             attrs.insert(
@@ -1086,6 +1115,7 @@ fn lower_local_component_nodes(
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
     let props = eval_props(component, functions, scope, resolver)?;
+    let passthrough_attrs = component_passthrough_attrs(&props, component_def);
     let mut component_scope = scope.clone();
     component_scope.insert(
         AX_COMPONENT_INSTANCE_PATH.to_string(),
@@ -1117,7 +1147,7 @@ fn lower_local_component_nodes(
         parent: slot_context,
     };
 
-    lower_statements(
+    let mut nodes = lower_statements(
         &component_def.body,
         functions,
         imports,
@@ -1126,7 +1156,41 @@ fn lower_local_component_nodes(
         resolver,
         import_resolver,
         Some(&slot_context),
-    )
+    )?;
+    apply_attrs_to_first_element(&mut nodes, passthrough_attrs);
+    Ok(nodes)
+}
+
+fn component_passthrough_attrs(
+    props: &BTreeMap<String, AxValue>,
+    component_def: &AxComponentDef,
+) -> Vec<Attribute> {
+    props
+        .iter()
+        .filter(|(name, _)| {
+            !component_def
+                .params
+                .iter()
+                .any(|param| param.name == **name)
+                && (name.starts_with("data-")
+                    || name.starts_with("aria-")
+                    || matches!(name.as_str(), "id" | "role" | "title" | "tabindex"))
+        })
+        .map(|(name, value)| attr_boxed(name.clone(), value.as_string()))
+        .collect()
+}
+
+fn apply_attrs_to_first_element(nodes: &mut [AxNode], incoming: Vec<Attribute>) {
+    if incoming.is_empty() {
+        return;
+    }
+    let Some(AxNode::Element { attrs, .. }) = nodes.first_mut() else {
+        return;
+    };
+    for attr in incoming {
+        attrs.retain(|existing| existing.name != attr.name);
+        attrs.push(attr);
+    }
 }
 
 fn lower_imported_component_nodes(
@@ -1417,7 +1481,15 @@ fn strip_slot_statement(statement: &AxStatement) -> AxStatement {
 
 fn push_remaining_props(attrs: &mut Vec<Attribute>, props: BTreeMap<String, AxValue>) {
     for (name, value) in props {
-        attrs.push(attr_boxed(format!("data-{name}"), value.as_string()));
+        let attr_name = if name.starts_with("data-")
+            || name.starts_with("aria-")
+            || matches!(name.as_str(), "id" | "role" | "title" | "tabindex")
+        {
+            name
+        } else {
+            format!("data-{name}")
+        };
+        attrs.push(attr_boxed(attr_name, value.as_string()));
     }
 }
 
@@ -1715,6 +1787,37 @@ page Home
         assert!(attrs
             .iter()
             .any(|attr| attr.name == "data-tone" && attr.value == "primary"));
+    }
+
+    #[test]
+    fn foundry_components_keep_global_html_attributes() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+<Button id="save" role="switch" title="Save changes" tabindex="0">Save</Button>
+"#,
+        )
+        .expect("document should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let node = lower_document(&document, &resolver).expect("document should lower");
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { attrs, .. } = &children[0] else {
+            panic!("expected button");
+        };
+
+        for (name, value) in [
+            ("id", "save"),
+            ("role", "switch"),
+            ("title", "Save changes"),
+            ("tabindex", "0"),
+        ] {
+            assert!(attrs
+                .iter()
+                .any(|attr| attr.name == name && attr.value == value));
+        }
+        assert!(!attrs.iter().any(|attr| attr.name == "data-id"));
     }
 
     #[test]
@@ -2477,6 +2580,70 @@ page Frame
                 )],
             )
         );
+    }
+
+    #[test]
+    fn forwards_local_event_metadata_to_imported_component_root() {
+        let document = AxDocument {
+            imports: vec![AxImport::new(
+                [AxImportBinding::named("PackageButton")],
+                "@axonyx/ui/PackageButton.asx",
+            )],
+            functions: Vec::new(),
+            components: Vec::new(),
+            head: AxHead::default(),
+            page: AxPage::new(
+                "Home",
+                [AxStatement::component(
+                    AxComponent::new("PackageButton")
+                        .prop("data-ax-on-click-signal", "root:count:1")
+                        .prop("data-ax-on-click-op", "add")
+                        .prop("data-ax-on-click-value", "1")
+                        .prop("id", "increase")
+                        .inline("Increase"),
+                )],
+            ),
+        };
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let import_resolver = |source: &str| -> Option<String> {
+            (source == "@axonyx/ui/PackageButton.asx").then(|| {
+                r#"
+component PackageButton() {
+  render ASX {
+    <button class="package-button">
+      <Slot />
+    </button>
+  }
+}
+"#
+                .to_string()
+            })
+        };
+
+        let node = lower_document_with_scope_and_imports(
+            &document,
+            BTreeMap::new(),
+            &resolver,
+            &import_resolver,
+        )
+        .expect("imported component should lower");
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { attrs, .. } = &children[0] else {
+            panic!("expected package button root");
+        };
+
+        for (name, value) in [
+            ("data-ax-on-click-signal", "root:count:1"),
+            ("data-ax-on-click-op", "add"),
+            ("data-ax-on-click-value", "1"),
+            ("id", "increase"),
+        ] {
+            assert!(attrs
+                .iter()
+                .any(|attr| attr.name == name && attr.value == value));
+        }
     }
 
     #[test]
