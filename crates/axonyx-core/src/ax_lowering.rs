@@ -1115,7 +1115,7 @@ fn lower_local_component_nodes(
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
     let props = eval_props(component, functions, scope, resolver)?;
-    let passthrough_attrs = component_passthrough_attrs(&props);
+    let passthrough_attrs = component_passthrough_attrs(&props, component_def);
     let mut component_scope = scope.clone();
     component_scope.insert(
         AX_COMPONENT_INSTANCE_PATH.to_string(),
@@ -1161,13 +1161,20 @@ fn lower_local_component_nodes(
     Ok(nodes)
 }
 
-fn component_passthrough_attrs(props: &BTreeMap<String, AxValue>) -> Vec<Attribute> {
+fn component_passthrough_attrs(
+    props: &BTreeMap<String, AxValue>,
+    component_def: &AxComponentDef,
+) -> Vec<Attribute> {
     props
         .iter()
         .filter(|(name, _)| {
-            name.starts_with("data-")
-                || name.starts_with("aria-")
-                || matches!(name.as_str(), "id" | "role" | "title" | "tabindex")
+            !component_def
+                .params
+                .iter()
+                .any(|param| param.name == **name)
+                && (name.starts_with("data-")
+                    || name.starts_with("aria-")
+                    || matches!(name.as_str(), "id" | "role" | "title" | "tabindex"))
         })
         .map(|(name, value)| attr_boxed(name.clone(), value.as_string()))
         .collect()
