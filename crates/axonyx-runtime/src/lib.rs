@@ -3068,12 +3068,14 @@ fn render_preview_document_chunks(document: &AxDocument, root: &AxNode) -> Vec<V
     } else {
         ""
     };
-    let state_bridge_script =
-        if body.contains("data-ax-signal=") || body.contains("data-ax-state-name=") {
-            ax_state_bridge_script()
-        } else {
-            ""
-        };
+    let state_bridge_script = if body.contains("data-ax-signal=")
+        || body.contains("data-ax-state-name=")
+        || body.contains("data-ax-state-if-signal=")
+    {
+        ax_state_bridge_script()
+    } else {
+        ""
+    };
     let action_script = if body.contains("/__axonyx/action?") {
         ax_action_script()
     } else {
@@ -3474,6 +3476,7 @@ fn ax_state_bridge_script() -> &'static str {
   const aliases = new Map();
   const readBindings = new Map();
   const subscribers = new Map();
+  const conditions = new Map();
 
   const readValue = (node, target) => {
     if (target === "checked") return !!node.checked;
@@ -3573,6 +3576,7 @@ fn ax_state_bridge_script() -> &'static str {
       moveSignalBucket(bindings, alias, signal);
       moveSignalBucket(readBindings, alias, signal);
       moveSignalBucket(subscribers, alias, signal);
+      moveSignalBucket(conditions, alias, signal);
       if (state.has(alias) && !state.has(signal)) state.set(signal, state.get(alias));
       if (types.has(alias) && !types.has(signal)) types.set(signal, types.get(alias));
       document.querySelectorAll(`[data-ax-signal="${alias}"]`).forEach((node) => {
@@ -3580,6 +3584,9 @@ fn ax_state_bridge_script() -> &'static str {
       });
       document.querySelectorAll(`[data-ax-state-key="${alias}"]`).forEach((node) => {
         node.setAttribute("data-ax-state-key", signal);
+      });
+      document.querySelectorAll(`[data-ax-state-if-signal="${alias}"]`).forEach((node) => {
+        node.setAttribute("data-ax-state-if-signal", signal);
       });
     });
   };
@@ -3624,6 +3631,47 @@ fn ax_state_bridge_script() -> &'static str {
     document.querySelectorAll("[data-ax-state-name]").forEach(registerRead);
   };
 
+  const evaluateCondition = (entry, current) => {
+    const expected = castValue(entry.node.getAttribute("data-ax-state-if-value"), entry.type);
+    if (entry.op === "truthy") return !!current;
+    if (entry.op === "falsy") return !current;
+    if (entry.op === "eq") return current === expected;
+    if (entry.op === "ne") return current !== expected;
+    if (entry.op === "gt") return current > expected;
+    if (entry.op === "ge") return current >= expected;
+    if (entry.op === "lt") return current < expected;
+    if (entry.op === "le") return current <= expected;
+    return false;
+  };
+
+  const updateCondition = (entry, current) => {
+    const active = evaluateCondition(entry, current);
+    entry.node.querySelectorAll(":scope > [data-ax-state-if-branch]").forEach((branch) => {
+      const show = branch.getAttribute("data-ax-state-if-branch") === (active ? "then" : "else");
+      branch.hidden = !show;
+      branch.style.display = show ? "contents" : "none";
+    });
+  };
+
+  const registerCondition = (node) => {
+    const rawSignal = node.getAttribute("data-ax-state-if-signal");
+    const signal = canonicalSignal(rawSignal);
+    if (!signal) return;
+    if (rawSignal !== signal) node.setAttribute("data-ax-state-if-signal", signal);
+    const type = node.getAttribute("data-ax-state-if-type") || "String";
+    const initial = castValue(node.getAttribute("data-ax-state-if-initial"), type);
+    const entry = {
+      node,
+      type,
+      op: node.getAttribute("data-ax-state-if-op") || "truthy",
+    };
+    if (!types.has(signal)) types.set(signal, type);
+    if (!state.has(signal)) state.set(signal, initial);
+    if (!conditions.has(signal)) conditions.set(signal, []);
+    conditions.get(signal).push(entry);
+    updateCondition(entry, state.get(signal));
+  };
+
   const writeSignal = (signal, value, source = "client", emit = true) => {
     signal = canonicalSignal(signal);
     const type = types.get(signal) || "String";
@@ -3636,6 +3684,7 @@ fn ax_state_bridge_script() -> &'static str {
       writeValue(node, target, nextValue);
       node.setAttribute("data-ax-state-source", source);
     });
+    (conditions.get(signal) || []).forEach((entry) => updateCondition(entry, nextValue));
     notifySubscribers(signal, nextValue, source);
     if (emit) emitPatch(signal, nextValue, source);
     return nextValue;
@@ -3643,6 +3692,35 @@ fn ax_state_bridge_script() -> &'static str {
 
   const setSignal = (signal, value, source = "client") => {
     return writeSignal(signal, value, source, true);
+  };
+
+  const executeLocalEvent = (node, eventName, event) => {
+    const prefix = `data-ax-on-${eventName}`;
+    const rawSignal = node.getAttribute(`${prefix}-signal`);
+    const op = node.getAttribute(`${prefix}-op`);
+    if (!rawSignal || !op) return false;
+
+    const signal = canonicalSignal(rawSignal);
+    const type = node.getAttribute(`${prefix}-type`) || types.get(signal) || "String";
+    const initial = castValue(node.getAttribute(`${prefix}-initial`), type);
+    const current = state.has(signal) ? state.get(signal) : initial;
+    const valueSource = node.getAttribute(`${prefix}-value-source`);
+    const rawOperand = valueSource === "checked"
+      ? !!event.target.checked
+      : valueSource === "value"
+        ? event.target.value
+        : node.getAttribute(`${prefix}-value`);
+    const operand = castValue(rawOperand, type);
+    let next;
+    if (op === "set") next = operand;
+    else if (op === "add") next = Number(current) + Number(operand);
+    else if (op === "sub") next = Number(current) - Number(operand);
+    else if (op === "toggle") next = !castValue(current, "Bool");
+    else return false;
+
+    if (!types.has(signal)) types.set(signal, type);
+    setSignal(signal, next, `event:${eventName}`);
+    return true;
   };
 
   const applyPatch = (patch) => {
@@ -3761,6 +3839,7 @@ fn ax_state_bridge_script() -> &'static str {
   const init = () => {
     document.querySelectorAll("[data-ax-signal]").forEach(register);
     registerReads();
+    document.querySelectorAll("[data-ax-state-if-signal]").forEach(registerCondition);
   };
 
   document.addEventListener("input", (event) => {
@@ -3775,6 +3854,13 @@ fn ax_state_bridge_script() -> &'static str {
     if (!node) return;
     const type = node.getAttribute("data-ax-state-type") || "String";
     setSignal(node.getAttribute("data-ax-signal"), castValue(readValue(node, node.getAttribute("data-ax-bind") || "value"), type));
+  });
+
+  ["click", "input", "change"].forEach((eventName) => {
+    document.addEventListener(eventName, (event) => {
+      const node = event.target.closest(`[data-ax-on-${eventName}-signal]`);
+      if (node) executeLocalEvent(node, eventName, event);
+    });
   });
 
   window.__axonyx = window.__axonyx || {};
@@ -4704,6 +4790,60 @@ state count: Number = 0
         assert!(html.contains("value=\"0\""));
         assert!(html.contains("data-ax-runtime=\"state-bridge\""));
         assert!(html.contains("castValue"));
+    }
+
+    #[test]
+    fn preview_lowers_local_state_events_without_inline_javascript() {
+        let html = preview_ax_page(
+            r#"
+page Counter() {
+  state count: Number = 0
+
+  return ASX {
+    <>
+      <Button on:click={count += 1}>Increase</Button>
+      <Copy>{count}</Copy>
+    </>
+  }
+}
+"#,
+        )
+        .expect("local state event preview should render");
+
+        assert!(html.contains("data-ax-on-click-signal=\"root:count:1\""));
+        assert!(html.contains("data-ax-on-click-op=\"add\""));
+        assert!(html.contains("data-ax-on-click-value=\"1\""));
+        assert!(html.contains("data-ax-signal=\"root:count:1\""));
+        assert!(html.contains("data-ax-bind=\"text\""));
+        assert!(html.contains("executeLocalEvent"));
+        assert!(!html.contains("onclick="));
+    }
+
+    #[test]
+    fn preview_preserves_state_dependent_if_branches_for_local_updates() {
+        let html = preview_ax_page(
+            r#"
+page Counter() {
+  state count: Number = 0
+  return ASX {
+    <If when={count > 5}>
+      <Badge>High value</Badge>
+      <Else><Copy>Low value</Copy></Else>
+    </If>
+  }
+}
+"#,
+        )
+        .expect("state condition preview should render");
+
+        assert!(html.contains("data-ax-state-if-signal=\"root:count:1\""));
+        assert!(html.contains("data-ax-state-if-op=\"gt\""));
+        assert!(html.contains("data-ax-state-if-value=\"5\""));
+        assert!(html.contains("data-ax-state-if-branch=\"then\""));
+        assert!(html.contains("data-ax-state-if-branch=\"else\""));
+        assert!(html.contains("High value"));
+        assert!(html.contains("Low value"));
+        assert!(html.contains("registerCondition"));
     }
 
     #[test]

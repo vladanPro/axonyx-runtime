@@ -65,6 +65,14 @@ pub enum AxConvertV2Error {
     UnknownStateBinding { attr: String },
     #[error("`{attr}` only supports expression bindings such as `{{theme}}`")]
     InvalidStateBinding { attr: String },
+    #[error("unsupported local state event `{attr}`; use on:click, on:input, or on:change")]
+    UnsupportedStateEvent { attr: String },
+    #[error("`{attr}` must mutate a declared state signal")]
+    UnknownStateEvent { attr: String },
+    #[error(
+        "invalid local state event `{expr_source}`; use `state = literal`, `state += number`, `state -= number`, or `state = !state`"
+    )]
+    InvalidStateEvent { expr_source: String },
 }
 
 pub fn looks_like_ax_v2(input: &str) -> bool {
@@ -202,6 +210,11 @@ fn convert_component_decl(
             StateBindingPlan {
                 signal_id: signal.clone(),
                 ty: ty.clone(),
+                initial: state_event_literal(&initializer.value).ok_or_else(|| {
+                    AxConvertV2Error::InvalidStateInitializer {
+                        expr_source: state.value.clone(),
+                    }
+                })?,
             },
         );
         states.push(AxComponentStateDef::new(
@@ -355,6 +368,9 @@ fn convert_element(
             name if name.starts_with("bind:") => {
                 component = apply_state_binding_attr(component, attr, state_bindings)?;
             }
+            name if name.starts_with("on:") => {
+                component = apply_state_event_attr(component, attr, state_bindings)?;
+            }
             "class" | "className" => {
                 if let Some(first) = class_attr_seen {
                     return Err(AxConvertV2Error::DuplicateClassAttr {
@@ -390,7 +406,15 @@ fn convert_element(
     if element.children.len() == 1 {
         return match &element.children[0] {
             AxNodeV2::Text(text) => Ok(component.inline(AxExpr::string(text.value.clone()))),
-            AxNodeV2::Expr(expr) => Ok(component.inline(parse_v2_expr(&expr.source)?)),
+            AxNodeV2::Expr(expr) => {
+                let value = parse_v2_expr(&expr.source)?;
+                if let AxExpr::Identifier(name) = &value {
+                    if let Some(binding) = state_bindings.get(name) {
+                        component = apply_state_read_binding(component, binding);
+                    }
+                }
+                Ok(component.inline(value))
+            }
             AxNodeV2::Element(child) => Ok(component.block([AxStatement::component(
                 convert_element(child, state_bindings)?,
             )])),
@@ -454,9 +478,44 @@ fn convert_if_statement(
 ) -> Result<AxStatement, AxConvertV2Error> {
     let condition = control_expr_attr(element, &["when", "condition"])?;
     let (body, else_body) = split_if_children(element, state_bindings)?;
+    if let Some(plan) = state_condition_plan(&condition, state_bindings) {
+        return Ok(AxStatement::component(state_if_component(
+            plan, body, else_body,
+        )));
+    }
     Ok(AxStatement::If(
         AxIfBlock::new(condition, body).else_body(else_body),
     ))
+}
+
+fn state_if_component(
+    plan: StateConditionPlan,
+    body: Vec<AxStatement>,
+    else_body: Vec<AxStatement>,
+) -> AxComponent {
+    let active = evaluate_initial_state_condition(&plan);
+    let mut component = AxComponent::new("__AxStateIf")
+        .prop("data-ax-state-if-signal", plan.signal_id)
+        .prop("data-ax-state-if-op", plan.op)
+        .prop("data-ax-state-if-type", plan.ty)
+        .prop("data-ax-state-if-initial", plan.initial);
+    if let Some(value) = plan.value {
+        component = component.prop("data-ax-state-if-value", value);
+    }
+
+    let mut then_branch = AxComponent::new("__AxStateIfThen").block(body);
+    if !active {
+        then_branch = then_branch.prop("hidden", true);
+    }
+    let mut branches = vec![AxStatement::component(then_branch)];
+    if !else_body.is_empty() {
+        let mut else_branch = AxComponent::new("__AxStateIfElse").block(else_body);
+        if active {
+            else_branch = else_branch.prop("hidden", true);
+        }
+        branches.push(AxStatement::component(else_branch));
+    }
+    component.block(branches)
 }
 
 fn convert_each_element(
@@ -658,12 +717,117 @@ fn convert_if_tail_with_state(
 struct StateBindingPlan {
     signal_id: String,
     ty: String,
+    initial: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct StateInitializerPlan {
     value: AxExpr,
     ty: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateConditionPlan {
+    signal_id: String,
+    ty: String,
+    initial: String,
+    op: String,
+    value: Option<String>,
+}
+
+fn state_condition_plan(
+    condition: &AxExpr,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Option<StateConditionPlan> {
+    match condition {
+        AxExpr::Identifier(name) => state_bindings.get(name).map(|binding| StateConditionPlan {
+            signal_id: binding.signal_id.clone(),
+            ty: binding.ty.clone(),
+            initial: binding.initial.clone(),
+            op: "truthy".to_string(),
+            value: None,
+        }),
+        AxExpr::Unary {
+            op: AxUnaryOp::Not,
+            expr,
+        } => {
+            let AxExpr::Identifier(name) = expr.as_ref() else {
+                return None;
+            };
+            state_bindings.get(name).map(|binding| StateConditionPlan {
+                signal_id: binding.signal_id.clone(),
+                ty: binding.ty.clone(),
+                initial: binding.initial.clone(),
+                op: "falsy".to_string(),
+                value: None,
+            })
+        }
+        AxExpr::Binary { op, left, right } => {
+            let AxExpr::Identifier(name) = left.as_ref() else {
+                return None;
+            };
+            let binding = state_bindings.get(name)?;
+            let value = state_event_literal(right)?;
+            let op = match op {
+                AxBinaryOp::Eq => "eq",
+                AxBinaryOp::Ne => "ne",
+                AxBinaryOp::Gt => "gt",
+                AxBinaryOp::Ge => "ge",
+                AxBinaryOp::Lt => "lt",
+                AxBinaryOp::Le => "le",
+                _ => return None,
+            };
+            Some(StateConditionPlan {
+                signal_id: binding.signal_id.clone(),
+                ty: binding.ty.clone(),
+                initial: binding.initial.clone(),
+                op: op.to_string(),
+                value: Some(value),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn evaluate_initial_state_condition(plan: &StateConditionPlan) -> bool {
+    match plan.ty.as_str() {
+        "Bool" => {
+            let current = plan.initial == "true";
+            match plan.op.as_str() {
+                "truthy" => current,
+                "falsy" => !current,
+                "eq" => current == plan.value.as_deref().is_some_and(|value| value == "true"),
+                "ne" => current != plan.value.as_deref().is_some_and(|value| value == "true"),
+                _ => false,
+            }
+        }
+        "Number" => {
+            let current = plan.initial.parse::<i64>().unwrap_or_default();
+            let expected = plan
+                .value
+                .as_deref()
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or_default();
+            match plan.op.as_str() {
+                "truthy" => current != 0,
+                "falsy" => current == 0,
+                "eq" => current == expected,
+                "ne" => current != expected,
+                "gt" => current > expected,
+                "ge" => current >= expected,
+                "lt" => current < expected,
+                "le" => current <= expected,
+                _ => false,
+            }
+        }
+        _ => match plan.op.as_str() {
+            "truthy" => !plan.initial.is_empty(),
+            "falsy" => plan.initial.is_empty(),
+            "eq" => plan.value.as_deref() == Some(plan.initial.as_str()),
+            "ne" => plan.value.as_deref() != Some(plan.initial.as_str()),
+            _ => false,
+        },
+    }
 }
 
 fn collect_state_bindings(
@@ -678,6 +842,11 @@ fn collect_state_bindings(
             StateBindingPlan {
                 signal_id: format!("root:{}:{}", state.name, index + 1),
                 ty,
+                initial: state_event_literal(&initializer.value).ok_or_else(|| {
+                    AxConvertV2Error::InvalidStateInitializer {
+                        expr_source: state.value.clone(),
+                    }
+                })?,
             },
         );
     }
@@ -760,6 +929,147 @@ fn apply_state_binding_attr(
     }
 
     Ok(component)
+}
+
+fn apply_state_read_binding(component: AxComponent, binding: &StateBindingPlan) -> AxComponent {
+    component
+        .prop("data-ax-signal", AxExpr::string(binding.signal_id.clone()))
+        .prop("data-ax-bind", AxExpr::string("text"))
+        .prop("data-ax-state-type", AxExpr::string(binding.ty.clone()))
+}
+
+fn apply_state_event_attr(
+    mut component: AxComponent,
+    attr: &AxAttributeNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<AxComponent, AxConvertV2Error> {
+    let event = attr.name.trim_start_matches("on:");
+    if !matches!(event, "click" | "input" | "change") {
+        return Err(AxConvertV2Error::UnsupportedStateEvent {
+            attr: attr.name.clone(),
+        });
+    }
+
+    let AxAttributeValue::Expr(source) = &attr.value else {
+        return Err(AxConvertV2Error::InvalidStateEvent {
+            expr_source: attr.name.clone(),
+        });
+    };
+    let mutation = parse_state_event_mutation(source)?;
+    let Some(binding) = state_bindings.get(&mutation.state) else {
+        return Err(AxConvertV2Error::UnknownStateEvent {
+            attr: attr.name.clone(),
+        });
+    };
+    if matches!(mutation.op.as_str(), "add" | "sub") && binding.ty != "Number"
+        || mutation.op == "set"
+            && mutation
+                .value_ty
+                .as_deref()
+                .is_some_and(|value_ty| value_ty != binding.ty)
+        || mutation.op == "toggle" && binding.ty != "Bool"
+    {
+        return Err(AxConvertV2Error::InvalidStateEvent {
+            expr_source: source.clone(),
+        });
+    }
+
+    let prefix = format!("data-ax-on-{event}");
+    component = component
+        .prop(
+            format!("{prefix}-signal"),
+            AxExpr::string(binding.signal_id.clone()),
+        )
+        .prop(format!("{prefix}-op"), AxExpr::string(mutation.op))
+        .prop(
+            format!("{prefix}-initial"),
+            AxExpr::string(binding.initial.clone()),
+        )
+        .prop(format!("{prefix}-type"), AxExpr::string(binding.ty.clone()));
+    if let Some(value) = mutation.value {
+        component = component.prop(format!("{prefix}-value"), AxExpr::string(value));
+    }
+    if let Some(value_source) = mutation.value_source {
+        component = component.prop(
+            format!("{prefix}-value-source"),
+            AxExpr::string(value_source),
+        );
+    }
+
+    Ok(component)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StateEventMutation {
+    state: String,
+    op: String,
+    value: Option<String>,
+    value_ty: Option<String>,
+    value_source: Option<String>,
+}
+
+fn parse_state_event_mutation(source: &str) -> Result<StateEventMutation, AxConvertV2Error> {
+    let source = source.trim();
+    for (token, op) in [("+=", "add"), ("-=", "sub"), ("=", "set")] {
+        let Some(index) = source.find(token) else {
+            continue;
+        };
+        let state = source[..index].trim();
+        let value_source = source[index + token.len()..].trim();
+        if !is_state_identifier(state) || value_source.is_empty() {
+            break;
+        }
+        if token == "=" && value_source == format!("!{state}") {
+            return Ok(StateEventMutation {
+                state: state.to_string(),
+                op: "toggle".to_string(),
+                value: None,
+                value_ty: None,
+                value_source: None,
+            });
+        }
+        if matches!(value_source, "event.value" | "event.checked") {
+            return Ok(StateEventMutation {
+                state: state.to_string(),
+                op: op.to_string(),
+                value: None,
+                value_ty: (value_source == "event.checked").then(|| "Bool".to_string()),
+                value_source: Some(value_source.trim_start_matches("event.").to_string()),
+            });
+        }
+        let literal = parse_v2_expr(value_source).ok().and_then(|expr| {
+            state_event_literal(&expr).map(|value| (value, infer_state_type(&expr).to_string()))
+        });
+        if let Some((value, value_ty)) = literal {
+            return Ok(StateEventMutation {
+                state: state.to_string(),
+                op: op.to_string(),
+                value: Some(value),
+                value_ty: Some(value_ty),
+                value_source: None,
+            });
+        }
+        break;
+    }
+
+    Err(AxConvertV2Error::InvalidStateEvent {
+        expr_source: source.to_string(),
+    })
+}
+
+fn is_state_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+}
+
+fn state_event_literal(expr: &AxExpr) -> Option<String> {
+    match expr {
+        AxExpr::String(value) => Some(value.clone()),
+        AxExpr::Number(value) => Some(value.to_string()),
+        AxExpr::Bool(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn convert_prop(attr: &AxAttributeNode) -> Result<AxProp, AxConvertV2Error> {
@@ -1223,6 +1533,170 @@ state count: Number = 0
         assert!(count_input
             .props
             .contains(&AxProp::new("data-ax-state-type", AxExpr::string("Number"))));
+    }
+
+    #[test]
+    fn converts_local_state_click_mutations_into_declarative_event_metadata() {
+        let document = parse_ax_auto(
+            r#"
+page Counter() {
+  state count: Number = 0
+  state open: Bool = false
+
+  return ASX {
+    <>
+      <Button on:click={count += 1}>Increase</Button>
+      <button on:click={count -= 2}>Decrease</button>
+      <button on:click={open = !open}>Toggle</button>
+      <Copy>{count}</Copy>
+    </>
+  }
+}
+"#,
+        )
+        .expect("local state event should convert");
+
+        let AxStatement::Component(fragment) = &document.page.body[2] else {
+            panic!("expected fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected fragment body");
+        };
+        let AxStatement::Component(increase) = &body[0] else {
+            panic!("expected increase button");
+        };
+        assert!(increase.props.contains(&AxProp::new(
+            "data-ax-on-click-signal",
+            AxExpr::string("root:count:1")
+        )));
+        assert!(increase
+            .props
+            .contains(&AxProp::new("data-ax-on-click-op", AxExpr::string("add"))));
+        assert!(increase
+            .props
+            .contains(&AxProp::new("data-ax-on-click-value", AxExpr::string("1"))));
+
+        let AxStatement::Component(toggle) = &body[2] else {
+            panic!("expected toggle button");
+        };
+        assert!(toggle.props.contains(&AxProp::new(
+            "data-ax-on-click-op",
+            AxExpr::string("toggle")
+        )));
+
+        let AxStatement::Component(copy) = &body[3] else {
+            panic!("expected state reader");
+        };
+        assert!(copy.props.contains(&AxProp::new(
+            "data-ax-signal",
+            AxExpr::string("root:count:1")
+        )));
+        assert!(copy
+            .props
+            .contains(&AxProp::new("data-ax-bind", AxExpr::string("text"))));
+    }
+
+    #[test]
+    fn rejects_local_events_that_do_not_mutate_declared_state() {
+        let error = parse_ax_auto(
+            r#"
+page Counter() {
+  state count: Number = 0
+  return ASX { <Button on:click={missing += 1}>Increase</Button> }
+}
+"#,
+        )
+        .expect_err("unknown event state should fail");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::UnknownStateEvent { .. })
+        ));
+    }
+
+    #[test]
+    fn converts_state_dependent_if_into_reactive_dom_boundary() {
+        let document = parse_ax_auto(
+            r#"
+page Counter() {
+  state count: Number = 0
+  return ASX {
+    <If when={count > 5}>
+      <Badge>High value</Badge>
+      <Else><Copy>Low value</Copy></Else>
+    </If>
+  }
+}
+"#,
+        )
+        .expect("state-dependent if should convert");
+
+        let AxStatement::Component(fragment) = &document.page.body[1] else {
+            panic!("expected return fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected return body");
+        };
+        let AxStatement::Component(state_if) = &body[0] else {
+            panic!("expected reactive state if component");
+        };
+        assert_eq!(state_if.name, "__AxStateIf");
+        assert!(state_if.props.contains(&AxProp::new(
+            "data-ax-state-if-signal",
+            AxExpr::string("root:count:1")
+        )));
+        assert!(state_if
+            .props
+            .contains(&AxProp::new("data-ax-state-if-op", AxExpr::string("gt"))));
+        let AxBody::Block(branches) = &state_if.body else {
+            panic!("expected condition branches");
+        };
+        let AxStatement::Component(then_branch) = &branches[0] else {
+            panic!("expected then branch");
+        };
+        assert!(then_branch
+            .props
+            .contains(&AxProp::new("hidden", AxExpr::bool(true))));
+    }
+
+    #[test]
+    fn converts_input_and_change_event_values_into_safe_metadata() {
+        let document = parse_ax_auto(
+            r#"
+page Filters() {
+  state query: String = ""
+  state enabled: Bool = false
+  return ASX {
+    <>
+      <input on:input={query = event.value} />
+      <input type="checkbox" on:change={enabled = event.checked} />
+    </>
+  }
+}
+"#,
+        )
+        .expect("event values should convert");
+
+        let AxStatement::Component(fragment) = &document.page.body[2] else {
+            panic!("expected fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected fragment body");
+        };
+        let AxStatement::Component(input) = &body[0] else {
+            panic!("expected text input");
+        };
+        assert!(input.props.contains(&AxProp::new(
+            "data-ax-on-input-value-source",
+            AxExpr::string("value")
+        )));
+        let AxStatement::Component(checkbox) = &body[1] else {
+            panic!("expected checkbox");
+        };
+        assert!(checkbox.props.contains(&AxProp::new(
+            "data-ax-on-change-value-source",
+            AxExpr::string("checked")
+        )));
     }
 
     #[test]
