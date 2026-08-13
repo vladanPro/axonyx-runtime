@@ -3,6 +3,7 @@ members = [
   "crates/axonyx-core",
   "crates/axonyx-macros",
   "crates/axonyx-runtime",
+  "crates/axonyx-state-wasm",
 ]
 resolver = "2"
 
