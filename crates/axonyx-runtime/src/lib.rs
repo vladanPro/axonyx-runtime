@@ -3483,12 +3483,17 @@ fn ax_state_bridge_script() -> &'static str {
   const readBindings = new Map();
   const subscribers = new Map();
   const conditions = new Map();
+  const domCapabilities = new WeakMap();
+  const validDomCapabilities = new WeakSet();
+  const domCapabilityList = [];
   let wasmExecutor;
   let wasmTextEncoder;
   let wasmTextDecoder;
   let executorMode = "js-fallback";
 
   const stateEventProtocol = "ax-state-event/1";
+  const domCapabilityProtocol = "ax-dom-capability/1";
+  const domWriteTargets = new Set(["value", "checked", "text"]);
   const maxStateEventSignalLength = 512;
   const maxStateEventStringBytes = 4096;
   const executorStats = {
@@ -3496,6 +3501,10 @@ fn ax_state_bridge_script() -> &'static str {
     fallbackOperations: 0,
     rejectedEvents: 0,
     dedupedEvents: 0,
+    registeredDomCapabilities: 0,
+    appliedDomWrites: 0,
+    rejectedDomCapabilities: 0,
+    rejectedDomWrites: 0,
   };
   const localOperationCode = Object.freeze({ set: 0, add: 1, sub: 2, toggle: 3 });
   const localValueTypeCode = Object.freeze({ String: 0, Number: 1, Bool: 2 });
@@ -3562,6 +3571,56 @@ fn ax_state_bridge_script() -> &'static str {
     }
     if ("value" in node) node.value = next;
     else node.setAttribute("value", next);
+  };
+
+  const rejectDomCapability = (node, signal, target, role, reason) => {
+    executorStats.rejectedDomCapabilities += 1;
+    window.dispatchEvent(new CustomEvent("axonyx:dom-capability-rejected", {
+      detail: { protocol: domCapabilityProtocol, signal, target, role, reason },
+    }));
+    return undefined;
+  };
+
+  const registerDomCapability = (node, signal, target, type, role, allowImplicit = false) => {
+    const existing = domCapabilities.get(node);
+    if (existing) {
+      if (existing.signal === signal && existing.target === target && existing.role === role) {
+        return existing;
+      }
+      return rejectDomCapability(node, signal, target, role, "capability-conflict");
+    }
+
+    const protocol = node.getAttribute("data-ax-dom-protocol");
+    const declaredTarget = node.getAttribute("data-ax-dom-write");
+    if (!allowImplicit && protocol !== domCapabilityProtocol) {
+      return rejectDomCapability(node, signal, target, role, "invalid-protocol");
+    }
+    if (!allowImplicit && declaredTarget !== target) {
+      return rejectDomCapability(node, signal, target, role, "target-mismatch");
+    }
+    if (!domWriteTargets.has(target)) {
+      return rejectDomCapability(node, signal, target, role, "unsupported-target");
+    }
+    if (target === "checked" && !("checked" in node)) {
+      return rejectDomCapability(node, signal, target, role, "unsupported-node-target");
+    }
+
+    const capability = Object.freeze({ node, signal, target, type, role });
+    domCapabilities.set(node, capability);
+    validDomCapabilities.add(capability);
+    domCapabilityList.push(capability);
+    executorStats.registeredDomCapabilities += 1;
+    return capability;
+  };
+
+  const writeDomCapability = (capability, value) => {
+    if (!capability || !validDomCapabilities.has(capability)) {
+      executorStats.rejectedDomWrites += 1;
+      return false;
+    }
+    writeValue(capability.node, capability.target, value);
+    executorStats.appliedDomWrites += 1;
+    return true;
   };
 
   const valueFromSnapshot = (entry) => {
@@ -3659,12 +3718,14 @@ fn ax_state_bridge_script() -> &'static str {
     if (rawSignal !== signal) node.setAttribute("data-ax-signal", signal);
     const target = node.getAttribute("data-ax-bind") || "value";
     const type = node.getAttribute("data-ax-state-type") || "String";
+    const capability = registerDomCapability(node, signal, target, type, "binding");
+    if (!capability) return;
     const initial = castValue(readValue(node, target), type);
     if (!types.has(signal)) types.set(signal, type);
     if (!state.has(signal)) state.set(signal, initial);
-    writeValue(node, target, state.get(signal));
+    writeDomCapability(capability, state.get(signal));
     if (!bindings.has(signal)) bindings.set(signal, []);
-    bindings.get(signal).push({ node, target, type });
+    bindings.get(signal).push(capability);
   };
 
   const registerRead = (node) => {
@@ -3673,11 +3734,14 @@ fn ax_state_bridge_script() -> &'static str {
     const target = node.getAttribute("data-ax-state-target") || "text";
     const signal = canonicalSignal(metadataByName.get(name) || node.getAttribute("data-ax-state-key"));
     if (!signal) return;
+    const type = types.get(signal) || "String";
+    const capability = registerDomCapability(node, signal, target, type, "named-read", true);
+    if (!capability) return;
     node.setAttribute("data-ax-state-key", signal);
     if (!readBindings.has(signal)) readBindings.set(signal, []);
-    readBindings.get(signal).push({ node, target });
+    if (!readBindings.get(signal).includes(capability)) readBindings.get(signal).push(capability);
     if (state.has(signal)) {
-      writeValue(node, target, state.get(signal));
+      writeDomCapability(capability, state.get(signal));
       node.setAttribute("data-ax-state-source", "state");
     }
   };
@@ -3732,12 +3796,12 @@ fn ax_state_bridge_script() -> &'static str {
     const type = types.get(signal) || "String";
     const nextValue = castValue(value, type);
     state.set(signal, nextValue);
-    (bindings.get(signal) || []).forEach(({ node, target }) => {
-      writeValue(node, target, nextValue);
+    (bindings.get(signal) || []).forEach((capability) => {
+      writeDomCapability(capability, nextValue);
     });
-    (readBindings.get(signal) || []).forEach(({ node, target }) => {
-      writeValue(node, target, nextValue);
-      node.setAttribute("data-ax-state-source", source);
+    (readBindings.get(signal) || []).forEach((capability) => {
+      writeDomCapability(capability, nextValue);
+      capability.node.setAttribute("data-ax-state-source", source);
     });
     (conditions.get(signal) || []).forEach((entry) => updateCondition(entry, nextValue));
     notifySubscribers(signal, nextValue, source);
@@ -4110,6 +4174,13 @@ fn ax_state_bridge_script() -> &'static str {
     meta: (signal) => metadata.get(canonicalSignal(signal)),
     manifest: () => Array.from(metadata.values()),
     describe,
+    capabilities: () => domCapabilityList.map(({ signal, target, type, role }) => ({
+      protocol: domCapabilityProtocol,
+      signal,
+      target,
+      type,
+      role,
+    })),
     snapshot: () => Object.fromEntries(state.entries()),
     runtime: () => executorMode,
     eventProtocol: stateEventProtocol,
@@ -4121,6 +4192,11 @@ fn ax_state_bridge_script() -> &'static str {
       fallbackOperations: executorStats.fallbackOperations,
       rejectedEvents: executorStats.rejectedEvents,
       dedupedEvents: executorStats.dedupedEvents,
+      domProtocol: domCapabilityProtocol,
+      registeredDomCapabilities: executorStats.registeredDomCapabilities,
+      appliedDomWrites: executorStats.appliedDomWrites,
+      rejectedDomCapabilities: executorStats.rejectedDomCapabilities,
+      rejectedDomWrites: executorStats.rejectedDomWrites,
     }),
     loadWasm: loadWasmExecutor,
   };
@@ -4994,6 +5070,11 @@ page Home
         assert!(state_html.contains("exports.ax_state_abi_version?.() !== 2"));
         assert!(state_html.contains("runtime: () => executorMode"));
         assert!(state_html.contains("stateEventProtocol = \"ax-state-event/1\""));
+        assert!(state_html.contains("domCapabilityProtocol = \"ax-dom-capability/1\""));
+        assert!(state_html.contains("registerDomCapability"));
+        assert!(state_html.contains("writeDomCapability"));
+        assert!(state_html.contains("axonyx:dom-capability-rejected"));
+        assert!(state_html.contains("capabilities: () => domCapabilityList.map"));
         assert!(state_html.contains("validateStateEventPayload"));
         assert!(state_html.contains("axonyx:state-event-rejected"));
         assert!(state_html.contains("if (node.hasAttribute(\"data-ax-on-input-signal\")) return"));
@@ -5053,8 +5134,11 @@ state count: Number = 0
         assert!(html.contains("data-ax-signal=\"root:theme:1\""));
         assert!(html.contains("data-ax-bind=\"value\""));
         assert!(html.contains("data-ax-state-type=\"String\""));
+        assert!(html.contains("data-ax-dom-protocol=\"ax-dom-capability/1\""));
+        assert!(html.contains("data-ax-dom-write=\"value\""));
         assert!(html.contains("value=\"silver\""));
         assert!(html.contains("data-ax-bind=\"text\""));
+        assert!(html.contains("data-ax-dom-write=\"text\""));
         assert!(html.contains(">silver</span>"));
         assert!(html.contains("data-ax-state-type=\"Number\""));
         assert!(html.contains("value=\"0\""));
