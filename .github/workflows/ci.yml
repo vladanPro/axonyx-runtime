@@ -28,6 +28,9 @@ jobs:
       - name: Run workspace tests
         run: cargo test --workspace
 
+      - name: Verify bundled state WASM ABI
+        run: node scripts/verify-state-wasm.mjs
+
       - name: Package axonyx-macros
         run: cargo package -p axonyx-macros --allow-dirty --no-verify
 
