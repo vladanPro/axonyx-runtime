@@ -920,6 +920,7 @@ fn apply_state_binding_attr(
     component = component
         .prop("data-ax-signal", AxExpr::string(binding.signal_id.clone()))
         .prop("data-ax-bind", AxExpr::string(bind_target.to_string()))
+        .prop("data-ax-bind-protocol", AxExpr::string("ax-state-event/1"))
         .prop("data-ax-state-type", AxExpr::string(binding.ty.clone()));
 
     if matches!(bind_target, "value" | "checked")
@@ -984,6 +985,10 @@ fn apply_state_event_attr(
         .prop(
             format!("{prefix}-initial"),
             AxExpr::string(binding.initial.clone()),
+        )
+        .prop(
+            format!("{prefix}-protocol"),
+            AxExpr::string("ax-state-event/1"),
         )
         .prop(format!("{prefix}-type"), AxExpr::string(binding.ty.clone()));
     if let Some(value) = mutation.value {
@@ -1512,6 +1517,10 @@ state count: Number = 0
         assert!(input
             .props
             .contains(&AxProp::new("data-ax-bind", AxExpr::string("value"))));
+        assert!(input.props.contains(&AxProp::new(
+            "data-ax-bind-protocol",
+            AxExpr::string("ax-state-event/1")
+        )));
         assert!(input
             .props
             .contains(&AxProp::new("data-ax-state-type", AxExpr::string("String"))));
@@ -1690,12 +1699,20 @@ page Filters() {
             "data-ax-on-input-value-source",
             AxExpr::string("value")
         )));
+        assert!(input.props.contains(&AxProp::new(
+            "data-ax-on-input-protocol",
+            AxExpr::string("ax-state-event/1")
+        )));
         let AxStatement::Component(checkbox) = &body[1] else {
             panic!("expected checkbox");
         };
         assert!(checkbox.props.contains(&AxProp::new(
             "data-ax-on-change-value-source",
             AxExpr::string("checked")
+        )));
+        assert!(checkbox.props.contains(&AxProp::new(
+            "data-ax-on-change-protocol",
+            AxExpr::string("ax-state-event/1")
         )));
     }
 
