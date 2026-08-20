@@ -921,6 +921,11 @@ fn apply_state_binding_attr(
         .prop("data-ax-signal", AxExpr::string(binding.signal_id.clone()))
         .prop("data-ax-bind", AxExpr::string(bind_target.to_string()))
         .prop("data-ax-bind-protocol", AxExpr::string("ax-state-event/1"))
+        .prop(
+            "data-ax-dom-protocol",
+            AxExpr::string("ax-dom-capability/1"),
+        )
+        .prop("data-ax-dom-write", AxExpr::string(bind_target.to_string()))
         .prop("data-ax-state-type", AxExpr::string(binding.ty.clone()));
 
     if matches!(bind_target, "value" | "checked")
@@ -936,6 +941,11 @@ fn apply_state_read_binding(component: AxComponent, binding: &StateBindingPlan) 
     component
         .prop("data-ax-signal", AxExpr::string(binding.signal_id.clone()))
         .prop("data-ax-bind", AxExpr::string("text"))
+        .prop(
+            "data-ax-dom-protocol",
+            AxExpr::string("ax-dom-capability/1"),
+        )
+        .prop("data-ax-dom-write", AxExpr::string("text"))
         .prop("data-ax-state-type", AxExpr::string(binding.ty.clone()))
 }
 
@@ -1521,6 +1531,13 @@ state count: Number = 0
             "data-ax-bind-protocol",
             AxExpr::string("ax-state-event/1")
         )));
+        assert!(input.props.contains(&AxProp::new(
+            "data-ax-dom-protocol",
+            AxExpr::string("ax-dom-capability/1")
+        )));
+        assert!(input
+            .props
+            .contains(&AxProp::new("data-ax-dom-write", AxExpr::string("value"))));
         assert!(input
             .props
             .contains(&AxProp::new("data-ax-state-type", AxExpr::string("String"))));
@@ -1534,6 +1551,9 @@ state count: Number = 0
         assert!(span
             .props
             .contains(&AxProp::new("data-ax-bind", AxExpr::string("text"))));
+        assert!(span
+            .props
+            .contains(&AxProp::new("data-ax-dom-write", AxExpr::string("text"))));
         assert!(!span.props.iter().any(|prop| prop.name == "text"));
 
         let AxStatement::Component(count_input) = &document.page.body[4] else {
