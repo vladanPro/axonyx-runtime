@@ -1,15 +1,35 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-pub const AX_STATE_ABI_VERSION: u32 = 1;
+pub const AX_STATE_ABI_VERSION: u32 = 2;
 pub const AX_STATE_OP_SET: u32 = 0;
 pub const AX_STATE_OP_ADD: u32 = 1;
 pub const AX_STATE_OP_SUB: u32 = 2;
 pub const AX_STATE_OP_TOGGLE: u32 = 3;
+pub const AX_STATE_TYPE_STRING: u32 = 0;
+pub const AX_STATE_TYPE_NUMBER: u32 = 1;
+pub const AX_STATE_TYPE_BOOL: u32 = 2;
 pub const AX_STATE_UNSUPPORTED_BOOL: u32 = u32::MAX;
+pub const AX_STATE_STRING_ERROR: u32 = u32::MAX;
+pub const AX_STATE_STRING_CAPACITY: usize = 4096;
+
+static mut STRING_BUFFER: [u8; AX_STATE_STRING_CAPACITY] = [0; AX_STATE_STRING_CAPACITY];
 
 #[unsafe(no_mangle)]
 pub extern "C" fn ax_state_abi_version() -> u32 {
     AX_STATE_ABI_VERSION
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ax_state_supports_operation(value_type: u32, operation: u32) -> u32 {
+    u32::from(matches!(
+        (value_type, operation),
+        (AX_STATE_TYPE_STRING, AX_STATE_OP_SET)
+            | (
+                AX_STATE_TYPE_NUMBER,
+                AX_STATE_OP_SET | AX_STATE_OP_ADD | AX_STATE_OP_SUB
+            )
+            | (AX_STATE_TYPE_BOOL, AX_STATE_OP_SET | AX_STATE_OP_TOGGLE)
+    ))
 }
 
 #[unsafe(no_mangle)]
@@ -31,13 +51,60 @@ pub extern "C" fn ax_state_apply_bool(operation: u32, current: u32, operand: u32
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn ax_state_string_buffer_ptr() -> *mut u8 {
+    std::ptr::addr_of_mut!(STRING_BUFFER).cast::<u8>()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ax_state_string_buffer_capacity() -> u32 {
+    AX_STATE_STRING_CAPACITY as u32
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn ax_state_apply_string(operation: u32, operand_len: u32) -> u32 {
+    let Ok(operand_len) = usize::try_from(operand_len) else {
+        return AX_STATE_STRING_ERROR;
+    };
+    if operation != AX_STATE_OP_SET || operand_len > AX_STATE_STRING_CAPACITY {
+        return AX_STATE_STRING_ERROR;
+    }
+
+    // The browser host writes into this exported scratch buffer before calling us.
+    let bytes = unsafe { std::slice::from_raw_parts(ax_state_string_buffer_ptr(), operand_len) };
+    if std::str::from_utf8(bytes).is_err() {
+        return AX_STATE_STRING_ERROR;
+    }
+    operand_len as u32
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn reports_stable_v0_abi() {
-        assert_eq!(ax_state_abi_version(), 1);
+    fn reports_stable_v1_abi() {
+        assert_eq!(ax_state_abi_version(), 2);
+    }
+
+    #[test]
+    fn reports_supported_type_operation_pairs() {
+        assert_eq!(
+            ax_state_supports_operation(AX_STATE_TYPE_STRING, AX_STATE_OP_SET),
+            1
+        );
+        assert_eq!(
+            ax_state_supports_operation(AX_STATE_TYPE_STRING, AX_STATE_OP_ADD),
+            0
+        );
+        assert_eq!(
+            ax_state_supports_operation(AX_STATE_TYPE_NUMBER, AX_STATE_OP_SUB),
+            1
+        );
+        assert_eq!(
+            ax_state_supports_operation(AX_STATE_TYPE_BOOL, AX_STATE_OP_TOGGLE),
+            1
+        );
     }
 
     #[test]
@@ -57,6 +124,30 @@ mod tests {
         assert_eq!(
             ax_state_apply_bool(AX_STATE_OP_ADD, 0, 0),
             AX_STATE_UNSUPPORTED_BOOL
+        );
+    }
+
+    #[test]
+    fn validates_utf8_string_set_payloads() {
+        let value = "Axonyx zdravo".as_bytes();
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                value.as_ptr(),
+                ax_state_string_buffer_ptr(),
+                value.len(),
+            );
+        }
+        assert_eq!(
+            ax_state_apply_string(AX_STATE_OP_SET, value.len() as u32),
+            value.len() as u32
+        );
+        assert_eq!(
+            ax_state_apply_string(AX_STATE_OP_ADD, value.len() as u32),
+            AX_STATE_STRING_ERROR
+        );
+        assert_eq!(
+            ax_state_apply_string(AX_STATE_OP_SET, AX_STATE_STRING_CAPACITY as u32 + 1),
+            AX_STATE_STRING_ERROR
         );
     }
 }

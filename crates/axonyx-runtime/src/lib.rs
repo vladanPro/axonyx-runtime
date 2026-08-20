@@ -31,10 +31,10 @@ use thiserror::Error;
 pub use backend::prelude as backend_prelude;
 pub use server::prelude as server_prelude;
 
-pub const AX_STATE_WASM_PATH: &str = "/_ax/runtime/axonyx-state-v0.wasm";
+pub const AX_STATE_WASM_PATH: &str = "/_ax/runtime/axonyx-state-v1.wasm";
 
 pub fn ax_state_wasm_bytes() -> &'static [u8] {
-    include_bytes!("../assets/axonyx-state-v0.wasm")
+    include_bytes!("../assets/axonyx-state-v1.wasm")
 }
 
 pub fn route_hooks_from_handler_plan(handler: &AxHandlerPlan) -> Vec<server::AxRouteHook> {
@@ -3484,21 +3484,31 @@ fn ax_state_bridge_script() -> &'static str {
   const subscribers = new Map();
   const conditions = new Map();
   let wasmExecutor;
+  let wasmTextEncoder;
+  let wasmTextDecoder;
   let executorMode = "js-fallback";
 
   const localOperationCode = Object.freeze({ set: 0, add: 1, sub: 2, toggle: 3 });
+  const localValueTypeCode = Object.freeze({ String: 0, Number: 1, Bool: 2 });
 
-  const loadWasmExecutor = async (url = "/_ax/runtime/axonyx-state-v0.wasm") => {
+  const loadWasmExecutor = async (url = "/_ax/runtime/axonyx-state-v1.wasm") => {
     if (!window.WebAssembly || !window.fetch) return false;
     try {
       const response = await fetch(url, { cache: "force-cache" });
       if (!response.ok) return false;
       const module = await WebAssembly.instantiate(await response.arrayBuffer(), {});
       const exports = module.instance?.exports;
-      if (!exports || exports.ax_state_abi_version?.() !== 1) return false;
+      if (!exports || exports.ax_state_abi_version?.() !== 2) return false;
+      if (typeof exports.ax_state_supports_operation !== "function") return false;
       if (typeof exports.ax_state_apply_number !== "function") return false;
       if (typeof exports.ax_state_apply_bool !== "function") return false;
+      if (typeof exports.ax_state_apply_string !== "function") return false;
+      if (typeof exports.ax_state_string_buffer_ptr !== "function") return false;
+      if (typeof exports.ax_state_string_buffer_capacity !== "function") return false;
+      if (!(exports.memory instanceof WebAssembly.Memory)) return false;
       wasmExecutor = exports;
+      wasmTextEncoder = new TextEncoder();
+      wasmTextDecoder = new TextDecoder("utf-8", { fatal: true });
       executorMode = "wasm";
       window.dispatchEvent(new CustomEvent("axonyx:state-runtime", {
         detail: { protocol: "ax-state/1", executor: executorMode, url },
@@ -3727,14 +3737,37 @@ fn ax_state_bridge_script() -> &'static str {
 
   const applyLocalOperation = (op, type, current, operand) => {
     const operation = localOperationCode[op];
-    if (wasmExecutor && operation !== undefined) {
+    const valueType = localValueTypeCode[type];
+    const wasmSupportsOperation = wasmExecutor
+      && operation !== undefined
+      && valueType !== undefined
+      && wasmExecutor.ax_state_supports_operation(valueType, operation) === 1;
+    if (wasmSupportsOperation) {
       if (type === "Number" && op !== "toggle") {
         const next = wasmExecutor.ax_state_apply_number(operation, Number(current), Number(operand));
         if (Number.isFinite(next)) return next;
       }
       if (type === "Bool" && (op === "set" || op === "toggle")) {
-        const next = wasmExecutor.ax_state_apply_bool(operation, current ? 1 : 0, operand ? 1 : 0);
+        const next = wasmExecutor.ax_state_apply_bool(
+          operation,
+          current ? 1 : 0,
+          operand ? 1 : 0,
+        ) >>> 0;
         if (next !== 0xffffffff) return next !== 0;
+      }
+      if (type === "String" && op === "set" && wasmTextEncoder && wasmTextDecoder) {
+        const bytes = wasmTextEncoder.encode(String(operand));
+        const capacity = wasmExecutor.ax_state_string_buffer_capacity();
+        const pointer = wasmExecutor.ax_state_string_buffer_ptr();
+        if (bytes.length <= capacity && pointer + bytes.length <= wasmExecutor.memory.buffer.byteLength) {
+          new Uint8Array(wasmExecutor.memory.buffer, pointer, bytes.length).set(bytes);
+          const resultLength = wasmExecutor.ax_state_apply_string(operation, bytes.length) >>> 0;
+          if (resultLength !== 0xffffffff && resultLength <= capacity) {
+            return wasmTextDecoder.decode(
+              new Uint8Array(wasmExecutor.memory.buffer, pointer, resultLength),
+            );
+          }
+        }
       }
     }
 
@@ -4795,6 +4828,9 @@ page Home
         assert!(state_html.contains(AX_STATE_WASM_PATH));
         assert!(state_html.contains("ax_state_apply_number"));
         assert!(state_html.contains("ax_state_apply_bool"));
+        assert!(state_html.contains("ax_state_apply_string"));
+        assert!(state_html.contains("ax_state_supports_operation"));
+        assert!(state_html.contains("exports.ax_state_abi_version?.() !== 2"));
         assert!(state_html.contains("runtime: () => executorMode"));
     }
 
