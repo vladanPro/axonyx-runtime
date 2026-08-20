@@ -3488,8 +3488,22 @@ fn ax_state_bridge_script() -> &'static str {
   let wasmTextDecoder;
   let executorMode = "js-fallback";
 
+  const stateEventProtocol = "ax-state-event/1";
+  const maxStateEventSignalLength = 512;
+  const maxStateEventStringBytes = 4096;
+  const executorStats = {
+    wasmOperations: 0,
+    fallbackOperations: 0,
+    rejectedEvents: 0,
+    dedupedEvents: 0,
+  };
   const localOperationCode = Object.freeze({ set: 0, add: 1, sub: 2, toggle: 3 });
   const localValueTypeCode = Object.freeze({ String: 0, Number: 1, Bool: 2 });
+  const localOperationsByType = Object.freeze({
+    String: new Set(["set"]),
+    Number: new Set(["set", "add", "sub"]),
+    Bool: new Set(["set", "toggle"]),
+  });
 
   const loadWasmExecutor = async (url = "/_ax/runtime/axonyx-state-v1.wasm") => {
     if (!window.WebAssembly || !window.fetch) return false;
@@ -3745,7 +3759,10 @@ fn ax_state_bridge_script() -> &'static str {
     if (wasmSupportsOperation) {
       if (type === "Number" && op !== "toggle") {
         const next = wasmExecutor.ax_state_apply_number(operation, Number(current), Number(operand));
-        if (Number.isFinite(next)) return next;
+        if (Number.isFinite(next)) {
+          executorStats.wasmOperations += 1;
+          return next;
+        }
       }
       if (type === "Bool" && (op === "set" || op === "toggle")) {
         const next = wasmExecutor.ax_state_apply_bool(
@@ -3753,7 +3770,10 @@ fn ax_state_bridge_script() -> &'static str {
           current ? 1 : 0,
           operand ? 1 : 0,
         ) >>> 0;
-        if (next !== 0xffffffff) return next !== 0;
+        if (next !== 0xffffffff) {
+          executorStats.wasmOperations += 1;
+          return next !== 0;
+        }
       }
       if (type === "String" && op === "set" && wasmTextEncoder && wasmTextDecoder) {
         const bytes = wasmTextEncoder.encode(String(operand));
@@ -3763,19 +3783,125 @@ fn ax_state_bridge_script() -> &'static str {
           new Uint8Array(wasmExecutor.memory.buffer, pointer, bytes.length).set(bytes);
           const resultLength = wasmExecutor.ax_state_apply_string(operation, bytes.length) >>> 0;
           if (resultLength !== 0xffffffff && resultLength <= capacity) {
-            return wasmTextDecoder.decode(
+            const next = wasmTextDecoder.decode(
               new Uint8Array(wasmExecutor.memory.buffer, pointer, resultLength),
             );
+            executorStats.wasmOperations += 1;
+            return next;
           }
         }
       }
     }
 
-    if (op === "set") return operand;
-    if (op === "add") return Number(current) + Number(operand);
-    if (op === "sub") return Number(current) - Number(operand);
-    if (op === "toggle") return !castValue(current, "Bool");
+    if (op === "set") {
+      executorStats.fallbackOperations += 1;
+      return operand;
+    }
+    if (op === "add") {
+      executorStats.fallbackOperations += 1;
+      return Number(current) + Number(operand);
+    }
+    if (op === "sub") {
+      executorStats.fallbackOperations += 1;
+      return Number(current) - Number(operand);
+    }
+    if (op === "toggle") {
+      executorStats.fallbackOperations += 1;
+      return !castValue(current, "Bool");
+    }
     return undefined;
+  };
+
+  const stringByteLength = (value) => {
+    if (wasmTextEncoder) return wasmTextEncoder.encode(value).length;
+    if (typeof TextEncoder === "function") return new TextEncoder().encode(value).length;
+    return undefined;
+  };
+
+  const validateStateEventPayload = (payload) => {
+    if (!payload || typeof payload !== "object") return { ok: false, reason: "invalid-payload" };
+    if (payload.protocol !== stateEventProtocol) return { ok: false, reason: "invalid-protocol" };
+    if (!["click", "input", "change"].includes(payload.event)) {
+      return { ok: false, reason: "unsupported-event" };
+    }
+    if (typeof payload.signal !== "string"
+      || payload.signal.length === 0
+      || payload.signal.length > maxStateEventSignalLength
+      || /[\u0000-\u001f\u007f]/.test(payload.signal)) {
+      return { ok: false, reason: "invalid-signal" };
+    }
+    if (!Object.hasOwn(localOperationsByType, payload.type)) {
+      return { ok: false, reason: "unsupported-type" };
+    }
+    if (!localOperationsByType[payload.type].has(payload.op)) {
+      return { ok: false, reason: "unsupported-operation" };
+    }
+    const registeredType = types.get(payload.signal);
+    if (registeredType && registeredType !== payload.type) {
+      return { ok: false, reason: "signal-type-mismatch" };
+    }
+    if (!["literal", "value", "checked"].includes(payload.valueSource)) {
+      return { ok: false, reason: "unsupported-value-source" };
+    }
+    if (payload.valueSource !== "literal" && !["input", "change"].includes(payload.event)) {
+      return { ok: false, reason: "event-source-mismatch" };
+    }
+    if (payload.valueSource === "checked"
+      && (payload.type !== "Bool" || typeof payload.value !== "boolean")) {
+      return { ok: false, reason: "checked-type-mismatch" };
+    }
+    if (payload.valueSource === "value"
+      && !["String", "Number"].includes(payload.type)) {
+      return { ok: false, reason: "value-type-mismatch" };
+    }
+
+    const operand = castValue(payload.value, payload.type);
+    if (payload.type === "Number" && !Number.isFinite(operand)) {
+      return { ok: false, reason: "invalid-number" };
+    }
+    if (payload.type === "String") {
+      const bytes = stringByteLength(operand);
+      if (bytes === undefined || bytes > maxStateEventStringBytes) {
+        return { ok: false, reason: "string-too-large" };
+      }
+    }
+    return { ok: true, operand };
+  };
+
+  const rejectStateEvent = (payload, reason) => {
+    executorStats.rejectedEvents += 1;
+    window.dispatchEvent(new CustomEvent("axonyx:state-event-rejected", {
+      detail: {
+        protocol: stateEventProtocol,
+        reason,
+        event: payload?.event,
+        signal: payload?.signal,
+        op: payload?.op,
+        type: payload?.type,
+      },
+    }));
+    return false;
+  };
+
+  const executeStateEventPayload = (payload) => {
+    const validation = validateStateEventPayload(payload);
+    if (!validation.ok) return rejectStateEvent(payload, validation.reason);
+    const initial = castValue(payload.initial, payload.type);
+    const current = state.has(payload.signal) ? state.get(payload.signal) : initial;
+    if (payload.op === "set" && Object.is(current, validation.operand)) {
+      executorStats.dedupedEvents += 1;
+      return true;
+    }
+    const next = applyLocalOperation(
+      payload.op,
+      payload.type,
+      current,
+      validation.operand,
+    );
+    if (next === undefined) return rejectStateEvent(payload, "executor-rejected");
+    if (!types.has(payload.signal)) types.set(payload.signal, payload.type);
+    setSignal(payload.signal, next, `event:${payload.event}`);
+    return true;
   };
 
   const executeLocalEvent = (node, eventName, event) => {
@@ -3786,21 +3912,46 @@ fn ax_state_bridge_script() -> &'static str {
 
     const signal = canonicalSignal(rawSignal);
     const type = node.getAttribute(`${prefix}-type`) || types.get(signal) || "String";
-    const initial = castValue(node.getAttribute(`${prefix}-initial`), type);
-    const current = state.has(signal) ? state.get(signal) : initial;
-    const valueSource = node.getAttribute(`${prefix}-value-source`);
-    const rawOperand = valueSource === "checked"
-      ? !!event.target.checked
+    const valueSource = node.getAttribute(`${prefix}-value-source`) || "literal";
+    const target = event?.target;
+    if (valueSource === "checked" && (!target || !("checked" in target))) {
+      return rejectStateEvent({ event: eventName, signal, op, type }, "missing-checked-target");
+    }
+    if (valueSource === "value" && (!target || !("value" in target))) {
+      return rejectStateEvent({ event: eventName, signal, op, type }, "missing-value-target");
+    }
+    const value = valueSource === "checked"
+      ? !!target.checked
       : valueSource === "value"
-        ? event.target.value
+        ? target.value
         : node.getAttribute(`${prefix}-value`);
-    const operand = castValue(rawOperand, type);
-    const next = applyLocalOperation(op, type, current, operand);
-    if (next === undefined) return false;
+    return executeStateEventPayload({
+      protocol: node.getAttribute(`${prefix}-protocol`),
+      event: eventName,
+      signal,
+      op,
+      type,
+      initial: node.getAttribute(`${prefix}-initial`),
+      valueSource,
+      value,
+    });
+  };
 
-    if (!types.has(signal)) types.set(signal, type);
-    setSignal(signal, next, `event:${eventName}`);
-    return true;
+  const executeBoundEvent = (node, eventName) => {
+    const signal = canonicalSignal(node.getAttribute("data-ax-signal"));
+    const type = node.getAttribute("data-ax-state-type") || types.get(signal) || "String";
+    const target = node.getAttribute("data-ax-bind") || "value";
+    const valueSource = target === "checked" ? "checked" : "value";
+    return executeStateEventPayload({
+      protocol: node.getAttribute("data-ax-bind-protocol"),
+      event: eventName,
+      signal,
+      op: "set",
+      type,
+      initial: readValue(node, target),
+      valueSource,
+      value: readValue(node, target),
+    });
   };
 
   const applyPatch = (patch) => {
@@ -3925,15 +4076,15 @@ fn ax_state_bridge_script() -> &'static str {
   document.addEventListener("input", (event) => {
     const node = event.target.closest("[data-ax-signal]");
     if (!node) return;
-    const type = node.getAttribute("data-ax-state-type") || "String";
-    setSignal(node.getAttribute("data-ax-signal"), castValue(readValue(node, node.getAttribute("data-ax-bind") || "value"), type));
+    if (node.hasAttribute("data-ax-on-input-signal")) return;
+    executeBoundEvent(node, "input");
   });
 
   document.addEventListener("change", (event) => {
     const node = event.target.closest("[data-ax-signal]");
     if (!node) return;
-    const type = node.getAttribute("data-ax-state-type") || "String";
-    setSignal(node.getAttribute("data-ax-signal"), castValue(readValue(node, node.getAttribute("data-ax-bind") || "value"), type));
+    if (node.hasAttribute("data-ax-on-change-signal")) return;
+    executeBoundEvent(node, "change");
   });
 
   ["click", "input", "change"].forEach((eventName) => {
@@ -3961,6 +4112,16 @@ fn ax_state_bridge_script() -> &'static str {
     describe,
     snapshot: () => Object.fromEntries(state.entries()),
     runtime: () => executorMode,
+    eventProtocol: stateEventProtocol,
+    validateEventPayload: validateStateEventPayload,
+    diagnostics: () => ({
+      protocol: stateEventProtocol,
+      executor: executorMode,
+      wasmOperations: executorStats.wasmOperations,
+      fallbackOperations: executorStats.fallbackOperations,
+      rejectedEvents: executorStats.rejectedEvents,
+      dedupedEvents: executorStats.dedupedEvents,
+    }),
     loadWasm: loadWasmExecutor,
   };
   window.__axonyx.applyPatch = applyPatch;
@@ -4832,6 +4993,17 @@ page Home
         assert!(state_html.contains("ax_state_supports_operation"));
         assert!(state_html.contains("exports.ax_state_abi_version?.() !== 2"));
         assert!(state_html.contains("runtime: () => executorMode"));
+        assert!(state_html.contains("stateEventProtocol = \"ax-state-event/1\""));
+        assert!(state_html.contains("validateStateEventPayload"));
+        assert!(state_html.contains("axonyx:state-event-rejected"));
+        assert!(state_html.contains("if (node.hasAttribute(\"data-ax-on-input-signal\")) return"));
+        assert!(state_html.contains("diagnostics: () => ({"));
+        assert!(state_html.contains("wasmOperations: executorStats.wasmOperations"));
+        assert!(state_html.contains("rejectedEvents: executorStats.rejectedEvents"));
+        assert!(state_html.contains("dedupedEvents: executorStats.dedupedEvents"));
+        assert!(
+            state_html.contains("payload.op === \"set\" && Object.is(current, validation.operand)")
+        );
     }
 
     #[test]
