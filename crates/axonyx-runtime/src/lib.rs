@@ -3486,6 +3486,11 @@ fn ax_state_bridge_script() -> &'static str {
   const domCapabilities = new WeakMap();
   const validDomCapabilities = new WeakSet();
   const domCapabilityList = [];
+  const storageCapabilities = new Map();
+  const storageCapabilityKeys = new Map();
+  const validStorageCapabilities = new WeakSet();
+  const storageCapabilityList = [];
+  const hydratedStorageSignals = new Set();
   let wasmExecutor;
   let wasmTextEncoder;
   let wasmTextDecoder;
@@ -3493,7 +3498,11 @@ fn ax_state_bridge_script() -> &'static str {
 
   const stateEventProtocol = "ax-state-event/1";
   const domCapabilityProtocol = "ax-dom-capability/1";
+  const storageCapabilityProtocol = "ax-storage-capability/1";
+  const storageValueProtocol = "ax-storage-value/1";
   const domWriteTargets = new Set(["value", "checked", "text"]);
+  const storageScopes = new Set(["local", "session"]);
+  const maxStorageKeyBytes = 128;
   const maxStateEventSignalLength = 512;
   const maxStateEventStringBytes = 4096;
   const executorStats = {
@@ -3505,6 +3514,12 @@ fn ax_state_bridge_script() -> &'static str {
     appliedDomWrites: 0,
     rejectedDomCapabilities: 0,
     rejectedDomWrites: 0,
+    registeredStorageCapabilities: 0,
+    restoredStorageValues: 0,
+    persistedStorageValues: 0,
+    rejectedStorageCapabilities: 0,
+    rejectedStorageReads: 0,
+    rejectedStorageWrites: 0,
   };
   const localOperationCode = Object.freeze({ set: 0, add: 1, sub: 2, toggle: 3 });
   const localValueTypeCode = Object.freeze({ String: 0, Number: 1, Bool: 2 });
@@ -3621,6 +3636,149 @@ fn ax_state_bridge_script() -> &'static str {
     writeValue(capability.node, capability.target, value);
     executorStats.appliedDomWrites += 1;
     return true;
+  };
+
+  const utf8ByteLength = (value) => {
+    if (typeof TextEncoder !== "function") return undefined;
+    return new TextEncoder().encode(String(value)).length;
+  };
+
+  const rejectStorageCapability = (signal, scope, reason) => {
+    executorStats.rejectedStorageCapabilities += 1;
+    window.dispatchEvent(new CustomEvent("axonyx:storage-capability-rejected", {
+      detail: { protocol: storageCapabilityProtocol, signal, scope, reason },
+    }));
+    return undefined;
+  };
+
+  const storageArea = (scope) => {
+    try {
+      return scope === "local" ? window.localStorage : window.sessionStorage;
+    } catch (_) {
+      return undefined;
+    }
+  };
+
+  const registerStorageCapability = (signal, type, persistence) => {
+    if (!persistence || typeof persistence !== "object") return undefined;
+    const scope = persistence.scope;
+    const key = persistence.key;
+    if (persistence.protocol !== storageCapabilityProtocol) {
+      return rejectStorageCapability(signal, scope, "invalid-protocol");
+    }
+    if (!storageScopes.has(scope)) {
+      return rejectStorageCapability(signal, scope, "unsupported-scope");
+    }
+    const keyBytes = typeof key === "string" ? utf8ByteLength(key) : undefined;
+    if (!key || keyBytes === undefined || keyBytes > maxStorageKeyBytes || /[\u0000-\u001f\u007f]/.test(key)) {
+      return rejectStorageCapability(signal, scope, "invalid-key");
+    }
+    if (!Object.hasOwn(localOperationsByType, type)) {
+      return rejectStorageCapability(signal, scope, "unsupported-type");
+    }
+
+    const existing = storageCapabilities.get(signal);
+    if (existing) {
+      if (existing.scope === scope && existing.key === key && existing.type === type) return existing;
+      return rejectStorageCapability(signal, scope, "signal-capability-conflict");
+    }
+    const storageKey = `${scope}\u0000${key}`;
+    if (storageCapabilityKeys.has(storageKey)) {
+      return rejectStorageCapability(signal, scope, "storage-key-conflict");
+    }
+
+    const capability = Object.freeze({ signal, type, scope, key });
+    storageCapabilities.set(signal, capability);
+    storageCapabilityKeys.set(storageKey, capability);
+    validStorageCapabilities.add(capability);
+    storageCapabilityList.push(capability);
+    executorStats.registeredStorageCapabilities += 1;
+    return capability;
+  };
+
+  const validateStoredValue = (capability, envelope) => {
+    if (!envelope || typeof envelope !== "object") return { ok: false, reason: "invalid-envelope" };
+    if (envelope.protocol !== storageValueProtocol) return { ok: false, reason: "invalid-value-protocol" };
+    if (envelope.type !== capability.type) return { ok: false, reason: "stored-type-mismatch" };
+    if (capability.type === "String") {
+      const bytes = typeof envelope.value === "string" ? utf8ByteLength(envelope.value) : undefined;
+      if (bytes === undefined || bytes > maxStateEventStringBytes) {
+        return { ok: false, reason: "invalid-string-value" };
+      }
+    } else if (capability.type === "Number") {
+      if (typeof envelope.value !== "number" || !Number.isFinite(envelope.value)) {
+        return { ok: false, reason: "invalid-number-value" };
+      }
+    } else if (capability.type === "Bool" && typeof envelope.value !== "boolean") {
+      return { ok: false, reason: "invalid-bool-value" };
+    }
+    return { ok: true, value: envelope.value };
+  };
+
+  const restoreStorageCapability = (capability) => {
+    if (!capability || !validStorageCapabilities.has(capability)) {
+      executorStats.rejectedStorageReads += 1;
+      return false;
+    }
+    const area = storageArea(capability.scope);
+    if (!area) return false;
+    try {
+      const raw = area.getItem(capability.key);
+      if (raw === null) return false;
+      const validation = validateStoredValue(capability, JSON.parse(raw));
+      if (!validation.ok) {
+        executorStats.rejectedStorageReads += 1;
+        window.dispatchEvent(new CustomEvent("axonyx:storage-value-rejected", {
+          detail: {
+            protocol: storageCapabilityProtocol,
+            signal: capability.signal,
+            scope: capability.scope,
+            reason: validation.reason,
+          },
+        }));
+        return false;
+      }
+      hydratedStorageSignals.add(capability.signal);
+      writeSignal(capability.signal, validation.value, `storage:${capability.scope}`, false);
+      executorStats.restoredStorageValues += 1;
+      return true;
+    } catch (_) {
+      executorStats.rejectedStorageReads += 1;
+      return false;
+    }
+  };
+
+  const persistStorageCapability = (signal, value, source) => {
+    const capability = storageCapabilities.get(signal);
+    const sourceName = String(source);
+    if (!capability || sourceName.startsWith("snapshot") || sourceName.startsWith("storage:")) return false;
+    if (!validStorageCapabilities.has(capability)) {
+      executorStats.rejectedStorageWrites += 1;
+      return false;
+    }
+    const validation = validateStoredValue(capability, {
+      protocol: storageValueProtocol,
+      type: capability.type,
+      value,
+    });
+    if (!validation.ok) {
+      executorStats.rejectedStorageWrites += 1;
+      return false;
+    }
+    const area = storageArea(capability.scope);
+    if (!area) return false;
+    try {
+      area.setItem(capability.key, JSON.stringify({
+        protocol: storageValueProtocol,
+        type: capability.type,
+        value: validation.value,
+      }));
+      executorStats.persistedStorageValues += 1;
+      return true;
+    } catch (_) {
+      executorStats.rejectedStorageWrites += 1;
+      return false;
+    }
   };
 
   const valueFromSnapshot = (entry) => {
@@ -3804,6 +3962,7 @@ fn ax_state_bridge_script() -> &'static str {
       capability.node.setAttribute("data-ax-state-source", source);
     });
     (conditions.get(signal) || []).forEach((entry) => updateCondition(entry, nextValue));
+    persistStorageCapability(signal, nextValue, source);
     notifySubscribers(signal, nextValue, source);
     if (emit) emitPatch(signal, nextValue, source);
     return nextValue;
@@ -4028,6 +4187,7 @@ fn ax_state_bridge_script() -> &'static str {
   const hydrateManifest = (manifest, source = "manifest") => {
     if (!manifest || !Array.isArray(manifest.files)) return 0;
     let count = 0;
+    const pendingStorageCapabilities = [];
     manifest.files.forEach((file) => {
       (file.signals || []).forEach((signal) => {
         if (!signal || !signal.key) return;
@@ -4049,11 +4209,16 @@ fn ax_state_bridge_script() -> &'static str {
         const keyParts = String(signal.key).split(":");
         const index = keyParts[keyParts.length - 1] || "1";
         bindAlias(`root:${meta.name}:${index}`, signal.key);
+        if (signal.persistence) {
+          const capability = registerStorageCapability(signal.key, meta.ty, signal.persistence);
+          if (capability) pendingStorageCapabilities.push(capability);
+        }
         count += 1;
       });
     });
     rebindAliasedSignals();
     registerReads();
+    pendingStorageCapabilities.forEach(restoreStorageCapability);
     if (count > 0) {
       window.dispatchEvent(new CustomEvent("axonyx:state-manifest", {
         detail: { count, manifest, source },
@@ -4082,8 +4247,11 @@ fn ax_state_bridge_script() -> &'static str {
     let count = 0;
     snapshot.signals.forEach((entry) => {
       if (!entry || !entry.key) return;
-      if (entry.ty && !types.has(entry.key)) types.set(entry.key, entry.ty);
-      writeSignal(entry.key, valueFromSnapshot(entry), source, false);
+      const signal = canonicalSignal(entry.key);
+      if (entry.ty && !types.has(signal)) types.set(signal, entry.ty);
+      if (!hydratedStorageSignals.has(signal)) {
+        writeSignal(signal, valueFromSnapshot(entry), source, false);
+      }
       count += 1;
     });
     return count;
@@ -4181,6 +4349,13 @@ fn ax_state_bridge_script() -> &'static str {
       type,
       role,
     })),
+    storageCapabilities: () => storageCapabilityList.map(({ signal, type, scope, key }) => ({
+      protocol: storageCapabilityProtocol,
+      signal,
+      type,
+      scope,
+      key,
+    })),
     snapshot: () => Object.fromEntries(state.entries()),
     runtime: () => executorMode,
     eventProtocol: stateEventProtocol,
@@ -4197,6 +4372,13 @@ fn ax_state_bridge_script() -> &'static str {
       appliedDomWrites: executorStats.appliedDomWrites,
       rejectedDomCapabilities: executorStats.rejectedDomCapabilities,
       rejectedDomWrites: executorStats.rejectedDomWrites,
+      storageProtocol: storageCapabilityProtocol,
+      registeredStorageCapabilities: executorStats.registeredStorageCapabilities,
+      restoredStorageValues: executorStats.restoredStorageValues,
+      persistedStorageValues: executorStats.persistedStorageValues,
+      rejectedStorageCapabilities: executorStats.rejectedStorageCapabilities,
+      rejectedStorageReads: executorStats.rejectedStorageReads,
+      rejectedStorageWrites: executorStats.rejectedStorageWrites,
     }),
     loadWasm: loadWasmExecutor,
   };
@@ -5075,6 +5257,14 @@ page Home
         assert!(state_html.contains("writeDomCapability"));
         assert!(state_html.contains("axonyx:dom-capability-rejected"));
         assert!(state_html.contains("capabilities: () => domCapabilityList.map"));
+        assert!(state_html.contains("storageCapabilityProtocol = \"ax-storage-capability/1\""));
+        assert!(state_html.contains("storageValueProtocol = \"ax-storage-value/1\""));
+        assert!(state_html.contains("registerStorageCapability"));
+        assert!(state_html.contains("restoreStorageCapability"));
+        assert!(state_html.contains("persistStorageCapability"));
+        assert!(state_html.contains("axonyx:storage-capability-rejected"));
+        assert!(state_html.contains("axonyx:storage-value-rejected"));
+        assert!(state_html.contains("storageCapabilities: () => storageCapabilityList.map"));
         assert!(state_html.contains("validateStateEventPayload"));
         assert!(state_html.contains("axonyx:state-event-rejected"));
         assert!(state_html.contains("if (node.hasAttribute(\"data-ax-on-input-signal\")) return"));
