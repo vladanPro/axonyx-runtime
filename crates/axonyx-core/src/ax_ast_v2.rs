@@ -170,6 +170,29 @@ pub struct AxStateDeclV2 {
     pub name: String,
     pub ty: Option<String>,
     pub value: String,
+    pub persistence: Option<AxStatePersistenceV2>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxStatePersistenceV2 {
+    pub scope: AxStateStorageScopeV2,
+    pub key: String,
+}
+
+impl AxStatePersistenceV2 {
+    pub fn new(scope: AxStateStorageScopeV2, key: impl Into<String>) -> Self {
+        Self {
+            scope,
+            key: key.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum AxStateStorageScopeV2 {
+    Local,
+    Session,
 }
 
 impl AxStateDeclV2 {
@@ -179,6 +202,7 @@ impl AxStateDeclV2 {
             name: name.into(),
             ty: None,
             value: value.into(),
+            persistence: None,
         }
     }
 
@@ -188,6 +212,7 @@ impl AxStateDeclV2 {
             name: name.into(),
             ty: Some(ty.into()),
             value: value.into(),
+            persistence: None,
         }
     }
 
@@ -201,6 +226,7 @@ impl AxStateDeclV2 {
             name: name.into(),
             ty: None,
             value: value.into(),
+            persistence: None,
         }
     }
 
@@ -215,7 +241,13 @@ impl AxStateDeclV2 {
             name: name.into(),
             ty: Some(ty.into()),
             value: value.into(),
+            persistence: None,
         }
+    }
+
+    pub fn with_persistence(mut self, persistence: AxStatePersistenceV2) -> Self {
+        self.persistence = Some(persistence);
+        self
     }
 }
 
@@ -506,6 +538,8 @@ pub mod prelude {
     pub use super::AxNodeV2;
     pub use super::AxPageDecl;
     pub use super::AxStateDeclV2;
+    pub use super::AxStatePersistenceV2;
+    pub use super::AxStateStorageScopeV2;
     pub use super::AxTextNode;
     pub use super::AxTypeDeclV2;
     pub use super::AxTypeFieldDeclV2;

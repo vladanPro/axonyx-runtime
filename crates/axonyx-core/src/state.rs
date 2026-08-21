@@ -1,5 +1,5 @@
 use crate::ax_ast::AxExpr;
-use crate::ax_ast_v2::{AxFileV2, AxStateDeclV2};
+use crate::ax_ast_v2::{AxFileV2, AxStateDeclV2, AxStatePersistenceV2, AxStateStorageScopeV2};
 use crate::ax_parser::parse_expr;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -206,6 +206,8 @@ pub struct AxStateManifestSignal {
     pub scope: String,
     pub ty: String,
     pub initial: AxStateValue,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub persistence: Option<AxStatePersistence>,
 }
 
 impl AxStateManifestSignal {
@@ -218,8 +220,50 @@ impl AxStateManifestSignal {
             key,
             ty: ty.into(),
             initial: initial.into(),
+            persistence: None,
         }
     }
+
+    pub fn with_persistence(mut self, persistence: AxStatePersistence) -> Self {
+        self.persistence = Some(persistence);
+        self
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxStatePersistence {
+    pub protocol: String,
+    pub scope: AxStateStorageScope,
+    pub key: String,
+}
+
+impl AxStatePersistence {
+    pub const PROTOCOL: &'static str = "ax-storage-capability/1";
+
+    pub fn new(scope: AxStateStorageScope, key: impl Into<String>) -> Self {
+        Self {
+            protocol: Self::PROTOCOL.to_string(),
+            scope,
+            key: key.into(),
+        }
+    }
+}
+
+impl From<&AxStatePersistenceV2> for AxStatePersistence {
+    fn from(value: &AxStatePersistenceV2) -> Self {
+        let scope = match value.scope {
+            AxStateStorageScopeV2::Local => AxStateStorageScope::Local,
+            AxStateStorageScopeV2::Session => AxStateStorageScope::Session,
+        };
+        Self::new(scope, value.key.clone())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AxStateStorageScope {
+    Local,
+    Session,
 }
 
 pub fn build_state_manifest(file: &AxFileV2) -> Result<AxStateManifest, AxStateManifestError> {
@@ -253,11 +297,15 @@ where
             .clone()
             .unwrap_or_else(|| initial.type_name().to_string());
         let signal_scope = resolve_scope(state, scope);
-        manifest = manifest.with_signal(AxStateManifestSignal::new(
+        let mut signal = AxStateManifestSignal::new(
             AxSignalId::new(signal_scope, &state.name, index as u32 + 1),
             ty,
             initial,
-        ));
+        );
+        if let Some(persistence) = &state.persistence {
+            signal = signal.with_persistence(AxStatePersistence::from(persistence));
+        }
+        manifest = manifest.with_signal(signal);
     }
 
     Ok(manifest)
@@ -335,7 +383,9 @@ pub mod prelude {
     pub use super::AxStateManifestError;
     pub use super::AxStateManifestSignal;
     pub use super::AxStatePatch;
+    pub use super::AxStatePersistence;
     pub use super::AxStateSnapshot;
+    pub use super::AxStateStorageScope;
     pub use super::AxStateValue;
 }
 
@@ -374,7 +424,7 @@ mod tests {
             r#"
 page Home
 
-state theme: String = "silver"
+state theme: String = "silver" persist local("axonyx:theme")
 state count: Number = 0
 state enabled = signal(true)
 
@@ -391,12 +441,20 @@ state enabled = signal(true)
         assert_eq!(manifest.signals[0].scope, "root");
         assert_eq!(manifest.signals[0].ty, "String");
         assert_eq!(
+            manifest.signals[0].persistence,
+            Some(AxStatePersistence::new(
+                AxStateStorageScope::Local,
+                "axonyx:theme"
+            ))
+        );
+        assert_eq!(
             manifest.signals[0].initial,
             AxStateValue::String("silver".to_string())
         );
         assert_eq!(manifest.signals[1].key, "root:count:2");
         assert_eq!(manifest.signals[1].ty, "Number");
         assert_eq!(manifest.signals[1].initial, AxStateValue::Number(0.0));
+        assert_eq!(manifest.signals[1].persistence, None);
         assert_eq!(manifest.signals[2].key, "root:enabled:3");
         assert_eq!(manifest.signals[2].ty, "Bool");
         assert_eq!(manifest.signals[2].initial, AxStateValue::Bool(true));

@@ -20,6 +20,8 @@ pub enum AxParseV2Error {
     InvalidLet { line: usize },
     #[error("invalid state syntax at line {line}")]
     InvalidState { line: usize },
+    #[error("invalid state persistence at line {line}: {message}")]
+    InvalidStatePersistence { line: usize, message: String },
     #[error("invalid type syntax at line {line}")]
     InvalidType { line: usize },
     #[error("invalid function syntax at line {line}")]
@@ -535,22 +537,27 @@ impl<'a> Parser<'a> {
         self.bump_char();
         self.skip_spaces();
 
-        let value = self
+        let source = self
             .read_until_line_end()
             .trim()
             .trim_end_matches(';')
             .trim()
             .to_string();
+        let (value, persistence) = parse_state_value_and_persistence(&source, line)?;
         if value.is_empty() {
             return Err(AxParseV2Error::InvalidState { line });
         }
 
-        Ok(match (scope, ty) {
+        let mut state = match (scope, ty) {
             (Some(scope), Some(ty)) => AxStateDeclV2::typed_scoped(scope, name, ty, value),
             (Some(scope), None) => AxStateDeclV2::scoped(scope, name, value),
             (None, Some(ty)) => AxStateDeclV2::typed(name, ty, value),
             (None, None) => AxStateDeclV2::new(name, value),
-        })
+        };
+        if let Some(persistence) = persistence {
+            state = state.with_persistence(persistence);
+        }
+        Ok(state)
     }
 
     fn parse_type_decl(&mut self) -> Result<AxTypeDeclV2, AxParseV2Error> {
@@ -1583,6 +1590,174 @@ fn normalize_text(raw: &str) -> Option<String> {
     }
 }
 
+fn parse_state_value_and_persistence(
+    source: &str,
+    line: usize,
+) -> Result<(String, Option<AxStatePersistenceV2>), AxParseV2Error> {
+    let Some(persist_index) = find_top_level_persist(source) else {
+        return Ok((source.trim().to_string(), None));
+    };
+
+    let value = source[..persist_index].trim().to_string();
+    let declaration = source[persist_index + "persist".len()..].trim();
+    if value.is_empty() || declaration.is_empty() {
+        return Err(invalid_state_persistence(
+            line,
+            "expected persist local(\"key\") or persist session(\"key\")",
+        ));
+    }
+
+    let (scope, arguments) = if let Some(arguments) = declaration.strip_prefix("local") {
+        (AxStateStorageScopeV2::Local, arguments)
+    } else if let Some(arguments) = declaration.strip_prefix("session") {
+        (AxStateStorageScopeV2::Session, arguments)
+    } else {
+        return Err(invalid_state_persistence(
+            line,
+            "storage scope must be local or session",
+        ));
+    };
+
+    let arguments = arguments.trim();
+    if !arguments.starts_with('(') || !arguments.ends_with(')') {
+        return Err(invalid_state_persistence(
+            line,
+            "storage scope must be called with one literal key",
+        ));
+    }
+    let key = parse_state_storage_key(&arguments[1..arguments.len() - 1], line)?;
+    Ok((value, Some(AxStatePersistenceV2::new(scope, key))))
+}
+
+fn find_top_level_persist(source: &str) -> Option<usize> {
+    let mut string_quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+
+    for (index, ch) in source.char_indices() {
+        if let Some(quote) = string_quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                string_quote = None;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' | '\'' => string_quote = Some(ch),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            'p' if paren_depth == 0 && bracket_depth == 0 && brace_depth == 0 => {
+                let rest = &source[index..];
+                let before_is_space = source[..index]
+                    .chars()
+                    .next_back()
+                    .is_some_and(char::is_whitespace);
+                if rest.starts_with("persist") {
+                    let after_is_space = rest["persist".len()..]
+                        .chars()
+                        .next()
+                        .is_some_and(char::is_whitespace);
+                    if before_is_space && after_is_space {
+                        return Some(index);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn parse_state_storage_key(source: &str, line: usize) -> Result<String, AxParseV2Error> {
+    let source = source.trim();
+    let mut chars = source.chars();
+    let Some(quote) = chars.next() else {
+        return Err(invalid_state_persistence(
+            line,
+            "storage key cannot be empty",
+        ));
+    };
+    if quote != '"' && quote != '\'' {
+        return Err(invalid_state_persistence(
+            line,
+            "storage key must be a string literal",
+        ));
+    }
+
+    let mut key = String::new();
+    let mut escaped = false;
+    let mut closed = false;
+    for ch in chars {
+        if closed {
+            if !ch.is_whitespace() {
+                return Err(invalid_state_persistence(
+                    line,
+                    "storage capability accepts exactly one literal key",
+                ));
+            }
+            continue;
+        }
+        if escaped {
+            key.push(match ch {
+                'n' => '\n',
+                'r' => '\r',
+                't' => '\t',
+                '\\' => '\\',
+                '"' => '"',
+                '\'' => '\'',
+                other => other,
+            });
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch == quote {
+            closed = true;
+        } else {
+            key.push(ch);
+        }
+    }
+
+    if !closed || escaped {
+        return Err(invalid_state_persistence(line, "unterminated storage key"));
+    }
+    if key.is_empty() {
+        return Err(invalid_state_persistence(
+            line,
+            "storage key cannot be empty",
+        ));
+    }
+    if key.len() > 128 {
+        return Err(invalid_state_persistence(
+            line,
+            "storage key cannot exceed 128 UTF-8 bytes",
+        ));
+    }
+    if key.chars().any(char::is_control) {
+        return Err(invalid_state_persistence(
+            line,
+            "storage key cannot contain control characters",
+        ));
+    }
+    Ok(key)
+}
+
+fn invalid_state_persistence(line: usize, message: impl Into<String>) -> AxParseV2Error {
+    AxParseV2Error::InvalidStatePersistence {
+        line,
+        message: message.into(),
+    }
+}
+
 fn parse_destructured_fields(
     pattern: &str,
     line: usize,
@@ -2005,6 +2180,57 @@ state count: Number = 0
             panic!("expected input element");
         };
         assert_eq!(input.attrs[0], AxAttributeNode::expr("bind:value", "theme"));
+    }
+
+    #[test]
+    fn parses_scoped_state_persistence_capabilities() {
+        let input = r#"
+page Settings
+
+app state theme: String = "silver" persist local("axonyx:theme")
+page state draft: String = "persist stays in this value" persist session('draft:settings')
+
+<input bind:value={theme} />
+"#;
+
+        let file = parse_ax_v2(input).expect("persistent state declarations should parse");
+
+        assert_eq!(
+            file.states[0].persistence,
+            Some(AxStatePersistenceV2::new(
+                AxStateStorageScopeV2::Local,
+                "axonyx:theme"
+            ))
+        );
+        assert_eq!(file.states[1].value, r#""persist stays in this value""#);
+        assert_eq!(
+            file.states[1].persistence,
+            Some(AxStatePersistenceV2::new(
+                AxStateStorageScopeV2::Session,
+                "draft:settings"
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_state_persistence_capabilities() {
+        for (source, expected) in [
+            (
+                "page Home\nstate theme = \"silver\" persist cookie(\"theme\")\n<Copy>Body</Copy>",
+                "storage scope must be local or session",
+            ),
+            (
+                "page Home\nstate theme = \"silver\" persist local(themeKey)\n<Copy>Body</Copy>",
+                "storage key must be a string literal",
+            ),
+            (
+                "page Home\nstate theme = \"silver\" persist local(\"\")\n<Copy>Body</Copy>",
+                "storage key cannot be empty",
+            ),
+        ] {
+            let error = parse_ax_v2(source).expect_err("invalid persistence should fail");
+            assert!(error.to_string().contains(expected), "{error}");
+        }
     }
 
     #[test]
