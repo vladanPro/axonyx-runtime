@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::ax_ast::prelude::AxExpr;
+use crate::ax_ast::prelude::{AxExpr, AxFloat};
 use crate::ax_backend_ast::prelude::*;
 use crate::ax_query_ast::prelude::*;
 
@@ -1770,6 +1770,11 @@ fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxBackendParseError> {
     if let Ok(value) = input.parse::<i64>() {
         return Ok(AxExpr::number(value));
     }
+    if input.contains('.') {
+        if let Some(value) = input.parse::<f64>().ok().and_then(AxFloat::new) {
+            return Ok(AxExpr::Float(value));
+        }
+    }
 
     if input.starts_with('[') && input.ends_with(']') {
         let items = &input[1..input.len() - 1];
@@ -3512,6 +3517,7 @@ action SetLanguage
   input:
     language?: string = "sr"
     count: i64 = 0
+    ratio: Float = 0.625
 
   return input
 "#;
@@ -3529,6 +3535,10 @@ action SetLanguage
         assert_eq!(
             action.input[1],
             AxField::with_default("count", "i64", AxExpr::number(0))
+        );
+        assert_eq!(
+            action.input[2],
+            AxField::with_default("ratio", "Float", AxExpr::float(0.625))
         );
     }
 

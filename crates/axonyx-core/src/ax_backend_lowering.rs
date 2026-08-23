@@ -747,6 +747,7 @@ fn render_expr(expr: &AxExpr) -> String {
     match expr {
         AxExpr::String(value) => format!("{value:?}.to_string()"),
         AxExpr::Number(value) => value.to_string(),
+        AxExpr::Float(value) => format!("{:?}_f64", value.get()),
         AxExpr::Bool(value) => value.to_string(),
         AxExpr::List(items) => {
             let items = items.iter().map(render_expr).collect::<Vec<_>>().join(", ");

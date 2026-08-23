@@ -384,6 +384,7 @@ fn expr_to_state_value(name: &str, expr: &AxExpr) -> Result<AxStateValue, AxStat
         AxExpr::String(value) => Ok(AxStateValue::String(value.clone())),
         AxExpr::Bool(value) => Ok(AxStateValue::Bool(*value)),
         AxExpr::Number(value) => Ok(AxStateValue::Number(*value as f64)),
+        AxExpr::Float(value) => Ok(AxStateValue::Number(value.get())),
         AxExpr::List(items) => items
             .iter()
             .map(|item| expr_to_state_value(name, item))
@@ -582,6 +583,40 @@ state result: Result<Post, String> = { Ok: { title: "Ready" } }
             panic!("result should use tagged object state");
         };
         assert!(matches!(result.get("Ok"), Some(AxStateValue::Object(_))));
+    }
+
+    #[test]
+    fn builds_float_and_lexically_validated_scalar_state() {
+        let file = crate::ax_parser_v2::parse_ax_v2(
+            r#"
+page Metrics
+
+state ratio: Float = 0.625
+state publishedAt: DateTime = "2026-08-23T10:15:30Z"
+state postId: Uuid = "550e8400-e29b-41d4-a716-446655440000"
+
+<Copy>{ratio}</Copy>
+"#,
+        )
+        .expect("typed scalar state source should parse");
+
+        let manifest = build_state_manifest(&file).expect("typed scalar state should build");
+        assert_eq!(manifest.signals[0].initial, AxStateValue::Number(0.625));
+        assert_eq!(
+            manifest.signals[1].initial,
+            AxStateValue::String("2026-08-23T10:15:30Z".to_string())
+        );
+        assert_eq!(manifest.signals[2].ty, "Uuid");
+
+        let invalid = crate::ax_parser_v2::parse_ax_v2(
+            r#"
+page Metrics
+state publishedAt: DateTime = "2026-08-23 10:15:30"
+<Copy>{publishedAt}</Copy>
+"#,
+        )
+        .expect("invalid lexical value is still valid syntax");
+        assert!(build_state_manifest(&invalid).is_err());
     }
 
     #[test]

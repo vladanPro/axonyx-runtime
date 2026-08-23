@@ -903,6 +903,7 @@ fn infer_state_type(value: &AxExpr) -> String {
         AxExpr::String(_) => "String",
         AxExpr::Bool(_) => "Bool",
         AxExpr::Number(_) => "Number",
+        AxExpr::Float(_) => "Float",
         AxExpr::List(_) => "List<Unknown>",
         AxExpr::Object(_) => "Json",
         _ => "Unknown",
@@ -1125,6 +1126,7 @@ fn state_event_literal(expr: &AxExpr) -> Option<String> {
     match expr {
         AxExpr::String(value) => Some(value.clone()),
         AxExpr::Number(value) => Some(value.to_string()),
+        AxExpr::Float(value) => Some(value.get().to_string()),
         AxExpr::Bool(value) => Some(value.to_string()),
         AxExpr::Identifier(value) if value == "null" => Some("null".to_string()),
         AxExpr::List(items) => Some(format!(
@@ -1155,6 +1157,7 @@ fn state_event_nested_literal(expr: &AxExpr) -> Option<String> {
     match expr {
         AxExpr::String(value) => Some(quote_state_string(value)),
         AxExpr::Number(value) => Some(value.to_string()),
+        AxExpr::Float(value) => Some(value.get().to_string()),
         AxExpr::Bool(value) => Some(value.to_string()),
         AxExpr::Identifier(value) if value == "null" => Some("null".to_string()),
         AxExpr::List(_) | AxExpr::Object(_) => state_event_literal(expr),
@@ -1681,12 +1684,14 @@ state count: Number = 0
             r#"
 page Counter() {
   state count: Number = 0
+  state ratio: Float = 0.5
   state open: Bool = false
 
   return ASX {
     <>
       <Button on:click={count += 1}>Increase</Button>
       <button on:click={count -= 2}>Decrease</button>
+      <button on:click={ratio += 0.25}>Increase ratio</button>
       <button on:click={open = !open}>Toggle</button>
       <Copy>{count}</Copy>
     </>
@@ -1696,7 +1701,7 @@ page Counter() {
         )
         .expect("local state event should convert");
 
-        let AxStatement::Component(fragment) = &document.page.body[2] else {
+        let AxStatement::Component(fragment) = &document.page.body[3] else {
             panic!("expected fragment");
         };
         let AxBody::Block(body) = &fragment.body else {
@@ -1716,7 +1721,19 @@ page Counter() {
             .props
             .contains(&AxProp::new("data-ax-on-click-value", AxExpr::string("1"))));
 
-        let AxStatement::Component(toggle) = &body[2] else {
+        let AxStatement::Component(increase_ratio) = &body[2] else {
+            panic!("expected ratio button");
+        };
+        assert!(increase_ratio.props.contains(&AxProp::new(
+            "data-ax-on-click-value",
+            AxExpr::string("0.25")
+        )));
+        assert!(increase_ratio.props.contains(&AxProp::new(
+            "data-ax-on-click-type",
+            AxExpr::string("Float")
+        )));
+
+        let AxStatement::Component(toggle) = &body[3] else {
             panic!("expected toggle button");
         };
         assert!(toggle.props.contains(&AxProp::new(
@@ -1724,7 +1741,7 @@ page Counter() {
             AxExpr::string("toggle")
         )));
 
-        let AxStatement::Component(copy) = &body[3] else {
+        let AxStatement::Component(copy) = &body[4] else {
             panic!("expected state reader");
         };
         assert!(copy.props.contains(&AxProp::new(
