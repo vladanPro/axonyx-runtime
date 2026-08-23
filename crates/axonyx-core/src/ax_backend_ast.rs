@@ -6,6 +6,8 @@ use crate::ax_query_ast::prelude::{AxQueryFilter, AxQuerySpec};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxBackendDocument {
     pub imports: Vec<AxBackendImport>,
+    #[serde(default)]
+    pub types: Vec<AxBackendTypeDecl>,
     pub blocks: Vec<AxBackendBlock>,
 }
 
@@ -13,6 +15,7 @@ impl AxBackendDocument {
     pub fn new(blocks: impl IntoIterator<Item = AxBackendBlock>) -> Self {
         Self {
             imports: Vec::new(),
+            types: Vec::new(),
             blocks: blocks.into_iter().collect(),
         }
     }
@@ -23,7 +26,56 @@ impl AxBackendDocument {
     ) -> Self {
         Self {
             imports: imports.into_iter().collect(),
+            types: Vec::new(),
             blocks: blocks.into_iter().collect(),
+        }
+    }
+
+    pub fn with_imports_and_types(
+        imports: impl IntoIterator<Item = AxBackendImport>,
+        types: impl IntoIterator<Item = AxBackendTypeDecl>,
+        blocks: impl IntoIterator<Item = AxBackendBlock>,
+    ) -> Self {
+        Self {
+            imports: imports.into_iter().collect(),
+            types: types.into_iter().collect(),
+            blocks: blocks.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxBackendTypeDecl {
+    pub name: String,
+    pub fields: Vec<AxBackendTypeField>,
+    pub exported: bool,
+}
+
+impl AxBackendTypeDecl {
+    pub fn new(
+        name: impl Into<String>,
+        fields: impl IntoIterator<Item = AxBackendTypeField>,
+        exported: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            fields: fields.into_iter().collect(),
+            exported,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxBackendTypeField {
+    pub name: String,
+    pub ty: String,
+}
+
+impl AxBackendTypeField {
+    pub fn new(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: ty.into(),
         }
     }
 }
@@ -761,6 +813,8 @@ pub mod prelude {
     pub use super::AxBackendImportBinding;
     pub use super::AxBackendRoot;
     pub use super::AxBackendStmt;
+    pub use super::AxBackendTypeDecl;
+    pub use super::AxBackendTypeField;
     pub use super::AxBackendValue;
     pub use super::AxField;
     pub use super::AxHook;

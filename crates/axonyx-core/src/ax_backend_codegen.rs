@@ -2,6 +2,7 @@ use thiserror::Error;
 
 use crate::ax_backend_lowering::prelude::*;
 use crate::ax_backend_parser::{parse_backend_ax, AxBackendParseError};
+use crate::ax_types::prelude::AxType;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxBackendCodegenError {
@@ -11,6 +12,32 @@ pub enum AxBackendCodegenError {
     UnsupportedFunctionDefaultInput { function: String, field: String },
     #[error("domain helper `{function}` cannot use query-backed data binding `{binding}` yet")]
     UnsupportedFunctionQueryBinding { function: String, binding: String },
+    #[error("duplicate backend type declaration `{name}`")]
+    DuplicateType { name: String },
+    #[error("unknown backend type `{target}` referenced by `{record}.{field}`")]
+    UnknownTypeReference {
+        record: String,
+        field: String,
+        target: String,
+    },
+    #[error("backend type `{record}.{field}` cannot use `{ty}` as a Rust data contract")]
+    UnsupportedContractType {
+        record: String,
+        field: String,
+        ty: String,
+    },
+    #[error("recursive backend type contract detected through `{name}`")]
+    RecursiveType { name: String },
+    #[error("backend type `{record}.{field}` cannot use `{ty}` as an ordered collection key")]
+    UnsupportedOrderedType {
+        record: String,
+        field: String,
+        ty: String,
+    },
+    #[error("domain helper `{function}` has invalid return type `{ty}`")]
+    InvalidFunctionReturnType { function: String, ty: String },
+    #[error("domain helper `{function}` cannot return `{ty}` from the Rust backend")]
+    UnsupportedFunctionReturnType { function: String, ty: String },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -29,7 +56,7 @@ pub enum AxBackendBundleError {
     Source {
         name: String,
         #[source]
-        source: AxBackendCompileError,
+        source: Box<AxBackendCompileError>,
     },
 }
 
@@ -41,6 +68,13 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("use axonyx_runtime::backend_prelude::*;\n");
     out.push_str("use axonyx_runtime::server_prelude::*;\n");
     out.push_str("use serde_json::{json, Value};\n\n");
+
+    validate_type_contracts(&plan.types)?;
+    for record in &plan.types {
+        out.push_str(&render_record_type(record)?);
+        out.push('\n');
+    }
+
     out.push_str("fn __ax_finalize_response(mut response: AxHttpResponse, headers: BTreeMap<String, String>, cookies: Vec<AxCookie>) -> AxHttpResponse {\n");
     out.push_str("    for (name, value) in headers {\n");
     out.push_str("        response = response.with_header(name, value);\n");
@@ -113,7 +147,8 @@ fn render_function_fn(function: &AxFunctionPlan) -> Result<String, AxBackendCode
     let returns = function
         .returns
         .as_deref()
-        .map(map_backend_return_type)
+        .map(|ty| map_backend_return_type(ty, &function.name))
+        .transpose()?
         .unwrap_or_else(|| "Value".to_string());
 
     let mut out = format!("pub fn {}({params}) -> {returns} {{\n", function.name);
@@ -197,16 +232,68 @@ fn default_function_return_expr(returns: &str) -> String {
     }
 }
 
-fn map_backend_return_type(ty: &str) -> String {
-    match ty.trim() {
-        "string" | "String" => "String".to_string(),
-        "bool" | "boolean" | "Bool" | "Boolean" => "bool".to_string(),
-        "i64" | "int" | "integer" | "Int" | "Integer" => "i64".to_string(),
-        "u64" => "u64".to_string(),
-        "f64" | "float" | "number" | "Float" | "Number" => "f64".to_string(),
-        "Value" | "Json" | "JSON" => "Value".to_string(),
-        other => other.to_string(),
+fn map_backend_return_type(ty: &str, function: &str) -> Result<String, AxBackendCodegenError> {
+    let normalized = match ty.trim() {
+        "string" => "String",
+        "bool" | "boolean" | "Boolean" => "Bool",
+        "i64" | "int" | "integer" | "Integer" => "Int",
+        "f64" | "float" | "number" => "Float",
+        "Value" | "JSON" => "Json",
+        other => other,
+    };
+    if normalized == "u64" {
+        return Ok("u64".to_string());
     }
+    let parsed = AxType::parse_annotation(normalized).map_err(|_| {
+        AxBackendCodegenError::InvalidFunctionReturnType {
+            function: function.to_string(),
+            ty: ty.to_string(),
+        }
+    })?;
+    rust_function_return_type(&parsed, function)
+}
+
+fn rust_function_return_type(ty: &AxType, function: &str) -> Result<String, AxBackendCodegenError> {
+    let mapped = match ty {
+        AxType::String | AxType::DateTime | AxType::Date | AxType::Time | AxType::Uuid => {
+            "String".to_string()
+        }
+        AxType::Number | AxType::Float => "f64".to_string(),
+        AxType::Int => "i64".to_string(),
+        AxType::Bool => "bool".to_string(),
+        AxType::Bytes => "Vec<u8>".to_string(),
+        AxType::Json | AxType::Unknown => "Value".to_string(),
+        AxType::Void => "()".to_string(),
+        AxType::List(inner) => format!("Vec<{}>", rust_function_return_type(inner, function)?),
+        AxType::Map(key, value) => format!(
+            "BTreeMap<{}, {}>",
+            rust_function_return_type(key, function)?,
+            rust_function_return_type(value, function)?
+        ),
+        AxType::Set(inner) => format!(
+            "std::collections::BTreeSet<{}>",
+            rust_function_return_type(inner, function)?
+        ),
+        AxType::Optional(inner) => {
+            format!("Option<{}>", rust_function_return_type(inner, function)?)
+        }
+        AxType::Result(ok, error) => format!(
+            "Result<{}, {}>",
+            rust_function_return_type(ok, function)?,
+            rust_function_return_type(error, function)?
+        ),
+        AxType::Secret(inner) | AxType::Public(inner) => {
+            rust_function_return_type(inner, function)?
+        }
+        AxType::Record(name) => name.clone(),
+        AxType::Never | AxType::Signal(_) | AxType::Resource(_, _) => {
+            return Err(AxBackendCodegenError::UnsupportedFunctionReturnType {
+                function: function.to_string(),
+                ty: ty.display_name(),
+            });
+        }
+    };
+    Ok(mapped)
 }
 
 pub fn compile_backend_ax_to_module(input: &str) -> Result<String, AxBackendCompileError> {
@@ -219,6 +306,7 @@ pub fn compile_backend_sources_to_module(
     sources: &[(&str, &str)],
 ) -> Result<String, AxBackendBundleError> {
     let mut globals = Vec::new();
+    let mut types = Vec::new();
     let mut envs = Vec::new();
     let mut functions = Vec::new();
     let mut handlers = Vec::new();
@@ -226,25 +314,204 @@ pub fn compile_backend_sources_to_module(
     for (name, input) in sources {
         let document = parse_backend_ax(input).map_err(|source| AxBackendBundleError::Source {
             name: (*name).to_string(),
-            source: AxBackendCompileError::Parse(source),
+            source: Box::new(AxBackendCompileError::Parse(source)),
         })?;
         let plan =
             lower_backend_document(&document).map_err(|source| AxBackendBundleError::Source {
                 name: (*name).to_string(),
-                source: AxBackendCompileError::Lower(source),
+                source: Box::new(AxBackendCompileError::Lower(source)),
             })?;
         envs.extend(plan.envs);
+        types.extend(plan.types);
         globals.extend(plan.globals);
         functions.extend(plan.functions);
         handlers.extend(plan.handlers);
     }
 
     generate_backend_module(&AxBackendPlan::with_globals(
-        envs, globals, functions, handlers,
+        types, envs, globals, functions, handlers,
     ))
     .map_err(|source| AxBackendBundleError::Source {
         name: "bundle".to_string(),
-        source: AxBackendCompileError::Codegen(source),
+        source: Box::new(AxBackendCompileError::Codegen(source)),
+    })
+}
+
+fn validate_type_contracts(types: &[AxRecordPlan]) -> Result<(), AxBackendCodegenError> {
+    let mut names = std::collections::BTreeSet::new();
+    for record in types {
+        if !names.insert(record.name.as_str()) {
+            return Err(AxBackendCodegenError::DuplicateType {
+                name: record.name.clone(),
+            });
+        }
+    }
+
+    for record in types {
+        for field in &record.fields {
+            validate_type_references(&field.ty, record, field, &names)?;
+        }
+    }
+
+    for record in types {
+        let mut path = Vec::new();
+        validate_no_recursive_type(&record.name, &record.name, types, &mut path)?;
+    }
+    Ok(())
+}
+
+fn validate_type_references(
+    ty: &AxType,
+    record: &AxRecordPlan,
+    field: &AxRecordFieldPlan,
+    names: &std::collections::BTreeSet<&str>,
+) -> Result<(), AxBackendCodegenError> {
+    match ty {
+        AxType::Record(name) if !names.contains(name.as_str()) => {
+            Err(AxBackendCodegenError::UnknownTypeReference {
+                record: record.name.clone(),
+                field: field.name.clone(),
+                target: name.clone(),
+            })
+        }
+        AxType::List(inner)
+        | AxType::Set(inner)
+        | AxType::Optional(inner)
+        | AxType::Secret(inner)
+        | AxType::Public(inner)
+        | AxType::Signal(inner) => validate_type_references(inner, record, field, names),
+        AxType::Map(left, right) | AxType::Result(left, right) | AxType::Resource(left, right) => {
+            validate_type_references(left, record, field, names)?;
+            validate_type_references(right, record, field, names)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn validate_no_recursive_type(
+    root: &str,
+    current: &str,
+    types: &[AxRecordPlan],
+    path: &mut Vec<String>,
+) -> Result<(), AxBackendCodegenError> {
+    if path.iter().any(|name| name == current) {
+        return Err(AxBackendCodegenError::RecursiveType {
+            name: root.to_string(),
+        });
+    }
+    path.push(current.to_string());
+    if let Some(record) = types.iter().find(|record| record.name == current) {
+        for field in &record.fields {
+            for reference in inline_record_references(&field.ty) {
+                validate_no_recursive_type(root, reference, types, path)?;
+            }
+        }
+    }
+    path.pop();
+    Ok(())
+}
+
+fn inline_record_references(ty: &AxType) -> Vec<&str> {
+    match ty {
+        AxType::Record(name) => vec![name],
+        AxType::Optional(inner) | AxType::Secret(inner) | AxType::Public(inner) => {
+            inline_record_references(inner)
+        }
+        AxType::Result(left, right) => {
+            let mut references = inline_record_references(left);
+            references.extend(inline_record_references(right));
+            references
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn render_record_type(record: &AxRecordPlan) -> Result<String, AxBackendCodegenError> {
+    let visibility = if record.exported { "pub " } else { "" };
+    let mut out = format!(
+        "#[derive(Debug, Clone, PartialEq, axonyx_runtime::serde::Serialize, axonyx_runtime::serde::Deserialize)]\n#[serde(crate = \"axonyx_runtime::serde\")]\n{visibility}struct {} {{\n",
+        record.name
+    );
+    for field in &record.fields {
+        let rust_ty = rust_contract_type(&field.ty, record, field)?;
+        out.push_str(&format!("    pub {}: {},\n", field.name, rust_ty));
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+fn rust_contract_type(
+    ty: &AxType,
+    record: &AxRecordPlan,
+    field: &AxRecordFieldPlan,
+) -> Result<String, AxBackendCodegenError> {
+    let mapped = match ty {
+        AxType::String | AxType::DateTime | AxType::Date | AxType::Time | AxType::Uuid => {
+            "String".to_string()
+        }
+        AxType::Number | AxType::Float => "f64".to_string(),
+        AxType::Int => "i64".to_string(),
+        AxType::Bool => "bool".to_string(),
+        AxType::Bytes => "Vec<u8>".to_string(),
+        AxType::Json | AxType::Unknown => "Value".to_string(),
+        AxType::List(inner) => format!("Vec<{}>", rust_contract_type(inner, record, field)?),
+        AxType::Optional(inner) => {
+            format!("Option<{}>", rust_contract_type(inner, record, field)?)
+        }
+        AxType::Map(key, value) => {
+            validate_ordered_type(key, record, field)?;
+            format!(
+                "BTreeMap<{}, {}>",
+                rust_contract_type(key, record, field)?,
+                rust_contract_type(value, record, field)?
+            )
+        }
+        AxType::Set(inner) => {
+            validate_ordered_type(inner, record, field)?;
+            format!(
+                "std::collections::BTreeSet<{}>",
+                rust_contract_type(inner, record, field)?
+            )
+        }
+        AxType::Result(ok, error) => format!(
+            "Result<{}, {}>",
+            rust_contract_type(ok, record, field)?,
+            rust_contract_type(error, record, field)?
+        ),
+        AxType::Secret(inner) | AxType::Public(inner) => rust_contract_type(inner, record, field)?,
+        AxType::Record(name) => name.clone(),
+        AxType::Never | AxType::Void | AxType::Signal(_) | AxType::Resource(_, _) => {
+            return Err(AxBackendCodegenError::UnsupportedContractType {
+                record: record.name.clone(),
+                field: field.name.clone(),
+                ty: ty.display_name(),
+            });
+        }
+    };
+    Ok(mapped)
+}
+
+fn validate_ordered_type(
+    ty: &AxType,
+    record: &AxRecordPlan,
+    field: &AxRecordFieldPlan,
+) -> Result<(), AxBackendCodegenError> {
+    if matches!(
+        ty,
+        AxType::String
+            | AxType::Int
+            | AxType::Bool
+            | AxType::DateTime
+            | AxType::Date
+            | AxType::Time
+            | AxType::Uuid
+    ) {
+        return Ok(());
+    }
+    Err(AxBackendCodegenError::UnsupportedOrderedType {
+        record: record.name.clone(),
+        field: field.name.clone(),
+        ty: ty.display_name(),
     })
 }
 
@@ -1174,6 +1441,118 @@ mod tests {
     use crate::ax_ast::prelude::AxExpr;
     use crate::ax_backend_ast::prelude::*;
     use crate::ax_backend_lowering::lower_backend_document;
+
+    #[test]
+    fn generates_rust_records_for_canonical_backend_types() {
+        let module = compile_backend_ax_to_module(
+            r#"
+export type Author {
+  id: Uuid
+  name: String
+}
+
+export type Post {
+  title: String
+  summary?: String
+  author: Author
+  score: Number
+  views: Int
+  ratio: Float
+  published: Bool
+  createdAt: DateTime
+  birthday: Date
+  publishAt: Time
+  image: Bytes
+  metadata: Json
+  tags: Set<String>
+  labels: Map<String, String>
+  result: Result<String, String>
+  publicSlug: Public<String>
+  secretDraft: Secret<String>
+}
+
+export fn emptyPosts() -> Post[] {
+  return []
+}
+
+loader PostsList() -> Post[] {
+  return []
+}
+"#,
+        )
+        .expect("backend contracts should compile");
+
+        for expected in [
+            "pub struct Author {",
+            "axonyx_runtime::serde::Serialize",
+            "#[serde(crate = \"axonyx_runtime::serde\")]",
+            "pub id: String,",
+            "pub summary: Option<String>,",
+            "pub author: Author,",
+            "pub score: f64,",
+            "pub views: i64,",
+            "pub image: Vec<u8>,",
+            "pub metadata: Value,",
+            "pub tags: std::collections::BTreeSet<String>,",
+            "pub labels: BTreeMap<String, String>,",
+            "pub result: Result<String, String>,",
+            "pub publicSlug: String,",
+            "pub secretDraft: String,",
+            "pub fn emptyPosts() -> Vec<Post>",
+        ] {
+            assert!(module.contains(expected), "missing `{expected}`\n{module}");
+        }
+    }
+
+    #[test]
+    fn validates_backend_type_contract_boundaries() {
+        let unknown = compile_backend_ax_to_module(
+            "export type Post {\n  author: Missing\n}\nloader Posts() {\n  return []\n}",
+        )
+        .expect_err("unknown record should fail");
+        assert!(unknown
+            .to_string()
+            .contains("unknown backend type `Missing`"));
+
+        let signal = compile_backend_ax_to_module(
+            "export type Post {\n  title: Signal<String>\n}\nloader Posts() {\n  return []\n}",
+        )
+        .expect_err("state wrapper should not be a data contract field");
+        assert!(signal.to_string().contains("cannot use `Signal<String>`"));
+
+        let map = compile_backend_ax_to_module(
+            "export type Post {\n  values: Map<Number, String>\n}\nloader Posts() {\n  return []\n}",
+        )
+        .expect_err("floating point map key should fail");
+        assert!(map.to_string().contains("ordered collection key"));
+    }
+
+    #[test]
+    fn rejects_inline_recursive_records_but_allows_list_recursion() {
+        let recursive = compile_backend_ax_to_module(
+            "export type Node {\n  next: Optional<Node>\n}\nloader Nodes() {\n  return []\n}",
+        )
+        .expect_err("inline recursive record should fail");
+        assert!(recursive.to_string().contains("recursive backend type"));
+
+        compile_backend_ax_to_module(
+            "export type Node {\n  children: List<Node>\n}\nloader Nodes() {\n  return []\n}",
+        )
+        .expect("Vec-backed recursion should be finite");
+    }
+
+    #[test]
+    fn rejects_duplicate_contracts_across_backend_sources() {
+        let error = compile_backend_sources_to_module(&[
+            ("one.ax", "export type Post {\n  title: String\n}"),
+            ("two.ax", "export type Post {\n  slug: String\n}"),
+        ])
+        .expect_err("bundle duplicates should fail");
+
+        assert!(error
+            .to_string()
+            .contains("duplicate backend type declaration `Post`"));
+    }
 
     #[test]
     fn generates_loader_and_action_module_against_runtime_traits() {

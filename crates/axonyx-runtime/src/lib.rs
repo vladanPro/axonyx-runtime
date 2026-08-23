@@ -29,6 +29,7 @@ use serde_json::json;
 use thiserror::Error;
 
 pub use backend::prelude as backend_prelude;
+pub use serde;
 pub use server::prelude as server_prelude;
 
 pub const AX_STATE_WASM_PATH: &str = "/_ax/runtime/axonyx-state-v1.wasm";
