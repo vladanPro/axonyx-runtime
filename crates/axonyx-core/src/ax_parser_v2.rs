@@ -59,6 +59,19 @@ pub fn parse_ax_v2(input: &str) -> Result<AxFileV2, AxParseV2Error> {
     parser.parse_file()
 }
 
+fn parse_literal_union_members(source: &str) -> Option<Vec<String>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let literals = source
+        .split('|')
+        .map(str::trim)
+        .map(|part| serde_json::from_str::<String>(part).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if literals.len() < 2 || literals.iter().any(|literal| !seen.insert(literal.clone())) {
+        return None;
+    }
+    Some(literals)
+}
+
 struct Parser<'a> {
     input: &'a str,
     pos: usize,
@@ -567,6 +580,15 @@ impl<'a> Parser<'a> {
         self.skip_spaces();
 
         let name = self.parse_identifier()?;
+        self.skip_spaces();
+        if self.peek_char() == Some('=') {
+            self.bump_char();
+            self.skip_spaces();
+            let source = self.read_until_line_end().trim().to_string();
+            let literals =
+                parse_literal_union_members(&source).ok_or(AxParseV2Error::InvalidType { line })?;
+            return Ok(AxTypeDeclV2::literal_union(name, literals));
+        }
         self.skip_layout_whitespace();
         if self.peek_char() != Some('{') {
             return Err(AxParseV2Error::InvalidType { line });
@@ -2493,6 +2515,36 @@ let posts: List<Post> = load PostsList
                 ]
             )]
         );
+    }
+
+    #[test]
+    fn parses_string_literal_union_type_declarations() {
+        let file = parse_ax_v2(
+            r#"page Home() {
+type Theme = "silver" | "bronze" | "gold"
+return ASX { <Copy>Theme</Copy> }
+}
+"#,
+        )
+        .expect("literal union should parse");
+
+        assert_eq!(
+            file.types,
+            vec![AxTypeDeclV2::literal_union(
+                "Theme",
+                ["silver", "bronze", "gold"]
+            )]
+        );
+    }
+
+    #[test]
+    fn rejects_duplicate_or_non_literal_union_members() {
+        for source in [
+            "page Home() {\ntype Theme = \"silver\" | \"silver\"\nreturn ASX { <Copy>x</Copy> }\n}",
+            "page Home() {\ntype Theme = String | Number\nreturn ASX { <Copy>x</Copy> }\n}",
+        ] {
+            assert!(parse_ax_v2(source).is_err());
+        }
     }
 
     #[test]

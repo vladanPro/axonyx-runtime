@@ -14,6 +14,15 @@ pub enum AxBackendCodegenError {
     UnsupportedFunctionQueryBinding { function: String, binding: String },
     #[error("duplicate backend type declaration `{name}`")]
     DuplicateType { name: String },
+    #[error("literal union `{name}` has unsupported value `{literal}`; use ASCII letters, numbers, `-`, or `_`")]
+    InvalidLiteralUnionValue { name: String, literal: String },
+    #[error("literal union `{name}` values `{first}` and `{second}` lower to the same Rust variant `{variant}`")]
+    DuplicateLiteralUnionVariant {
+        name: String,
+        first: String,
+        second: String,
+        variant: String,
+    },
     #[error("unknown backend type `{target}` referenced by `{record}.{field}`")]
     UnknownTypeReference {
         record: String,
@@ -69,7 +78,11 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("use axonyx_runtime::server_prelude::*;\n");
     out.push_str("use serde_json::{json, Value};\n\n");
 
-    validate_type_contracts(&plan.types)?;
+    validate_type_contracts(&plan.types, &plan.literal_unions)?;
+    for literal_union in &plan.literal_unions {
+        out.push_str(&render_literal_union_type(literal_union)?);
+        out.push('\n');
+    }
     for record in &plan.types {
         out.push_str(&render_record_type(record)?);
         out.push('\n');
@@ -307,6 +320,7 @@ pub fn compile_backend_sources_to_module(
 ) -> Result<String, AxBackendBundleError> {
     let mut globals = Vec::new();
     let mut types = Vec::new();
+    let mut literal_unions = Vec::new();
     let mut envs = Vec::new();
     let mut functions = Vec::new();
     let mut handlers = Vec::new();
@@ -323,13 +337,19 @@ pub fn compile_backend_sources_to_module(
             })?;
         envs.extend(plan.envs);
         types.extend(plan.types);
+        literal_unions.extend(plan.literal_unions);
         globals.extend(plan.globals);
         functions.extend(plan.functions);
         handlers.extend(plan.handlers);
     }
 
     generate_backend_module(&AxBackendPlan::with_globals(
-        types, envs, globals, functions, handlers,
+        types,
+        literal_unions,
+        envs,
+        globals,
+        functions,
+        handlers,
     ))
     .map_err(|source| AxBackendBundleError::Source {
         name: "bundle".to_string(),
@@ -337,7 +357,10 @@ pub fn compile_backend_sources_to_module(
     })
 }
 
-fn validate_type_contracts(types: &[AxRecordPlan]) -> Result<(), AxBackendCodegenError> {
+fn validate_type_contracts(
+    types: &[AxRecordPlan],
+    literal_unions: &[AxLiteralUnionPlan],
+) -> Result<(), AxBackendCodegenError> {
     let mut names = std::collections::BTreeSet::new();
     for record in types {
         if !names.insert(record.name.as_str()) {
@@ -345,6 +368,14 @@ fn validate_type_contracts(types: &[AxRecordPlan]) -> Result<(), AxBackendCodege
                 name: record.name.clone(),
             });
         }
+    }
+    for literal_union in literal_unions {
+        if !names.insert(literal_union.name.as_str()) {
+            return Err(AxBackendCodegenError::DuplicateType {
+                name: literal_union.name.clone(),
+            });
+        }
+        literal_union_variants(literal_union)?;
     }
 
     for record in types {
@@ -358,6 +389,71 @@ fn validate_type_contracts(types: &[AxRecordPlan]) -> Result<(), AxBackendCodege
         validate_no_recursive_type(&record.name, &record.name, types, &mut path)?;
     }
     Ok(())
+}
+
+fn render_literal_union_type(
+    literal_union: &AxLiteralUnionPlan,
+) -> Result<String, AxBackendCodegenError> {
+    let visibility = if literal_union.exported { "pub " } else { "" };
+    let mut out = format!(
+        "#[derive(Debug, Clone, PartialEq, Eq, axonyx_runtime::serde::Serialize, axonyx_runtime::serde::Deserialize)]\n#[serde(crate = \"axonyx_runtime::serde\")]\n{visibility}enum {} {{\n",
+        literal_union.name
+    );
+    for (literal, variant) in literal_union_variants(literal_union)? {
+        out.push_str(&format!(
+            "    #[serde(rename = {})]\n    {},\n",
+            serde_json::to_string(&literal).expect("string serialization cannot fail"),
+            variant
+        ));
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+fn literal_union_variants(
+    literal_union: &AxLiteralUnionPlan,
+) -> Result<Vec<(String, String)>, AxBackendCodegenError> {
+    let mut variants = std::collections::BTreeMap::new();
+    let mut lowered = Vec::new();
+    for literal in &literal_union.literals {
+        let variant = literal_union_variant(literal).ok_or_else(|| {
+            AxBackendCodegenError::InvalidLiteralUnionValue {
+                name: literal_union.name.clone(),
+                literal: literal.clone(),
+            }
+        })?;
+        if let Some(first) = variants.insert(variant.clone(), literal.clone()) {
+            return Err(AxBackendCodegenError::DuplicateLiteralUnionVariant {
+                name: literal_union.name.clone(),
+                first,
+                second: literal.clone(),
+                variant,
+            });
+        }
+        lowered.push((literal.clone(), variant));
+    }
+    Ok(lowered)
+}
+
+fn literal_union_variant(literal: &str) -> Option<String> {
+    if literal.is_empty()
+        || literal
+            .chars()
+            .any(|ch| !ch.is_ascii_alphanumeric() && ch != '-' && ch != '_')
+    {
+        return None;
+    }
+    let mut variant = String::new();
+    for part in literal.split(['-', '_']).filter(|part| !part.is_empty()) {
+        let mut chars = part.chars();
+        let first = chars.next()?;
+        variant.extend(first.to_uppercase());
+        variant.extend(chars);
+    }
+    if variant.starts_with(|ch: char| ch.is_ascii_digit()) {
+        variant.insert(0, 'V');
+    }
+    (!variant.is_empty()).then_some(variant)
 }
 
 fn validate_type_references(
@@ -1502,6 +1598,25 @@ loader PostsList() -> Post[] {
         ] {
             assert!(module.contains(expected), "missing `{expected}`\n{module}");
         }
+    }
+
+    #[test]
+    fn generates_serde_compatible_rust_enums_for_literal_unions() {
+        let module = compile_backend_ax_to_module(
+            r#"
+export type Theme = "silver" | "bronze" | "warm-gold"
+
+export type Settings {
+  theme: Theme
+}
+"#,
+        )
+        .expect("literal union contract should compile");
+
+        assert!(module.contains("pub enum Theme"));
+        assert!(module.contains("#[serde(rename = \"silver\")]\n    Silver"));
+        assert!(module.contains("#[serde(rename = \"warm-gold\")]\n    WarmGold"));
+        assert!(module.contains("pub theme: Theme"));
     }
 
     #[test]

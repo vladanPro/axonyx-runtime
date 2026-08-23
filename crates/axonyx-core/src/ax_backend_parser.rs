@@ -349,6 +349,16 @@ impl Parser {
         } else {
             return Err(AxBackendParseError::InvalidTypeDeclaration { line: line.line });
         };
+        if let Some((name, source)) = rest.split_once('=') {
+            let name = name.trim();
+            let literals = parse_backend_literal_union(source.trim())
+                .ok_or(AxBackendParseError::InvalidTypeDeclaration { line: line.line })?;
+            if !is_backend_identifier(name) {
+                return Err(AxBackendParseError::InvalidTypeDeclaration { line: line.line });
+            }
+            self.pos += 1;
+            return Ok(AxBackendTypeDecl::literal_union(name, literals, exported));
+        }
         let (name, braced) = split_block_brace(rest);
         if !braced || !is_backend_identifier(name.trim()) {
             return Err(AxBackendParseError::InvalidTypeDeclaration { line: line.line });
@@ -1992,6 +2002,19 @@ fn is_backend_identifier(input: &str) -> bool {
     chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
+fn parse_backend_literal_union(source: &str) -> Option<Vec<String>> {
+    let mut seen = std::collections::BTreeSet::new();
+    let literals = source
+        .split('|')
+        .map(str::trim)
+        .map(|part| serde_json::from_str::<String>(part).ok())
+        .collect::<Option<Vec<_>>>()?;
+    if literals.len() < 2 || literals.iter().any(|literal| !seen.insert(literal.clone())) {
+        return None;
+    }
+    Some(literals)
+}
+
 fn split_top_level_signature_params(input: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut start = 0usize;
@@ -2232,6 +2255,28 @@ loader PostsList() -> Post[] {
                 AxBackendTypeField::new("summary", "Optional<String>"),
                 AxBackendTypeField::new("tags", "List<String>"),
             ]
+        );
+    }
+
+    #[test]
+    fn parses_exported_literal_union_contract() {
+        let document = parse_backend_ax(
+            r#"export type Theme = "silver" | "bronze" | "gold"
+
+query loadTheme() -> Theme {
+  return "silver"
+}
+"#,
+        )
+        .expect("backend literal union should parse");
+
+        assert_eq!(
+            document.types,
+            vec![AxBackendTypeDecl::literal_union(
+                "Theme",
+                ["silver", "bronze", "gold"],
+                true
+            )]
         );
     }
 
