@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -528,6 +530,7 @@ pub enum AxExpr {
     Number(i64),
     Bool(bool),
     List(Vec<AxExpr>),
+    Object(BTreeMap<String, AxExpr>),
     Identifier(String),
     Unary {
         op: AxUnaryOp,
@@ -596,6 +599,15 @@ impl AxExpr {
 
     pub fn list(items: impl IntoIterator<Item = AxExpr>) -> Self {
         Self::List(items.into_iter().collect())
+    }
+
+    pub fn object(fields: impl IntoIterator<Item = (impl Into<String>, AxExpr)>) -> Self {
+        Self::Object(
+            fields
+                .into_iter()
+                .map(|(name, value)| (name.into(), value))
+                .collect(),
+        )
     }
 
     pub fn ident(value: impl Into<String>) -> Self {

@@ -6,6 +6,7 @@ use crate::ax_ast_v2::prelude::*;
 use crate::ax_parser::{parse_ax, parse_expr, AxParseError};
 use crate::ax_parser_v2::{parse_ax_v2, AxParseV2Error};
 use crate::ax_semantics_v2::{validate_ax_v2_semantics, AxSemanticV2Error};
+use crate::ax_types::{AxDataContext, AxType, AxTypeParseError};
 
 #[derive(Debug, Error)]
 pub enum AxAutoParseError {
@@ -57,10 +58,13 @@ pub enum AxConvertV2Error {
         "invalid state initializer `{expr_source}`; expected a literal value or `signal(...)`"
     )]
     InvalidStateInitializer { expr_source: String },
-    #[error(
-        "component state `{name}` uses unsupported v1 type `{ty}`; use String, Bool, or Number"
-    )]
+    #[error("component state `{name}` uses unsupported client-state type `{ty}`")]
     UnsupportedComponentStateType { name: String, ty: String },
+    #[error("invalid state type contract: {error}")]
+    InvalidStateTypeContract {
+        #[source]
+        error: AxTypeParseError,
+    },
     #[error("`{attr}` must bind to a declared `state` signal")]
     UnknownStateBinding { attr: String },
     #[error("`{attr}` only supports expression bindings such as `{{theme}}`")]
@@ -105,7 +109,9 @@ pub fn parse_ax_auto(input: &str) -> Result<AxDocument, AxAutoParseError> {
 pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Error> {
     let mut head = AxHead::default();
     let mut body = Vec::new();
-    let state_bindings = collect_state_bindings(file)?;
+    let data_context = AxDataContext::from_v2_let_types(file)
+        .map_err(|error| AxConvertV2Error::InvalidStateTypeContract { error })?;
+    let state_bindings = collect_state_bindings(file, &data_context)?;
 
     for binding in &file.lets {
         let mut value = parse_v2_expr(&binding.value)?;
@@ -148,7 +154,7 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
         components: file
             .components
             .iter()
-            .map(|component| convert_component_decl(component, &state_bindings))
+            .map(|component| convert_component_decl(component, &state_bindings, &data_context))
             .collect::<Result<Vec<_>, _>>()?,
         head,
         page: AxPage::with_params(
@@ -187,16 +193,22 @@ fn convert_function_decl(function: &AxFunctionDeclV2) -> Result<AxFunctionDef, A
 fn convert_component_decl(
     component: &AxComponentDeclV2,
     state_bindings: &BTreeMap<String, StateBindingPlan>,
+    data_context: &AxDataContext,
 ) -> Result<AxComponentDef, AxConvertV2Error> {
     let mut bindings = state_bindings.clone();
     let mut states = Vec::new();
     for (index, state) in component.states.iter().enumerate() {
         let initializer = parse_state_initializer(&state.value)?;
         let ty = state.ty.clone().unwrap_or(initializer.ty);
-        if !matches!(ty.as_str(), "String" | "Bool" | "Number") {
+        if !is_supported_client_state_type(&ty) {
             return Err(AxConvertV2Error::UnsupportedComponentStateType {
                 name: state.name.clone(),
                 ty,
+            });
+        }
+        if !state_initializer_matches_type(&initializer.value, &ty, data_context) {
+            return Err(AxConvertV2Error::InvalidStateInitializer {
+                expr_source: state.value.clone(),
             });
         }
         let signal = format!(
@@ -832,11 +844,23 @@ fn evaluate_initial_state_condition(plan: &StateConditionPlan) -> bool {
 
 fn collect_state_bindings(
     file: &AxFileV2,
+    data_context: &AxDataContext,
 ) -> Result<BTreeMap<String, StateBindingPlan>, AxConvertV2Error> {
     let mut bindings = BTreeMap::new();
     for (index, state) in file.states.iter().enumerate() {
         let initializer = parse_state_initializer(&state.value)?;
         let ty = state.ty.clone().unwrap_or_else(|| initializer.ty.clone());
+        if !is_supported_client_state_type(&ty) {
+            return Err(AxConvertV2Error::UnsupportedComponentStateType {
+                name: state.name.clone(),
+                ty,
+            });
+        }
+        if !state_initializer_matches_type(&initializer.value, &ty, data_context) {
+            return Err(AxConvertV2Error::InvalidStateInitializer {
+                expr_source: state.value.clone(),
+            });
+        }
         bindings.insert(
             state.name.clone(),
             StateBindingPlan {
@@ -869,19 +893,37 @@ fn parse_state_initializer(source: &str) -> Result<StateInitializerPlan, AxConve
     };
 
     Ok(StateInitializerPlan {
-        ty: infer_state_type(&value).to_string(),
+        ty: infer_state_type(&value),
         value,
     })
 }
 
-fn infer_state_type(value: &AxExpr) -> &'static str {
+fn infer_state_type(value: &AxExpr) -> String {
     match value {
         AxExpr::String(_) => "String",
         AxExpr::Bool(_) => "Bool",
         AxExpr::Number(_) => "Number",
-        AxExpr::List(_) => "List",
+        AxExpr::List(_) => "List<Unknown>",
+        AxExpr::Object(_) => "Json",
         _ => "Unknown",
     }
+    .to_string()
+}
+
+fn is_supported_client_state_type(source: &str) -> bool {
+    AxType::parse_annotation(source)
+        .as_ref()
+        .is_ok_and(|ty| ty.supports_client_state())
+}
+
+fn state_initializer_matches_type(
+    value: &AxExpr,
+    source: &str,
+    data_context: &AxDataContext,
+) -> bool {
+    AxType::parse_annotation(source)
+        .as_ref()
+        .is_ok_and(|ty| data_context.accepts_state_initializer(ty, value))
 }
 
 fn apply_state_binding_attr(
@@ -972,12 +1014,13 @@ fn apply_state_event_attr(
             attr: attr.name.clone(),
         });
     };
-    if matches!(mutation.op.as_str(), "add" | "sub") && binding.ty != "Number"
+    if matches!(mutation.op.as_str(), "add" | "sub")
+        && !matches!(binding.ty.as_str(), "Number" | "Int" | "Float")
         || mutation.op == "set"
             && mutation
                 .value_ty
                 .as_deref()
-                .is_some_and(|value_ty| value_ty != binding.ty)
+                .is_some_and(|value_ty| !state_literal_matches_type(value_ty, &binding.ty))
         || mutation.op == "toggle" && binding.ty != "Bool"
     {
         return Err(AxConvertV2Error::InvalidStateEvent {
@@ -1053,7 +1096,7 @@ fn parse_state_event_mutation(source: &str) -> Result<StateEventMutation, AxConv
             });
         }
         let literal = parse_v2_expr(value_source).ok().and_then(|expr| {
-            state_event_literal(&expr).map(|value| (value, infer_state_type(&expr).to_string()))
+            state_event_literal(&expr).map(|value| (value, infer_state_type(&expr)))
         });
         if let Some((value, value_ty)) = literal {
             return Ok(StateEventMutation {
@@ -1083,8 +1126,76 @@ fn state_event_literal(expr: &AxExpr) -> Option<String> {
         AxExpr::String(value) => Some(value.clone()),
         AxExpr::Number(value) => Some(value.to_string()),
         AxExpr::Bool(value) => Some(value.to_string()),
+        AxExpr::Identifier(value) if value == "null" => Some("null".to_string()),
+        AxExpr::List(items) => Some(format!(
+            "[{}]",
+            items
+                .iter()
+                .map(state_event_nested_literal)
+                .collect::<Option<Vec<_>>>()?
+                .join(",")
+        )),
+        AxExpr::Object(fields) => Some(format!(
+            "{{{}}}",
+            fields
+                .iter()
+                .map(|(name, value)| Some(format!(
+                    "{}:{}",
+                    quote_state_string(name),
+                    state_event_nested_literal(value)?
+                )))
+                .collect::<Option<Vec<_>>>()?
+                .join(",")
+        )),
         _ => None,
     }
+}
+
+fn state_event_nested_literal(expr: &AxExpr) -> Option<String> {
+    match expr {
+        AxExpr::String(value) => Some(quote_state_string(value)),
+        AxExpr::Number(value) => Some(value.to_string()),
+        AxExpr::Bool(value) => Some(value.to_string()),
+        AxExpr::Identifier(value) if value == "null" => Some("null".to_string()),
+        AxExpr::List(_) | AxExpr::Object(_) => state_event_literal(expr),
+        _ => None,
+    }
+}
+
+fn quote_state_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if ch.is_control() => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn state_literal_matches_type(literal: &str, declared: &str) -> bool {
+    literal == declared
+        || literal == "Number" && matches!(declared, "Int" | "Float")
+        || literal == "List<Unknown>" && declared.starts_with("List<")
+        || literal == "Unknown" && declared.starts_with("Optional<")
+        || literal == "Json"
+            && AxType::parse_annotation(declared).is_ok_and(|ty| {
+                matches!(
+                    ty,
+                    AxType::Json
+                        | AxType::Unknown
+                        | AxType::Map(_, _)
+                        | AxType::Result(_, _)
+                        | AxType::Record(_)
+                )
+            })
 }
 
 fn convert_prop(attr: &AxAttributeNode) -> Result<AxProp, AxConvertV2Error> {
@@ -1780,13 +1891,45 @@ component ThemePicker() {
     }
 
     #[test]
-    fn rejects_unsupported_component_state_types_in_v1() {
+    fn converts_structured_component_state_into_typed_metadata() {
+        let document = parse_ax_auto(
+            r#"
+page Home
+
+component Filters() {
+  state selected: List<Optional<String>> = ["published", null]
+
+  render ASX {
+    <Copy bind:text={selected}>{selected}</Copy>
+  }
+}
+
+<Filters />
+"#,
+        )
+        .expect("structured component state should convert");
+
+        assert_eq!(
+            document.components[0].states[0].ty,
+            "List<Optional<String>>"
+        );
+        let AxStatement::Component(copy) = &document.components[0].body[0] else {
+            panic!("copy should convert into component");
+        };
+        assert!(copy.props.contains(&AxProp::new(
+            "data-ax-state-type",
+            AxExpr::string("List<Optional<String>>")
+        )));
+    }
+
+    #[test]
+    fn rejects_secret_component_state_types() {
         let error = parse_ax_auto(
             r#"
 page Home
 
 component Demo() {
-  state post: Post = "draft"
+  state token: Secret<String> = "private"
 
   render ASX {
     <Copy>Demo</Copy>
@@ -1794,7 +1937,7 @@ component Demo() {
 }
 "#,
         )
-        .expect_err("unsupported component state should fail");
+        .expect_err("secret component state should fail");
 
         assert!(matches!(
             error,

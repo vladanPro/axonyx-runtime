@@ -558,6 +558,10 @@ fn parse_primary_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> 
         return parse_list_expr(input, line);
     }
 
+    if input.starts_with('{') || input.ends_with('}') {
+        return parse_object_expr(input, line);
+    }
+
     if input.ends_with(')') {
         if let Some(open_index) = find_call_open(input) {
             let path = input[..open_index].trim();
@@ -719,6 +723,93 @@ fn parse_list_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AxExpr::list(items))
+}
+
+fn parse_object_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
+    if !input.starts_with('{') || !input.ends_with('}') {
+        return Err(AxParseError::InvalidExpression {
+            line,
+            message: format!("invalid object literal `{input}`"),
+        });
+    }
+
+    let inner = input[1..input.len() - 1].trim();
+    if inner.is_empty() {
+        return Ok(AxExpr::Object(std::collections::BTreeMap::new()));
+    }
+
+    let mut fields = std::collections::BTreeMap::new();
+    let parts = split_top_level(inner, ',');
+    for (index, part) in parts.iter().enumerate() {
+        if part.is_empty() && index + 1 == parts.len() && inner.ends_with(',') {
+            continue;
+        }
+        let Some(colon) = find_top_level_object_colon(part) else {
+            return Err(AxParseError::InvalidExpression {
+                line,
+                message: format!("object field `{part}` requires `key: value`"),
+            });
+        };
+        let key_source = part[..colon].trim();
+        let value_source = part[colon + 1..].trim();
+        if key_source.is_empty() || value_source.is_empty() {
+            return Err(AxParseError::InvalidExpression {
+                line,
+                message: format!("invalid object field `{part}`"),
+            });
+        }
+        let key = if let Some(value) = parse_quoted_string(key_source, line)? {
+            value
+        } else if is_valid_object_key(key_source) {
+            key_source.to_string()
+        } else {
+            return Err(AxParseError::InvalidExpression {
+                line,
+                message: format!("invalid object key `{key_source}`"),
+            });
+        };
+        if fields.contains_key(&key) {
+            return Err(AxParseError::InvalidExpression {
+                line,
+                message: format!("duplicate object key `{key}`"),
+            });
+        }
+        fields.insert(key, parse_expr(value_source, line)?);
+    }
+
+    Ok(AxExpr::Object(fields))
+}
+
+fn find_top_level_object_colon(input: &str) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut in_string = None;
+    let mut escaped = false;
+    for (index, ch) in input.char_indices() {
+        if let Some(quote) = in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                in_string = None;
+            }
+            continue;
+        }
+        match ch {
+            '"' | '\'' => in_string = Some(ch),
+            '(' | '[' | '{' => depth += 1,
+            ')' | ']' | '}' => depth = depth.saturating_sub(1),
+            ':' if depth == 0 => return Some(index),
+            _ => {}
+        }
+    }
+    None
+}
+
+fn is_valid_object_key(value: &str) -> bool {
+    let mut chars = value.chars();
+    matches!(chars.next(), Some(first) if first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn find_lowest_precedence_operator(
@@ -1380,6 +1471,27 @@ page Home
                 AxExpr::ident("input").member("theme"),
             ])
         );
+    }
+
+    #[test]
+    fn parses_nested_object_literal_expression() {
+        let expr = parse_expr(
+            r#"{ title: "Hello", meta: { published: true }, tags: ["rust", "wasm"] }"#,
+            1,
+        )
+        .expect("object literal should parse");
+
+        let AxExpr::Object(fields) = expr else {
+            panic!("expected object expression");
+        };
+        assert_eq!(fields.get("title"), Some(&AxExpr::string("Hello")));
+        assert!(matches!(fields.get("meta"), Some(AxExpr::Object(_))));
+        assert!(matches!(fields.get("tags"), Some(AxExpr::List(_))));
+    }
+
+    #[test]
+    fn rejects_duplicate_object_literal_keys() {
+        assert!(parse_expr(r#"{ title: "One", "title": "Two" }"#, 1).is_err());
     }
 
     #[test]
