@@ -8,6 +8,7 @@ use crate::ax_types::prelude::{AxType, AxTypeParseError};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxBackendPlan {
     pub types: Vec<AxRecordPlan>,
+    pub literal_unions: Vec<AxLiteralUnionPlan>,
     pub envs: Vec<AxEnvPlan>,
     pub globals: Vec<AxStepPlan>,
     pub functions: Vec<AxFunctionPlan>,
@@ -18,6 +19,7 @@ impl AxBackendPlan {
     pub fn new(handlers: impl IntoIterator<Item = AxHandlerPlan>) -> Self {
         Self {
             types: Vec::new(),
+            literal_unions: Vec::new(),
             envs: Vec::new(),
             globals: Vec::new(),
             functions: Vec::new(),
@@ -27,6 +29,7 @@ impl AxBackendPlan {
 
     pub fn with_globals(
         types: impl IntoIterator<Item = AxRecordPlan>,
+        literal_unions: impl IntoIterator<Item = AxLiteralUnionPlan>,
         envs: impl IntoIterator<Item = AxEnvPlan>,
         globals: impl IntoIterator<Item = AxStepPlan>,
         functions: impl IntoIterator<Item = AxFunctionPlan>,
@@ -34,12 +37,20 @@ impl AxBackendPlan {
     ) -> Self {
         Self {
             types: types.into_iter().collect(),
+            literal_unions: literal_unions.into_iter().collect(),
             envs: envs.into_iter().collect(),
             globals: globals.into_iter().collect(),
             functions: functions.into_iter().collect(),
             handlers: handlers.into_iter().collect(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxLiteralUnionPlan {
+    pub name: String,
+    pub literals: Vec<String>,
+    pub exported: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -296,7 +307,7 @@ pub enum AxBackendLowerError {
 pub fn lower_backend_document(
     document: &AxBackendDocument,
 ) -> Result<AxBackendPlan, AxBackendLowerError> {
-    let types = lower_type_contracts(&document.types)?;
+    let (types, literal_unions) = lower_type_contracts(&document.types)?;
     let mut envs = Vec::new();
     let mut globals = Vec::new();
     let mut functions = Vec::new();
@@ -319,21 +330,36 @@ pub fn lower_backend_document(
     }
 
     Ok(AxBackendPlan::with_globals(
-        types, envs, globals, functions, handlers,
+        types,
+        literal_unions,
+        envs,
+        globals,
+        functions,
+        handlers,
     ))
 }
 
 fn lower_type_contracts(
     declarations: &[AxBackendTypeDecl],
-) -> Result<Vec<AxRecordPlan>, AxBackendLowerError> {
+) -> Result<(Vec<AxRecordPlan>, Vec<AxLiteralUnionPlan>), AxBackendLowerError> {
     let mut names = std::collections::BTreeSet::new();
     let mut records = Vec::new();
+    let mut literal_unions = Vec::new();
 
     for declaration in declarations {
         if !names.insert(declaration.name.clone()) {
             return Err(AxBackendLowerError::DuplicateType {
                 name: declaration.name.clone(),
             });
+        }
+
+        if declaration.is_literal_union() {
+            literal_unions.push(AxLiteralUnionPlan {
+                name: declaration.name.clone(),
+                literals: declaration.literals.clone(),
+                exported: declaration.exported,
+            });
+            continue;
         }
 
         let mut field_names = std::collections::BTreeSet::new();
@@ -366,7 +392,7 @@ fn lower_type_contracts(
         });
     }
 
-    Ok(records)
+    Ok((records, literal_unions))
 }
 
 fn lower_backend_block(block: &AxBackendBlock) -> Result<AxHandlerPlan, AxBackendLowerError> {
@@ -951,6 +977,7 @@ pub mod prelude {
     pub use super::AxHandlerKind;
     pub use super::AxHandlerPlan;
     pub use super::AxHookPhasePlan;
+    pub use super::AxLiteralUnionPlan;
     pub use super::AxQueryFilterOpPlan;
     pub use super::AxQueryFilterPlan;
     pub use super::AxQueryModePlan;

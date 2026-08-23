@@ -53,13 +53,16 @@ const assert = (condition, message) => {
 
 assert(await state.loadWasm("memory://axonyx-state-v2.wasm"), "WASM executor did not load");
 state.hydrateManifest({
-  types: [{
-    name: "Post",
-    fields: [
-      { name: "title", ty: "String", optional: false },
-      { name: "summary", ty: "String", optional: true },
-    ],
-  }],
+  types: [
+    {
+      name: "Post",
+      fields: [
+        { name: "title", ty: "String", optional: false },
+        { name: "summary", ty: "String", optional: true },
+      ],
+    },
+    { name: "Theme", literals: ["silver", "bronze", "gold"] },
+  ],
   files: [{
     file: "app/posts/page.asx",
     signals: [
@@ -84,6 +87,8 @@ state.hydrateManifest({
 const valid = [{ title: "First", summary: null }, null];
 assert(state.validateValue(valid, "List<Optional<Post>>"), "valid record list was rejected");
 assert(!state.validateValue([{ title: 7 }], "List<Post>"), "invalid record field was accepted");
+assert(state.validateValue("bronze", "Theme"), "literal union member was rejected");
+assert(!state.validateValue("purple", "Theme"), "unknown literal union member was accepted");
 assert(state.validateValue(0.625, "Float"), "finite Float was rejected");
 assert(!state.validateValue(Number.POSITIVE_INFINITY, "Float"), "infinite Float was accepted");
 assert(state.validateValue("2024-02-29", "Date"), "valid leap date was rejected");

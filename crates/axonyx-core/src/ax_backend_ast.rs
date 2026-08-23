@@ -48,6 +48,8 @@ impl AxBackendDocument {
 pub struct AxBackendTypeDecl {
     pub name: String,
     pub fields: Vec<AxBackendTypeField>,
+    #[serde(default)]
+    pub literals: Vec<String>,
     pub exported: bool,
 }
 
@@ -60,8 +62,26 @@ impl AxBackendTypeDecl {
         Self {
             name: name.into(),
             fields: fields.into_iter().collect(),
+            literals: Vec::new(),
             exported,
         }
+    }
+
+    pub fn literal_union(
+        name: impl Into<String>,
+        literals: impl IntoIterator<Item = impl Into<String>>,
+        exported: bool,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            fields: Vec::new(),
+            literals: literals.into_iter().map(Into::into).collect(),
+            exported,
+        }
+    }
+
+    pub fn is_literal_union(&self) -> bool {
+        !self.literals.is_empty()
     }
 }
 
