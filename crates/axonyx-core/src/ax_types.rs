@@ -320,6 +320,7 @@ impl AxRecordType {
 pub struct AxDataContext {
     pub bindings: BTreeMap<String, AxType>,
     pub records: BTreeMap<String, AxRecordType>,
+    pub literal_unions: BTreeMap<String, Vec<String>>,
 }
 
 impl AxDataContext {
@@ -329,6 +330,16 @@ impl AxDataContext {
 
     pub fn with_record(mut self, record: AxRecordType) -> Self {
         self.records.insert(record.name.clone(), record);
+        self
+    }
+
+    pub fn with_literal_union(
+        mut self,
+        name: impl Into<String>,
+        literals: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.literal_unions
+            .insert(name.into(), literals.into_iter().map(Into::into).collect());
         self
     }
 
@@ -364,6 +375,9 @@ impl AxDataContext {
         }
         match ty {
             AxType::Record(name) => {
+                if let Some(literals) = self.literal_unions.get(name) {
+                    return matches!(value, AxExpr::String(value) if literals.contains(value));
+                }
                 let AxExpr::Object(values) = value else {
                     return false;
                 };
@@ -409,17 +423,24 @@ impl AxDataContext {
 
     pub fn from_v2_let_types(file: &AxFileV2) -> Result<Self, AxTypeParseError> {
         let mut context = Self::new();
-        for record in &file.types {
-            if context.records.contains_key(&record.name) {
+        for declaration in &file.types {
+            if context.records.contains_key(&declaration.name)
+                || context.literal_unions.contains_key(&declaration.name)
+            {
                 return Err(AxTypeParseError::DuplicateRecord {
-                    name: record.name.clone(),
+                    name: declaration.name.clone(),
                 });
             }
-            let mut record_type = AxRecordType::new(record.name.clone());
-            for field in &record.fields {
+            if declaration.is_literal_union() {
+                context = context
+                    .with_literal_union(declaration.name.clone(), declaration.literals.clone());
+                continue;
+            }
+            let mut record_type = AxRecordType::new(declaration.name.clone());
+            for field in &declaration.fields {
                 if record_type.fields.contains_key(&field.name) {
                     return Err(AxTypeParseError::DuplicateField {
-                        record: record.name.clone(),
+                        record: declaration.name.clone(),
                         field: field.name.clone(),
                     });
                 }
@@ -1517,6 +1538,27 @@ type Post {
             AxTypeParseError::DuplicateRecord {
                 name: "Post".to_string(),
             }
+        );
+    }
+
+    #[test]
+    fn validates_literal_union_state_initializers() {
+        let file = parse_ax_v2(
+            r#"page ThemePreview() {
+type Theme = "silver" | "bronze" | "gold"
+state theme: Theme = "silver"
+return ASX { <Copy>{theme}</Copy> }
+}
+"#,
+        )
+        .expect("literal union state should parse");
+        let context = AxDataContext::from_v2_let_types(&file).expect("context should build");
+
+        assert!(
+            context.accepts_state_initializer(&AxType::record("Theme"), &AxExpr::string("gold"))
+        );
+        assert!(
+            !context.accepts_state_initializer(&AxType::record("Theme"), &AxExpr::string("purple"))
         );
     }
 

@@ -94,6 +94,8 @@ impl AxPageDecl {
 pub struct AxTypeDeclV2 {
     pub name: String,
     pub fields: Vec<AxTypeFieldDeclV2>,
+    #[serde(default)]
+    pub literals: Vec<String>,
 }
 
 impl AxTypeDeclV2 {
@@ -104,7 +106,23 @@ impl AxTypeDeclV2 {
         Self {
             name: name.into(),
             fields: fields.into_iter().collect(),
+            literals: Vec::new(),
         }
+    }
+
+    pub fn literal_union(
+        name: impl Into<String>,
+        literals: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            fields: Vec::new(),
+            literals: literals.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    pub fn is_literal_union(&self) -> bool {
+        !self.literals.is_empty()
     }
 }
 

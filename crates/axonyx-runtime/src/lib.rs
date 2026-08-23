@@ -3714,7 +3714,11 @@ fn ax_state_bridge_script() -> &'static str {
           : keys[0] === "Err" && validateStateValueForType(value.Err, result[1], depth + 1));
     }
     const schema = typeSchemas.get(type);
-    if (!schema || !value || typeof value !== "object" || Array.isArray(value)) return false;
+    if (!schema) return false;
+    if (Array.isArray(schema.literals) && schema.literals.length > 0) {
+      return typeof value === "string" && schema.literals.includes(value);
+    }
+    if (!value || typeof value !== "object" || Array.isArray(value)) return false;
     const fields = new Map((schema.fields || []).map((field) => [field.name, field]));
     if (Object.keys(value).some((key) => !fields.has(key))) return false;
     return (schema.fields || []).every((field) => {
@@ -4637,7 +4641,12 @@ fn ax_state_bridge_script() -> &'static str {
   const hydrateManifest = (manifest, source = "manifest") => {
     if (!manifest || !Array.isArray(manifest.files)) return 0;
     (manifest.types || []).forEach((schema) => {
-      if (!schema || typeof schema.name !== "string" || !Array.isArray(schema.fields)) return;
+      const hasFields = Array.isArray(schema?.fields);
+      const hasLiterals = Array.isArray(schema?.literals)
+        && schema.literals.length > 0
+        && schema.literals.every((literal) => typeof literal === "string")
+        && new Set(schema.literals).size === schema.literals.length;
+      if (!schema || typeof schema.name !== "string" || (!hasFields && !hasLiterals)) return;
       if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schema.name)) return;
       typeSchemas.set(schema.name, schema);
     });
