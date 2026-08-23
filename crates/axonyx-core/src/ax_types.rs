@@ -12,10 +12,26 @@ use crate::ax_ast_v2::prelude::AxFileV2;
 pub enum AxType {
     String,
     Number,
+    Int,
+    Float,
     Bool,
     DateTime,
+    Date,
+    Time,
+    Uuid,
+    Bytes,
+    Json,
+    Never,
+    Void,
     List(Box<AxType>),
+    Map(Box<AxType>, Box<AxType>),
+    Set(Box<AxType>),
     Optional(Box<AxType>),
+    Result(Box<AxType>, Box<AxType>),
+    Secret(Box<AxType>),
+    Public(Box<AxType>),
+    Signal(Box<AxType>),
+    Resource(Box<AxType>, Box<AxType>),
     Record(String),
     Unknown,
 }
@@ -26,7 +42,10 @@ impl AxType {
     }
 
     pub fn optional(item: AxType) -> Self {
-        Self::Optional(Box::new(item))
+        match item {
+            Self::Optional(_) => item,
+            other => Self::Optional(Box::new(other)),
+        }
     }
 
     pub fn record(name: impl Into<String>) -> Self {
@@ -37,10 +56,36 @@ impl AxType {
         match self {
             Self::String => "String".to_string(),
             Self::Number => "Number".to_string(),
+            Self::Int => "Int".to_string(),
+            Self::Float => "Float".to_string(),
             Self::Bool => "Bool".to_string(),
             Self::DateTime => "DateTime".to_string(),
+            Self::Date => "Date".to_string(),
+            Self::Time => "Time".to_string(),
+            Self::Uuid => "Uuid".to_string(),
+            Self::Bytes => "Bytes".to_string(),
+            Self::Json => "Json".to_string(),
+            Self::Never => "Never".to_string(),
+            Self::Void => "Void".to_string(),
             Self::List(item) => format!("List<{}>", item.display_name()),
+            Self::Map(key, value) => {
+                format!("Map<{}, {}>", key.display_name(), value.display_name())
+            }
+            Self::Set(item) => format!("Set<{}>", item.display_name()),
             Self::Optional(item) => format!("Optional<{}>", item.display_name()),
+            Self::Result(ok, error) => {
+                format!("Result<{}, {}>", ok.display_name(), error.display_name())
+            }
+            Self::Secret(item) => format!("Secret<{}>", item.display_name()),
+            Self::Public(item) => format!("Public<{}>", item.display_name()),
+            Self::Signal(item) => format!("Signal<{}>", item.display_name()),
+            Self::Resource(value, error) => {
+                format!(
+                    "Resource<{}, {}>",
+                    value.display_name(),
+                    error.display_name()
+                )
+            }
             Self::Record(name) => name.clone(),
             Self::Unknown => "Unknown".to_string(),
         }
@@ -48,7 +93,7 @@ impl AxType {
 
     pub fn list_item(&self) -> Option<&AxType> {
         match self {
-            Self::List(item) => Some(item),
+            Self::List(item) | Self::Set(item) => Some(item),
             _ => None,
         }
     }
@@ -158,7 +203,7 @@ impl AxDataContext {
                 match op {
                     AxUnaryOp::Not => Ok(AxType::Bool),
                     AxUnaryOp::Neg => match ty {
-                        AxType::Number | AxType::Unknown => Ok(ty),
+                        AxType::Number | AxType::Int | AxType::Float | AxType::Unknown => Ok(ty),
                         other => Err(AxTypeError::ExpectedNumber {
                             found: other.display_name(),
                         }),
@@ -170,15 +215,21 @@ impl AxDataContext {
                 let right_type = self.resolve_expr_type(right)?;
                 match op {
                     AxBinaryOp::Add => match (&left_type, &right_type) {
-                        (AxType::Number, AxType::Number) => Ok(AxType::Number),
+                        (left, right) if is_numeric_type(left) && is_numeric_type(right) => {
+                            Ok(promote_numeric_type(left, right))
+                        }
                         (AxType::Unknown, _) | (_, AxType::Unknown) => Ok(AxType::Unknown),
                         _ => Ok(AxType::String),
                     },
                     AxBinaryOp::Sub | AxBinaryOp::Mul | AxBinaryOp::Div | AxBinaryOp::Rem => {
-                        if matches!(left_type, AxType::Number | AxType::Unknown)
-                            && matches!(right_type, AxType::Number | AxType::Unknown)
-                        {
-                            Ok(AxType::Number)
+                        if matches!(
+                            left_type,
+                            AxType::Number | AxType::Int | AxType::Float | AxType::Unknown
+                        ) && matches!(
+                            right_type,
+                            AxType::Number | AxType::Int | AxType::Float | AxType::Unknown
+                        ) {
+                            Ok(promote_numeric_type(&left_type, &right_type))
                         } else {
                             Err(AxTypeError::ExpectedNumber {
                                 found: format!(
@@ -209,6 +260,7 @@ impl AxDataContext {
                 let object_type = self.resolve_expr_type(object)?;
                 match &object_type {
                     AxType::List(item) => Ok((**item).clone()),
+                    AxType::Map(_, value) => Ok((**value).clone()),
                     AxType::Record(_) => match &**index {
                         AxExpr::String(property) => {
                             self.resolve_member_type(&object_type, property)
@@ -304,6 +356,22 @@ impl AxDataContext {
     }
 }
 
+fn is_numeric_type(ty: &AxType) -> bool {
+    matches!(ty, AxType::Number | AxType::Int | AxType::Float)
+}
+
+fn promote_numeric_type(left: &AxType, right: &AxType) -> AxType {
+    if matches!(left, AxType::Float) || matches!(right, AxType::Float) {
+        AxType::Float
+    } else if matches!(left, AxType::Number) || matches!(right, AxType::Number) {
+        AxType::Number
+    } else if matches!(left, AxType::Int) && matches!(right, AxType::Int) {
+        AxType::Int
+    } else {
+        AxType::Number
+    }
+}
+
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum AxTypeParseError {
     #[error("empty type annotation")]
@@ -322,6 +390,10 @@ fn parse_type_annotation(input: &str) -> Result<AxType, AxTypeParseError> {
         return Err(AxTypeParseError::Empty);
     }
 
+    if let Some(item) = input.strip_suffix("[]") {
+        return Ok(AxType::list(parse_type_annotation(item)?));
+    }
+
     if let Some(inner) = parse_wrapped_type(input, "List")? {
         return Ok(AxType::list(parse_type_annotation(inner)?));
     }
@@ -330,11 +402,60 @@ fn parse_type_annotation(input: &str) -> Result<AxType, AxTypeParseError> {
         return Ok(AxType::optional(parse_type_annotation(inner)?));
     }
 
+    if let Some(inner) = parse_wrapped_type(input, "Set")? {
+        return Ok(AxType::Set(Box::new(parse_type_annotation(inner)?)));
+    }
+
+    if let Some(inner) = parse_wrapped_type(input, "Secret")? {
+        return Ok(AxType::Secret(Box::new(parse_type_annotation(inner)?)));
+    }
+
+    if let Some(inner) = parse_wrapped_type(input, "Public")? {
+        return Ok(AxType::Public(Box::new(parse_type_annotation(inner)?)));
+    }
+
+    if let Some(inner) = parse_wrapped_type(input, "Signal")? {
+        return Ok(AxType::Signal(Box::new(parse_type_annotation(inner)?)));
+    }
+
+    if let Some(inner) = parse_wrapped_type(input, "Map")? {
+        let (key, value) = split_type_pair(inner, input)?;
+        return Ok(AxType::Map(
+            Box::new(parse_type_annotation(key)?),
+            Box::new(parse_type_annotation(value)?),
+        ));
+    }
+
+    if let Some(inner) = parse_wrapped_type(input, "Result")? {
+        let (ok, error) = split_type_pair(inner, input)?;
+        return Ok(AxType::Result(
+            Box::new(parse_type_annotation(ok)?),
+            Box::new(parse_type_annotation(error)?),
+        ));
+    }
+
+    if let Some(inner) = parse_wrapped_type(input, "Resource")? {
+        let (value, error) = split_type_pair(inner, input)?;
+        return Ok(AxType::Resource(
+            Box::new(parse_type_annotation(value)?),
+            Box::new(parse_type_annotation(error)?),
+        ));
+    }
+
     Ok(match input {
         "String" => AxType::String,
         "Number" => AxType::Number,
+        "Int" => AxType::Int,
+        "Float" => AxType::Float,
         "Bool" => AxType::Bool,
         "DateTime" => AxType::DateTime,
+        "Date" => AxType::Date,
+        "Time" => AxType::Time,
+        "Uuid" => AxType::Uuid,
+        "Bytes" => AxType::Bytes,
+        "Json" => AxType::Json,
+        "Never" => AxType::Never,
+        "Void" => AxType::Void,
         "Unknown" => AxType::Unknown,
         name if is_type_identifier(name) => AxType::record(name),
         source => {
@@ -343,6 +464,50 @@ fn parse_type_annotation(input: &str) -> Result<AxType, AxTypeParseError> {
             })
         }
     })
+}
+
+fn split_type_pair<'a>(
+    inner: &'a str,
+    source: &str,
+) -> Result<(&'a str, &'a str), AxTypeParseError> {
+    let mut angle_depth = 0usize;
+    let mut separator = None;
+
+    for (index, ch) in inner.char_indices() {
+        match ch {
+            '<' => angle_depth += 1,
+            '>' => {
+                angle_depth =
+                    angle_depth
+                        .checked_sub(1)
+                        .ok_or_else(|| AxTypeParseError::Invalid {
+                            raw: source.to_string(),
+                        })?;
+            }
+            ',' if angle_depth == 0 => {
+                if separator.replace(index).is_some() {
+                    return Err(AxTypeParseError::Invalid {
+                        raw: source.to_string(),
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let Some(separator) = separator else {
+        return Err(AxTypeParseError::Invalid {
+            raw: source.to_string(),
+        });
+    };
+    let left = inner[..separator].trim();
+    let right = inner[separator + 1..].trim();
+    if left.is_empty() || right.is_empty() {
+        return Err(AxTypeParseError::Invalid {
+            raw: source.to_string(),
+        });
+    }
+    Ok((left, right))
 }
 
 fn parse_wrapped_type<'a>(
@@ -699,6 +864,98 @@ mod tests {
                     .field("excerpt", AxType::String),
             )
             .with_binding("posts", AxType::list(AxType::record("Post")))
+    }
+
+    #[test]
+    fn parses_canonical_scalar_and_collection_types() {
+        let cases = [
+            ("Int", AxType::Int),
+            ("Float", AxType::Float),
+            ("Date", AxType::Date),
+            ("Time", AxType::Time),
+            ("Uuid", AxType::Uuid),
+            ("Bytes", AxType::Bytes),
+            ("Json", AxType::Json),
+            ("Never", AxType::Never),
+            ("Void", AxType::Void),
+            ("Post[]", AxType::list(AxType::record("Post"))),
+            (
+                "Map<String, List<Post>>",
+                AxType::Map(
+                    Box::new(AxType::String),
+                    Box::new(AxType::list(AxType::record("Post"))),
+                ),
+            ),
+            ("Set<Uuid>", AxType::Set(Box::new(AxType::Uuid))),
+            (
+                "Result<Post, String>",
+                AxType::Result(Box::new(AxType::record("Post")), Box::new(AxType::String)),
+            ),
+            (
+                "Resource<List<Post>, String>",
+                AxType::Resource(
+                    Box::new(AxType::list(AxType::record("Post"))),
+                    Box::new(AxType::String),
+                ),
+            ),
+        ];
+
+        for (source, expected) in cases {
+            assert_eq!(AxType::parse_annotation(source), Ok(expected), "{source}");
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_multi_parameter_types() {
+        for source in [
+            "Map<String>",
+            "Map<String, Post, Bool>",
+            "Result<Post>",
+            "Resource<Post,>",
+        ] {
+            assert!(AxType::parse_annotation(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn promotes_numeric_types_without_falling_back_to_string() {
+        let context = AxDataContext::new()
+            .with_binding("count", AxType::Int)
+            .with_binding("delta", AxType::Int)
+            .with_binding("ratio", AxType::Float);
+
+        let int_sum = context
+            .resolve_expr_type(&AxExpr::binary(
+                AxBinaryOp::Add,
+                AxExpr::ident("count"),
+                AxExpr::ident("delta"),
+            ))
+            .expect("integer addition should resolve");
+        let mixed_sum = context
+            .resolve_expr_type(&AxExpr::binary(
+                AxBinaryOp::Add,
+                AxExpr::ident("count"),
+                AxExpr::ident("ratio"),
+            ))
+            .expect("mixed numeric addition should resolve");
+
+        assert_eq!(int_sum, AxType::Int);
+        assert_eq!(mixed_sum, AxType::Float);
+    }
+
+    #[test]
+    fn set_items_can_bind_each_and_optional_wrappers_are_idempotent() {
+        let context =
+            AxDataContext::new().with_binding("tags", AxType::Set(Box::new(AxType::record("Tag"))));
+        let each = context
+            .bind_each_item("tag", &AxExpr::ident("tags"))
+            .expect("set should be iterable");
+
+        assert_eq!(each.binding("tag"), Some(&AxType::record("Tag")));
+        assert_eq!(
+            AxType::optional(AxType::optional(AxType::String)),
+            AxType::optional(AxType::String)
+        );
     }
 
     #[test]

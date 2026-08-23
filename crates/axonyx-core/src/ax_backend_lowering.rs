@@ -3,9 +3,11 @@ use thiserror::Error;
 use crate::ax_ast::prelude::{AxBinaryOp, AxExpr, AxUnaryOp};
 use crate::ax_backend_ast::prelude::*;
 use crate::ax_query_ast::prelude::*;
+use crate::ax_types::prelude::{AxType, AxTypeParseError};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxBackendPlan {
+    pub types: Vec<AxRecordPlan>,
     pub envs: Vec<AxEnvPlan>,
     pub globals: Vec<AxStepPlan>,
     pub functions: Vec<AxFunctionPlan>,
@@ -15,6 +17,7 @@ pub struct AxBackendPlan {
 impl AxBackendPlan {
     pub fn new(handlers: impl IntoIterator<Item = AxHandlerPlan>) -> Self {
         Self {
+            types: Vec::new(),
             envs: Vec::new(),
             globals: Vec::new(),
             functions: Vec::new(),
@@ -23,18 +26,33 @@ impl AxBackendPlan {
     }
 
     pub fn with_globals(
+        types: impl IntoIterator<Item = AxRecordPlan>,
         envs: impl IntoIterator<Item = AxEnvPlan>,
         globals: impl IntoIterator<Item = AxStepPlan>,
         functions: impl IntoIterator<Item = AxFunctionPlan>,
         handlers: impl IntoIterator<Item = AxHandlerPlan>,
     ) -> Self {
         Self {
+            types: types.into_iter().collect(),
             envs: envs.into_iter().collect(),
             globals: globals.into_iter().collect(),
             functions: functions.into_iter().collect(),
             handlers: handlers.into_iter().collect(),
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxRecordPlan {
+    pub name: String,
+    pub fields: Vec<AxRecordFieldPlan>,
+    pub exported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxRecordFieldPlan {
+    pub name: String,
+    pub ty: AxType,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -261,11 +279,24 @@ pub enum AxBackendLowerError {
     EmptyInputType { field: String },
     #[error("invalid runtime env path `{path}`")]
     InvalidRuntimeEnvPath { path: String },
+    #[error("duplicate backend type declaration `{name}`")]
+    DuplicateType { name: String },
+    #[error("duplicate field `{field}` in backend type `{record}`")]
+    DuplicateTypeField { record: String, field: String },
+    #[error("invalid type `{annotation}` for `{record}.{field}`: {source}")]
+    InvalidTypeAnnotation {
+        record: String,
+        field: String,
+        annotation: String,
+        #[source]
+        source: AxTypeParseError,
+    },
 }
 
 pub fn lower_backend_document(
     document: &AxBackendDocument,
 ) -> Result<AxBackendPlan, AxBackendLowerError> {
+    let types = lower_type_contracts(&document.types)?;
     let mut envs = Vec::new();
     let mut globals = Vec::new();
     let mut functions = Vec::new();
@@ -288,8 +319,54 @@ pub fn lower_backend_document(
     }
 
     Ok(AxBackendPlan::with_globals(
-        envs, globals, functions, handlers,
+        types, envs, globals, functions, handlers,
     ))
+}
+
+fn lower_type_contracts(
+    declarations: &[AxBackendTypeDecl],
+) -> Result<Vec<AxRecordPlan>, AxBackendLowerError> {
+    let mut names = std::collections::BTreeSet::new();
+    let mut records = Vec::new();
+
+    for declaration in declarations {
+        if !names.insert(declaration.name.clone()) {
+            return Err(AxBackendLowerError::DuplicateType {
+                name: declaration.name.clone(),
+            });
+        }
+
+        let mut field_names = std::collections::BTreeSet::new();
+        let mut fields = Vec::new();
+        for field in &declaration.fields {
+            if !field_names.insert(field.name.clone()) {
+                return Err(AxBackendLowerError::DuplicateTypeField {
+                    record: declaration.name.clone(),
+                    field: field.name.clone(),
+                });
+            }
+            let ty = AxType::parse_annotation(&field.ty).map_err(|source| {
+                AxBackendLowerError::InvalidTypeAnnotation {
+                    record: declaration.name.clone(),
+                    field: field.name.clone(),
+                    annotation: field.ty.clone(),
+                    source,
+                }
+            })?;
+            fields.push(AxRecordFieldPlan {
+                name: field.name.clone(),
+                ty,
+            });
+        }
+
+        records.push(AxRecordPlan {
+            name: declaration.name.clone(),
+            fields,
+            exported: declaration.exported,
+        });
+    }
+
+    Ok(records)
 }
 
 fn lower_backend_block(block: &AxBackendBlock) -> Result<AxHandlerPlan, AxBackendLowerError> {
@@ -872,6 +949,8 @@ pub mod prelude {
     pub use super::AxQueryOrderPlan;
     pub use super::AxQueryPlan;
     pub use super::AxQuerySourcePlan;
+    pub use super::AxRecordFieldPlan;
+    pub use super::AxRecordPlan;
     pub use super::AxReturnPlan;
     pub use super::AxRustExpr;
     pub use super::AxStepPlan;
