@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxDocument {
@@ -528,6 +528,7 @@ impl AxEachStage {
 pub enum AxExpr {
     String(String),
     Number(i64),
+    Float(AxFloat),
     Bool(bool),
     List(Vec<AxExpr>),
     Object(BTreeMap<String, AxExpr>),
@@ -557,6 +558,42 @@ pub enum AxExpr {
         path: Vec<String>,
         args: Vec<AxExpr>,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AxFloat(f64);
+
+impl AxFloat {
+    pub fn new(value: f64) -> Option<Self> {
+        value
+            .is_finite()
+            .then_some(Self(if value == 0.0 { 0.0 } else { value }))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+impl Eq for AxFloat {}
+
+impl Serialize for AxFloat {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_f64(self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AxFloat {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = f64::deserialize(deserializer)?;
+        Self::new(value).ok_or_else(|| serde::de::Error::custom("float must be finite"))
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -591,6 +628,10 @@ impl AxExpr {
 
     pub fn number(value: i64) -> Self {
         Self::Number(value)
+    }
+
+    pub fn float(value: f64) -> Self {
+        Self::Float(AxFloat::new(value).expect("AxExpr::float requires a finite value"))
     }
 
     pub fn bool(value: bool) -> Self {
@@ -679,6 +720,12 @@ impl From<i64> for AxExpr {
     }
 }
 
+impl From<f64> for AxExpr {
+    fn from(value: f64) -> Self {
+        AxExpr::float(value)
+    }
+}
+
 impl From<bool> for AxExpr {
     fn from(value: bool) -> Self {
         AxExpr::Bool(value)
@@ -697,6 +744,7 @@ pub mod prelude {
     pub use super::AxEachBlock;
     pub use super::AxEachStage;
     pub use super::AxExpr;
+    pub use super::AxFloat;
     pub use super::AxFunctionDef;
     pub use super::AxHead;
     pub use super::AxHeadTag;

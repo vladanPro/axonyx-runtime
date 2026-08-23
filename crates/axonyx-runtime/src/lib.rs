@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use axonyx_core::ax_ast_prelude::{
-    AxBinaryOp, AxBody, AxComponent, AxDocument, AxExpr, AxHead, AxHeadTag, AxPipeline,
+    AxBinaryOp, AxBody, AxComponent, AxDocument, AxExpr, AxFloat, AxHead, AxHeadTag, AxPipeline,
     AxPipelineStage, AxProp, AxStatement, AxUnaryOp,
 };
 use axonyx_core::ax_backend_lowering::AxBackendLowerError;
@@ -1067,6 +1067,7 @@ fn preview_value_cache_key(value: &AxValue) -> String {
         AxValue::Null => "null".to_string(),
         AxValue::String(value) => format!("s:{value:?}"),
         AxValue::Number(value) => format!("n:{value}"),
+        AxValue::Float(value) => format!("f:{:?}", value.get()),
         AxValue::Bool(value) => format!("b:{value}"),
         AxValue::Record(fields) => {
             let fields = fields
@@ -1736,6 +1737,7 @@ fn preview_require_passes(value: &AxValue) -> bool {
         AxValue::Bool(value) => *value,
         AxValue::String(value) => !value.is_empty(),
         AxValue::Number(_) => true,
+        AxValue::Float(_) => true,
         AxValue::Record(fields) => !fields.is_empty(),
         AxValue::List(items) => !items.is_empty(),
     }
@@ -2087,6 +2089,13 @@ fn eval_preview_expr_with_functions(
 
     if let Ok(value) = code.parse::<i64>() {
         return Ok(AxValue::Number(value));
+    }
+    if let Some(value) = code.strip_suffix("_f64") {
+        if let Ok(value) = value.parse::<f64>() {
+            if let Some(value) = AxFloat::new(value) {
+                return Ok(AxValue::Float(value));
+            }
+        }
     }
 
     if let Some(key) = parse_preview_env_call(code, "public") {
@@ -2474,12 +2483,15 @@ fn coerce_preview_loader_input_value(
 ) -> Result<AxValue, PreviewError> {
     match (rust_ty, value) {
         ("String", AxValue::String(value)) => Ok(AxValue::String(value)),
-        ("String", value @ (AxValue::Number(_) | AxValue::Bool(_))) => {
+        ("String", value @ (AxValue::Number(_) | AxValue::Float(_) | AxValue::Bool(_))) => {
             Ok(AxValue::String(value.as_string()))
         }
         ("bool", AxValue::Bool(value)) => Ok(AxValue::Bool(value)),
         ("i64" | "u64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
-        ("f64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        ("f64", AxValue::Number(value)) => Ok(AxValue::Float(
+            AxFloat::new(value as f64).expect("i64 is always a finite f64"),
+        )),
+        ("f64", AxValue::Float(value)) => Ok(AxValue::Float(value)),
         (_, AxValue::Null) => Ok(AxValue::Null),
         (_, value) => Err(PreviewError::Runtime {
             message: format!(
@@ -2496,12 +2508,15 @@ fn coerce_preview_function_input_value(
 ) -> Result<AxValue, PreviewError> {
     match (field.rust_ty.as_str(), value) {
         ("String", AxValue::String(value)) => Ok(AxValue::String(value)),
-        ("String", value @ (AxValue::Number(_) | AxValue::Bool(_))) => {
+        ("String", value @ (AxValue::Number(_) | AxValue::Float(_) | AxValue::Bool(_))) => {
             Ok(AxValue::String(value.as_string()))
         }
         ("bool", AxValue::Bool(value)) => Ok(AxValue::Bool(value)),
         ("i64" | "u64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
-        ("f64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        ("f64", AxValue::Number(value)) => Ok(AxValue::Float(
+            AxFloat::new(value as f64).expect("i64 is always a finite f64"),
+        )),
+        ("f64", AxValue::Float(value)) => Ok(AxValue::Float(value)),
         (_, AxValue::Null) if field.optional => Ok(AxValue::Null),
         (_, value) => Err(PreviewError::Runtime {
             message: format!(
@@ -2525,6 +2540,10 @@ fn coerce_preview_default_input_value(
     match (rust_ty, value) {
         ("bool", AxValue::Bool(value)) => Ok(AxValue::Bool(value)),
         ("i64" | "u64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        ("f64", AxValue::Number(value)) => Ok(AxValue::Float(
+            AxFloat::new(value as f64).expect("i64 is always a finite f64"),
+        )),
+        ("f64", AxValue::Float(value)) => Ok(AxValue::Float(value)),
         ("String", AxValue::String(value)) => Ok(AxValue::String(value)),
         ("String", value) => Ok(AxValue::String(value.as_string())),
         (_, value) => Err(PreviewError::Runtime {
@@ -2566,6 +2585,15 @@ fn coerce_preview_input_value(
                     message: format!("input `{field_name}` exceeded Axonyx preview number range"),
                 })
         }
+        "f64" => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(AxFloat::new)
+            .map(AxValue::Float)
+            .ok_or_else(|| PreviewError::Runtime {
+                message: format!("input `{field_name}` expected finite f64 but received `{value}`"),
+            }),
         _ => Ok(AxValue::String(value)),
     }
 }
@@ -2575,6 +2603,7 @@ fn preview_value_type_name(value: &AxValue) -> &'static str {
         AxValue::Null => "Null",
         AxValue::String(_) => "String",
         AxValue::Number(_) => "Number",
+        AxValue::Float(_) => "Float",
         AxValue::Bool(_) => "Bool",
         AxValue::Record(_) => "Record",
         AxValue::List(_) => "List",
@@ -2912,6 +2941,9 @@ fn preview_value_to_json(value: &AxValue) -> serde_json::Value {
         AxValue::Null => serde_json::Value::Null,
         AxValue::String(value) => serde_json::Value::String(value.clone()),
         AxValue::Number(value) => serde_json::Value::Number((*value).into()),
+        AxValue::Float(value) => serde_json::Number::from_f64(value.get())
+            .map(serde_json::Value::Number)
+            .expect("AxFloat always contains a finite value"),
         AxValue::Bool(value) => serde_json::Value::Bool(*value),
         AxValue::Record(fields) => serde_json::Value::Object(
             fields
@@ -3537,6 +3569,45 @@ fn ax_state_bridge_script() -> &'static str {
   const maxStateValueBytes = 64 * 1024;
   const valueFrameVersion = 1;
 
+  const validDateValue = (value) => {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) return false;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    if (year === 0 || month < 1 || month > 12) return false;
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const maxDay = month === 2 ? (leap ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
+    return day >= 1 && day <= maxDay;
+  };
+
+  const validTimeValue = (value) => {
+    const match = /^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?$/.exec(value);
+    return !!match
+      && Number(match[1]) <= 23
+      && Number(match[2]) <= 59
+      && Number(match[3]) <= 59;
+  };
+
+  const validDateTimeValue = (value) => {
+    const match = /^(\d{4}-\d{2}-\d{2})T(.+)(Z|[+-]\d{2}:\d{2})$/.exec(value);
+    if (!match || !validDateValue(match[1]) || !validTimeValue(match[2])) return false;
+    if (match[3] === "Z") return true;
+    return Number(match[3].slice(1, 3)) <= 23 && Number(match[3].slice(4, 6)) <= 59;
+  };
+
+  const validStringLikeValue = (value, type) => {
+    if (typeof value !== "string") return false;
+    if (type === "String") return true;
+    if (type === "Date") return validDateValue(value);
+    if (type === "Time") return validTimeValue(value);
+    if (type === "DateTime") return validDateTimeValue(value);
+    if (type === "Uuid") {
+      return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
+    }
+    return false;
+  };
+
   const unwrapPublicType = (type) => {
     let current = String(type || "Unknown").replace(/\s+/g, "");
     while (current.startsWith("Public<") && current.endsWith(">")) {
@@ -3591,7 +3662,7 @@ fn ax_state_bridge_script() -> &'static str {
     if (depth > maxStateValueDepth) return false;
     type = unwrapPublicType(type);
     if (type === "Unknown" || type === "Json") return !!encodeStateValue(value, type);
-    if (stringLikeTypes.has(type)) return typeof value === "string";
+    if (stringLikeTypes.has(type)) return validStringLikeValue(value, type);
     if (type === "Number" || type === "Float") return typeof value === "number" && Number.isFinite(value);
     if (type === "Int") return typeof value === "number" && Number.isSafeInteger(value);
     if (type === "Bool") return typeof value === "boolean";
@@ -3628,8 +3699,7 @@ fn ax_state_bridge_script() -> &'static str {
         && typeof value === "object"
         && !Array.isArray(value)
         && Object.entries(value).every(([key, item]) => {
-          const keyValid = stringLikeTypes.has(map[0])
-            || map[0] === "String"
+          const keyValid = stringLikeTypes.has(map[0]) && validStringLikeValue(key, map[0])
             || map[0] === "Int" && /^-?\d+$/.test(key)
             || map[0] === "Bool" && /^(true|false)$/.test(key);
           return keyValid && validateStateValueForType(item, map[1], depth + 1);
@@ -4893,6 +4963,7 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
     match expr {
         AxExpr::String(value) => value.clone(),
         AxExpr::Number(value) => value.to_string(),
+        AxExpr::Float(value) => value.get().to_string(),
         AxExpr::Bool(value) => value.to_string(),
         AxExpr::List(items) => {
             let items = items
@@ -5254,6 +5325,19 @@ mod tests {
     use axonyx_core::compile_pipeline;
 
     use super::*;
+
+    #[test]
+    fn preview_inputs_preserve_finite_float_values() {
+        let from_text = coerce_preview_input_value("ratio", "f64", "0.625".to_string())
+            .expect("finite decimal input should coerce");
+        let from_default =
+            coerce_preview_default_input_value("ratio", "f64", &AxRustExpr::new("0.625_f64"))
+                .expect("lowered Float default should evaluate");
+
+        assert!(matches!(from_text, AxValue::Float(value) if value.get() == 0.625));
+        assert!(matches!(from_default, AxValue::Float(value) if value.get() == 0.625));
+        assert!(coerce_preview_input_value("ratio", "f64", "NaN".to_string()).is_err());
+    }
 
     #[test]
     fn renders_compiled_page_ast_with_fresh_loader_values() {

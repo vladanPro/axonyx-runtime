@@ -119,10 +119,13 @@ impl AxType {
 
     pub fn accepts_state_initializer(&self, value: &AxExpr) -> bool {
         match self {
-            Self::String | Self::DateTime | Self::Date | Self::Time | Self::Uuid => {
-                matches!(value, AxExpr::String(_))
+            Self::String => matches!(value, AxExpr::String(_)),
+            Self::DateTime | Self::Date | Self::Time | Self::Uuid => {
+                matches!(value, AxExpr::String(value) if self.accepts_string_literal(value))
             }
-            Self::Number | Self::Int | Self::Float => matches!(value, AxExpr::Number(_)),
+            Self::Number => matches!(value, AxExpr::Number(_) | AxExpr::Float(_)),
+            Self::Int => matches!(value, AxExpr::Number(_)),
+            Self::Float => matches!(value, AxExpr::Number(_) | AxExpr::Float(_)),
             Self::Bool => matches!(value, AxExpr::Bool(_)),
             Self::Bytes => matches!(value, AxExpr::List(items) if items.iter().all(|item| {
                 matches!(item, AxExpr::Number(number) if (0..=255).contains(number))
@@ -131,6 +134,7 @@ impl AxType {
                 value,
                 AxExpr::String(_)
                     | AxExpr::Number(_)
+                    | AxExpr::Float(_)
                     | AxExpr::Bool(_)
                     | AxExpr::List(_)
                     | AxExpr::Object(_)
@@ -162,13 +166,134 @@ impl AxType {
 
     fn accepts_map_key(&self, value: &str) -> bool {
         match self {
-            Self::String | Self::DateTime | Self::Date | Self::Time | Self::Uuid => true,
+            Self::String => true,
+            Self::DateTime | Self::Date | Self::Time | Self::Uuid => {
+                self.accepts_string_literal(value)
+            }
             Self::Int => value.parse::<i64>().is_ok(),
             Self::Bool => matches!(value, "true" | "false"),
             Self::Public(inner) => inner.accepts_map_key(value),
             _ => false,
         }
     }
+
+    fn accepts_string_literal(&self, value: &str) -> bool {
+        match self {
+            Self::String => true,
+            Self::Date => is_valid_date(value),
+            Self::Time => is_valid_time(value),
+            Self::DateTime => is_valid_datetime(value),
+            Self::Uuid => is_valid_uuid(value),
+            Self::Public(inner) => inner.accepts_string_literal(value),
+            _ => false,
+        }
+    }
+}
+
+fn is_valid_date(value: &str) -> bool {
+    if !value.is_ascii()
+        || value.len() != 10
+        || value.as_bytes()[4] != b'-'
+        || value.as_bytes()[7] != b'-'
+    {
+        return false;
+    }
+    let Some(year) = parse_fixed_u32(&value[0..4]) else {
+        return false;
+    };
+    let Some(month) = parse_fixed_u32(&value[5..7]) else {
+        return false;
+    };
+    let Some(day) = parse_fixed_u32(&value[8..10]) else {
+        return false;
+    };
+    if year == 0 || !(1..=12).contains(&month) {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let max_day = match month {
+        2 if leap => 29,
+        2 => 28,
+        4 | 6 | 9 | 11 => 30,
+        _ => 31,
+    };
+    (1..=max_day).contains(&day)
+}
+
+fn is_valid_time(value: &str) -> bool {
+    if !value.is_ascii() {
+        return false;
+    }
+    let (clock, fraction) = value
+        .split_once('.')
+        .map_or((value, None), |(clock, fraction)| (clock, Some(fraction)));
+    if clock.len() != 8 || clock.as_bytes()[2] != b':' || clock.as_bytes()[5] != b':' {
+        return false;
+    }
+    let Some(hour) = parse_fixed_u32(&clock[0..2]) else {
+        return false;
+    };
+    let Some(minute) = parse_fixed_u32(&clock[3..5]) else {
+        return false;
+    };
+    let Some(second) = parse_fixed_u32(&clock[6..8]) else {
+        return false;
+    };
+    hour <= 23
+        && minute <= 59
+        && second <= 59
+        && fraction.is_none_or(|fraction| {
+            (1..=9).contains(&fraction.len()) && fraction.bytes().all(|byte| byte.is_ascii_digit())
+        })
+}
+
+fn is_valid_datetime(value: &str) -> bool {
+    if !value.is_ascii() {
+        return false;
+    }
+    let Some((date, time_and_zone)) = value.split_once('T') else {
+        return false;
+    };
+    if !is_valid_date(date) {
+        return false;
+    }
+    let (time, zone) = if let Some(time) = time_and_zone.strip_suffix('Z') {
+        (time, "Z")
+    } else {
+        let Some(index) = time_and_zone.rfind(['+', '-']) else {
+            return false;
+        };
+        (&time_and_zone[..index], &time_and_zone[index..])
+    };
+    if !is_valid_time(time) {
+        return false;
+    }
+    if zone == "Z" {
+        return true;
+    }
+    zone.len() == 6
+        && matches!(zone.as_bytes()[0], b'+' | b'-')
+        && zone.as_bytes()[3] == b':'
+        && parse_fixed_u32(&zone[1..3]).is_some_and(|hour| hour <= 23)
+        && parse_fixed_u32(&zone[4..6]).is_some_and(|minute| minute <= 59)
+}
+
+fn is_valid_uuid(value: &str) -> bool {
+    value.is_ascii()
+        && value.len() == 36
+        && [8, 13, 18, 23]
+            .into_iter()
+            .all(|index| value.as_bytes()[index] == b'-')
+        && value
+            .bytes()
+            .enumerate()
+            .all(|(index, byte)| [8, 13, 18, 23].contains(&index) || byte.is_ascii_hexdigit())
+}
+
+fn parse_fixed_u32(value: &str) -> Option<u32> {
+    (!value.is_empty() && value.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| value.parse().ok())
+        .flatten()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -317,6 +442,7 @@ impl AxDataContext {
         match expr {
             AxExpr::String(_) => Ok(AxType::String),
             AxExpr::Number(_) => Ok(AxType::Number),
+            AxExpr::Float(_) => Ok(AxType::Float),
             AxExpr::Bool(_) => Ok(AxType::Bool),
             AxExpr::List(items) => self.resolve_list_type(items),
             AxExpr::Object(_) => Ok(AxType::Json),
@@ -896,6 +1022,7 @@ fn format_expr(expr: &AxExpr) -> String {
     match expr {
         AxExpr::String(value) => format!("{value:?}"),
         AxExpr::Number(value) => value.to_string(),
+        AxExpr::Float(value) => value.get().to_string(),
         AxExpr::Bool(value) => value.to_string(),
         AxExpr::List(items) => {
             let items = items.iter().map(format_expr).collect::<Vec<_>>().join(", ");
@@ -1076,6 +1203,41 @@ mod tests {
 
         assert_eq!(int_sum, AxType::Int);
         assert_eq!(mixed_sum, AxType::Float);
+        assert_eq!(
+            context.resolve_expr_type(&AxExpr::float(0.5)),
+            Ok(AxType::Float)
+        );
+    }
+
+    #[test]
+    fn validates_canonical_date_time_and_uuid_literals() {
+        for (ty, valid, invalid) in [
+            (AxType::Date, "2024-02-29", "2023-02-29"),
+            (AxType::Time, "23:59:59.125", "24:00:00"),
+            (
+                AxType::DateTime,
+                "2026-08-23T10:15:30Z",
+                "2026-08-23T10:15:30",
+            ),
+            (
+                AxType::Uuid,
+                "550e8400-e29b-41d4-a716-446655440000",
+                "550e8400e29b41d4a716446655440000",
+            ),
+        ] {
+            assert!(
+                ty.accepts_state_initializer(&AxExpr::string(valid)),
+                "{valid}"
+            );
+            assert!(
+                !ty.accepts_state_initializer(&AxExpr::string(invalid)),
+                "{invalid}"
+            );
+        }
+
+        assert!(AxType::DateTime
+            .accepts_state_initializer(&AxExpr::string("2026-08-23T10:15:30.250+02:00")));
+        assert!(!AxType::Date.accepts_state_initializer(&AxExpr::string("é026-08-23")));
     }
 
     #[test]

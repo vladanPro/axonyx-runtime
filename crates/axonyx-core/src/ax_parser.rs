@@ -473,7 +473,55 @@ pub(crate) fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseErro
         });
     }
 
+    if let Some(number) = parse_numeric_literal(input, line) {
+        return number;
+    }
+
     parse_operator_expr(input, line)
+}
+
+fn parse_numeric_literal(input: &str, line: usize) -> Option<Result<AxExpr, AxParseError>> {
+    let unsigned = input.strip_prefix('-').unwrap_or(input);
+    if unsigned.is_empty() || !unsigned.as_bytes()[0].is_ascii_digit() {
+        return None;
+    }
+
+    if unsigned.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Some(input.parse::<i64>().map(AxExpr::number).map_err(|_| {
+            AxParseError::InvalidExpression {
+                line,
+                message: format!("integer literal `{input}` is outside the Int range"),
+            }
+        }));
+    }
+
+    if unsigned
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || byte == b'.')
+    {
+        let mut parts = unsigned.split('.');
+        let whole = parts.next().unwrap_or_default();
+        let fraction = parts.next().unwrap_or_default();
+        if whole.is_empty() || fraction.is_empty() || parts.next().is_some() {
+            return Some(Err(AxParseError::InvalidExpression {
+                line,
+                message: format!("invalid decimal Float literal `{input}`"),
+            }));
+        }
+        return Some(
+            input
+                .parse::<f64>()
+                .ok()
+                .and_then(AxFloat::new)
+                .map(AxExpr::Float)
+                .ok_or_else(|| AxParseError::InvalidExpression {
+                    line,
+                    message: format!("Float literal `{input}` must be finite"),
+                }),
+        );
+    }
+
+    None
 }
 
 fn parse_operator_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
@@ -504,6 +552,9 @@ fn parse_binary_expr(input: &str, line: usize, min_precedence: u8) -> Result<AxE
 
 fn parse_unary_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
     let input = input.trim();
+    if let Some(number) = parse_numeric_literal(input, line) {
+        return number;
+    }
     if let Some(rest) = input.strip_prefix('!') {
         let rest = rest.trim();
         if rest.is_empty() || rest.starts_with('=') {
@@ -1408,6 +1459,23 @@ page Home
                 AxExpr::binary(AxBinaryOp::Mul, AxExpr::number(1), AxExpr::number(2)),
             )
         );
+    }
+
+    #[test]
+    fn parses_decimal_float_literals_without_erasing_ints() {
+        assert_eq!(parse_expr("12", 1).unwrap(), AxExpr::number(12));
+        assert_eq!(parse_expr("12.5", 1).unwrap(), AxExpr::float(12.5));
+        assert_eq!(parse_expr("-0.25", 1).unwrap(), AxExpr::float(-0.25));
+        assert_eq!(
+            parse_expr("price + 0.5", 1).unwrap(),
+            AxExpr::binary(AxBinaryOp::Add, AxExpr::ident("price"), AxExpr::float(0.5),)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_or_overflowing_numeric_literals() {
+        assert!(parse_expr("1.2.3", 7).is_err());
+        assert!(parse_expr("9223372036854775808", 7).is_err());
     }
 
     #[test]

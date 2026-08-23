@@ -14,6 +14,7 @@ pub enum AxValue {
     Null,
     String(String),
     Number(i64),
+    Float(AxFloat),
     Bool(bool),
     Record(BTreeMap<String, AxValue>),
     List(Vec<AxValue>),
@@ -37,6 +38,7 @@ impl AxValue {
             AxValue::Null => String::new(),
             AxValue::String(value) => value.clone(),
             AxValue::Number(value) => value.to_string(),
+            AxValue::Float(value) => value.get().to_string(),
             AxValue::Bool(value) => value.to_string(),
             AxValue::Record(_) => "[record]".to_string(),
             AxValue::List(_) => "[list]".to_string(),
@@ -59,6 +61,12 @@ impl From<String> for AxValue {
 impl From<i64> for AxValue {
     fn from(value: i64) -> Self {
         AxValue::Number(value)
+    }
+}
+
+impl From<f64> for AxValue {
+    fn from(value: f64) -> Self {
+        AxValue::Float(AxFloat::new(value).expect("AxValue requires a finite Float"))
     }
 }
 
@@ -789,6 +797,7 @@ fn eval_expr(
     match expr {
         AxExpr::String(value) => Ok(AxValue::String(value.clone())),
         AxExpr::Number(value) => Ok(AxValue::Number(*value)),
+        AxExpr::Float(value) => Ok(AxValue::Float(*value)),
         AxExpr::Bool(value) => Ok(AxValue::Bool(*value)),
         AxExpr::List(items) => items
             .iter()
@@ -910,6 +919,9 @@ fn eval_unary_expr(op: AxUnaryOp, value: AxValue) -> Result<AxValue, AxLowerErro
         AxUnaryOp::Not => Ok(AxValue::Bool(!is_truthy(&value))),
         AxUnaryOp::Neg => match value {
             AxValue::Number(value) => Ok(AxValue::Number(-value)),
+            AxValue::Float(value) => Ok(AxValue::Float(
+                AxFloat::new(-value.get()).expect("negating a finite Float stays finite"),
+            )),
             _ => Err(AxLowerError::UnsupportedExpression {
                 message: "unary `-` expects a number".to_string(),
             }),
@@ -925,20 +937,53 @@ fn eval_binary_expr(
     match op {
         AxBinaryOp::Add => match (left, right) {
             (AxValue::Number(left), AxValue::Number(right)) => Ok(AxValue::Number(left + right)),
+            (AxValue::Float(left), AxValue::Float(right)) => {
+                finite_float_value(left.get() + right.get(), "`+`")
+            }
+            (AxValue::Number(left), AxValue::Float(right)) => {
+                finite_float_value(left as f64 + right.get(), "`+`")
+            }
+            (AxValue::Float(left), AxValue::Number(right)) => {
+                finite_float_value(left.get() + right as f64, "`+`")
+            }
             (left, right) => Ok(AxValue::String(format!(
                 "{}{}",
                 left.as_string(),
                 right.as_string()
             ))),
         },
-        AxBinaryOp::Sub => eval_number_binary(left, right, |left, right| left - right, "`-`"),
-        AxBinaryOp::Mul => eval_number_binary(left, right, |left, right| left * right, "`*`"),
-        AxBinaryOp::Div => {
-            eval_checked_number_binary(left, right, |left, right| left / right, "`/`", true)
-        }
-        AxBinaryOp::Rem => {
-            eval_checked_number_binary(left, right, |left, right| left % right, "`%`", true)
-        }
+        AxBinaryOp::Sub => eval_numeric_binary(
+            left,
+            right,
+            |left, right| left - right,
+            |left, right| left - right,
+            "`-`",
+            false,
+        ),
+        AxBinaryOp::Mul => eval_numeric_binary(
+            left,
+            right,
+            |left, right| left * right,
+            |left, right| left * right,
+            "`*`",
+            false,
+        ),
+        AxBinaryOp::Div => eval_numeric_binary(
+            left,
+            right,
+            |left, right| left / right,
+            |left, right| left / right,
+            "`/`",
+            true,
+        ),
+        AxBinaryOp::Rem => eval_numeric_binary(
+            left,
+            right,
+            |left, right| left % right,
+            |left, right| left % right,
+            "`%`",
+            true,
+        ),
         AxBinaryOp::Eq => Ok(AxValue::Bool(left == right)),
         AxBinaryOp::Ne => Ok(AxValue::Bool(left != right)),
         AxBinaryOp::Gt => eval_compare_binary(left, right, |ordering| ordering.is_gt(), "`>`"),
@@ -957,33 +1002,46 @@ fn eval_binary_expr(
     }
 }
 
-fn eval_number_binary(
+fn eval_numeric_binary(
     left: AxValue,
     right: AxValue,
-    operation: impl FnOnce(i64, i64) -> i64,
-    operator: &str,
-) -> Result<AxValue, AxLowerError> {
-    eval_checked_number_binary(left, right, operation, operator, false)
-}
-
-fn eval_checked_number_binary(
-    left: AxValue,
-    right: AxValue,
-    operation: impl FnOnce(i64, i64) -> i64,
+    int_operation: impl FnOnce(i64, i64) -> i64,
+    float_operation: impl FnOnce(f64, f64) -> f64,
     operator: &str,
     reject_zero_right: bool,
 ) -> Result<AxValue, AxLowerError> {
-    let (AxValue::Number(left), AxValue::Number(right)) = (left, right) else {
-        return Err(AxLowerError::UnsupportedExpression {
-            message: format!("{operator} expects numbers"),
-        });
-    };
-    if reject_zero_right && right == 0 {
+    let right_is_zero = matches!(&right, AxValue::Number(0))
+        || matches!(&right, AxValue::Float(value) if value.get() == 0.0);
+    if reject_zero_right && right_is_zero {
         return Err(AxLowerError::UnsupportedExpression {
             message: format!("{operator} cannot use zero as the right operand"),
         });
     }
-    Ok(AxValue::Number(operation(left, right)))
+    match (left, right) {
+        (AxValue::Number(left), AxValue::Number(right)) => {
+            Ok(AxValue::Number(int_operation(left, right)))
+        }
+        (AxValue::Float(left), AxValue::Float(right)) => {
+            finite_float_value(float_operation(left.get(), right.get()), operator)
+        }
+        (AxValue::Number(left), AxValue::Float(right)) => {
+            finite_float_value(float_operation(left as f64, right.get()), operator)
+        }
+        (AxValue::Float(left), AxValue::Number(right)) => {
+            finite_float_value(float_operation(left.get(), right as f64), operator)
+        }
+        _ => Err(AxLowerError::UnsupportedExpression {
+            message: format!("{operator} expects numbers"),
+        }),
+    }
+}
+
+fn finite_float_value(value: f64, operator: &str) -> Result<AxValue, AxLowerError> {
+    AxFloat::new(value)
+        .map(AxValue::Float)
+        .ok_or_else(|| AxLowerError::UnsupportedExpression {
+            message: format!("{operator} produced a non-finite Float"),
+        })
 }
 
 fn eval_compare_binary(
@@ -996,6 +1054,21 @@ fn eval_compare_binary(
         (AxValue::Number(left), AxValue::Number(right)) => {
             Ok(AxValue::Bool(operation(left.cmp(&right))))
         }
+        (AxValue::Float(left), AxValue::Float(right)) => Ok(AxValue::Bool(operation(
+            left.get()
+                .partial_cmp(&right.get())
+                .expect("finite Float values are comparable"),
+        ))),
+        (AxValue::Number(left), AxValue::Float(right)) => Ok(AxValue::Bool(operation(
+            (left as f64)
+                .partial_cmp(&right.get())
+                .expect("finite Float values are comparable"),
+        ))),
+        (AxValue::Float(left), AxValue::Number(right)) => Ok(AxValue::Bool(operation(
+            left.get()
+                .partial_cmp(&(right as f64))
+                .expect("finite Float values are comparable"),
+        ))),
         (AxValue::String(left), AxValue::String(right)) => {
             Ok(AxValue::Bool(operation(left.cmp(&right))))
         }
@@ -1058,6 +1131,7 @@ fn prop_bool(props: &mut BTreeMap<String, AxValue>, names: &[&str]) -> Option<bo
                 AxValue::Bool(value) => value,
                 AxValue::String(value) => matches!(value.as_str(), "true" | "1" | "yes" | "on"),
                 AxValue::Number(value) => value != 0,
+                AxValue::Float(value) => value.get() != 0.0,
                 AxValue::Null => false,
                 AxValue::Record(fields) => !fields.is_empty(),
                 AxValue::List(items) => !items.is_empty(),
@@ -1072,6 +1146,7 @@ fn is_truthy(value: &AxValue) -> bool {
         AxValue::Null => false,
         AxValue::String(value) => !value.is_empty(),
         AxValue::Number(value) => *value != 0,
+        AxValue::Float(value) => value.get() != 0.0,
         AxValue::Bool(value) => *value,
         AxValue::Record(fields) => !fields.is_empty(),
         AxValue::List(items) => !items.is_empty(),
@@ -2137,6 +2212,24 @@ component ThemePicker() {
         };
 
         assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn evaluates_mixed_int_and_float_arithmetic_as_float() {
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let value = eval_expr(
+            &AxExpr::binary(
+                AxBinaryOp::Mul,
+                AxExpr::binary(AxBinaryOp::Add, AxExpr::number(2), AxExpr::float(0.5)),
+                AxExpr::float(2.0),
+            ),
+            &[],
+            &BTreeMap::new(),
+            &resolver,
+        )
+        .expect("mixed numeric expression should evaluate");
+
+        assert_eq!(value, AxValue::from(5.0));
     }
 
     #[test]
