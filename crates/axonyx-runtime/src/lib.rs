@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 
 use axonyx_core::ax_ast_prelude::{
-    AxBinaryOp, AxBody, AxComponent, AxDocument, AxExpr, AxHead, AxHeadTag, AxPipeline,
+    AxBinaryOp, AxBody, AxComponent, AxDocument, AxExpr, AxFloat, AxHead, AxHeadTag, AxPipeline,
     AxPipelineStage, AxProp, AxStatement, AxUnaryOp,
 };
 use axonyx_core::ax_backend_lowering::AxBackendLowerError;
@@ -29,12 +29,13 @@ use serde_json::json;
 use thiserror::Error;
 
 pub use backend::prelude as backend_prelude;
+pub use serde;
 pub use server::prelude as server_prelude;
 
-pub const AX_STATE_WASM_PATH: &str = "/_ax/runtime/axonyx-state-v1.wasm";
+pub const AX_STATE_WASM_PATH: &str = "/_ax/runtime/axonyx-state-v2.wasm";
 
 pub fn ax_state_wasm_bytes() -> &'static [u8] {
-    include_bytes!("../assets/axonyx-state-v1.wasm")
+    include_bytes!("../assets/axonyx-state-v2.wasm")
 }
 
 pub fn route_hooks_from_handler_plan(handler: &AxHandlerPlan) -> Vec<server::AxRouteHook> {
@@ -1066,6 +1067,7 @@ fn preview_value_cache_key(value: &AxValue) -> String {
         AxValue::Null => "null".to_string(),
         AxValue::String(value) => format!("s:{value:?}"),
         AxValue::Number(value) => format!("n:{value}"),
+        AxValue::Float(value) => format!("f:{:?}", value.get()),
         AxValue::Bool(value) => format!("b:{value}"),
         AxValue::Record(fields) => {
             let fields = fields
@@ -1735,6 +1737,7 @@ fn preview_require_passes(value: &AxValue) -> bool {
         AxValue::Bool(value) => *value,
         AxValue::String(value) => !value.is_empty(),
         AxValue::Number(_) => true,
+        AxValue::Float(_) => true,
         AxValue::Record(fields) => !fields.is_empty(),
         AxValue::List(items) => !items.is_empty(),
     }
@@ -2086,6 +2089,13 @@ fn eval_preview_expr_with_functions(
 
     if let Ok(value) = code.parse::<i64>() {
         return Ok(AxValue::Number(value));
+    }
+    if let Some(value) = code.strip_suffix("_f64") {
+        if let Ok(value) = value.parse::<f64>() {
+            if let Some(value) = AxFloat::new(value) {
+                return Ok(AxValue::Float(value));
+            }
+        }
     }
 
     if let Some(key) = parse_preview_env_call(code, "public") {
@@ -2473,12 +2483,15 @@ fn coerce_preview_loader_input_value(
 ) -> Result<AxValue, PreviewError> {
     match (rust_ty, value) {
         ("String", AxValue::String(value)) => Ok(AxValue::String(value)),
-        ("String", value @ (AxValue::Number(_) | AxValue::Bool(_))) => {
+        ("String", value @ (AxValue::Number(_) | AxValue::Float(_) | AxValue::Bool(_))) => {
             Ok(AxValue::String(value.as_string()))
         }
         ("bool", AxValue::Bool(value)) => Ok(AxValue::Bool(value)),
         ("i64" | "u64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
-        ("f64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        ("f64", AxValue::Number(value)) => Ok(AxValue::Float(
+            AxFloat::new(value as f64).expect("i64 is always a finite f64"),
+        )),
+        ("f64", AxValue::Float(value)) => Ok(AxValue::Float(value)),
         (_, AxValue::Null) => Ok(AxValue::Null),
         (_, value) => Err(PreviewError::Runtime {
             message: format!(
@@ -2495,12 +2508,15 @@ fn coerce_preview_function_input_value(
 ) -> Result<AxValue, PreviewError> {
     match (field.rust_ty.as_str(), value) {
         ("String", AxValue::String(value)) => Ok(AxValue::String(value)),
-        ("String", value @ (AxValue::Number(_) | AxValue::Bool(_))) => {
+        ("String", value @ (AxValue::Number(_) | AxValue::Float(_) | AxValue::Bool(_))) => {
             Ok(AxValue::String(value.as_string()))
         }
         ("bool", AxValue::Bool(value)) => Ok(AxValue::Bool(value)),
         ("i64" | "u64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
-        ("f64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        ("f64", AxValue::Number(value)) => Ok(AxValue::Float(
+            AxFloat::new(value as f64).expect("i64 is always a finite f64"),
+        )),
+        ("f64", AxValue::Float(value)) => Ok(AxValue::Float(value)),
         (_, AxValue::Null) if field.optional => Ok(AxValue::Null),
         (_, value) => Err(PreviewError::Runtime {
             message: format!(
@@ -2524,6 +2540,10 @@ fn coerce_preview_default_input_value(
     match (rust_ty, value) {
         ("bool", AxValue::Bool(value)) => Ok(AxValue::Bool(value)),
         ("i64" | "u64", AxValue::Number(value)) => Ok(AxValue::Number(value)),
+        ("f64", AxValue::Number(value)) => Ok(AxValue::Float(
+            AxFloat::new(value as f64).expect("i64 is always a finite f64"),
+        )),
+        ("f64", AxValue::Float(value)) => Ok(AxValue::Float(value)),
         ("String", AxValue::String(value)) => Ok(AxValue::String(value)),
         ("String", value) => Ok(AxValue::String(value.as_string())),
         (_, value) => Err(PreviewError::Runtime {
@@ -2565,6 +2585,15 @@ fn coerce_preview_input_value(
                     message: format!("input `{field_name}` exceeded Axonyx preview number range"),
                 })
         }
+        "f64" => value
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(AxFloat::new)
+            .map(AxValue::Float)
+            .ok_or_else(|| PreviewError::Runtime {
+                message: format!("input `{field_name}` expected finite f64 but received `{value}`"),
+            }),
         _ => Ok(AxValue::String(value)),
     }
 }
@@ -2574,6 +2603,7 @@ fn preview_value_type_name(value: &AxValue) -> &'static str {
         AxValue::Null => "Null",
         AxValue::String(_) => "String",
         AxValue::Number(_) => "Number",
+        AxValue::Float(_) => "Float",
         AxValue::Bool(_) => "Bool",
         AxValue::Record(_) => "Record",
         AxValue::List(_) => "List",
@@ -2911,6 +2941,9 @@ fn preview_value_to_json(value: &AxValue) -> serde_json::Value {
         AxValue::Null => serde_json::Value::Null,
         AxValue::String(value) => serde_json::Value::String(value.clone()),
         AxValue::Number(value) => serde_json::Value::Number((*value).into()),
+        AxValue::Float(value) => serde_json::Number::from_f64(value.get())
+            .map(serde_json::Value::Number)
+            .expect("AxFloat always contains a finite value"),
         AxValue::Bool(value) => serde_json::Value::Bool(*value),
         AxValue::Record(fields) => serde_json::Value::Object(
             fields
@@ -3479,6 +3512,7 @@ fn ax_state_bridge_script() -> &'static str {
   const types = new Map();
   const metadata = new Map();
   const metadataByName = new Map();
+  const typeSchemas = new Map();
   const aliases = new Map();
   const readBindings = new Map();
   const subscribers = new Map();
@@ -3494,8 +3528,10 @@ fn ax_state_bridge_script() -> &'static str {
   const pendingStorageWrites = new Map();
   let storageManifestReady = false;
   let wasmExecutor;
-  let wasmTextEncoder;
-  let wasmTextDecoder;
+  let wasmTextEncoder = typeof TextEncoder === "function" ? new TextEncoder() : undefined;
+  let wasmTextDecoder = typeof TextDecoder === "function"
+    ? new TextDecoder("utf-8", { fatal: true })
+    : undefined;
   let executorMode = "js-fallback";
 
   const stateEventProtocol = "ax-state-event/1";
@@ -3526,27 +3562,185 @@ fn ax_state_bridge_script() -> &'static str {
     flushedStorageWrites: 0,
   };
   const localOperationCode = Object.freeze({ set: 0, add: 1, sub: 2, toggle: 3 });
-  const localValueTypeCode = Object.freeze({ String: 0, Number: 1, Bool: 2 });
-  const localOperationsByType = Object.freeze({
-    String: new Set(["set"]),
-    Number: new Set(["set", "add", "sub"]),
-    Bool: new Set(["set", "toggle"]),
-  });
+  const stringLikeTypes = new Set(["String", "DateTime", "Date", "Time", "Uuid"]);
+  const numericTypes = new Set(["Number", "Int", "Float"]);
+  const rejectedClientTypes = new Set(["Never", "Void"]);
+  const maxStateValueDepth = 32;
+  const maxStateValueBytes = 64 * 1024;
+  const valueFrameVersion = 1;
 
-  const loadWasmExecutor = async (url = "/_ax/runtime/axonyx-state-v1.wasm") => {
+  const validDateValue = (value) => {
+    const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
+    if (!match) return false;
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    if (year === 0 || month < 1 || month > 12) return false;
+    const leap = year % 4 === 0 && (year % 100 !== 0 || year % 400 === 0);
+    const maxDay = month === 2 ? (leap ? 29 : 28) : [4, 6, 9, 11].includes(month) ? 30 : 31;
+    return day >= 1 && day <= maxDay;
+  };
+
+  const validTimeValue = (value) => {
+    const match = /^(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?$/.exec(value);
+    return !!match
+      && Number(match[1]) <= 23
+      && Number(match[2]) <= 59
+      && Number(match[3]) <= 59;
+  };
+
+  const validDateTimeValue = (value) => {
+    const match = /^(\d{4}-\d{2}-\d{2})T(.+)(Z|[+-]\d{2}:\d{2})$/.exec(value);
+    if (!match || !validDateValue(match[1]) || !validTimeValue(match[2])) return false;
+    if (match[3] === "Z") return true;
+    return Number(match[3].slice(1, 3)) <= 23 && Number(match[3].slice(4, 6)) <= 59;
+  };
+
+  const validStringLikeValue = (value, type) => {
+    if (typeof value !== "string") return false;
+    if (type === "String") return true;
+    if (type === "Date") return validDateValue(value);
+    if (type === "Time") return validTimeValue(value);
+    if (type === "DateTime") return validDateTimeValue(value);
+    if (type === "Uuid") {
+      return /^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$/.test(value);
+    }
+    return false;
+  };
+
+  const unwrapPublicType = (type) => {
+    let current = String(type || "Unknown").replace(/\s+/g, "");
+    while (current.startsWith("Public<") && current.endsWith(">")) {
+      current = current.slice(7, -1);
+    }
+    return current;
+  };
+
+  const valueTypeCode = (type) => {
+    type = unwrapPublicType(type);
+    if (stringLikeTypes.has(type)) return 0;
+    if (numericTypes.has(type)) return 1;
+    if (type === "Bool") return 2;
+    if (rejectedClientTypes.has(type)
+      || type.startsWith("Secret<")
+      || type.startsWith("Signal<")
+      || type.startsWith("Resource<")) return undefined;
+    return 3;
+  };
+
+  const operationsForType = (type) => {
+    const code = valueTypeCode(type);
+    if (code === 0 || code === 3) return new Set(["set"]);
+    if (code === 1) return new Set(["set", "add", "sub"]);
+    if (code === 2) return new Set(["set", "toggle"]);
+    return undefined;
+  };
+
+  const genericType = (type, name) => {
+    type = unwrapPublicType(type);
+    const prefix = `${name}<`;
+    if (!type.startsWith(prefix) || !type.endsWith(">")) return undefined;
+    const source = type.slice(prefix.length, -1);
+    const args = [];
+    let depth = 0;
+    let start = 0;
+    for (let index = 0; index < source.length; index += 1) {
+      if (source[index] === "<") depth += 1;
+      else if (source[index] === ">") depth -= 1;
+      else if (source[index] === "," && depth === 0) {
+        args.push(source.slice(start, index));
+        start = index + 1;
+      }
+      if (depth < 0) return undefined;
+    }
+    if (depth !== 0) return undefined;
+    args.push(source.slice(start));
+    return args.filter(Boolean);
+  };
+
+  const validateStateValueForType = (value, type, depth = 0) => {
+    if (depth > maxStateValueDepth) return false;
+    type = unwrapPublicType(type);
+    if (type === "Unknown" || type === "Json") return !!encodeStateValue(value, type);
+    if (stringLikeTypes.has(type)) return validStringLikeValue(value, type);
+    if (type === "Number" || type === "Float") return typeof value === "number" && Number.isFinite(value);
+    if (type === "Int") return typeof value === "number" && Number.isSafeInteger(value);
+    if (type === "Bool") return typeof value === "boolean";
+    if (type === "Bytes") {
+      return (Array.isArray(value) || value instanceof Uint8Array)
+        && Array.from(value).every((item) => Number.isInteger(item) && item >= 0 && item <= 255);
+    }
+    const optional = genericType(type, "Optional");
+    if (optional?.length === 1) {
+      return value === null || validateStateValueForType(value, optional[0], depth + 1);
+    }
+    const list = genericType(type, "List");
+    if (list?.length === 1) {
+      return Array.isArray(value)
+        && value.every((item) => validateStateValueForType(item, list[0], depth + 1));
+    }
+    const set = genericType(type, "Set");
+    if (set?.length === 1 && Array.isArray(value)) {
+      const encoded = value.map((item) => encodeStateValue(item, set[0]));
+      return encoded.every(Boolean)
+        && encoded.every((item, index) => encoded.findIndex((candidate) => (
+          candidate.length === item.length
+            && candidate.every((byte, byteIndex) => byte === item[byteIndex])
+        )) === index)
+        && value.every((item) => validateStateValueForType(item, set[0], depth + 1));
+    }
+    if (type.endsWith("[]")) {
+      return Array.isArray(value)
+        && value.every((item) => validateStateValueForType(item, type.slice(0, -2), depth + 1));
+    }
+    const map = genericType(type, "Map");
+    if (map?.length === 2) {
+      return !!value
+        && typeof value === "object"
+        && !Array.isArray(value)
+        && Object.entries(value).every(([key, item]) => {
+          const keyValid = stringLikeTypes.has(map[0]) && validStringLikeValue(key, map[0])
+            || map[0] === "Int" && /^-?\d+$/.test(key)
+            || map[0] === "Bool" && /^(true|false)$/.test(key);
+          return keyValid && validateStateValueForType(item, map[1], depth + 1);
+        });
+    }
+    const result = genericType(type, "Result");
+    if (result?.length === 2 && value && typeof value === "object" && !Array.isArray(value)) {
+      const keys = Object.keys(value);
+      return keys.length === 1
+        && (keys[0] === "Ok"
+          ? validateStateValueForType(value.Ok, result[0], depth + 1)
+          : keys[0] === "Err" && validateStateValueForType(value.Err, result[1], depth + 1));
+    }
+    const schema = typeSchemas.get(type);
+    if (!schema || !value || typeof value !== "object" || Array.isArray(value)) return false;
+    const fields = new Map((schema.fields || []).map((field) => [field.name, field]));
+    if (Object.keys(value).some((key) => !fields.has(key))) return false;
+    return (schema.fields || []).every((field) => {
+      if (!Object.hasOwn(value, field.name)) return !!field.optional;
+      const fieldType = field.optional ? `Optional<${field.ty}>` : field.ty;
+      return validateStateValueForType(value[field.name], fieldType, depth + 1);
+    });
+  };
+
+  const loadWasmExecutor = async (url = "/_ax/runtime/axonyx-state-v2.wasm") => {
     if (!window.WebAssembly || !window.fetch) return false;
     try {
       const response = await fetch(url, { cache: "force-cache" });
       if (!response.ok) return false;
       const module = await WebAssembly.instantiate(await response.arrayBuffer(), {});
       const exports = module.instance?.exports;
-      if (!exports || exports.ax_state_abi_version?.() !== 2) return false;
+      if (!exports || exports.ax_state_abi_version?.() !== 3) return false;
       if (typeof exports.ax_state_supports_operation !== "function") return false;
       if (typeof exports.ax_state_apply_number !== "function") return false;
       if (typeof exports.ax_state_apply_bool !== "function") return false;
       if (typeof exports.ax_state_apply_string !== "function") return false;
       if (typeof exports.ax_state_string_buffer_ptr !== "function") return false;
       if (typeof exports.ax_state_string_buffer_capacity !== "function") return false;
+      if (typeof exports.ax_state_apply_value !== "function") return false;
+      if (typeof exports.ax_state_value_buffer_ptr !== "function") return false;
+      if (typeof exports.ax_state_value_buffer_capacity !== "function") return false;
       if (!(exports.memory instanceof WebAssembly.Memory)) return false;
       wasmExecutor = exports;
       wasmTextEncoder = new TextEncoder();
@@ -3568,14 +3762,182 @@ fn ax_state_bridge_script() -> &'static str {
   };
 
   const castValue = (value, type) => {
+    type = unwrapPublicType(type);
     if (type === "Bool") {
       return value === true || value === "true" || value === "on";
     }
-    if (type === "Number") {
+    if (numericTypes.has(type)) {
       const next = Number(value);
-      return Number.isFinite(next) ? next : value;
+      if (!Number.isFinite(next)) return value;
+      return type === "Int" && !Number.isSafeInteger(next) ? value : next;
     }
-    return value == null ? "" : String(value);
+    if (stringLikeTypes.has(type)) return value == null ? "" : String(value);
+    if (typeof value === "string") {
+      try { return JSON.parse(value); } catch (_) { return value; }
+    }
+    return value;
+  };
+
+  const encodeStateValue = (value, type = "Unknown") => {
+    if (!wasmTextEncoder) return undefined;
+    const seen = new WeakSet();
+    const frame = (tag, payload = []) => Uint8Array.from([65, 88, valueFrameVersion, tag, ...payload]);
+    const u32 = (value) => {
+      const bytes = new Uint8Array(4);
+      new DataView(bytes.buffer).setUint32(0, value, true);
+      return Array.from(bytes);
+    };
+    const f64 = (value) => {
+      const bytes = new Uint8Array(8);
+      new DataView(bytes.buffer).setFloat64(0, value, true);
+      return Array.from(bytes);
+    };
+    const i64 = (value) => {
+      const bytes = new Uint8Array(8);
+      new DataView(bytes.buffer).setBigInt64(0, BigInt(value), true);
+      return Array.from(bytes);
+    };
+    const visit = (current, depth, typeHint) => {
+      if (depth > maxStateValueDepth) throw new Error("state-value-too-deep");
+      if (current === null) return frame(0);
+      if (current === undefined) throw new Error("undefined-state-value");
+      if (typeof current === "string") {
+        const bytes = wasmTextEncoder.encode(current);
+        return frame(1, [...u32(bytes.length), ...bytes]);
+      }
+      if (typeof current === "boolean") return frame(2, [current ? 1 : 0]);
+      if (typeof current === "number") {
+        if (!Number.isFinite(current)) throw new Error("invalid-state-number");
+        return Number.isSafeInteger(current)
+          ? frame(4, i64(current))
+          : frame(3, f64(current));
+      }
+      if (current instanceof Uint8Array || unwrapPublicType(typeHint) === "Bytes") {
+        const bytes = current instanceof Uint8Array ? current : Uint8Array.from(current);
+        return frame(5, [...u32(bytes.length), ...bytes]);
+      }
+      if (current instanceof Set) current = Array.from(current.values());
+      if (current instanceof Map) current = Object.fromEntries(current.entries());
+      if (Array.isArray(current)) {
+        if (seen.has(current)) throw new Error("cyclic-state-value");
+        seen.add(current);
+        const values = current.map((item) => visit(item, depth + 1, "Unknown"));
+        seen.delete(current);
+        return frame(6, [...u32(values.length), ...values.flatMap((value) => Array.from(value))]);
+      }
+      if (typeof current === "object") {
+        if (seen.has(current)) throw new Error("cyclic-state-value");
+        seen.add(current);
+        const entries = Object.keys(current).sort().map((key) => {
+          const keyBytes = wasmTextEncoder.encode(key);
+          const encoded = visit(current[key], depth + 1, "Unknown");
+          return [...u32(keyBytes.length), ...keyBytes, ...encoded];
+        });
+        seen.delete(current);
+        return frame(7, [...u32(entries.length), ...entries.flat()]);
+      }
+      throw new Error("unsupported-state-value");
+    };
+
+    try {
+      const bytes = visit(value, 0, type);
+      return bytes.length <= maxStateValueBytes ? bytes : undefined;
+    } catch (_) {
+      return undefined;
+    }
+  };
+
+  const decodeStateValue = (bytes) => {
+    if (!wasmTextDecoder) return undefined;
+    const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+    const read = (offset, length) => {
+      if (offset < 0 || length < 0 || offset + length > bytes.length) throw new Error("truncated-state-value");
+      return bytes.subarray(offset, offset + length);
+    };
+    const visit = (start, depth) => {
+      if (depth > maxStateValueDepth || start + 4 > bytes.length) throw new Error("invalid-state-value");
+      if (bytes[start] !== 65 || bytes[start + 1] !== 88 || bytes[start + 2] !== valueFrameVersion) {
+        throw new Error("invalid-state-value-frame");
+      }
+      const tag = bytes[start + 3];
+      let cursor = start + 4;
+      const readU32 = () => {
+        if (cursor + 4 > bytes.length) throw new Error("truncated-state-value");
+        const value = view.getUint32(cursor, true);
+        cursor += 4;
+        return value;
+      };
+      if (tag === 0) return { value: null, cursor };
+      if (tag === 1 || tag === 5) {
+        const length = readU32();
+        const value = read(cursor, length);
+        cursor += length;
+        return { value: tag === 1 ? wasmTextDecoder.decode(value) : Array.from(value), cursor };
+      }
+      if (tag === 2) {
+        const value = read(cursor, 1)[0];
+        if (value > 1) throw new Error("invalid-state-bool");
+        return { value: value === 1, cursor: cursor + 1 };
+      }
+      if (tag === 3) {
+        if (cursor + 8 > bytes.length) throw new Error("truncated-state-value");
+        const value = view.getFloat64(cursor, true);
+        if (!Number.isFinite(value)) throw new Error("invalid-state-number");
+        return { value, cursor: cursor + 8 };
+      }
+      if (tag === 4) {
+        if (cursor + 8 > bytes.length) throw new Error("truncated-state-value");
+        const raw = view.getBigInt64(cursor, true);
+        const value = Number(raw);
+        if (!Number.isSafeInteger(value)) throw new Error("unsafe-state-int");
+        return { value, cursor: cursor + 8 };
+      }
+      if (tag === 6) {
+        const count = readU32();
+        const value = [];
+        for (let index = 0; index < count; index += 1) {
+          const nested = visit(cursor, depth + 1);
+          value.push(nested.value);
+          cursor = nested.cursor;
+        }
+        return { value, cursor };
+      }
+      if (tag === 7) {
+        const count = readU32();
+        const value = {};
+        for (let index = 0; index < count; index += 1) {
+          const keyLength = readU32();
+          const key = wasmTextDecoder.decode(read(cursor, keyLength));
+          cursor += keyLength;
+          if (["__proto__", "prototype", "constructor"].includes(key) || Object.hasOwn(value, key)) {
+            throw new Error("invalid-state-object-key");
+          }
+          const nested = visit(cursor, depth + 1);
+          value[key] = nested.value;
+          cursor = nested.cursor;
+        }
+        return { value, cursor };
+      }
+      throw new Error("unknown-state-value-tag");
+    };
+
+    try {
+      const decoded = visit(0, 0);
+      return decoded.cursor === bytes.length ? decoded.value : undefined;
+    } catch (_) {
+      return undefined;
+    }
+  };
+
+  const stateValuesEqual = (left, right, type) => {
+    if (Object.is(left, right)) return true;
+    if (valueTypeCode(type) !== 3) return false;
+    const leftBytes = encodeStateValue(left, type);
+    const rightBytes = encodeStateValue(right, type);
+    return !!leftBytes
+      && !!rightBytes
+      && leftBytes.length === rightBytes.length
+      && leftBytes.every((value, index) => value === rightBytes[index]);
   };
 
   const writeValue = (node, target, value) => {
@@ -3677,7 +4039,7 @@ fn ax_state_bridge_script() -> &'static str {
     if (!key || keyBytes === undefined || keyBytes > maxStorageKeyBytes || /[\u0000-\u001f\u007f]/.test(key)) {
       return rejectStorageCapability(signal, scope, "invalid-key");
     }
-    if (!Object.hasOwn(localOperationsByType, type)) {
+    if (!operationsForType(type)) {
       return rejectStorageCapability(signal, scope, "unsupported-type");
     }
 
@@ -3704,17 +4066,24 @@ fn ax_state_bridge_script() -> &'static str {
     if (!envelope || typeof envelope !== "object") return { ok: false, reason: "invalid-envelope" };
     if (envelope.protocol !== storageValueProtocol) return { ok: false, reason: "invalid-value-protocol" };
     if (envelope.type !== capability.type) return { ok: false, reason: "stored-type-mismatch" };
-    if (capability.type === "String") {
+    const normalizedType = unwrapPublicType(capability.type);
+    if (stringLikeTypes.has(normalizedType)) {
       const bytes = typeof envelope.value === "string" ? utf8ByteLength(envelope.value) : undefined;
       if (bytes === undefined || bytes > maxStateEventStringBytes) {
         return { ok: false, reason: "invalid-string-value" };
       }
-    } else if (capability.type === "Number") {
+    } else if (numericTypes.has(normalizedType)) {
       if (typeof envelope.value !== "number" || !Number.isFinite(envelope.value)) {
         return { ok: false, reason: "invalid-number-value" };
       }
-    } else if (capability.type === "Bool" && typeof envelope.value !== "boolean") {
+      if (normalizedType === "Int" && !Number.isSafeInteger(envelope.value)) {
+        return { ok: false, reason: "invalid-int-value" };
+      }
+    } else if (normalizedType === "Bool" && typeof envelope.value !== "boolean") {
       return { ok: false, reason: "invalid-bool-value" };
+    } else if (!validateStateValueForType(envelope.value, normalizedType)
+      || !encodeStateValue(envelope.value, normalizedType)) {
+      return { ok: false, reason: "invalid-structured-value" };
     }
     return { ok: true, value: envelope.value };
   };
@@ -3797,6 +4166,15 @@ fn ax_state_bridge_script() -> &'static str {
     const value = entry.value;
     if (value && typeof value === "object" && "kind" in value) {
       if (value.kind === "null") return null;
+      if (value.kind === "list" && Array.isArray(value.value)) {
+        return value.value.map((item) => valueFromSnapshot({ value: item }));
+      }
+      if (value.kind === "object" && value.value && typeof value.value === "object") {
+        return Object.fromEntries(
+          Object.entries(value.value).map(([key, item]) => [key, valueFromSnapshot({ value: item })]),
+        );
+      }
+      if (value.kind === "bytes" && Array.isArray(value.value)) return value.value.slice();
       return value.value;
     }
     return value;
@@ -3988,6 +4366,13 @@ fn ax_state_bridge_script() -> &'static str {
     signal = canonicalSignal(signal);
     const type = types.get(signal) || "String";
     const nextValue = castValue(value, type);
+    if (!validateStateValueForType(nextValue, type)) {
+      executorStats.rejectedEvents += 1;
+      window.dispatchEvent(new CustomEvent("axonyx:state-value-rejected", {
+        detail: { protocol: stateEventProtocol, signal, type, source, reason: "type-mismatch" },
+      }));
+      return state.get(signal);
+    }
     state.set(signal, nextValue);
     (bindings.get(signal) || []).forEach((capability) => {
       writeDomCapability(capability, nextValue);
@@ -4009,20 +4394,21 @@ fn ax_state_bridge_script() -> &'static str {
 
   const applyLocalOperation = (op, type, current, operand) => {
     const operation = localOperationCode[op];
-    const valueType = localValueTypeCode[type];
+    const normalizedType = unwrapPublicType(type);
+    const valueType = valueTypeCode(normalizedType);
     const wasmSupportsOperation = wasmExecutor
       && operation !== undefined
       && valueType !== undefined
       && wasmExecutor.ax_state_supports_operation(valueType, operation) === 1;
     if (wasmSupportsOperation) {
-      if (type === "Number" && op !== "toggle") {
+      if (numericTypes.has(normalizedType) && op !== "toggle") {
         const next = wasmExecutor.ax_state_apply_number(operation, Number(current), Number(operand));
-        if (Number.isFinite(next)) {
+        if (Number.isFinite(next) && (normalizedType !== "Int" || Number.isSafeInteger(next))) {
           executorStats.wasmOperations += 1;
           return next;
         }
       }
-      if (type === "Bool" && (op === "set" || op === "toggle")) {
+      if (normalizedType === "Bool" && (op === "set" || op === "toggle")) {
         const next = wasmExecutor.ax_state_apply_bool(
           operation,
           current ? 1 : 0,
@@ -4033,7 +4419,7 @@ fn ax_state_bridge_script() -> &'static str {
           return next !== 0;
         }
       }
-      if (type === "String" && op === "set" && wasmTextEncoder && wasmTextDecoder) {
+      if (stringLikeTypes.has(normalizedType) && op === "set" && wasmTextEncoder && wasmTextDecoder) {
         const bytes = wasmTextEncoder.encode(String(operand));
         const capacity = wasmExecutor.ax_state_string_buffer_capacity();
         const pointer = wasmExecutor.ax_state_string_buffer_ptr();
@@ -4046,6 +4432,25 @@ fn ax_state_bridge_script() -> &'static str {
             );
             executorStats.wasmOperations += 1;
             return next;
+          }
+        }
+      }
+      if (valueType === 3 && op === "set") {
+        const bytes = encodeStateValue(operand, normalizedType);
+        const capacity = wasmExecutor.ax_state_value_buffer_capacity();
+        const pointer = wasmExecutor.ax_state_value_buffer_ptr();
+        if (bytes && bytes.length <= capacity
+          && pointer + bytes.length <= wasmExecutor.memory.buffer.byteLength) {
+          new Uint8Array(wasmExecutor.memory.buffer, pointer, bytes.length).set(bytes);
+          const resultLength = wasmExecutor.ax_state_apply_value(operation, bytes.length) >>> 0;
+          if (resultLength !== 0xffffffff && resultLength <= capacity) {
+            const next = decodeStateValue(
+              new Uint8Array(wasmExecutor.memory.buffer, pointer, resultLength),
+            );
+            if (next !== undefined) {
+              executorStats.wasmOperations += 1;
+              return next;
+            }
           }
         }
       }
@@ -4088,14 +4493,15 @@ fn ax_state_bridge_script() -> &'static str {
       || /[\u0000-\u001f\u007f]/.test(payload.signal)) {
       return { ok: false, reason: "invalid-signal" };
     }
-    if (!Object.hasOwn(localOperationsByType, payload.type)) {
+    const operations = operationsForType(payload.type);
+    if (!operations) {
       return { ok: false, reason: "unsupported-type" };
     }
-    if (!localOperationsByType[payload.type].has(payload.op)) {
+    if (!operations.has(payload.op)) {
       return { ok: false, reason: "unsupported-operation" };
     }
     const registeredType = types.get(payload.signal);
-    if (registeredType && registeredType !== payload.type) {
+    if (registeredType && unwrapPublicType(registeredType) !== unwrapPublicType(payload.type)) {
       return { ok: false, reason: "signal-type-mismatch" };
     }
     if (!["literal", "value", "checked"].includes(payload.valueSource)) {
@@ -4105,23 +4511,32 @@ fn ax_state_bridge_script() -> &'static str {
       return { ok: false, reason: "event-source-mismatch" };
     }
     if (payload.valueSource === "checked"
-      && (payload.type !== "Bool" || typeof payload.value !== "boolean")) {
+      && (unwrapPublicType(payload.type) !== "Bool" || typeof payload.value !== "boolean")) {
       return { ok: false, reason: "checked-type-mismatch" };
     }
     if (payload.valueSource === "value"
-      && !["String", "Number"].includes(payload.type)) {
+      && !(stringLikeTypes.has(unwrapPublicType(payload.type))
+        || numericTypes.has(unwrapPublicType(payload.type)))) {
       return { ok: false, reason: "value-type-mismatch" };
     }
 
     const operand = castValue(payload.value, payload.type);
-    if (payload.type === "Number" && !Number.isFinite(operand)) {
+    const normalizedType = unwrapPublicType(payload.type);
+    if (numericTypes.has(normalizedType) && !Number.isFinite(operand)) {
       return { ok: false, reason: "invalid-number" };
     }
-    if (payload.type === "String") {
+    if (normalizedType === "Int" && !Number.isSafeInteger(operand)) {
+      return { ok: false, reason: "invalid-int" };
+    }
+    if (stringLikeTypes.has(normalizedType)) {
       const bytes = stringByteLength(operand);
       if (bytes === undefined || bytes > maxStateEventStringBytes) {
         return { ok: false, reason: "string-too-large" };
       }
+    } else if (valueTypeCode(normalizedType) === 3
+      && (!validateStateValueForType(operand, normalizedType)
+        || !encodeStateValue(operand, normalizedType))) {
+      return { ok: false, reason: "invalid-structured-value" };
     }
     return { ok: true, operand };
   };
@@ -4146,7 +4561,7 @@ fn ax_state_bridge_script() -> &'static str {
     if (!validation.ok) return rejectStateEvent(payload, validation.reason);
     const initial = castValue(payload.initial, payload.type);
     const current = state.has(payload.signal) ? state.get(payload.signal) : initial;
-    if (payload.op === "set" && Object.is(current, validation.operand)) {
+    if (payload.op === "set" && stateValuesEqual(current, validation.operand, payload.type)) {
       executorStats.dedupedEvents += 1;
       return true;
     }
@@ -4221,6 +4636,11 @@ fn ax_state_bridge_script() -> &'static str {
 
   const hydrateManifest = (manifest, source = "manifest") => {
     if (!manifest || !Array.isArray(manifest.files)) return 0;
+    (manifest.types || []).forEach((schema) => {
+      if (!schema || typeof schema.name !== "string" || !Array.isArray(schema.fields)) return;
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(schema.name)) return;
+      typeSchemas.set(schema.name, schema);
+    });
     let count = 0;
     const pendingStorageCapabilities = [];
     manifest.files.forEach((file) => {
@@ -4385,6 +4805,7 @@ fn ax_state_bridge_script() -> &'static str {
     loadSnapshot,
     meta: (signal) => metadata.get(canonicalSignal(signal)),
     manifest: () => Array.from(metadata.values()),
+    types: () => Array.from(typeSchemas.values()),
     describe,
     capabilities: () => domCapabilityList.map(({ signal, target, type, role }) => ({
       protocol: domCapabilityProtocol,
@@ -4403,6 +4824,8 @@ fn ax_state_bridge_script() -> &'static str {
     snapshot: () => Object.fromEntries(state.entries()),
     runtime: () => executorMode,
     eventProtocol: stateEventProtocol,
+    dispatch: executeStateEventPayload,
+    validateValue: validateStateValueForType,
     validateEventPayload: validateStateEventPayload,
     diagnostics: () => ({
       protocol: stateEventProtocol,
@@ -4540,6 +4963,7 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
     match expr {
         AxExpr::String(value) => value.clone(),
         AxExpr::Number(value) => value.to_string(),
+        AxExpr::Float(value) => value.get().to_string(),
         AxExpr::Bool(value) => value.to_string(),
         AxExpr::List(items) => {
             let items = items
@@ -4548,6 +4972,14 @@ fn head_expr_to_string(expr: &AxExpr) -> String {
                 .collect::<Vec<_>>()
                 .join(", ");
             format!("[{items}]")
+        }
+        AxExpr::Object(fields) => {
+            let fields = fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", head_expr_to_string(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{fields}}}")
         }
         AxExpr::Identifier(value) => value.clone(),
         AxExpr::Unary { op, expr } => {
@@ -4893,6 +5325,19 @@ mod tests {
     use axonyx_core::compile_pipeline;
 
     use super::*;
+
+    #[test]
+    fn preview_inputs_preserve_finite_float_values() {
+        let from_text = coerce_preview_input_value("ratio", "f64", "0.625".to_string())
+            .expect("finite decimal input should coerce");
+        let from_default =
+            coerce_preview_default_input_value("ratio", "f64", &AxRustExpr::new("0.625_f64"))
+                .expect("lowered Float default should evaluate");
+
+        assert!(matches!(from_text, AxValue::Float(value) if value.get() == 0.625));
+        assert!(matches!(from_default, AxValue::Float(value) if value.get() == 0.625));
+        assert!(coerce_preview_input_value("ratio", "f64", "NaN".to_string()).is_err());
+    }
 
     #[test]
     fn renders_compiled_page_ast_with_fresh_loader_values() {
@@ -5271,6 +5716,9 @@ page Home
         assert!(state_html.contains("X-Axonyx-Tab"));
         assert!(state_html.contains("applyPatch"));
         assert!(state_html.contains("hydrateManifest"));
+        assert!(state_html.contains("validateStateValueForType"));
+        assert!(state_html.contains("typeSchemas.set(schema.name, schema)"));
+        assert!(state_html.contains("types: () => Array.from(typeSchemas.values())"));
         assert!(state_html.contains("loadManifest"));
         assert!(state_html.contains("/_ax/state/manifest.json"));
         assert!(state_html.contains("axonyx:state-manifest"));
@@ -5295,7 +5743,8 @@ page Home
         assert!(state_html.contains("ax_state_apply_bool"));
         assert!(state_html.contains("ax_state_apply_string"));
         assert!(state_html.contains("ax_state_supports_operation"));
-        assert!(state_html.contains("exports.ax_state_abi_version?.() !== 2"));
+        assert!(state_html.contains("exports.ax_state_abi_version?.() !== 3"));
+        assert!(state_html.contains("exports.ax_state_apply_value"));
         assert!(state_html.contains("runtime: () => executorMode"));
         assert!(state_html.contains("stateEventProtocol = \"ax-state-event/1\""));
         assert!(state_html.contains("domCapabilityProtocol = \"ax-dom-capability/1\""));
@@ -5323,13 +5772,13 @@ page Home
         assert!(state_html.contains("wasmOperations: executorStats.wasmOperations"));
         assert!(state_html.contains("rejectedEvents: executorStats.rejectedEvents"));
         assert!(state_html.contains("dedupedEvents: executorStats.dedupedEvents"));
-        assert!(
-            state_html.contains("payload.op === \"set\" && Object.is(current, validation.operand)")
-        );
+        assert!(state_html.contains(
+            "payload.op === \"set\" && stateValuesEqual(current, validation.operand, payload.type)"
+        ));
     }
 
     #[test]
-    fn bundled_state_executor_is_a_wasm_v1_module() {
+    fn bundled_state_executor_is_a_wasm_v2_module() {
         let bytes = ax_state_wasm_bytes();
 
         assert!(bytes.starts_with(b"\0asm"));

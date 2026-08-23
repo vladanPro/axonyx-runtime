@@ -1,6 +1,6 @@
 use thiserror::Error;
 
-use crate::ax_ast::prelude::AxExpr;
+use crate::ax_ast::prelude::{AxExpr, AxFloat};
 use crate::ax_backend_ast::prelude::*;
 use crate::ax_query_ast::prelude::*;
 
@@ -30,6 +30,8 @@ pub enum AxBackendParseError {
     InvalidInputSection { line: usize },
     #[error("invalid field declaration at line {line}")]
     InvalidField { line: usize },
+    #[error("invalid type declaration at line {line}")]
+    InvalidTypeDeclaration { line: usize },
     #[error("invalid mutation at line {line}")]
     InvalidMutation { line: usize },
     #[error("invalid assignment at line {line}")]
@@ -94,6 +96,7 @@ struct Parser {
 impl Parser {
     fn parse_document(&mut self) -> Result<AxBackendDocument, AxBackendParseError> {
         let mut imports = Vec::new();
+        let mut types = Vec::new();
         let mut blocks = Vec::new();
 
         while let Some(line) = self.current() {
@@ -112,13 +115,15 @@ impl Parser {
                 return Err(AxBackendParseError::UnexpectedIndentation { line: line.line });
             }
             if line.text.starts_with("type ") || line.text.starts_with("export type ") {
-                self.skip_type_block()?;
+                types.push(self.parse_type_block()?);
                 continue;
             }
             blocks.push(self.parse_block()?);
         }
 
-        Ok(AxBackendDocument::with_imports(imports, blocks))
+        Ok(AxBackendDocument::with_imports_and_types(
+            imports, types, blocks,
+        ))
     }
 
     fn parse_import(&mut self) -> Result<AxBackendImport, AxBackendParseError> {
@@ -335,31 +340,49 @@ impl Parser {
         Err(AxBackendParseError::InvalidBlock { line: line.line })
     }
 
-    fn skip_type_block(&mut self) -> Result<(), AxBackendParseError> {
+    fn parse_type_block(&mut self) -> Result<AxBackendTypeDecl, AxBackendParseError> {
         let line = self.current().expect("type line exists").clone();
-        let rest = line
-            .text
-            .strip_prefix("export type ")
-            .or_else(|| line.text.strip_prefix("type "))
-            .ok_or(AxBackendParseError::InvalidBlock { line: line.line })?;
+        let (rest, exported) = if let Some(rest) = line.text.strip_prefix("export type ") {
+            (rest, true)
+        } else if let Some(rest) = line.text.strip_prefix("type ") {
+            (rest, false)
+        } else {
+            return Err(AxBackendParseError::InvalidTypeDeclaration { line: line.line });
+        };
         let (name, braced) = split_block_brace(rest);
         if !braced || !is_backend_identifier(name.trim()) {
-            return Err(AxBackendParseError::InvalidBlock { line: line.line });
+            return Err(AxBackendParseError::InvalidTypeDeclaration { line: line.line });
         }
 
         self.pos += 1;
+        let mut fields = Vec::new();
         while let Some(current) = self.current() {
             if current.indent == 0 && current.text == "}" {
                 self.pos += 1;
-                return Ok(());
+                return Ok(AxBackendTypeDecl::new(name.trim(), fields, exported));
             }
-            if current.indent == 0 {
-                return Err(AxBackendParseError::InvalidBlock { line: line.line });
+            if current.indent != 2 {
+                return Err(AxBackendParseError::UnexpectedIndentation { line: current.line });
             }
+            let Some((raw_name, raw_ty)) = current.text.split_once(':') else {
+                return Err(AxBackendParseError::InvalidField { line: current.line });
+            };
+            let optional = raw_name.trim().ends_with('?');
+            let field_name = raw_name.trim().trim_end_matches('?').trim();
+            let field_ty = raw_ty.trim().trim_end_matches(',').trim();
+            if !is_backend_identifier(field_name) || field_ty.is_empty() {
+                return Err(AxBackendParseError::InvalidField { line: current.line });
+            }
+            let field_ty = if optional {
+                format!("Optional<{field_ty}>")
+            } else {
+                field_ty.to_string()
+            };
+            fields.push(AxBackendTypeField::new(field_name, field_ty));
             self.pos += 1;
         }
 
-        Err(AxBackendParseError::InvalidBlock { line: line.line })
+        Err(AxBackendParseError::InvalidTypeDeclaration { line: line.line })
     }
 
     fn parse_input_sections(
@@ -1747,6 +1770,11 @@ fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxBackendParseError> {
     if let Ok(value) = input.parse::<i64>() {
         return Ok(AxExpr::number(value));
     }
+    if input.contains('.') {
+        if let Some(value) = input.parse::<f64>().ok().and_then(AxFloat::new) {
+            return Ok(AxExpr::Float(value));
+        }
+    }
 
     if input.starts_with('[') && input.ends_with(']') {
         let items = &input[1..input.len() - 1];
@@ -2173,6 +2201,39 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn retains_exported_backend_type_contracts() {
+        let document = parse_backend_ax(
+            r#"
+export type Post {
+  title: String
+  slug: String
+  summary?: String
+  tags: List<String>
+}
+
+loader PostsList() -> Post[] {
+  return []
+}
+"#,
+        )
+        .expect("backend source should parse");
+
+        assert_eq!(document.types.len(), 1);
+        let contract = &document.types[0];
+        assert_eq!(contract.name, "Post");
+        assert!(contract.exported);
+        assert_eq!(
+            contract.fields,
+            vec![
+                AxBackendTypeField::new("title", "String"),
+                AxBackendTypeField::new("slug", "String"),
+                AxBackendTypeField::new("summary", "Optional<String>"),
+                AxBackendTypeField::new("tags", "List<String>"),
+            ]
+        );
+    }
 
     #[test]
     fn parses_backend_imports_before_blocks() {
@@ -3456,6 +3517,7 @@ action SetLanguage
   input:
     language?: string = "sr"
     count: i64 = 0
+    ratio: Float = 0.625
 
   return input
 "#;
@@ -3473,6 +3535,10 @@ action SetLanguage
         assert_eq!(
             action.input[1],
             AxField::with_default("count", "i64", AxExpr::number(0))
+        );
+        assert_eq!(
+            action.input[2],
+            AxField::with_default("ratio", "Float", AxExpr::float(0.625))
         );
     }
 

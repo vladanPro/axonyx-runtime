@@ -1,6 +1,9 @@
+use std::collections::BTreeMap;
+
 use crate::ax_ast::AxExpr;
 use crate::ax_ast_v2::{AxFileV2, AxStateDeclV2, AxStatePersistenceV2, AxStateStorageScopeV2};
 use crate::ax_parser::parse_expr;
+use crate::ax_types::{AxDataContext, AxType};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -40,6 +43,9 @@ pub enum AxStateValue {
     String(String),
     Bool(bool),
     Number(f64),
+    Bytes(Vec<u8>),
+    List(Vec<AxStateValue>),
+    Object(BTreeMap<String, AxStateValue>),
 }
 
 impl AxStateValue {
@@ -49,6 +55,9 @@ impl AxStateValue {
             Self::String(_) => "String",
             Self::Bool(_) => "Bool",
             Self::Number(_) => "Number",
+            Self::Bytes(_) => "Bytes",
+            Self::List(_) => "List<Unknown>",
+            Self::Object(_) => "Json",
         }
     }
 }
@@ -289,9 +298,20 @@ where
 {
     let mut manifest = AxStateManifest::new();
     let scope = scope.as_ref();
+    let data_context = AxDataContext::from_v2_let_types(file).map_err(|error| {
+        AxStateManifestError::InvalidInitializer {
+            name: "type-contract".to_string(),
+            message: error.to_string(),
+        }
+    })?;
 
     for (index, state) in file.states.iter().enumerate() {
-        let initial = parse_state_manifest_value(&state.name, &state.value)?;
+        let initial = parse_state_manifest_value(
+            &state.name,
+            &state.value,
+            state.ty.as_deref(),
+            &data_context,
+        )?;
         let ty = state
             .ty
             .clone()
@@ -314,6 +334,8 @@ where
 fn parse_state_manifest_value(
     name: &str,
     source: &str,
+    declared_type: Option<&str>,
+    data_context: &AxDataContext,
 ) -> Result<AxStateValue, AxStateManifestError> {
     let expr = parse_expr(source, 1).map_err(|error| AxStateManifestError::InvalidInitializer {
         name: name.to_string(),
@@ -333,6 +355,27 @@ fn parse_state_manifest_value(
         other => other,
     };
 
+    if let Some(source_type) = declared_type {
+        let ty = AxType::parse_annotation(source_type).map_err(|error| {
+            AxStateManifestError::InvalidInitializer {
+                name: name.to_string(),
+                message: format!("invalid state type `{source_type}`: {error}"),
+            }
+        })?;
+        if !ty.supports_client_state() {
+            return Err(AxStateManifestError::InvalidInitializer {
+                name: name.to_string(),
+                message: format!("`{source_type}` is not a client-state value type"),
+            });
+        }
+        if !data_context.accepts_state_initializer(&ty, &expr) {
+            return Err(AxStateManifestError::InvalidInitializer {
+                name: name.to_string(),
+                message: format!("initializer does not match `{source_type}`"),
+            });
+        }
+    }
+
     expr_to_state_value(name, &expr)
 }
 
@@ -341,10 +384,23 @@ fn expr_to_state_value(name: &str, expr: &AxExpr) -> Result<AxStateValue, AxStat
         AxExpr::String(value) => Ok(AxStateValue::String(value.clone())),
         AxExpr::Bool(value) => Ok(AxStateValue::Bool(*value)),
         AxExpr::Number(value) => Ok(AxStateValue::Number(*value as f64)),
+        AxExpr::Float(value) => Ok(AxStateValue::Number(value.get())),
+        AxExpr::List(items) => items
+            .iter()
+            .map(|item| expr_to_state_value(name, item))
+            .collect::<Result<Vec<_>, _>>()
+            .map(AxStateValue::List),
+        AxExpr::Object(fields) => fields
+            .iter()
+            .map(|(key, value)| {
+                expr_to_state_value(name, value).map(|value| (key.clone(), value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map(AxStateValue::Object),
+        AxExpr::Identifier(value) if value == "null" => Ok(AxStateValue::Null),
         _ => Err(AxStateManifestError::InvalidInitializer {
             name: name.to_string(),
-            message: "state manifest v1 supports only String, Bool, Number, or signal(literal)"
-                .to_string(),
+            message: "state manifest v2 supports null, String, Bool, Number, List/Object literals, or signal(literal)".to_string(),
         }),
     }
 }
@@ -468,6 +524,102 @@ state enabled = signal(true)
     }
 
     #[test]
+    fn builds_nested_list_and_null_state_values() {
+        let file = crate::ax_parser_v2::parse_ax_v2(
+            r#"
+page Home
+
+state filters: List<Optional<String>> = ["published", null]
+
+<Copy>{filters}</Copy>
+"#,
+        )
+        .expect("v2 file should parse");
+
+        let manifest = build_state_manifest(&file).expect("manifest should build");
+
+        assert_eq!(manifest.signals[0].ty, "List<Optional<String>>");
+        assert_eq!(
+            manifest.signals[0].initial,
+            AxStateValue::List(vec![
+                AxStateValue::String("published".to_string()),
+                AxStateValue::Null,
+            ])
+        );
+    }
+
+    #[test]
+    fn builds_record_map_and_result_state_values() {
+        let file = crate::ax_parser_v2::parse_ax_v2(
+            r#"
+page Home
+
+type Post {
+  title: String
+}
+
+state post: Post = { title: "Hello" }
+state counts: Map<String, Int> = { draft: 2 }
+state result: Result<Post, String> = { Ok: { title: "Ready" } }
+
+<Copy>{post.title}</Copy>
+"#,
+        )
+        .expect("typed object state source should parse");
+
+        let manifest = build_state_manifest(&file).expect("object state manifest should build");
+        assert!(matches!(
+            manifest.signals[0].initial,
+            AxStateValue::Object(_)
+        ));
+        assert_eq!(
+            manifest.signals[1].initial.clone(),
+            AxStateValue::Object(BTreeMap::from([(
+                "draft".to_string(),
+                AxStateValue::Number(2.0),
+            )]))
+        );
+        let AxStateValue::Object(result) = &manifest.signals[2].initial else {
+            panic!("result should use tagged object state");
+        };
+        assert!(matches!(result.get("Ok"), Some(AxStateValue::Object(_))));
+    }
+
+    #[test]
+    fn builds_float_and_lexically_validated_scalar_state() {
+        let file = crate::ax_parser_v2::parse_ax_v2(
+            r#"
+page Metrics
+
+state ratio: Float = 0.625
+state publishedAt: DateTime = "2026-08-23T10:15:30Z"
+state postId: Uuid = "550e8400-e29b-41d4-a716-446655440000"
+
+<Copy>{ratio}</Copy>
+"#,
+        )
+        .expect("typed scalar state source should parse");
+
+        let manifest = build_state_manifest(&file).expect("typed scalar state should build");
+        assert_eq!(manifest.signals[0].initial, AxStateValue::Number(0.625));
+        assert_eq!(
+            manifest.signals[1].initial,
+            AxStateValue::String("2026-08-23T10:15:30Z".to_string())
+        );
+        assert_eq!(manifest.signals[2].ty, "Uuid");
+
+        let invalid = crate::ax_parser_v2::parse_ax_v2(
+            r#"
+page Metrics
+state publishedAt: DateTime = "2026-08-23 10:15:30"
+<Copy>{publishedAt}</Copy>
+"#,
+        )
+        .expect("invalid lexical value is still valid syntax");
+        assert!(build_state_manifest(&invalid).is_err());
+    }
+
+    #[test]
     fn state_manifest_rejects_non_literal_initializers() {
         let file = crate::ax_parser_v2::parse_ax_v2(
             r#"
@@ -486,10 +638,36 @@ state theme = Runtime.Env.public.THEME
             error,
             AxStateManifestError::InvalidInitializer {
                 name: "theme".to_string(),
-                message: "state manifest v1 supports only String, Bool, Number, or signal(literal)"
-                    .to_string(),
+                message: "state manifest v2 supports null, String, Bool, Number, List/Object literals, or signal(literal)".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn state_manifest_rejects_type_mismatches_and_secret_state() {
+        for source in [
+            r#"
+page Home
+state count: Int = "one"
+<Copy>{count}</Copy>
+"#,
+            r#"
+page Home
+state token: Secret<String> = "private"
+<Copy>Hidden</Copy>
+"#,
+            r#"
+page Home
+type Post {
+  title: String
+}
+state post: Post = { title: 7, extra: true }
+<Copy>{post.title}</Copy>
+"#,
+        ] {
+            let file = crate::ax_parser_v2::parse_ax_v2(source).expect("state source should parse");
+            assert!(build_state_manifest(&file).is_err());
+        }
     }
 
     #[test]
