@@ -31,6 +31,9 @@ jobs:
       - name: Verify bundled state WASM ABI
         run: node scripts/verify-state-wasm.mjs
 
+      - name: Verify typed browser state bridge
+        run: node scripts/verify-state-bridge.mjs
+
       - name: Package axonyx-macros
         run: cargo package -p axonyx-macros --allow-dirty --no-verify
 
@@ -41,6 +44,7 @@ jobs:
             echo "## Release Gate Summary"
             echo
             echo "- \`cargo test --workspace\` passed."
+            echo "- Typed \`List<Optional<Post>>\` state crossed the browser/WASM bridge."
             echo "- \`cargo package -p axonyx-macros --allow-dirty --no-verify\` passed."
             echo "- \`axonyx-core\` and \`axonyx-runtime\` are validated after publish order and crates.io propagation."
             echo "- Expected publish order: \`axonyx-macros\` -> \`axonyx-core\` -> \`axonyx-runtime\`."

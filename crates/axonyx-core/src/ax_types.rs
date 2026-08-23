@@ -101,6 +101,74 @@ impl AxType {
     pub fn parse_annotation(input: &str) -> Result<Self, AxTypeParseError> {
         parse_type_annotation(input)
     }
+
+    pub fn supports_client_state(&self) -> bool {
+        match self {
+            Self::Never | Self::Void | Self::Secret(_) | Self::Signal(_) | Self::Resource(_, _) => {
+                false
+            }
+            Self::List(item) | Self::Set(item) | Self::Optional(item) | Self::Public(item) => {
+                item.supports_client_state()
+            }
+            Self::Map(key, value) | Self::Result(key, value) => {
+                key.supports_client_state() && value.supports_client_state()
+            }
+            _ => true,
+        }
+    }
+
+    pub fn accepts_state_initializer(&self, value: &AxExpr) -> bool {
+        match self {
+            Self::String | Self::DateTime | Self::Date | Self::Time | Self::Uuid => {
+                matches!(value, AxExpr::String(_))
+            }
+            Self::Number | Self::Int | Self::Float => matches!(value, AxExpr::Number(_)),
+            Self::Bool => matches!(value, AxExpr::Bool(_)),
+            Self::Bytes => matches!(value, AxExpr::List(items) if items.iter().all(|item| {
+                matches!(item, AxExpr::Number(number) if (0..=255).contains(number))
+            })),
+            Self::Json | Self::Unknown => matches!(
+                value,
+                AxExpr::String(_)
+                    | AxExpr::Number(_)
+                    | AxExpr::Bool(_)
+                    | AxExpr::List(_)
+                    | AxExpr::Object(_)
+                    | AxExpr::Identifier(_)
+            ),
+            Self::List(item) | Self::Set(item) => matches!(
+                value,
+                AxExpr::List(items) if items.iter().all(|value| item.accepts_state_initializer(value))
+            ),
+            Self::Optional(item) => {
+                matches!(value, AxExpr::Identifier(name) if name == "null")
+                    || item.accepts_state_initializer(value)
+            }
+            Self::Map(key, item) => matches!(value, AxExpr::Object(fields) if fields.iter().all(
+                |(name, value)| key.accepts_map_key(name) && item.accepts_state_initializer(value)
+            )),
+            Self::Result(ok, error) => matches!(value, AxExpr::Object(fields) if {
+                fields.len() == 1
+                    && (fields.get("Ok").is_some_and(|value| ok.accepts_state_initializer(value))
+                        || fields.get("Err").is_some_and(|value| error.accepts_state_initializer(value)))
+            }),
+            Self::Record(_) => matches!(value, AxExpr::Object(_)),
+            Self::Public(item) => item.accepts_state_initializer(value),
+            Self::Never | Self::Void | Self::Secret(_) | Self::Signal(_) | Self::Resource(_, _) => {
+                false
+            }
+        }
+    }
+
+    fn accepts_map_key(&self, value: &str) -> bool {
+        match self {
+            Self::String | Self::DateTime | Self::Date | Self::Time | Self::Uuid => true,
+            Self::Int => value.parse::<i64>().is_ok(),
+            Self::Bool => matches!(value, "true" | "false"),
+            Self::Public(inner) => inner.accepts_map_key(value),
+            _ => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -156,6 +224,64 @@ impl AxDataContext {
         self.bindings.get(name)
     }
 
+    pub fn accepts_state_initializer(&self, ty: &AxType, value: &AxExpr) -> bool {
+        self.accepts_state_initializer_at_depth(ty, value, 0)
+    }
+
+    fn accepts_state_initializer_at_depth(
+        &self,
+        ty: &AxType,
+        value: &AxExpr,
+        depth: usize,
+    ) -> bool {
+        if depth > 32 {
+            return false;
+        }
+        match ty {
+            AxType::Record(name) => {
+                let AxExpr::Object(values) = value else {
+                    return false;
+                };
+                let Some(record) = self.record(name) else {
+                    return true;
+                };
+                if values.keys().any(|name| !record.fields.contains_key(name)) {
+                    return false;
+                }
+                record.fields.iter().all(|(name, field_ty)| {
+                    values.get(name).map_or_else(
+                        || matches!(field_ty, AxType::Optional(_)),
+                        |value| self.accepts_state_initializer_at_depth(field_ty, value, depth + 1),
+                    )
+                })
+            }
+            AxType::List(item) | AxType::Set(item) => matches!(
+                value,
+                AxExpr::List(items) if items.iter().all(|value| {
+                    self.accepts_state_initializer_at_depth(item, value, depth + 1)
+                })
+            ),
+            AxType::Map(key, item) => matches!(value, AxExpr::Object(fields) if fields.iter().all(
+                |(name, value)| key.accepts_map_key(name)
+                    && self.accepts_state_initializer_at_depth(item, value, depth + 1)
+            )),
+            AxType::Optional(item) => {
+                matches!(value, AxExpr::Identifier(name) if name == "null")
+                    || self.accepts_state_initializer_at_depth(item, value, depth + 1)
+            }
+            AxType::Result(ok, error) => matches!(value, AxExpr::Object(fields) if {
+                fields.len() == 1
+                    && (fields.get("Ok").is_some_and(|value| {
+                        self.accepts_state_initializer_at_depth(ok, value, depth + 1)
+                    }) || fields.get("Err").is_some_and(|value| {
+                        self.accepts_state_initializer_at_depth(error, value, depth + 1)
+                    }))
+            }),
+            AxType::Public(item) => self.accepts_state_initializer_at_depth(item, value, depth + 1),
+            _ => ty.accepts_state_initializer(value),
+        }
+    }
+
     pub fn from_v2_let_types(file: &AxFileV2) -> Result<Self, AxTypeParseError> {
         let mut context = Self::new();
         for record in &file.types {
@@ -193,6 +319,7 @@ impl AxDataContext {
             AxExpr::Number(_) => Ok(AxType::Number),
             AxExpr::Bool(_) => Ok(AxType::Bool),
             AxExpr::List(items) => self.resolve_list_type(items),
+            AxExpr::Object(_) => Ok(AxType::Json),
             AxExpr::Identifier(name) => self
                 .bindings
                 .get(name)
@@ -774,6 +901,14 @@ fn format_expr(expr: &AxExpr) -> String {
             let items = items.iter().map(format_expr).collect::<Vec<_>>().join(", ");
             format!("[{items}]")
         }
+        AxExpr::Object(fields) => {
+            let fields = fields
+                .iter()
+                .map(|(name, value)| format!("{name}: {}", format_expr(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("{{{fields}}}")
+        }
         AxExpr::Identifier(name) => name.clone(),
         AxExpr::Unary { op, expr } => format!("{}{}", format_unary_op(*op), format_expr(expr)),
         AxExpr::Binary { op, left, right } => format!(
@@ -1114,6 +1249,19 @@ let posts: List<Post> = load PostsList
             AxType::parse_annotation("List<Optional<Post>>"),
             Ok(AxType::list(AxType::optional(AxType::record("Post"))))
         );
+    }
+
+    #[test]
+    fn classifies_client_state_types_and_initializers() {
+        let list = AxType::parse_annotation("List<Optional<String>>")
+            .expect("list state type should parse");
+        assert!(list.supports_client_state());
+        assert!(list.accepts_state_initializer(&AxExpr::List(vec![
+            AxExpr::string("published"),
+            AxExpr::ident("null"),
+        ])));
+        assert!(!AxType::Secret(Box::new(AxType::String)).supports_client_state());
+        assert!(!AxType::record("Post").accepts_state_initializer(&AxExpr::string("draft")));
     }
 
     #[test]

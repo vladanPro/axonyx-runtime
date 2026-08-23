@@ -795,6 +795,14 @@ fn eval_expr(
             .map(|item| eval_expr(item, functions, scope, resolver))
             .collect::<Result<Vec<_>, _>>()
             .map(AxValue::List),
+        AxExpr::Object(fields) => fields
+            .iter()
+            .map(|(name, value)| {
+                eval_expr(value, functions, scope, resolver).map(|value| (name.clone(), value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map(AxValue::Record),
+        AxExpr::Identifier(name) if name == "null" => Ok(AxValue::Null),
         AxExpr::Identifier(name) => scope
             .get(name)
             .cloned()
@@ -2191,6 +2199,23 @@ component ThemePicker() {
         };
 
         assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn null_literal_lowers_inside_structured_values() {
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let value = eval_expr(
+            &AxExpr::list([AxExpr::string("published"), AxExpr::ident("null")]),
+            &[],
+            &BTreeMap::new(),
+            &resolver,
+        )
+        .expect("null literal should lower");
+
+        assert_eq!(
+            value,
+            AxValue::list([AxValue::from("published"), AxValue::Null])
+        );
     }
 
     #[test]

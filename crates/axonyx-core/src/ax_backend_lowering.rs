@@ -752,6 +752,14 @@ fn render_expr(expr: &AxExpr) -> String {
             let items = items.iter().map(render_expr).collect::<Vec<_>>().join(", ");
             format!("vec![{items}]")
         }
+        AxExpr::Object(fields) => {
+            let fields = fields
+                .iter()
+                .map(|(name, value)| format!("{name:?}: {}", render_expr(value)))
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("json!({{{fields}}})")
+        }
         AxExpr::Identifier(name) => name.clone(),
         AxExpr::Unary { op, expr } => format!("({}{})", render_unary_op(*op), render_expr(expr)),
         AxExpr::Binary { op, left, right } => {
