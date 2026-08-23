@@ -3491,6 +3491,8 @@ fn ax_state_bridge_script() -> &'static str {
   const validStorageCapabilities = new WeakSet();
   const storageCapabilityList = [];
   const hydratedStorageSignals = new Set();
+  const pendingStorageWrites = new Map();
+  let storageManifestReady = false;
   let wasmExecutor;
   let wasmTextEncoder;
   let wasmTextDecoder;
@@ -3520,6 +3522,8 @@ fn ax_state_bridge_script() -> &'static str {
     rejectedStorageCapabilities: 0,
     rejectedStorageReads: 0,
     rejectedStorageWrites: 0,
+    queuedStorageWrites: 0,
+    flushedStorageWrites: 0,
   };
   const localOperationCode = Object.freeze({ set: 0, add: 1, sub: 2, toggle: 3 });
   const localValueTypeCode = Object.freeze({ String: 0, Number: 1, Bool: 2 });
@@ -3749,9 +3753,16 @@ fn ax_state_bridge_script() -> &'static str {
   };
 
   const persistStorageCapability = (signal, value, source) => {
-    const capability = storageCapabilities.get(signal);
     const sourceName = String(source);
-    if (!capability || sourceName.startsWith("snapshot") || sourceName.startsWith("storage:")) return false;
+    if (sourceName.startsWith("snapshot") || sourceName.startsWith("storage:")) return false;
+    const capability = storageCapabilities.get(signal);
+    if (!capability) {
+      if (!storageManifestReady) {
+        pendingStorageWrites.set(signal, { value, source: sourceName });
+        executorStats.queuedStorageWrites += 1;
+      }
+      return false;
+    }
     if (!validStorageCapabilities.has(capability)) {
       executorStats.rejectedStorageWrites += 1;
       return false;
@@ -3861,6 +3872,30 @@ fn ax_state_bridge_script() -> &'static str {
         node.setAttribute("data-ax-state-if-signal", signal);
       });
     });
+  };
+
+  const rebindPendingStorageWrites = () => {
+    Array.from(pendingStorageWrites.entries()).forEach(([signal, pending]) => {
+      const canonical = canonicalSignal(signal);
+      if (canonical === signal) return;
+      pendingStorageWrites.delete(signal);
+      pendingStorageWrites.set(canonical, pending);
+    });
+  };
+
+  const hydrateStorageCapability = (capability) => {
+    const pending = pendingStorageWrites.get(capability.signal);
+    if (!pending) return restoreStorageCapability(capability);
+    pendingStorageWrites.delete(capability.signal);
+    if (!persistStorageCapability(capability.signal, pending.value, pending.source)) return false;
+    hydratedStorageSignals.add(capability.signal);
+    executorStats.flushedStorageWrites += 1;
+    return true;
+  };
+
+  const settleStorageManifest = () => {
+    storageManifestReady = true;
+    pendingStorageWrites.clear();
   };
 
   const notifySubscribers = (signal, value, source) => {
@@ -4217,8 +4252,10 @@ fn ax_state_bridge_script() -> &'static str {
       });
     });
     rebindAliasedSignals();
+    rebindPendingStorageWrites();
     registerReads();
-    pendingStorageCapabilities.forEach(restoreStorageCapability);
+    pendingStorageCapabilities.forEach(hydrateStorageCapability);
+    settleStorageManifest();
     if (count > 0) {
       window.dispatchEvent(new CustomEvent("axonyx:state-manifest", {
         detail: { count, manifest, source },
@@ -4228,16 +4265,23 @@ fn ax_state_bridge_script() -> &'static str {
   };
 
   const loadManifest = async (url = "/_ax/state/manifest.json") => {
-    if (!window.fetch) return false;
+    if (!window.fetch) {
+      settleStorageManifest();
+      return false;
+    }
     try {
       const response = await fetch(url, {
         cache: "no-store",
         headers: stateRequestHeaders(),
       });
-      if (!response.ok) return false;
+      if (!response.ok) {
+        settleStorageManifest();
+        return false;
+      }
       const manifest = await response.json();
       return hydrateManifest(manifest, "manifest") > 0;
     } catch (_) {
+      settleStorageManifest();
       return false;
     }
   };
@@ -4379,6 +4423,8 @@ fn ax_state_bridge_script() -> &'static str {
       rejectedStorageCapabilities: executorStats.rejectedStorageCapabilities,
       rejectedStorageReads: executorStats.rejectedStorageReads,
       rejectedStorageWrites: executorStats.rejectedStorageWrites,
+      queuedStorageWrites: executorStats.queuedStorageWrites,
+      flushedStorageWrites: executorStats.flushedStorageWrites,
     }),
     loadWasm: loadWasmExecutor,
   };
@@ -5262,6 +5308,11 @@ page Home
         assert!(state_html.contains("registerStorageCapability"));
         assert!(state_html.contains("restoreStorageCapability"));
         assert!(state_html.contains("persistStorageCapability"));
+        assert!(state_html.contains("pendingStorageWrites"));
+        assert!(state_html.contains("rebindPendingStorageWrites"));
+        assert!(state_html.contains("hydrateStorageCapability"));
+        assert!(state_html.contains("queuedStorageWrites: executorStats.queuedStorageWrites"));
+        assert!(state_html.contains("flushedStorageWrites: executorStats.flushedStorageWrites"));
         assert!(state_html.contains("axonyx:storage-capability-rejected"));
         assert!(state_html.contains("axonyx:storage-value-rejected"));
         assert!(state_html.contains("storageCapabilities: () => storageCapabilityList.map"));
