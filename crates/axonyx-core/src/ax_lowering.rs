@@ -119,6 +119,13 @@ pub enum AxLowerError {
         import_path: String,
         message: String,
     },
+    #[error("invalid value `{value}` for `{component}.{prop}`; expected one of {expected}")]
+    InvalidComponentPropLiteral {
+        component: String,
+        prop: String,
+        value: String,
+        expected: String,
+    },
 }
 
 pub fn lower_document(
@@ -1213,6 +1220,24 @@ fn lower_local_component_nodes(
         } else {
             AxValue::Null
         };
+        if !param.literal_values.is_empty()
+            && !matches!(&value, AxValue::String(value) if param.literal_values.contains(value))
+        {
+            return Err(AxLowerError::InvalidComponentPropLiteral {
+                component: component_def.name.clone(),
+                prop: param.name.clone(),
+                value: match &value {
+                    AxValue::Null => "null".to_string(),
+                    value => value.as_string(),
+                },
+                expected: param
+                    .literal_values
+                    .iter()
+                    .map(|value| format!("\"{value}\""))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            });
+        }
         component_scope.insert(param.name.clone(), value);
     }
 
@@ -2480,6 +2505,83 @@ component FeatureCard(title) {
                 )],
             )
         );
+    }
+
+    #[test]
+    fn rejects_invalid_literal_union_prop_on_local_component() {
+        let document = parse_ax_auto(
+            r#"
+page Home() {
+  type Theme = "silver" | "bronze" | "gold"
+
+  component ThemeSwitcher(theme: Theme = "silver") {
+    <Copy>{theme}</Copy>
+  }
+
+  return ASX { <ThemeSwitcher theme="purple" /> }
+}
+"#,
+        )
+        .expect("document should parse before prop values are evaluated");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let error = lower_document(&document, &resolver)
+            .expect_err("invalid literal union prop should fail lowering");
+
+        assert_eq!(
+            error,
+            AxLowerError::InvalidComponentPropLiteral {
+                component: "ThemeSwitcher".to_string(),
+                prop: "theme".to_string(),
+                value: "purple".to_string(),
+                expected: "\"silver\", \"bronze\", \"gold\"".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_literal_union_prop_on_imported_component() {
+        let document = parse_ax_auto(
+            r#"
+import { ThemeSwitcher } from "@/ThemeSwitcher.ax"
+
+page Home() {
+  return ASX { <ThemeSwitcher theme="purple" /> }
+}
+"#,
+        )
+        .expect("importing page should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let import_resolver = |source: &str| -> Option<String> {
+            (source == "@/ThemeSwitcher.ax").then(|| {
+                r#"
+type Theme = "silver" | "bronze" | "gold"
+
+component ThemeSwitcher(theme: Theme = "silver") {
+  <Copy>{theme}</Copy>
+}
+"#
+                .to_string()
+            })
+        };
+
+        let error = lower_document_with_scope_and_imports(
+            &document,
+            BTreeMap::new(),
+            &resolver,
+            &import_resolver,
+        )
+        .expect_err("invalid imported literal union prop should fail lowering");
+
+        assert!(matches!(
+            error,
+            AxLowerError::InvalidComponentPropLiteral {
+                component,
+                prop,
+                value,
+                ..
+            } if component == "ThemeSwitcher" && prop == "theme" && value == "purple"
+        ));
     }
 
     #[test]
