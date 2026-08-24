@@ -160,6 +160,10 @@ impl AxComponentStateDef {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxComponentParamDef {
     pub name: String,
+    #[serde(default)]
+    pub ty: Option<String>,
+    #[serde(default)]
+    pub literal_values: Vec<String>,
     pub default: Option<AxExpr>,
 }
 
@@ -167,6 +171,8 @@ impl AxComponentParamDef {
     pub fn new(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
+            ty: None,
+            literal_values: Vec::new(),
             default: None,
         }
     }
@@ -174,8 +180,40 @@ impl AxComponentParamDef {
     pub fn with_default(name: impl Into<String>, default: AxExpr) -> Self {
         Self {
             name: name.into(),
+            ty: None,
+            literal_values: Vec::new(),
             default: Some(default),
         }
+    }
+
+    pub fn typed(name: impl Into<String>, ty: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            ty: Some(ty.into()),
+            literal_values: Vec::new(),
+            default: None,
+        }
+    }
+
+    pub fn typed_with_default(
+        name: impl Into<String>,
+        ty: impl Into<String>,
+        default: AxExpr,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            ty: Some(ty.into()),
+            literal_values: Vec::new(),
+            default: Some(default),
+        }
+    }
+
+    pub fn with_literal_values(
+        mut self,
+        values: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.literal_values = values.into_iter().map(Into::into).collect();
+        self
     }
 }
 

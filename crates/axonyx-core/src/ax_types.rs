@@ -356,6 +356,10 @@ impl AxDataContext {
         self.records.get(name)
     }
 
+    pub fn literal_union(&self, name: &str) -> Option<&[String]> {
+        self.literal_unions.get(name).map(Vec::as_slice)
+    }
+
     pub fn binding(&self, name: &str) -> Option<&AxType> {
         self.bindings.get(name)
     }

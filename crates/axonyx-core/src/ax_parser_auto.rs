@@ -60,6 +60,19 @@ pub enum AxConvertV2Error {
     InvalidStateInitializer { expr_source: String },
     #[error("component state `{name}` uses unsupported client-state type `{ty}`")]
     UnsupportedComponentStateType { name: String, ty: String },
+    #[error("component parameter `{name}` has invalid type `{ty}`: {error}")]
+    InvalidComponentParamType {
+        name: String,
+        ty: String,
+        #[source]
+        error: AxTypeParseError,
+    },
+    #[error("component parameter `{name}` has an invalid default `{expr_source}` for type `{ty}`")]
+    InvalidComponentParamDefault {
+        name: String,
+        ty: String,
+        expr_source: String,
+    },
     #[error("invalid state type contract: {error}")]
     InvalidStateTypeContract {
         #[source]
@@ -149,7 +162,7 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
         functions: file
             .functions
             .iter()
-            .map(convert_function_decl)
+            .map(|function| convert_function_decl(function, &data_context))
             .collect::<Result<Vec<_>, _>>()?,
         components: file
             .components
@@ -162,7 +175,7 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
             file.page
                 .params
                 .iter()
-                .map(convert_component_param_decl)
+                .map(|param| convert_component_param_decl(param, &data_context))
                 .collect::<Result<Vec<_>, _>>()?,
             body,
         ),
@@ -178,13 +191,16 @@ fn convert_import_decl(import_decl: &crate::ax_ast_v2::AxImportDecl) -> AxImport
     )
 }
 
-fn convert_function_decl(function: &AxFunctionDeclV2) -> Result<AxFunctionDef, AxConvertV2Error> {
+fn convert_function_decl(
+    function: &AxFunctionDeclV2,
+    data_context: &AxDataContext,
+) -> Result<AxFunctionDef, AxConvertV2Error> {
     Ok(AxFunctionDef::new(
         function.name.clone(),
         function
             .params
             .iter()
-            .map(convert_component_param_decl)
+            .map(|param| convert_component_param_decl(param, data_context))
             .collect::<Result<Vec<_>, _>>()?,
         parse_v2_expr(&function.body)?,
     ))
@@ -242,7 +258,7 @@ fn convert_component_decl(
         component
             .params
             .iter()
-            .map(convert_component_param_decl)
+            .map(|param| convert_component_param_decl(param, data_context))
             .collect::<Result<Vec<_>, _>>()?,
         states,
         convert_children(&component.body, &bindings)?,
@@ -251,13 +267,53 @@ fn convert_component_decl(
 
 fn convert_component_param_decl(
     param: &AxComponentParamDeclV2,
+    data_context: &AxDataContext,
 ) -> Result<AxComponentParamDef, AxConvertV2Error> {
-    Ok(match &param.default {
-        Some(default) => {
-            AxComponentParamDef::with_default(param.name.clone(), parse_v2_expr(default)?)
+    let default = param.default.as_deref().map(parse_v2_expr).transpose()?;
+    let Some(ty_source) = param.ty.as_deref() else {
+        return Ok(match default {
+            Some(default) => AxComponentParamDef::with_default(param.name.clone(), default),
+            None => AxComponentParamDef::new(param.name.clone()),
+        });
+    };
+    let ty = AxType::parse_annotation(ty_source).map_err(|error| {
+        AxConvertV2Error::InvalidComponentParamType {
+            name: param.name.clone(),
+            ty: ty_source.to_string(),
+            error,
         }
-        None => AxComponentParamDef::new(param.name.clone()),
-    })
+    })?;
+    if let Some(default) = &default {
+        if is_static_param_default(default) && !data_context.accepts_state_initializer(&ty, default)
+        {
+            return Err(AxConvertV2Error::InvalidComponentParamDefault {
+                name: param.name.clone(),
+                ty: ty_source.to_string(),
+                expr_source: param.default.clone().unwrap_or_default(),
+            });
+        }
+    }
+    let literal_values = match &ty {
+        AxType::Record(name) => data_context.literal_union(name).unwrap_or_default(),
+        _ => &[],
+    };
+    Ok(match default {
+        Some(default) => {
+            AxComponentParamDef::typed_with_default(param.name.clone(), ty_source, default)
+        }
+        None => AxComponentParamDef::typed(param.name.clone(), ty_source),
+    }
+    .with_literal_values(literal_values.iter().cloned()))
+}
+
+fn is_static_param_default(expr: &AxExpr) -> bool {
+    match expr {
+        AxExpr::String(_) | AxExpr::Bool(_) | AxExpr::Number(_) | AxExpr::Float(_) => true,
+        AxExpr::Identifier(name) => name == "null",
+        AxExpr::List(items) => items.iter().all(is_static_param_default),
+        AxExpr::Object(fields) => fields.values().all(is_static_param_default),
+        _ => false,
+    }
 }
 
 fn merge_head_element(head: &mut AxHead, element: &AxElementNode) -> Result<(), AxConvertV2Error> {
@@ -1473,6 +1529,62 @@ component FeatureCard(title = "Hello") {
                 AxExpr::string("Hello")
             )]
         );
+    }
+
+    #[test]
+    fn preserves_literal_union_component_param_contracts() {
+        let document = parse_ax_auto(
+            r#"
+page Home() {
+  type Theme = "silver" | "bronze" | "gold"
+
+  component ThemeSwitcher(theme: Theme = "silver") {
+    <Copy>{theme}</Copy>
+  }
+
+  return ASX {
+    <ThemeSwitcher theme="bronze" />
+  }
+}
+"#,
+        )
+        .expect("literal union component contract should convert");
+
+        assert_eq!(
+            document.components[0].params[0].ty.as_deref(),
+            Some("Theme")
+        );
+        assert_eq!(
+            document.components[0].params[0].literal_values,
+            ["silver", "bronze", "gold"]
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_literal_union_component_param_default() {
+        let error = parse_ax_auto(
+            r#"
+page Home() {
+  type Theme = "silver" | "bronze" | "gold"
+
+  component ThemeSwitcher(theme: Theme = "purple") {
+    <Copy>{theme}</Copy>
+  }
+
+  return ASX { <ThemeSwitcher /> }
+}
+"#,
+        )
+        .expect_err("invalid literal union default should fail");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::InvalidComponentParamDefault {
+                name,
+                ty,
+                expr_source,
+            }) if name == "theme" && ty == "Theme" && expr_source == "\"purple\""
+        ));
     }
 
     #[test]
