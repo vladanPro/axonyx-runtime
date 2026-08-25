@@ -242,6 +242,7 @@ fn convert_component_decl(
             StateBindingPlan {
                 signal_id: signal.clone(),
                 ty: ty.clone(),
+                literals: data_context.literal_union(&ty).map(<[_]>::to_vec),
                 initial: state_event_literal(&initializer.value).ok_or_else(|| {
                     AxConvertV2Error::InvalidStateInitializer {
                         expr_source: state.value.clone(),
@@ -574,6 +575,16 @@ fn convert_match_statement(
 ) -> Result<AxStatement, AxConvertV2Error> {
     let value = control_expr_attr(element, &["value"])?;
     let (cases, default_body) = split_match_children(element, state_bindings)?;
+    if let AxExpr::Identifier(name) = &value {
+        if let Some(binding) = state_bindings.get(name) {
+            return Ok(AxStatement::component(state_match_component(
+                name,
+                binding,
+                cases,
+                default_body,
+            )));
+        }
+    }
     let mut match_block = AxMatchBlock::new(value, cases);
     if let Some(default_body) = default_body {
         match_block = match_block.default_body(default_body);
@@ -629,6 +640,52 @@ fn split_match_children(
     }
 
     Ok((cases, default_body))
+}
+
+fn state_match_component(
+    state_name: &str,
+    binding: &StateBindingPlan,
+    cases: Vec<AxMatchCase>,
+    default_body: Option<Vec<AxStatement>>,
+) -> AxComponent {
+    let initial = binding.initial.as_str();
+    let has_initial_case = cases.iter().any(|case| case.value == initial);
+    let mut branches = cases
+        .into_iter()
+        .map(|case| {
+            let active = case.value == initial;
+            let mut branch = AxComponent::new("__AxStateMatchCase")
+                .prop("case", case.value)
+                .block(case.body);
+            if !active {
+                branch = branch.prop("hidden", true);
+            }
+            AxStatement::component(branch)
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(default_body) = default_body {
+        let mut branch = AxComponent::new("__AxStateMatchDefault").block(default_body);
+        if has_initial_case {
+            branch = branch.prop("hidden", true);
+        }
+        branches.push(AxStatement::component(branch));
+    }
+
+    let mut component = AxComponent::new("__AxStateMatch")
+        .prop("data-ax-state-match-name", state_name)
+        .prop("data-ax-state-match-signal", binding.signal_id.clone())
+        .prop("data-ax-state-match-type", binding.ty.clone())
+        .prop("data-ax-state-match-initial", binding.initial.clone())
+        .block(branches);
+    if let Some(literals) = &binding.literals {
+        component = component.prop(
+            "data-ax-state-match-literals",
+            serde_json::to_string(literals)
+                .expect("serializing string literal union metadata cannot fail"),
+        );
+    }
+    component
 }
 
 fn state_if_component(
@@ -870,6 +927,7 @@ fn convert_if_tail_with_state(
 struct StateBindingPlan {
     signal_id: String,
     ty: String,
+    literals: Option<Vec<String>>,
     initial: String,
 }
 
@@ -1006,6 +1064,7 @@ fn collect_state_bindings(
             state.name.clone(),
             StateBindingPlan {
                 signal_id: format!("root:{}:{}", state.name, index + 1),
+                literals: data_context.literal_union(&ty).map(<[_]>::to_vec),
                 ty,
                 initial: state_event_literal(&initializer.value).ok_or_else(|| {
                     AxConvertV2Error::InvalidStateInitializer {
@@ -1156,13 +1215,19 @@ fn apply_state_event_attr(
             attr: attr.name.clone(),
         });
     };
+    let set_value_matches = mutation.value_ty.as_deref().is_none_or(|value_ty| {
+        state_literal_matches_type(value_ty, &binding.ty)
+            || value_ty == "String"
+                && mutation.value.as_ref().is_some_and(|value| {
+                    binding
+                        .literals
+                        .as_ref()
+                        .is_some_and(|literals| literals.contains(value))
+                })
+    });
     if matches!(mutation.op.as_str(), "add" | "sub")
         && !matches!(binding.ty.as_str(), "Number" | "Int" | "Float")
-        || mutation.op == "set"
-            && mutation
-                .value_ty
-                .as_deref()
-                .is_some_and(|value_ty| !state_literal_matches_type(value_ty, &binding.ty))
+        || mutation.op == "set" && !set_value_matches
         || mutation.op == "toggle" && binding.ty != "Bool"
     {
         return Err(AxConvertV2Error::InvalidStateEvent {
@@ -2011,6 +2076,74 @@ page Counter() {
         assert!(then_branch
             .props
             .contains(&AxProp::new("hidden", AxExpr::bool(true))));
+    }
+
+    #[test]
+    fn converts_state_dependent_match_into_reactive_dom_boundary() {
+        let document = parse_ax_auto(
+            r#"
+page ThemePreview() {
+  type Theme = "silver" | "bronze" | "gold"
+  state theme: Theme = "silver"
+  return ASX {
+    <Match value={theme}>
+      <Case is="silver"><Copy>Silver</Copy></Case>
+      <Case is="gold"><Copy>Gold</Copy></Case>
+      <Default><Copy>Other</Copy></Default>
+    </Match>
+  }
+}
+"#,
+        )
+        .expect("state-dependent match should convert");
+
+        let AxStatement::Component(fragment) = &document.page.body[1] else {
+            panic!("expected return fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected return body");
+        };
+        let AxStatement::Component(state_match) = &body[0] else {
+            panic!("expected reactive state match component");
+        };
+        assert_eq!(state_match.name, "__AxStateMatch");
+        assert!(state_match.props.contains(&AxProp::new(
+            "data-ax-state-match-signal",
+            AxExpr::string("root:theme:1")
+        )));
+        assert!(state_match.props.contains(&AxProp::new(
+            "data-ax-state-match-literals",
+            AxExpr::string(r#"["silver","bronze","gold"]"#)
+        )));
+        let AxBody::Block(branches) = &state_match.body else {
+            panic!("expected match branches");
+        };
+        assert_eq!(branches.len(), 3);
+        let AxStatement::Component(gold) = &branches[1] else {
+            panic!("expected gold branch");
+        };
+        assert!(gold
+            .props
+            .contains(&AxProp::new("hidden", AxExpr::bool(true))));
+    }
+
+    #[test]
+    fn rejects_literal_union_state_events_outside_the_contract() {
+        let error = parse_ax_auto(
+            r#"
+page ThemePreview() {
+  type Theme = "silver" | "gold"
+  state theme: Theme = "silver"
+  return ASX { <Button on:click={theme = "purple"}>Purple</Button> }
+}
+"#,
+        )
+        .expect_err("literal union events should enforce the declared contract");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::InvalidStateEvent { .. })
+        ));
     }
 
     #[test]

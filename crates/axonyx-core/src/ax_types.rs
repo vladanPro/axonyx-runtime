@@ -979,16 +979,7 @@ impl AxTypeChecker {
             }
             AxStatement::Match(block) => {
                 self.check_expr(&block.value, format!("{location}.match.value"));
-                let mut seen = BTreeSet::new();
                 for (case_index, case) in block.cases.iter().enumerate() {
-                    if !seen.insert(case.value.as_str()) {
-                        self.push_error(
-                            format!("{location}.match.case[{case_index}]"),
-                            AxTypeError::DuplicateMatchCase {
-                                value: case.value.clone(),
-                            },
-                        );
-                    }
                     self.check_statements(
                         &case.body,
                         &format!("{location}.match.case[{case_index}]"),
@@ -999,37 +990,16 @@ impl AxTypeChecker {
                     &format!("{location}.match.default"),
                 );
 
-                if let Ok(AxType::Record(union)) = self.context.resolve_expr_type(&block.value) {
-                    if let Some(literals) = self.context.literal_union(&union).map(<[_]>::to_vec) {
-                        for value in &seen {
-                            if !literals.iter().any(|literal| literal == *value) {
-                                self.push_error(
-                                    format!("{location}.match"),
-                                    AxTypeError::UnknownMatchCase {
-                                        union: union.clone(),
-                                        value: (*value).to_string(),
-                                    },
-                                );
-                            }
-                        }
-                        if block.default_body.is_none() {
-                            let missing = literals
-                                .iter()
-                                .filter(|literal| !seen.contains(literal.as_str()))
-                                .cloned()
-                                .collect::<Vec<_>>();
-                            if !missing.is_empty() {
-                                self.push_error(
-                                    format!("{location}.match"),
-                                    AxTypeError::NonExhaustiveMatch {
-                                        union,
-                                        missing: missing.join(", "),
-                                    },
-                                );
-                            }
-                        }
-                    }
-                }
+                let union = match self.context.resolve_expr_type(&block.value) {
+                    Ok(AxType::Record(union)) => Some(union),
+                    _ => None,
+                };
+                self.check_match_cases(
+                    union,
+                    block.cases.iter().map(|case| case.value.clone()).collect(),
+                    block.default_body.is_some(),
+                    &format!("{location}.match"),
+                );
             }
             AxStatement::Text(expr) => self.check_expr(expr, format!("{location}.text")),
             AxStatement::Component(component) => self.check_component(component, location),
@@ -1065,6 +1035,9 @@ impl AxTypeChecker {
     }
 
     fn check_component(&mut self, component: &AxComponent, location: &str) {
+        if component.name == "__AxStateMatch" {
+            self.check_reactive_match(component, location);
+        }
         for prop in &component.props {
             self.check_expr(
                 &prop.value,
@@ -1086,6 +1059,95 @@ impl AxTypeChecker {
             AxBody::Block(body) => {
                 self.check_statements(body, &format!("{location}.{}", component.name));
             }
+        }
+    }
+
+    fn check_reactive_match(&mut self, component: &AxComponent, location: &str) {
+        let state_name = component.props.iter().find_map(|prop| {
+            (prop.name == "data-ax-state-match-name")
+                .then_some(&prop.value)
+                .and_then(|value| match value {
+                    AxExpr::String(value) => Some(value.as_str()),
+                    _ => None,
+                })
+        });
+        let union = state_name.and_then(|name| match self.context.binding(name) {
+            Some(AxType::Record(union)) => Some(union.clone()),
+            _ => None,
+        });
+        let AxBody::Block(branches) = &component.body else {
+            return;
+        };
+        let cases = branches
+            .iter()
+            .filter_map(|statement| match statement {
+                AxStatement::Component(branch) if branch.name == "__AxStateMatchCase" => branch
+                    .props
+                    .iter()
+                    .find_map(|prop| match (prop.name.as_str(), &prop.value) {
+                        ("case", AxExpr::String(value)) => Some(value.clone()),
+                        _ => None,
+                    }),
+                _ => None,
+            })
+            .collect();
+        let has_default = branches.iter().any(|statement| {
+            matches!(statement, AxStatement::Component(branch) if branch.name == "__AxStateMatchDefault")
+        });
+        self.check_match_cases(union, cases, has_default, &format!("{location}.match"));
+    }
+
+    fn check_match_cases(
+        &mut self,
+        union: Option<String>,
+        cases: Vec<String>,
+        has_default: bool,
+        location: &str,
+    ) {
+        let mut seen = BTreeSet::new();
+        for (index, value) in cases.iter().enumerate() {
+            if !seen.insert(value.as_str()) {
+                self.push_error(
+                    format!("{location}.case[{index}]"),
+                    AxTypeError::DuplicateMatchCase {
+                        value: value.clone(),
+                    },
+                );
+            }
+        }
+        let Some(union) = union else {
+            return;
+        };
+        let Some(literals) = self.context.literal_union(&union).map(<[_]>::to_vec) else {
+            return;
+        };
+        for value in &seen {
+            if !literals.iter().any(|literal| literal == *value) {
+                self.push_error(
+                    location,
+                    AxTypeError::UnknownMatchCase {
+                        union: union.clone(),
+                        value: (*value).to_string(),
+                    },
+                );
+            }
+        }
+        if has_default {
+            return;
+        }
+        let missing = literals
+            .iter()
+            .filter(|literal| !seen.contains(literal.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            self.push_error(
+                location,
+                AxTypeError::NonExhaustiveMatch {
+                    union,
+                    missing: missing.join(", "),
+                },
+            );
         }
     }
 
