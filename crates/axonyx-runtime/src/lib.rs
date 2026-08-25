@@ -3049,6 +3049,15 @@ fn inject_slot_statements(statements: &mut Vec<AxStatement>, page_body: &[AxStat
                 found_slot |= inject_slot_statements(&mut if_block.else_body, page_body);
                 composed.push(AxStatement::If(if_block));
             }
+            AxStatement::Match(mut match_block) => {
+                for case in &mut match_block.cases {
+                    found_slot |= inject_slot_statements(&mut case.body, page_body);
+                }
+                if let Some(default_body) = &mut match_block.default_body {
+                    found_slot |= inject_slot_statements(default_body, page_body);
+                }
+                composed.push(AxStatement::Match(match_block));
+            }
             AxStatement::Pipeline(mut pipeline) => {
                 found_slot |= inject_slot_pipeline(&mut pipeline, page_body);
                 composed.push(AxStatement::Pipeline(pipeline));
