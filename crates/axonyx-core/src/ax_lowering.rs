@@ -512,6 +512,37 @@ fn lower_component_node(
             push_native_props(&mut attrs, props);
             element_with_attrs("ax-state-branch", attrs, children)
         }
+        "__AxStateMatch" => {
+            attrs.push(attr("style", "display: contents"));
+            push_remaining_props(&mut attrs, props);
+            element_with_attrs("ax-state-match", attrs, children)
+        }
+        "__AxStateMatchCase" | "__AxStateMatchDefault" => {
+            let initially_hidden = prop_bool(&mut props, &["hidden"]).unwrap_or(false);
+            let is_case = component.name == "__AxStateMatchCase";
+            attrs.push(attr(
+                "data-ax-state-match-branch",
+                if is_case { "case" } else { "default" },
+            ));
+            if is_case {
+                if let Some(value) = prop_string(&mut props, &["case"]) {
+                    attrs.push(attr("data-ax-state-match-value", value));
+                }
+            }
+            attrs.push(attr(
+                "style",
+                if initially_hidden {
+                    "display: none"
+                } else {
+                    "display: contents"
+                },
+            ));
+            if initially_hidden {
+                attrs.push(attr("hidden", "true"));
+            }
+            push_native_props(&mut attrs, props);
+            element_with_attrs("ax-state-match-branch", attrs, children)
+        }
         "Container" => {
             prepend_class_attr(&mut attrs, "ax-container");
             attrs.insert(

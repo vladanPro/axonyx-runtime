@@ -3119,6 +3119,7 @@ fn render_preview_document_chunks(document: &AxDocument, root: &AxNode) -> Vec<V
     let state_bridge_script = if body.contains("data-ax-signal=")
         || body.contains("data-ax-state-name=")
         || body.contains("data-ax-state-if-signal=")
+        || body.contains("data-ax-state-match-signal=")
     {
         ax_state_bridge_script()
     } else {
@@ -3526,6 +3527,7 @@ fn ax_state_bridge_script() -> &'static str {
   const readBindings = new Map();
   const subscribers = new Map();
   const conditions = new Map();
+  const matches = new Map();
   const domCapabilities = new WeakMap();
   const validDomCapabilities = new WeakSet();
   const domCapabilityList = [];
@@ -4251,6 +4253,7 @@ fn ax_state_bridge_script() -> &'static str {
       moveSignalBucket(readBindings, alias, signal);
       moveSignalBucket(subscribers, alias, signal);
       moveSignalBucket(conditions, alias, signal);
+      moveSignalBucket(matches, alias, signal);
       if (state.has(alias) && !state.has(signal)) state.set(signal, state.get(alias));
       if (types.has(alias) && !types.has(signal)) types.set(signal, types.get(alias));
       document.querySelectorAll(`[data-ax-signal="${alias}"]`).forEach((node) => {
@@ -4261,6 +4264,9 @@ fn ax_state_bridge_script() -> &'static str {
       });
       document.querySelectorAll(`[data-ax-state-if-signal="${alias}"]`).forEach((node) => {
         node.setAttribute("data-ax-state-if-signal", signal);
+      });
+      document.querySelectorAll(`[data-ax-state-match-signal="${alias}"]`).forEach((node) => {
+        node.setAttribute("data-ax-state-match-signal", signal);
       });
     });
   };
@@ -4375,6 +4381,53 @@ fn ax_state_bridge_script() -> &'static str {
     updateCondition(entry, state.get(signal));
   };
 
+  const updateMatch = (entry, current) => {
+    const value = current == null ? "" : String(current);
+    let matched = false;
+    const branches = Array.from(
+      entry.node.querySelectorAll(":scope > [data-ax-state-match-branch]"),
+    );
+    branches.forEach((branch) => {
+      if (branch.getAttribute("data-ax-state-match-branch") !== "case") return;
+      const show = !matched && branch.getAttribute("data-ax-state-match-value") === value;
+      if (show) matched = true;
+      branch.hidden = !show;
+      branch.style.display = show ? "contents" : "none";
+    });
+    branches.forEach((branch) => {
+      if (branch.getAttribute("data-ax-state-match-branch") !== "default") return;
+      branch.hidden = matched;
+      branch.style.display = matched ? "none" : "contents";
+    });
+  };
+
+  const registerMatch = (node) => {
+    const rawSignal = node.getAttribute("data-ax-state-match-signal");
+    const signal = canonicalSignal(rawSignal);
+    if (!signal) return;
+    if (rawSignal !== signal) node.setAttribute("data-ax-state-match-signal", signal);
+    const type = node.getAttribute("data-ax-state-match-type") || "String";
+    const literalSource = node.getAttribute("data-ax-state-match-literals");
+    if (literalSource && !typeSchemas.has(type)) {
+      try {
+        const literals = JSON.parse(literalSource);
+        if (Array.isArray(literals)
+          && literals.length > 0
+          && literals.every((literal) => typeof literal === "string")
+          && new Set(literals).size === literals.length) {
+          typeSchemas.set(type, { name: type, literals });
+        }
+      } catch (_) {}
+    }
+    const initial = castValue(node.getAttribute("data-ax-state-match-initial"), type);
+    const entry = { node, type };
+    if (!types.has(signal)) types.set(signal, type);
+    if (!state.has(signal)) state.set(signal, initial);
+    if (!matches.has(signal)) matches.set(signal, []);
+    matches.get(signal).push(entry);
+    updateMatch(entry, state.get(signal));
+  };
+
   const writeSignal = (signal, value, source = "client", emit = true) => {
     signal = canonicalSignal(signal);
     const type = types.get(signal) || "String";
@@ -4395,6 +4448,7 @@ fn ax_state_bridge_script() -> &'static str {
       capability.node.setAttribute("data-ax-state-source", source);
     });
     (conditions.get(signal) || []).forEach((entry) => updateCondition(entry, nextValue));
+    (matches.get(signal) || []).forEach((entry) => updateMatch(entry, nextValue));
     persistStorageCapability(signal, nextValue, source);
     notifySubscribers(signal, nextValue, source);
     if (emit) emitPatch(signal, nextValue, source);
@@ -4785,6 +4839,7 @@ fn ax_state_bridge_script() -> &'static str {
     document.querySelectorAll("[data-ax-signal]").forEach(register);
     registerReads();
     document.querySelectorAll("[data-ax-state-if-signal]").forEach(registerCondition);
+    document.querySelectorAll("[data-ax-state-match-signal]").forEach(registerMatch);
   };
 
   document.addEventListener("input", (event) => {
@@ -5906,6 +5961,41 @@ page Counter() {
         assert!(html.contains("High value"));
         assert!(html.contains("Low value"));
         assert!(html.contains("registerCondition"));
+    }
+
+    #[test]
+    fn preview_preserves_state_dependent_match_branches_for_local_updates() {
+        let html = preview_ax_page(
+            r#"
+page ThemePreview() {
+  type Theme = "silver" | "bronze" | "gold"
+  state theme: Theme = "silver"
+  return ASX {
+    <>
+      <Button on:click={theme = "gold"}>Gold</Button>
+      <Match value={theme}>
+        <Case is="silver"><Copy>Silver preview</Copy></Case>
+        <Case is="bronze"><Copy>Bronze preview</Copy></Case>
+        <Case is="gold"><Copy>Gold preview</Copy></Case>
+        <Default><Copy>Custom preview</Copy></Default>
+      </Match>
+    </>
+  }
+}
+"#,
+        )
+        .expect("state match preview should render");
+
+        assert!(html.contains("data-ax-state-match-signal=\"root:theme:1\""));
+        assert!(html.contains("data-ax-state-match-type=\"Theme\""));
+        assert!(html.contains("data-ax-state-match-literals="));
+        assert!(html.contains("data-ax-state-match-value=\"silver\""));
+        assert!(html.contains("data-ax-state-match-value=\"gold\""));
+        assert!(html.contains("data-ax-state-match-branch=\"default\""));
+        assert!(html.contains("Silver preview"));
+        assert!(html.contains("Gold preview"));
+        assert!(html.contains("updateMatch"));
+        assert!(html.contains("registerMatch"));
     }
 
     #[test]
