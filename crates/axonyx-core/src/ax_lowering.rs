@@ -278,6 +278,33 @@ fn lower_statements(
                     )?);
                 }
             }
+            AxStatement::Match(block) => {
+                let value = eval_expr(&block.value, functions, scope, resolver)?.as_string();
+                let body = block
+                    .cases
+                    .iter()
+                    .find(|case| case.value == value)
+                    .map(|case| case.body.as_slice())
+                    .or(block.default_body.as_deref())
+                    .unwrap_or_default();
+                if !body.is_empty() {
+                    let mut nested = scope.clone();
+                    nested.insert(
+                        AX_RENDER_PATH.to_string(),
+                        AxValue::String(format!("{statement_render_path}.match")),
+                    );
+                    nodes.extend(lower_statements(
+                        body,
+                        functions,
+                        imports,
+                        components,
+                        &mut nested,
+                        resolver,
+                        import_resolver,
+                        slot_context,
+                    )?);
+                }
+            }
             AxStatement::Text(expr) => {
                 nodes.push(text(
                     eval_expr(expr, functions, scope, resolver)?.as_string(),
@@ -2119,6 +2146,50 @@ component ThemePicker() {
         };
 
         assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn lowers_only_the_matching_case() {
+        let document = AxDocument::page(
+            "ThemePreview",
+            [AxStatement::Match(AxMatchBlock::new(
+                AxExpr::string("gold"),
+                [
+                    AxMatchCase::new("silver", [AxStatement::text("Silver")]),
+                    AxMatchCase::new("gold", [AxStatement::text("Gold")]),
+                ],
+            ))],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+
+        assert_eq!(children, vec![text("Gold")]);
+    }
+
+    #[test]
+    fn lowers_match_default_when_no_case_matches() {
+        let document = AxDocument::page(
+            "ThemePreview",
+            [AxStatement::Match(
+                AxMatchBlock::new(
+                    AxExpr::string("custom"),
+                    [AxMatchCase::new("silver", [AxStatement::text("Silver")])],
+                )
+                .default_body([AxStatement::text("Custom")]),
+            )],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+
+        let node = lower_document(&document, &resolver).expect("document should lower");
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+
+        assert_eq!(children, vec![text("Custom")]);
     }
 
     #[test]

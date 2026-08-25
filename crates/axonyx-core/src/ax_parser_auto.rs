@@ -40,6 +40,10 @@ pub enum AxConvertV2Error {
     ControlBranchMustBeLast { tag: String, branch: String },
     #[error("`<{branch}>` is only valid inside `<{tag}>`")]
     UnexpectedControlBranch { tag: String, branch: String },
+    #[error("`<Match>` only accepts `<Case>` and an optional final `<Default>` child")]
+    InvalidMatchChild,
+    #[error("`<Case>` requires `is` to be a string literal")]
+    InvalidMatchCaseValue,
     #[error("`<Head>` only accepts element children")]
     InvalidHeadChild,
     #[error("unsupported head tag `<{tag}>`")]
@@ -427,6 +431,9 @@ fn convert_element(
     if element.name == "If" {
         return convert_if_element(element, state_bindings);
     }
+    if element.name == "Match" {
+        return convert_match_element(element, state_bindings);
+    }
 
     let mut component = AxComponent::new(element.name.clone());
     let mut class_attr_seen: Option<&str> = None;
@@ -513,7 +520,12 @@ fn convert_child(
         AxNodeV2::Element(element) if element.name == "If" => {
             convert_if_statement(element, state_bindings)
         }
-        AxNodeV2::Element(element) if element.name == "Else" || element.name == "Empty" => {
+        AxNodeV2::Element(element) if element.name == "Match" => {
+            convert_match_statement(element, state_bindings)
+        }
+        AxNodeV2::Element(element)
+            if matches!(element.name.as_str(), "Else" | "Empty" | "Case" | "Default") =>
+        {
             Err(AxConvertV2Error::UnexpectedControlBranch {
                 tag: "control-flow".to_string(),
                 branch: element.name.clone(),
@@ -554,6 +566,69 @@ fn convert_if_statement(
     Ok(AxStatement::If(
         AxIfBlock::new(condition, body).else_body(else_body),
     ))
+}
+
+fn convert_match_statement(
+    element: &AxElementNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<AxStatement, AxConvertV2Error> {
+    let value = control_expr_attr(element, &["value"])?;
+    let (cases, default_body) = split_match_children(element, state_bindings)?;
+    let mut match_block = AxMatchBlock::new(value, cases);
+    if let Some(default_body) = default_body {
+        match_block = match_block.default_body(default_body);
+    }
+    Ok(AxStatement::Match(match_block))
+}
+
+fn split_match_children(
+    element: &AxElementNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<(Vec<AxMatchCase>, Option<Vec<AxStatement>>), AxConvertV2Error> {
+    let mut cases = Vec::new();
+    let mut default_body = None;
+
+    for child in &element.children {
+        let AxNodeV2::Element(branch) = child else {
+            return Err(AxConvertV2Error::InvalidMatchChild);
+        };
+        match branch.name.as_str() {
+            "Case" => {
+                if default_body.is_some() {
+                    return Err(AxConvertV2Error::ControlBranchMustBeLast {
+                        tag: "Match".to_string(),
+                        branch: "Default".to_string(),
+                    });
+                }
+                let case_value = match control_expr_attr(branch, &["is"])? {
+                    AxExpr::String(value) => value,
+                    _ => return Err(AxConvertV2Error::InvalidMatchCaseValue),
+                };
+                cases.push(AxMatchCase::new(
+                    case_value,
+                    convert_children(&branch.children, state_bindings)?,
+                ));
+            }
+            "Default" => {
+                if !branch.attrs.is_empty() {
+                    return Err(AxConvertV2Error::ControlBranchAttrsNotSupported {
+                        tag: "Match".to_string(),
+                        branch: "Default".to_string(),
+                    });
+                }
+                if default_body.is_some() {
+                    return Err(AxConvertV2Error::DuplicateControlBranch {
+                        tag: "Match".to_string(),
+                        branch: "Default".to_string(),
+                    });
+                }
+                default_body = Some(convert_children(&branch.children, state_bindings)?);
+            }
+            _ => return Err(AxConvertV2Error::InvalidMatchChild),
+        }
+    }
+
+    Ok((cases, default_body))
 }
 
 fn state_if_component(
@@ -601,6 +676,16 @@ fn convert_if_element(
     state_bindings: &BTreeMap<String, StateBindingPlan>,
 ) -> Result<AxComponent, AxConvertV2Error> {
     Ok(AxComponent::fragment([convert_if_statement(
+        element,
+        state_bindings,
+    )?]))
+}
+
+fn convert_match_element(
+    element: &AxElementNode,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<AxComponent, AxConvertV2Error> {
+    Ok(AxComponent::fragment([convert_match_statement(
         element,
         state_bindings,
     )?]))
@@ -2229,6 +2314,65 @@ page Home
             panic!("expected each block");
         };
         assert_eq!(each_block.empty_body.len(), 1);
+    }
+
+    #[test]
+    fn converts_match_cases_and_default_into_runtime_block() {
+        let document = parse_ax_auto(
+            r#"
+page ThemePreview() {
+  const theme: String = "gold"
+
+  return ASX {
+    <Match value={theme}>
+      <Case is="silver"><Copy>Silver</Copy></Case>
+      <Case is="gold"><Copy>Gold</Copy></Case>
+      <Default><Copy>Custom</Copy></Default>
+    </Match>
+  }
+}
+"#,
+        )
+        .expect("match control element should parse");
+
+        let AxStatement::Component(fragment) = &document.page.body[1] else {
+            panic!("match should convert into a fragment component");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("match fragment should contain a control statement");
+        };
+        let AxStatement::Match(match_block) = &body[0] else {
+            panic!("expected match block");
+        };
+
+        assert_eq!(match_block.value, AxExpr::ident("theme"));
+        assert_eq!(
+            match_block
+                .cases
+                .iter()
+                .map(|case| case.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["silver", "gold"]
+        );
+        assert_eq!(match_block.default_body.as_deref().map(<[_]>::len), Some(1));
+    }
+
+    #[test]
+    fn rejects_non_literal_match_case_values() {
+        let error = parse_ax_auto(
+            r#"
+page ThemePreview
+<Match value={theme}>
+  <Case is={otherTheme}><Copy>Theme</Copy></Case>
+</Match>
+"#,
+        )
+        .expect_err("match cases should require literal values");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::InvalidMatchCaseValue)
+        ));
     }
 
     #[test]
