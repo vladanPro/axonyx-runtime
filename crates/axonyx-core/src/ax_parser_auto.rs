@@ -1008,6 +1008,9 @@ const AX_EXPR_FALLBACK: u8 = 34;
 const AX_EXPR_INDEX: u8 = 40;
 const AX_EXPR_MEMBER: u8 = 41;
 const AX_EXPR_OPTIONAL_MEMBER: u8 = 42;
+const AX_EXPR_BUILD_LIST: u8 = 50;
+const AX_EXPR_BUILD_OBJECT: u8 = 51;
+const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
 
 fn is_reactive_boolean_attr(name: &str) -> bool {
     matches!(
@@ -1413,11 +1416,36 @@ fn compile_reactive_expression_node(
                 path.join(".")
             ));
         }
-        AxExpr::List(_) | AxExpr::Object(_) => {
-            return Err("reactive list/object literals are not supported in V0".to_string());
+        AxExpr::List(items) => {
+            let count = reactive_collection_count(items.len(), "list")?;
+            for item in items {
+                compile_reactive_expression_node(item, bindings, dependencies, program)?;
+            }
+            program.push(AX_EXPR_BUILD_LIST);
+            program.extend_from_slice(&count.to_le_bytes());
+        }
+        AxExpr::Object(fields) => {
+            let count = reactive_collection_count(fields.len(), "object")?;
+            for value in fields.values() {
+                compile_reactive_expression_node(value, bindings, dependencies, program)?;
+            }
+            program.push(AX_EXPR_BUILD_OBJECT);
+            program.extend_from_slice(&count.to_le_bytes());
+            for name in fields.keys() {
+                push_program_string(program, name)?;
+            }
         }
     }
     Ok(())
+}
+
+fn reactive_collection_count(count: usize, kind: &str) -> Result<u16, String> {
+    if count > AX_EXPRESSION_COLLECTION_MAX_ITEMS {
+        return Err(format!(
+            "reactive {kind} literal exceeds the {AX_EXPRESSION_COLLECTION_MAX_ITEMS}-item limit"
+        ));
+    }
+    u16::try_from(count).map_err(|_| format!("reactive {kind} literal has too many items"))
 }
 
 fn push_program_string(program: &mut Vec<u8>, value: &str) -> Result<(), String> {
@@ -2795,6 +2823,53 @@ page Counter() {
             "data-ax-expression-0-signals",
             AxExpr::string(r#"["root:count:1"]"#)
         )));
+    }
+
+    #[test]
+    fn compiles_reactive_list_and_object_literals() {
+        let document = parse_ax_auto(
+            r#"
+page CollectionProbe() {
+  state count: Int = 2
+  state limit: Int = 3
+  return ASX {
+    <>
+      <Copy>{count in [1, 2, 3]}</Copy>
+      <button disabled={({active: count >= limit}).active}>Locked</button>
+    </>
+  }
+}
+"#,
+        )
+        .expect("reactive collection literals should compile");
+
+        let AxStatement::Component(fragment) = &document.page.body[2] else {
+            panic!("expected return fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected fragment body");
+        };
+        let AxStatement::Component(copy) = &body[0] else {
+            panic!("expected Copy");
+        };
+        let AxBody::Block(copy_body) = &copy.body else {
+            panic!("expected reactive text wrapper");
+        };
+        let AxStatement::Component(expression) = &copy_body[0] else {
+            panic!("expected reactive expression");
+        };
+        assert!(expression.props.iter().any(|prop| {
+            prop.name == "data-ax-expression-0-program"
+                && matches!(&prop.value, AxExpr::String(value) if value.ends_with("3203001f"))
+        }));
+
+        let AxStatement::Component(button) = &body[1] else {
+            panic!("expected button");
+        };
+        assert!(button.props.iter().any(|prop| {
+            prop.name == "data-ax-expression-0-program"
+                && matches!(&prop.value, AxExpr::String(value) if value.contains("33010006000000616374697665"))
+        }));
     }
 
     #[test]

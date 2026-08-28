@@ -16,6 +16,8 @@ pub const AX_STATE_VALUE_CAPACITY: usize = 64 * 1024;
 pub const AX_STATE_VALUE_FRAME_VERSION: u8 = 1;
 pub const AX_STATE_VALUE_MAX_DEPTH: usize = 32;
 pub const AX_EXPRESSION_PROGRAM_VERSION: u8 = 1;
+const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
+const AX_EXPRESSION_STACK_MAX_VALUES: usize = 4096;
 
 static mut STRING_BUFFER: [u8; AX_STATE_STRING_CAPACITY] = [0; AX_STATE_STRING_CAPACITY];
 static mut VALUE_BUFFER: [u8; AX_STATE_VALUE_CAPACITY] = [0; AX_STATE_VALUE_CAPACITY];
@@ -237,10 +239,47 @@ fn evaluate_expression_program(program: &[u8], dependencies: &[ExprValue]) -> Op
                     _ => return None,
                 });
             }
+            50 => {
+                let count = read_program_u16(program, &mut cursor)?;
+                if count > AX_EXPRESSION_COLLECTION_MAX_ITEMS {
+                    return None;
+                }
+                let values = pop_expression_values(&mut stack, count)?;
+                stack.push(ExprValue::List(values));
+            }
+            51 => {
+                let count = read_program_u16(program, &mut cursor)?;
+                if count > AX_EXPRESSION_COLLECTION_MAX_ITEMS {
+                    return None;
+                }
+                let mut keys = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let key = read_program_string(program, &mut cursor)?;
+                    if keys.contains(&key) {
+                        return None;
+                    }
+                    keys.push(key);
+                }
+                let values = pop_expression_values(&mut stack, count)?;
+                stack.push(ExprValue::Object(keys.into_iter().zip(values).collect()));
+            }
             _ => return None,
+        }
+        if stack.len() > AX_EXPRESSION_STACK_MAX_VALUES {
+            return None;
         }
     }
     (stack.len() == 1).then(|| stack.pop()).flatten()
+}
+
+fn read_program_u16(program: &[u8], cursor: &mut usize) -> Option<usize> {
+    let raw: [u8; 2] = take(program, cursor, 2)?.try_into().ok()?;
+    Some(u16::from_le_bytes(raw) as usize)
+}
+
+fn pop_expression_values(stack: &mut Vec<ExprValue>, count: usize) -> Option<Vec<ExprValue>> {
+    let start = stack.len().checked_sub(count)?;
+    Some(stack.split_off(start))
 }
 
 fn evaluate_binary_opcode(opcode: u8, left: ExprValue, right: ExprValue) -> Option<ExprValue> {
@@ -806,6 +845,44 @@ mod tests {
     }
 
     #[test]
+    fn builds_reactive_list_and_object_literals() {
+        let _guard = BUFFER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+
+        let mut list_program = b"AXE\x01".to_vec();
+        list_program.extend_from_slice(&[0, 0, 0]);
+        for value in [1i64, 2, 3] {
+            list_program.push(5);
+            list_program.extend_from_slice(&value.to_le_bytes());
+        }
+        list_program.push(50);
+        list_program.extend_from_slice(&3u16.to_le_bytes());
+        list_program.push(31);
+        assert_eq!(
+            evaluate_expression_program(&list_program, &[ExprValue::Int(2)]),
+            Some(ExprValue::Bool(true))
+        );
+
+        let mut object_program = b"AXE\x01".to_vec();
+        object_program.extend_from_slice(&[0, 0, 0]);
+        object_program.push(5);
+        object_program.extend_from_slice(&0i64.to_le_bytes());
+        object_program.push(27);
+        object_program.push(51);
+        object_program.extend_from_slice(&1u16.to_le_bytes());
+        object_program.extend_from_slice(&6u32.to_le_bytes());
+        object_program.extend_from_slice(b"active");
+        object_program.push(41);
+        object_program.extend_from_slice(&6u32.to_le_bytes());
+        object_program.extend_from_slice(b"active");
+        assert_eq!(
+            evaluate_expression_program(&object_program, &[ExprValue::Int(2)]),
+            Some(ExprValue::Bool(true))
+        );
+    }
+
+    #[test]
     fn rejects_impossible_expression_collection_counts_before_allocation() {
         let mut request = Vec::new();
         request.extend_from_slice(&4u32.to_le_bytes());
@@ -817,6 +894,11 @@ mod tests {
         assert_eq!(decode_expr_value(&list, 0), None);
         list[3] = 7;
         assert_eq!(decode_expr_value(&list, 0), None);
+
+        let mut program = b"AXE\x01".to_vec();
+        program.push(50);
+        program.extend_from_slice(&1025u16.to_le_bytes());
+        assert_eq!(evaluate_expression_program(&program, &[]), None);
     }
 
     fn value_frame(tag: u8, payload: &[u8]) -> Vec<u8> {
