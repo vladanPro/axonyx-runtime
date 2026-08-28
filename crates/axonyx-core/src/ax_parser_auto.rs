@@ -6,7 +6,7 @@ use crate::ax_ast_v2::prelude::*;
 use crate::ax_parser::{parse_ax, parse_expr, AxParseError};
 use crate::ax_parser_v2::{parse_ax_v2, AxParseV2Error};
 use crate::ax_semantics_v2::{validate_ax_v2_semantics, AxSemanticV2Error};
-use crate::ax_types::{AxDataContext, AxType, AxTypeParseError};
+use crate::ax_types::{format_expr, AxDataContext, AxType, AxTypeParseError};
 
 #[derive(Debug, Error)]
 pub enum AxAutoParseError {
@@ -1062,7 +1062,7 @@ fn compile_reactive_expression(
     let mut program = AX_EXPRESSION_MAGIC.to_vec();
     compile_reactive_expression_node(expr, state_bindings, &mut dependencies, &mut program)
         .map_err(|reason| AxConvertV2Error::UnsupportedReactiveExpression {
-            expr_source: format_ax_expr(expr),
+            expr_source: format_expr(expr),
             reason,
         })?;
     let signals = dependencies
@@ -1226,10 +1226,6 @@ fn encode_hex(bytes: &[u8]) -> String {
         encoded.push(HEX[(byte & 0x0f) as usize] as char);
     }
     encoded
-}
-
-fn format_ax_expr(expr: &AxExpr) -> String {
-    serde_json::to_string(expr).unwrap_or_else(|_| "<expression>".to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2497,9 +2493,13 @@ page Counter() {
         .expect_err("reactive calls should not silently become static");
 
         assert!(matches!(
-            error,
-            AxAutoParseError::Convert(AxConvertV2Error::UnsupportedReactiveExpression { .. })
+            &error,
+            AxAutoParseError::Convert(AxConvertV2Error::UnsupportedReactiveExpression {
+                expr_source,
+                ..
+            }) if expr_source == "format(count)"
         ));
+        assert!(error.to_string().contains("format(count)"));
     }
 
     #[test]
