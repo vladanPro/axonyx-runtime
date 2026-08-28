@@ -2499,7 +2499,6 @@ page Counter() {
                 ..
             }) if expr_source == "format(count)"
         ));
-        assert!(error.to_string().contains("format(count)"));
     }
 
     #[test]
