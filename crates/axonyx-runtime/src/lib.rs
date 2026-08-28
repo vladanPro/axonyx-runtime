@@ -6201,6 +6201,33 @@ page Counter() {
     }
 
     #[test]
+    fn preview_renders_reactive_collection_literals_for_server_and_wasm() {
+        let html = preview_ax_page(
+            r#"
+page CollectionProbe() {
+  state count: Int = 2
+  state limit: Int = 3
+  return ASX {
+    <>
+      <Copy>{count in [1, 2, 3]}</Copy>
+      <button disabled={({active: count >= limit}).active}>Locked</button>
+    </>
+  }
+}
+"#,
+        )
+        .expect("reactive collection preview should render");
+
+        assert!(html.contains(">true</ax-expression>"));
+        assert!(html.contains("data-ax-expression-0-target=\"text\""));
+        assert!(html.contains("data-ax-expression-0-target=\"boolean:disabled\""));
+        assert!(html.contains("3203001f"));
+        assert!(html.contains("33010006000000616374697665"));
+        assert!(html.contains("exports.ax_state_evaluate_expression"));
+        assert!(!html.contains("disabled=\"false\""));
+    }
+
+    #[test]
     fn preview_preserves_state_dependent_if_branches_for_local_updates() {
         let html = preview_ax_page(
             r#"
