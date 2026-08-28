@@ -1171,7 +1171,7 @@ impl AxTypeChecker {
     }
 }
 
-fn format_expr(expr: &AxExpr) -> String {
+pub(crate) fn format_expr(expr: &AxExpr) -> String {
     match expr {
         AxExpr::String(value) => format!("{value:?}"),
         AxExpr::Number(value) => value.to_string(),
