@@ -543,6 +543,11 @@ fn lower_component_node(
             push_native_props(&mut attrs, props);
             element_with_attrs("ax-state-match-branch", attrs, children)
         }
+        "__AxReactiveText" => {
+            attrs.push(attr("style", "display: contents"));
+            push_remaining_props(&mut attrs, props);
+            element_with_attrs("ax-expression", attrs, children)
+        }
         "Container" => {
             prepend_class_attr(&mut attrs, "ax-container");
             attrs.insert(
@@ -1691,8 +1696,25 @@ fn push_selected_native_props(
 
 fn push_native_props(attrs: &mut Vec<Attribute>, props: BTreeMap<String, AxValue>) {
     for (name, value) in props {
+        if is_html_boolean_attr(&name) && matches!(value, AxValue::Bool(false) | AxValue::Null) {
+            continue;
+        }
         attrs.push(attr_boxed(name, value.as_string()));
     }
+}
+
+fn is_html_boolean_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "disabled"
+            | "checked"
+            | "selected"
+            | "hidden"
+            | "required"
+            | "readonly"
+            | "multiple"
+            | "open"
+    )
 }
 
 fn is_native_html_tag(name: &str) -> bool {
@@ -1925,6 +1947,34 @@ page Home
                 }],
             }
         );
+    }
+
+    #[test]
+    fn omits_false_native_boolean_attributes() {
+        let document = parse_ax_auto(
+            r#"
+page Home() {
+  return ASX {
+    <button disabled={false} hidden={false} required={true}>Save</button>
+  }
+}
+"#,
+        )
+        .expect("document should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let node = lower_document(&document, &resolver).expect("document should lower");
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element { attrs, .. } = &children[0] else {
+            panic!("expected native button");
+        };
+
+        assert!(!attrs.iter().any(|attr| attr.name == "disabled"));
+        assert!(!attrs.iter().any(|attr| attr.name == "hidden"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "required" && attr.value == "true"));
     }
 
     #[test]

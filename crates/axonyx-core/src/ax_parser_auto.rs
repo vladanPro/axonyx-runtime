@@ -94,6 +94,8 @@ pub enum AxConvertV2Error {
         "invalid local state event `{expr_source}`; use `state = literal`, `state += number`, `state -= number`, or `state = !state`"
     )]
     InvalidStateEvent { expr_source: String },
+    #[error("unsupported reactive expression `{expr_source}`: {reason}")]
+    UnsupportedReactiveExpression { expr_source: String, reason: String },
 }
 
 pub fn looks_like_ax_v2(input: &str) -> bool {
@@ -439,6 +441,7 @@ fn convert_element(
     let mut component = AxComponent::new(element.name.clone());
     let mut class_attr_seen: Option<&str> = None;
 
+    let mut reactive_expression_index = 0usize;
     for attr in &element.attrs {
         match attr.name.as_str() {
             name if name.starts_with("bind:") => {
@@ -458,7 +461,21 @@ fn convert_element(
                 component = component.class(convert_attr_value(&attr.value)?);
             }
             "recipe" => component = component.recipe(convert_attr_value(&attr.value)?),
-            _ => component = component.prop(attr.name.clone(), convert_attr_value(&attr.value)?),
+            _ => {
+                let value = convert_attr_value(&attr.value)?;
+                if is_reactive_boolean_attr(&attr.name) {
+                    if let Some(plan) = compile_reactive_expression(&value, state_bindings)? {
+                        component = apply_reactive_expression_metadata(
+                            component,
+                            reactive_expression_index,
+                            &format!("boolean:{}", attr.name),
+                            &plan,
+                        );
+                        reactive_expression_index += 1;
+                    }
+                }
+                component = component.prop(attr.name.clone(), value);
+            }
         }
     }
 
@@ -488,6 +505,12 @@ fn convert_element(
                     if let Some(binding) = state_bindings.get(name) {
                         component = apply_state_read_binding(component, binding);
                     }
+                } else if let Some(plan) = compile_reactive_expression(&value, state_bindings)? {
+                    return Ok(
+                        component.block([AxStatement::component(reactive_text_component(
+                            value, &plan,
+                        ))]),
+                    );
                 }
                 Ok(component.inline(value))
             }
@@ -537,7 +560,16 @@ fn convert_child(
             state_bindings,
         )?)),
         AxNodeV2::Text(text) => Ok(AxStatement::text(text.value.clone())),
-        AxNodeV2::Expr(expr) => Ok(AxStatement::text(parse_v2_expr(&expr.source)?)),
+        AxNodeV2::Expr(expr) => {
+            let value = parse_v2_expr(&expr.source)?;
+            if let Some(plan) = compile_reactive_expression(&value, state_bindings)? {
+                Ok(AxStatement::component(reactive_text_component(
+                    value, &plan,
+                )))
+            } else {
+                Ok(AxStatement::text(value))
+            }
+        }
     }
 }
 
@@ -929,6 +961,275 @@ struct StateBindingPlan {
     ty: String,
     literals: Option<Vec<String>>,
     initial: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReactiveExpressionPlan {
+    program: Vec<u8>,
+    signals: Vec<String>,
+    types: Vec<String>,
+    initials: Vec<String>,
+}
+
+const AX_EXPRESSION_MAGIC: &[u8; 4] = b"AXE\x01";
+const AX_EXPR_PUSH_DEPENDENCY: u8 = 0;
+const AX_EXPR_PUSH_NULL: u8 = 1;
+const AX_EXPR_PUSH_STRING: u8 = 2;
+const AX_EXPR_PUSH_BOOL: u8 = 3;
+const AX_EXPR_PUSH_FLOAT: u8 = 4;
+const AX_EXPR_PUSH_INT: u8 = 5;
+const AX_EXPR_NOT: u8 = 10;
+const AX_EXPR_NEG: u8 = 11;
+const AX_EXPR_ADD: u8 = 20;
+const AX_EXPR_SUB: u8 = 21;
+const AX_EXPR_MUL: u8 = 22;
+const AX_EXPR_DIV: u8 = 23;
+const AX_EXPR_REM: u8 = 24;
+const AX_EXPR_EQ: u8 = 25;
+const AX_EXPR_NE: u8 = 26;
+const AX_EXPR_GT: u8 = 27;
+const AX_EXPR_GE: u8 = 28;
+const AX_EXPR_LT: u8 = 29;
+const AX_EXPR_LE: u8 = 30;
+const AX_EXPR_IN: u8 = 31;
+const AX_EXPR_AND: u8 = 32;
+const AX_EXPR_OR: u8 = 33;
+const AX_EXPR_FALLBACK: u8 = 34;
+const AX_EXPR_INDEX: u8 = 40;
+const AX_EXPR_MEMBER: u8 = 41;
+const AX_EXPR_OPTIONAL_MEMBER: u8 = 42;
+
+fn is_reactive_boolean_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "disabled"
+            | "checked"
+            | "selected"
+            | "hidden"
+            | "required"
+            | "readonly"
+            | "multiple"
+            | "open"
+    )
+}
+
+fn reactive_text_component(value: AxExpr, plan: &ReactiveExpressionPlan) -> AxComponent {
+    apply_reactive_expression_metadata(
+        AxComponent::new("__AxReactiveText").inline(value),
+        0,
+        "text",
+        plan,
+    )
+}
+
+fn apply_reactive_expression_metadata(
+    component: AxComponent,
+    index: usize,
+    target: &str,
+    plan: &ReactiveExpressionPlan,
+) -> AxComponent {
+    let signals = serde_json::to_string(&plan.signals)
+        .expect("serializing reactive signal metadata cannot fail");
+    let types =
+        serde_json::to_string(&plan.types).expect("serializing reactive type metadata cannot fail");
+    let initials = serde_json::to_string(&plan.initials)
+        .expect("serializing reactive initial metadata cannot fail");
+    component
+        .prop("data-ax-expression-protocol", "ax-expression/1")
+        .prop("data-ax-expression-count", (index + 1).to_string())
+        .prop(
+            format!("data-ax-expression-{index}-program"),
+            encode_hex(&plan.program),
+        )
+        .prop(format!("data-ax-expression-{index}-signals"), signals)
+        .prop(format!("data-ax-expression-{index}-types"), types)
+        .prop(format!("data-ax-expression-{index}-initials"), initials)
+        .prop(
+            format!("data-ax-expression-{index}-target"),
+            target.to_string(),
+        )
+}
+
+fn compile_reactive_expression(
+    expr: &AxExpr,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> Result<Option<ReactiveExpressionPlan>, AxConvertV2Error> {
+    if !expression_references_state(expr, state_bindings) {
+        return Ok(None);
+    }
+
+    let mut dependencies = Vec::<String>::new();
+    let mut program = AX_EXPRESSION_MAGIC.to_vec();
+    compile_reactive_expression_node(expr, state_bindings, &mut dependencies, &mut program)
+        .map_err(|reason| AxConvertV2Error::UnsupportedReactiveExpression {
+            expr_source: format_ax_expr(expr),
+            reason,
+        })?;
+    let signals = dependencies
+        .iter()
+        .map(|name| state_bindings[name].signal_id.clone())
+        .collect();
+    let types = dependencies
+        .iter()
+        .map(|name| state_bindings[name].ty.clone())
+        .collect();
+    let initials = dependencies
+        .iter()
+        .map(|name| state_bindings[name].initial.clone())
+        .collect();
+    Ok(Some(ReactiveExpressionPlan {
+        program,
+        signals,
+        types,
+        initials,
+    }))
+}
+
+fn expression_references_state(
+    expr: &AxExpr,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> bool {
+    match expr {
+        AxExpr::Identifier(name) => state_bindings.contains_key(name),
+        AxExpr::Unary { expr, .. } => expression_references_state(expr, state_bindings),
+        AxExpr::Binary { left, right, .. } => {
+            expression_references_state(left, state_bindings)
+                || expression_references_state(right, state_bindings)
+        }
+        AxExpr::Index { object, index } => {
+            expression_references_state(object, state_bindings)
+                || expression_references_state(index, state_bindings)
+        }
+        AxExpr::Member { object, .. } | AxExpr::OptionalMember { object, .. } => {
+            expression_references_state(object, state_bindings)
+        }
+        AxExpr::Call { args, .. } => args
+            .iter()
+            .any(|arg| expression_references_state(arg, state_bindings)),
+        AxExpr::List(items) => items
+            .iter()
+            .any(|item| expression_references_state(item, state_bindings)),
+        AxExpr::Object(fields) => fields
+            .values()
+            .any(|value| expression_references_state(value, state_bindings)),
+        AxExpr::String(_) | AxExpr::Number(_) | AxExpr::Float(_) | AxExpr::Bool(_) => false,
+    }
+}
+
+fn compile_reactive_expression_node(
+    expr: &AxExpr,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    dependencies: &mut Vec<String>,
+    program: &mut Vec<u8>,
+) -> Result<(), String> {
+    match expr {
+        AxExpr::String(value) => {
+            program.push(AX_EXPR_PUSH_STRING);
+            push_program_string(program, value)?;
+        }
+        AxExpr::Number(value) => {
+            program.push(AX_EXPR_PUSH_INT);
+            program.extend_from_slice(&value.to_le_bytes());
+        }
+        AxExpr::Float(value) => {
+            program.push(AX_EXPR_PUSH_FLOAT);
+            program.extend_from_slice(&value.get().to_le_bytes());
+        }
+        AxExpr::Bool(value) => {
+            program.push(AX_EXPR_PUSH_BOOL);
+            program.push(u8::from(*value));
+        }
+        AxExpr::Identifier(name) if name == "null" => program.push(AX_EXPR_PUSH_NULL),
+        AxExpr::Identifier(name) => {
+            if !state_bindings.contains_key(name) {
+                return Err(format!("`{name}` is not reactive state"));
+            }
+            let index = if let Some(index) = dependencies.iter().position(|item| item == name) {
+                index
+            } else {
+                dependencies.push(name.clone());
+                dependencies.len() - 1
+            };
+            let index = u16::try_from(index)
+                .map_err(|_| "reactive expression has too many dependencies".to_string())?;
+            program.push(AX_EXPR_PUSH_DEPENDENCY);
+            program.extend_from_slice(&index.to_le_bytes());
+        }
+        AxExpr::Unary { op, expr } => {
+            compile_reactive_expression_node(expr, state_bindings, dependencies, program)?;
+            program.push(match op {
+                AxUnaryOp::Not => AX_EXPR_NOT,
+                AxUnaryOp::Neg => AX_EXPR_NEG,
+            });
+        }
+        AxExpr::Binary { op, left, right } => {
+            compile_reactive_expression_node(left, state_bindings, dependencies, program)?;
+            compile_reactive_expression_node(right, state_bindings, dependencies, program)?;
+            program.push(match op {
+                AxBinaryOp::Add => AX_EXPR_ADD,
+                AxBinaryOp::Sub => AX_EXPR_SUB,
+                AxBinaryOp::Mul => AX_EXPR_MUL,
+                AxBinaryOp::Div => AX_EXPR_DIV,
+                AxBinaryOp::Rem => AX_EXPR_REM,
+                AxBinaryOp::Eq => AX_EXPR_EQ,
+                AxBinaryOp::Ne => AX_EXPR_NE,
+                AxBinaryOp::Gt => AX_EXPR_GT,
+                AxBinaryOp::Ge => AX_EXPR_GE,
+                AxBinaryOp::Lt => AX_EXPR_LT,
+                AxBinaryOp::Le => AX_EXPR_LE,
+                AxBinaryOp::In => AX_EXPR_IN,
+                AxBinaryOp::And => AX_EXPR_AND,
+                AxBinaryOp::Or => AX_EXPR_OR,
+                AxBinaryOp::Fallback => AX_EXPR_FALLBACK,
+            });
+        }
+        AxExpr::Index { object, index } => {
+            compile_reactive_expression_node(object, state_bindings, dependencies, program)?;
+            compile_reactive_expression_node(index, state_bindings, dependencies, program)?;
+            program.push(AX_EXPR_INDEX);
+        }
+        AxExpr::Member { object, property } | AxExpr::OptionalMember { object, property } => {
+            compile_reactive_expression_node(object, state_bindings, dependencies, program)?;
+            program.push(if matches!(expr, AxExpr::Member { .. }) {
+                AX_EXPR_MEMBER
+            } else {
+                AX_EXPR_OPTIONAL_MEMBER
+            });
+            push_program_string(program, property)?;
+        }
+        AxExpr::Call { path, .. } => {
+            return Err(format!(
+                "reactive function calls are not supported in V0 (`{}`)",
+                path.join(".")
+            ));
+        }
+        AxExpr::List(_) | AxExpr::Object(_) => {
+            return Err("reactive list/object literals are not supported in V0".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn push_program_string(program: &mut Vec<u8>, value: &str) -> Result<(), String> {
+    let length = u32::try_from(value.len())
+        .map_err(|_| "reactive expression string is too large".to_string())?;
+    program.extend_from_slice(&length.to_le_bytes());
+    program.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+fn format_ax_expr(expr: &AxExpr) -> String {
+    serde_json::to_string(expr).unwrap_or_else(|_| "<expression>".to_string())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2125,6 +2426,80 @@ page ThemePreview() {
         assert!(gold
             .props
             .contains(&AxProp::new("hidden", AxExpr::bool(true))));
+    }
+
+    #[test]
+    fn compiles_reactive_text_and_boolean_attribute_expression_metadata() {
+        let document = parse_ax_auto(
+            r#"
+page Counter() {
+  state count: Int = 2
+  state limit: Int = 5
+  return ASX {
+    <>
+      <Copy>{count * 2}</Copy>
+      <Button disabled={count >= limit}>Increase</Button>
+    </>
+  }
+}
+"#,
+        )
+        .expect("reactive expressions should compile");
+
+        let AxStatement::Component(fragment) = &document.page.body[2] else {
+            panic!("expected return fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected return body");
+        };
+        let AxStatement::Component(copy) = &body[0] else {
+            panic!("expected Copy");
+        };
+        let AxBody::Block(copy_body) = &copy.body else {
+            panic!("expected reactive text wrapper");
+        };
+        let AxStatement::Component(expression) = &copy_body[0] else {
+            panic!("expected reactive expression");
+        };
+        assert_eq!(expression.name, "__AxReactiveText");
+        assert!(expression.props.contains(&AxProp::new(
+            "data-ax-expression-0-signals",
+            AxExpr::string(r#"["root:count:1"]"#)
+        )));
+        assert!(expression.props.contains(&AxProp::new(
+            "data-ax-expression-0-target",
+            AxExpr::string("text")
+        )));
+
+        let AxStatement::Component(button) = &body[1] else {
+            panic!("expected Button");
+        };
+        assert!(button.props.contains(&AxProp::new(
+            "data-ax-expression-0-signals",
+            AxExpr::string(r#"["root:count:1","root:limit:2"]"#)
+        )));
+        assert!(button.props.contains(&AxProp::new(
+            "data-ax-expression-0-target",
+            AxExpr::string("boolean:disabled")
+        )));
+    }
+
+    #[test]
+    fn rejects_state_dependent_function_calls_until_wasm_calls_are_defined() {
+        let error = parse_ax_auto(
+            r#"
+page Counter() {
+  state count: Int = 2
+  return ASX { <Copy>{format(count)}</Copy> }
+}
+"#,
+        )
+        .expect_err("reactive calls should not silently become static");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::UnsupportedReactiveExpression { .. })
+        ));
     }
 
     #[test]

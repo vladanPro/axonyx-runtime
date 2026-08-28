@@ -18,6 +18,10 @@ assert(wasm.ax_state_apply_bool(3, 0, 0) === 1, "bool toggle failed");
 assert(wasm.ax_state_supports_operation(0, 0) === 1, "string set should be supported");
 assert(wasm.ax_state_supports_operation(0, 1) === 0, "string add should be rejected");
 assert(wasm.ax_state_supports_operation(3, 0) === 1, "structured set should be supported");
+assert(
+  typeof wasm.ax_state_evaluate_expression === "function",
+  "expression evaluator export is missing",
+);
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -70,4 +74,39 @@ assert(
   "malformed value frame was accepted",
 );
 
-console.log(`Axonyx state WASM ABI v3 passed (${bytes.length} bytes).`);
+const intFrame = (value) => {
+  const payload = new Uint8Array(8);
+  new DataView(payload.buffer).setBigInt64(0, BigInt(value), true);
+  return frame(4, payload);
+};
+const expressionProgram = Uint8Array.from([
+  65, 88, 69, 1,
+  0, 0, 0,
+  0, 1, 0,
+  20,
+]);
+const expressionRequest = Uint8Array.from([
+  ...u32(expressionProgram.length),
+  ...expressionProgram,
+  ...u32(2),
+  ...intFrame(3),
+  ...intFrame(4),
+]);
+assert(expressionRequest.length <= valueCapacity, "expression request exceeds WASM value buffer");
+new Uint8Array(wasm.memory.buffer, valuePointer, expressionRequest.length).set(expressionRequest);
+const expressionLength = wasm.ax_state_evaluate_expression(expressionRequest.length) >>> 0;
+assert(expressionLength === 12, "expression evaluator returned an invalid frame");
+const expressionResult = new Uint8Array(wasm.memory.buffer, valuePointer, expressionLength);
+assert(
+  expressionResult[0] === 65
+    && expressionResult[1] === 88
+    && expressionResult[2] === 1
+    && expressionResult[3] === 4,
+  "expression evaluator returned an invalid value protocol frame",
+);
+assert(
+  new DataView(expressionResult.buffer, expressionResult.byteOffset).getBigInt64(4, true) === 7n,
+  "expression evaluator returned the wrong result",
+);
+
+console.log(`Axonyx state WASM ABI v3 + expression/1 passed (${bytes.length} bytes).`);
