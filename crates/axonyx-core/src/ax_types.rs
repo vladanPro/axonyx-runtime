@@ -541,6 +541,11 @@ impl AxDataContext {
                 }
             }
             AxExpr::Index { object, index } => {
+                if let (AxExpr::Object(fields), AxExpr::String(property)) =
+                    (object.as_ref(), index.as_ref())
+                {
+                    return self.resolve_object_literal_field(fields, property);
+                }
                 let object_type = self.resolve_expr_type(object)?;
                 match &object_type {
                     AxType::List(item) => Ok((**item).clone()),
@@ -558,10 +563,19 @@ impl AxDataContext {
                 }
             }
             AxExpr::Member { object, property } => {
+                if let AxExpr::Object(fields) = object.as_ref() {
+                    return self.resolve_object_literal_field(fields, property);
+                }
                 let object_type = self.resolve_expr_type(object)?;
                 self.resolve_member_type(&object_type, property)
             }
             AxExpr::OptionalMember { object, property } => {
+                if let AxExpr::Object(fields) = object.as_ref() {
+                    return Ok(match fields.get(property) {
+                        Some(value) => AxType::optional(self.resolve_expr_type(value)?),
+                        None => AxType::Unknown,
+                    });
+                }
                 let object_type = self.resolve_expr_type(object)?;
                 match self.resolve_member_type(&object_type, property) {
                     Ok(ty) => Ok(AxType::optional(ty)),
@@ -621,6 +635,20 @@ impl AxDataContext {
                 field: property.to_string(),
             }),
         }
+    }
+
+    fn resolve_object_literal_field(
+        &self,
+        fields: &BTreeMap<String, AxExpr>,
+        property: &str,
+    ) -> Result<AxType, AxTypeError> {
+        let value = fields
+            .get(property)
+            .ok_or_else(|| AxTypeError::UnknownField {
+                record: "object literal".to_string(),
+                field: property.to_string(),
+            })?;
+        self.resolve_expr_type(value)
     }
 
     fn resolve_list_type(&self, items: &[AxExpr]) -> Result<AxType, AxTypeError> {
@@ -1438,6 +1466,32 @@ mod tests {
 
         assert_eq!(strings, AxType::list(AxType::String));
         assert_eq!(mixed, AxType::list(AxType::Unknown));
+    }
+
+    #[test]
+    fn resolves_object_literal_field_types() {
+        let context = AxDataContext::new();
+        let object = AxExpr::object([("active", AxExpr::bool(true)), ("count", AxExpr::number(2))]);
+
+        assert_eq!(
+            context.resolve_expr_type(&object.clone().member("active")),
+            Ok(AxType::Bool)
+        );
+        assert_eq!(
+            context.resolve_expr_type(&object.clone().index(AxExpr::string("count"))),
+            Ok(AxType::Number)
+        );
+        assert_eq!(
+            context.resolve_expr_type(&object.clone().optional_member("active")),
+            Ok(AxType::optional(AxType::Bool))
+        );
+        assert_eq!(
+            context.resolve_expr_type(&object.member("missing")),
+            Err(AxTypeError::UnknownField {
+                record: "object literal".to_string(),
+                field: "missing".to_string(),
+            })
+        );
     }
 
     #[test]
