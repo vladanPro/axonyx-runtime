@@ -615,6 +615,9 @@ fn take<'a>(bytes: &'a [u8], cursor: &mut usize, length: usize) -> Option<&'a [u
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    static BUFFER_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn reports_stable_v2_abi() {
@@ -667,6 +670,9 @@ mod tests {
 
     #[test]
     fn validates_utf8_string_set_payloads() {
+        let _guard = BUFFER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let value = "Axonyx zdravo".as_bytes();
         unsafe {
             std::ptr::copy_nonoverlapping(
@@ -691,6 +697,9 @@ mod tests {
 
     #[test]
     fn validates_nested_binary_value_frames() {
+        let _guard = BUFFER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let string = value_frame(1, &[2, 0, 0, 0, b'o', b'k']);
         let number = value_frame(3, &2.5f64.to_le_bytes());
         let mut list_payload = vec![2, 0, 0, 0];
@@ -723,6 +732,9 @@ mod tests {
 
     #[test]
     fn evaluates_compiler_expression_bytecode_with_multiple_dependencies() {
+        let _guard = BUFFER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut program = b"AXE\x01".to_vec();
         program.extend_from_slice(&[0, 0, 0]);
         program.extend_from_slice(&[0, 1, 0]);
@@ -754,6 +766,9 @@ mod tests {
 
     #[test]
     fn evaluates_object_member_and_boolean_comparison() {
+        let _guard = BUFFER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let mut program = b"AXE\x01".to_vec();
         program.extend_from_slice(&[0, 0, 0]);
         program.push(41);
