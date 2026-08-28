@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -460,6 +460,12 @@ impl AxDataContext {
             };
             context.bind(binding.name.clone(), AxType::parse_annotation(ty)?);
         }
+        for binding in &file.states {
+            let Some(ty) = &binding.ty else {
+                continue;
+            };
+            context.bind(binding.name.clone(), AxType::parse_annotation(ty)?);
+        }
         Ok(context)
     }
 
@@ -535,6 +541,11 @@ impl AxDataContext {
                 }
             }
             AxExpr::Index { object, index } => {
+                if let (AxExpr::Object(fields), AxExpr::String(property)) =
+                    (object.as_ref(), index.as_ref())
+                {
+                    return self.resolve_object_literal_field(fields, property);
+                }
                 let object_type = self.resolve_expr_type(object)?;
                 match &object_type {
                     AxType::List(item) => Ok((**item).clone()),
@@ -552,10 +563,19 @@ impl AxDataContext {
                 }
             }
             AxExpr::Member { object, property } => {
+                if let AxExpr::Object(fields) = object.as_ref() {
+                    return self.resolve_object_literal_field(fields, property);
+                }
                 let object_type = self.resolve_expr_type(object)?;
                 self.resolve_member_type(&object_type, property)
             }
             AxExpr::OptionalMember { object, property } => {
+                if let AxExpr::Object(fields) = object.as_ref() {
+                    return Ok(match fields.get(property) {
+                        Some(value) => AxType::optional(self.resolve_expr_type(value)?),
+                        None => AxType::Unknown,
+                    });
+                }
                 let object_type = self.resolve_expr_type(object)?;
                 match self.resolve_member_type(&object_type, property) {
                     Ok(ty) => Ok(AxType::optional(ty)),
@@ -615,6 +635,20 @@ impl AxDataContext {
                 field: property.to_string(),
             }),
         }
+    }
+
+    fn resolve_object_literal_field(
+        &self,
+        fields: &BTreeMap<String, AxExpr>,
+        property: &str,
+    ) -> Result<AxType, AxTypeError> {
+        let value = fields
+            .get(property)
+            .ok_or_else(|| AxTypeError::UnknownField {
+                record: "object literal".to_string(),
+                field: property.to_string(),
+            })?;
+        self.resolve_expr_type(value)
     }
 
     fn resolve_list_type(&self, items: &[AxExpr]) -> Result<AxType, AxTypeError> {
@@ -858,6 +892,12 @@ pub enum AxTypeError {
     ExpectedNumber { found: String },
     #[error("cannot index value of type {ty}")]
     CannotIndex { ty: String },
+    #[error("duplicate match case `{value}`")]
+    DuplicateMatchCase { value: String },
+    #[error("match case `{value}` is not part of literal union `{union}`")]
+    UnknownMatchCase { union: String, value: String },
+    #[error("match on literal union `{union}` is not exhaustive; missing {missing}")]
+    NonExhaustiveMatch { union: String, missing: String },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -933,7 +973,7 @@ impl AxTypeChecker {
     fn check_statement(&mut self, statement: &AxStatement, location: &str) {
         match statement {
             AxStatement::Data(binding) => match self.context.resolve_expr_type(&binding.value) {
-                Ok(AxType::Unknown) if self.context.binding(&binding.name).is_some() => {}
+                Ok(_) if self.context.binding(&binding.name).is_some() => {}
                 Ok(ty) => self.context.bind(binding.name.clone(), ty),
                 Err(error) => self.push_expr_error(
                     format!("{location}.data.{}", binding.name),
@@ -945,6 +985,9 @@ impl AxTypeChecker {
                 match self.context.bind_each_item(&block.binding, &block.source) {
                     Ok(each_context) => {
                         let mut body_checker = self.fork(each_context);
+                        if let Some(key) = &block.key {
+                            body_checker.check_expr(key, format!("{location}.each.key"));
+                        }
                         body_checker.check_statements(&block.body, &format!("{location}.each"));
                         self.errors.extend(body_checker.errors);
 
@@ -964,6 +1007,30 @@ impl AxTypeChecker {
                 self.check_expr(&block.condition, format!("{location}.if.condition"));
                 self.check_statements(&block.body, &format!("{location}.if"));
                 self.check_statements(&block.else_body, &format!("{location}.else"));
+            }
+            AxStatement::Match(block) => {
+                self.check_expr(&block.value, format!("{location}.match.value"));
+                for (case_index, case) in block.cases.iter().enumerate() {
+                    self.check_statements(
+                        &case.body,
+                        &format!("{location}.match.case[{case_index}]"),
+                    );
+                }
+                self.check_statements(
+                    block.default_body.as_deref().unwrap_or_default(),
+                    &format!("{location}.match.default"),
+                );
+
+                let union = match self.context.resolve_expr_type(&block.value) {
+                    Ok(AxType::Record(union)) => Some(union),
+                    _ => None,
+                };
+                self.check_match_cases(
+                    union,
+                    block.cases.iter().map(|case| case.value.clone()).collect(),
+                    block.default_body.is_some(),
+                    &format!("{location}.match"),
+                );
             }
             AxStatement::Text(expr) => self.check_expr(expr, format!("{location}.text")),
             AxStatement::Component(component) => self.check_component(component, location),
@@ -999,6 +1066,9 @@ impl AxTypeChecker {
     }
 
     fn check_component(&mut self, component: &AxComponent, location: &str) {
+        if component.name == "__AxStateMatch" {
+            self.check_reactive_match(component, location);
+        }
         for prop in &component.props {
             self.check_expr(
                 &prop.value,
@@ -1023,6 +1093,95 @@ impl AxTypeChecker {
         }
     }
 
+    fn check_reactive_match(&mut self, component: &AxComponent, location: &str) {
+        let state_name = component.props.iter().find_map(|prop| {
+            (prop.name == "data-ax-state-match-name")
+                .then_some(&prop.value)
+                .and_then(|value| match value {
+                    AxExpr::String(value) => Some(value.as_str()),
+                    _ => None,
+                })
+        });
+        let union = state_name.and_then(|name| match self.context.binding(name) {
+            Some(AxType::Record(union)) => Some(union.clone()),
+            _ => None,
+        });
+        let AxBody::Block(branches) = &component.body else {
+            return;
+        };
+        let cases = branches
+            .iter()
+            .filter_map(|statement| match statement {
+                AxStatement::Component(branch) if branch.name == "__AxStateMatchCase" => branch
+                    .props
+                    .iter()
+                    .find_map(|prop| match (prop.name.as_str(), &prop.value) {
+                        ("case", AxExpr::String(value)) => Some(value.clone()),
+                        _ => None,
+                    }),
+                _ => None,
+            })
+            .collect();
+        let has_default = branches.iter().any(|statement| {
+            matches!(statement, AxStatement::Component(branch) if branch.name == "__AxStateMatchDefault")
+        });
+        self.check_match_cases(union, cases, has_default, &format!("{location}.match"));
+    }
+
+    fn check_match_cases(
+        &mut self,
+        union: Option<String>,
+        cases: Vec<String>,
+        has_default: bool,
+        location: &str,
+    ) {
+        let mut seen = BTreeSet::new();
+        for (index, value) in cases.iter().enumerate() {
+            if !seen.insert(value.as_str()) {
+                self.push_error(
+                    format!("{location}.case[{index}]"),
+                    AxTypeError::DuplicateMatchCase {
+                        value: value.clone(),
+                    },
+                );
+            }
+        }
+        let Some(union) = union else {
+            return;
+        };
+        let Some(literals) = self.context.literal_union(&union).map(<[_]>::to_vec) else {
+            return;
+        };
+        for value in &seen {
+            if !literals.iter().any(|literal| literal == *value) {
+                self.push_error(
+                    location,
+                    AxTypeError::UnknownMatchCase {
+                        union: union.clone(),
+                        value: (*value).to_string(),
+                    },
+                );
+            }
+        }
+        if has_default {
+            return;
+        }
+        let missing = literals
+            .iter()
+            .filter(|literal| !seen.contains(literal.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            self.push_error(
+                location,
+                AxTypeError::NonExhaustiveMatch {
+                    union,
+                    missing: missing.join(", "),
+                },
+            );
+        }
+    }
+
     fn check_expr(&mut self, expr: &AxExpr, location: String) {
         if let Err(error) = self.context.resolve_expr_type(expr) {
             self.push_expr_error(location, expr, error);
@@ -1043,7 +1202,7 @@ impl AxTypeChecker {
     }
 }
 
-fn format_expr(expr: &AxExpr) -> String {
+pub(crate) fn format_expr(expr: &AxExpr) -> String {
     match expr {
         AxExpr::String(value) => format!("{value:?}"),
         AxExpr::Number(value) => value.to_string(),
@@ -1313,6 +1472,32 @@ mod tests {
     }
 
     #[test]
+    fn resolves_object_literal_field_types() {
+        let context = AxDataContext::new();
+        let object = AxExpr::object([("active", AxExpr::bool(true)), ("count", AxExpr::number(2))]);
+
+        assert_eq!(
+            context.resolve_expr_type(&object.clone().member("active")),
+            Ok(AxType::Bool)
+        );
+        assert_eq!(
+            context.resolve_expr_type(&object.clone().index(AxExpr::string("count"))),
+            Ok(AxType::Number)
+        );
+        assert_eq!(
+            context.resolve_expr_type(&object.clone().optional_member("active")),
+            Ok(AxType::optional(AxType::Bool))
+        );
+        assert_eq!(
+            context.resolve_expr_type(&object.member("missing")),
+            Err(AxTypeError::UnknownField {
+                record: "object literal".to_string(),
+                field: "missing".to_string(),
+            })
+        );
+    }
+
+    #[test]
     fn resolves_index_expression_type() {
         let context = post_context().with_binding("post", AxType::record("Post"));
 
@@ -1564,6 +1749,101 @@ return ASX { <Copy>{theme}</Copy> }
         assert!(
             !context.accepts_state_initializer(&AxType::record("Theme"), &AxExpr::string("purple"))
         );
+    }
+
+    fn check_v2_source(source: &str) -> AxTypeCheckReport {
+        let file = parse_ax_v2(source).expect("source should parse as v2");
+        let context = AxDataContext::from_v2_let_types(&file).expect("context should build");
+        let document = crate::ax_parser_auto::parse_ax_auto(source)
+            .expect("source should convert into runtime AST");
+        check_document_types(&document, &context)
+    }
+
+    #[test]
+    fn accepts_exhaustive_literal_union_match() {
+        let report = check_v2_source(
+            r#"page ThemePreview() {
+type Theme = "silver" | "bronze" | "gold"
+state theme: Theme = "silver"
+return ASX {
+  <Match value={theme}>
+    <Case is="silver"><Copy>Silver</Copy></Case>
+    <Case is="bronze"><Copy>Bronze</Copy></Case>
+    <Case is="gold"><Copy>Gold</Copy></Case>
+  </Match>
+}
+}
+"#,
+        );
+
+        assert!(report.is_ok(), "{report:#?}");
+    }
+
+    #[test]
+    fn reports_missing_literal_union_match_cases() {
+        let report = check_v2_source(
+            r#"page ThemePreview() {
+type Theme = "silver" | "bronze" | "gold"
+state theme: Theme = "silver"
+return ASX {
+  <Match value={theme}>
+    <Case is="silver"><Copy>Silver</Copy></Case>
+  </Match>
+}
+}
+"#,
+        );
+
+        assert!(report.errors.iter().any(|error| {
+            error.message
+                == "match on literal union `Theme` is not exhaustive; missing bronze, gold"
+        }));
+    }
+
+    #[test]
+    fn reports_unknown_and_duplicate_literal_union_match_cases() {
+        let report = check_v2_source(
+            r#"page ThemePreview() {
+type Theme = "silver" | "gold"
+state theme: Theme = "silver"
+return ASX {
+  <Match value={theme}>
+    <Case is="silver"><Copy>Silver</Copy></Case>
+    <Case is="purple"><Copy>Purple</Copy></Case>
+    <Case is="purple"><Copy>Purple again</Copy></Case>
+    <Default><Copy>Other</Copy></Default>
+  </Match>
+}
+}
+"#,
+        );
+
+        assert!(report
+            .errors
+            .iter()
+            .any(|error| error.message == "duplicate match case `purple`"));
+        assert!(report.errors.iter().any(|error| {
+            error.message == "match case `purple` is not part of literal union `Theme`"
+        }));
+    }
+
+    #[test]
+    fn empty_default_makes_literal_union_match_exhaustive() {
+        let report = check_v2_source(
+            r#"page ThemePreview() {
+type Theme = "silver" | "gold"
+state theme: Theme = "silver"
+return ASX {
+  <Match value={theme}>
+    <Case is="silver"><Copy>Silver</Copy></Case>
+    <Default />
+  </Match>
+}
+}
+"#,
+        );
+
+        assert!(report.is_ok(), "{report:#?}");
     }
 
     #[test]

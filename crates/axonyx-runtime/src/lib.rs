@@ -3049,6 +3049,15 @@ fn inject_slot_statements(statements: &mut Vec<AxStatement>, page_body: &[AxStat
                 found_slot |= inject_slot_statements(&mut if_block.else_body, page_body);
                 composed.push(AxStatement::If(if_block));
             }
+            AxStatement::Match(mut match_block) => {
+                for case in &mut match_block.cases {
+                    found_slot |= inject_slot_statements(&mut case.body, page_body);
+                }
+                if let Some(default_body) = &mut match_block.default_body {
+                    found_slot |= inject_slot_statements(default_body, page_body);
+                }
+                composed.push(AxStatement::Match(match_block));
+            }
             AxStatement::Pipeline(mut pipeline) => {
                 found_slot |= inject_slot_pipeline(&mut pipeline, page_body);
                 composed.push(AxStatement::Pipeline(pipeline));
@@ -3110,6 +3119,8 @@ fn render_preview_document_chunks(document: &AxDocument, root: &AxNode) -> Vec<V
     let state_bridge_script = if body.contains("data-ax-signal=")
         || body.contains("data-ax-state-name=")
         || body.contains("data-ax-state-if-signal=")
+        || body.contains("data-ax-state-match-signal=")
+        || body.contains("data-ax-expression-protocol=")
     {
         ax_state_bridge_script()
     } else {
@@ -3517,6 +3528,9 @@ fn ax_state_bridge_script() -> &'static str {
   const readBindings = new Map();
   const subscribers = new Map();
   const conditions = new Map();
+  const matches = new Map();
+  const expressions = new Map();
+  const expressionEntries = [];
   const domCapabilities = new WeakMap();
   const validDomCapabilities = new WeakSet();
   const domCapabilityList = [];
@@ -3539,6 +3553,9 @@ fn ax_state_bridge_script() -> &'static str {
   const storageCapabilityProtocol = "ax-storage-capability/1";
   const storageValueProtocol = "ax-storage-value/1";
   const domWriteTargets = new Set(["value", "checked", "text"]);
+  const expressionBooleanTargets = new Set([
+    "disabled", "checked", "selected", "hidden", "required", "readonly", "multiple", "open",
+  ]);
   const storageScopes = new Set(["local", "session"]);
   const maxStorageKeyBytes = 128;
   const maxStateEventSignalLength = 512;
@@ -3560,6 +3577,8 @@ fn ax_state_bridge_script() -> &'static str {
     rejectedStorageWrites: 0,
     queuedStorageWrites: 0,
     flushedStorageWrites: 0,
+    expressionEvaluations: 0,
+    rejectedExpressions: 0,
   };
   const localOperationCode = Object.freeze({ set: 0, add: 1, sub: 2, toggle: 3 });
   const stringLikeTypes = new Set(["String", "DateTime", "Date", "Time", "Uuid"]);
@@ -3743,6 +3762,7 @@ fn ax_state_bridge_script() -> &'static str {
       if (typeof exports.ax_state_string_buffer_ptr !== "function") return false;
       if (typeof exports.ax_state_string_buffer_capacity !== "function") return false;
       if (typeof exports.ax_state_apply_value !== "function") return false;
+      if (typeof exports.ax_state_evaluate_expression !== "function") return false;
       if (typeof exports.ax_state_value_buffer_ptr !== "function") return false;
       if (typeof exports.ax_state_value_buffer_capacity !== "function") return false;
       if (!(exports.memory instanceof WebAssembly.Memory)) return false;
@@ -3753,6 +3773,7 @@ fn ax_state_bridge_script() -> &'static str {
       window.dispatchEvent(new CustomEvent("axonyx:state-runtime", {
         detail: { protocol: "ax-state/1", executor: executorMode, url },
       }));
+      expressionEntries.forEach(updateExpression);
       return true;
     } catch (_) {
       return false;
@@ -3945,6 +3966,13 @@ fn ax_state_bridge_script() -> &'static str {
   };
 
   const writeValue = (node, target, value) => {
+    if (target.startsWith("boolean:")) {
+      const attribute = target.slice("boolean:".length);
+      const enabled = value === true;
+      node.toggleAttribute(attribute, enabled);
+      if (attribute in node) node[attribute] = enabled;
+      return;
+    }
     const next = value == null ? "" : String(value);
     if (target === "checked") {
       node.checked = value === true || value === "true" || value === "on";
@@ -3967,7 +3995,12 @@ fn ax_state_bridge_script() -> &'static str {
   };
 
   const registerDomCapability = (node, signal, target, type, role, allowImplicit = false) => {
-    const existing = domCapabilities.get(node);
+    let nodeCapabilities = domCapabilities.get(node);
+    if (!nodeCapabilities) {
+      nodeCapabilities = new Map();
+      domCapabilities.set(node, nodeCapabilities);
+    }
+    const existing = nodeCapabilities.get(target);
     if (existing) {
       if (existing.signal === signal && existing.target === target && existing.role === role) {
         return existing;
@@ -3983,7 +4016,10 @@ fn ax_state_bridge_script() -> &'static str {
     if (!allowImplicit && declaredTarget !== target) {
       return rejectDomCapability(node, signal, target, role, "target-mismatch");
     }
-    if (!domWriteTargets.has(target)) {
+    const booleanTarget = target.startsWith("boolean:")
+      ? target.slice("boolean:".length)
+      : undefined;
+    if (!domWriteTargets.has(target) && !expressionBooleanTargets.has(booleanTarget)) {
       return rejectDomCapability(node, signal, target, role, "unsupported-target");
     }
     if (target === "checked" && !("checked" in node)) {
@@ -3991,7 +4027,7 @@ fn ax_state_bridge_script() -> &'static str {
     }
 
     const capability = Object.freeze({ node, signal, target, type, role });
-    domCapabilities.set(node, capability);
+    nodeCapabilities.set(target, capability);
     validDomCapabilities.add(capability);
     domCapabilityList.push(capability);
     executorStats.registeredDomCapabilities += 1;
@@ -4235,6 +4271,21 @@ fn ax_state_bridge_script() -> &'static str {
     bucket.delete(from);
   };
 
+  const indexExpressionEntry = (entry) => {
+    entry.signals.forEach((signal) => {
+      if (!expressions.has(signal)) expressions.set(signal, []);
+      if (!expressions.get(signal).includes(entry)) expressions.get(signal).push(entry);
+    });
+  };
+
+  const rebindExpressions = () => {
+    expressions.clear();
+    expressionEntries.forEach((entry) => {
+      entry.signals = entry.signals.map(canonicalSignal);
+      indexExpressionEntry(entry);
+    });
+  };
+
   const rebindAliasedSignals = () => {
     aliases.forEach((signal, alias) => {
       if (alias === signal) return;
@@ -4242,6 +4293,7 @@ fn ax_state_bridge_script() -> &'static str {
       moveSignalBucket(readBindings, alias, signal);
       moveSignalBucket(subscribers, alias, signal);
       moveSignalBucket(conditions, alias, signal);
+      moveSignalBucket(matches, alias, signal);
       if (state.has(alias) && !state.has(signal)) state.set(signal, state.get(alias));
       if (types.has(alias) && !types.has(signal)) types.set(signal, types.get(alias));
       document.querySelectorAll(`[data-ax-signal="${alias}"]`).forEach((node) => {
@@ -4253,7 +4305,11 @@ fn ax_state_bridge_script() -> &'static str {
       document.querySelectorAll(`[data-ax-state-if-signal="${alias}"]`).forEach((node) => {
         node.setAttribute("data-ax-state-if-signal", signal);
       });
+      document.querySelectorAll(`[data-ax-state-match-signal="${alias}"]`).forEach((node) => {
+        node.setAttribute("data-ax-state-match-signal", signal);
+      });
     });
+    rebindExpressions();
   };
 
   const rebindPendingStorageWrites = () => {
@@ -4366,6 +4422,210 @@ fn ax_state_bridge_script() -> &'static str {
     updateCondition(entry, state.get(signal));
   };
 
+  const updateMatch = (entry, current) => {
+    const value = current == null ? "" : String(current);
+    let matched = false;
+    const branches = Array.from(
+      entry.node.querySelectorAll(":scope > [data-ax-state-match-branch]"),
+    );
+    branches.forEach((branch) => {
+      if (branch.getAttribute("data-ax-state-match-branch") !== "case") return;
+      const show = !matched && branch.getAttribute("data-ax-state-match-value") === value;
+      if (show) matched = true;
+      branch.hidden = !show;
+      branch.style.display = show ? "contents" : "none";
+    });
+    branches.forEach((branch) => {
+      if (branch.getAttribute("data-ax-state-match-branch") !== "default") return;
+      branch.hidden = matched;
+      branch.style.display = matched ? "none" : "contents";
+    });
+  };
+
+  const registerMatch = (node) => {
+    const rawSignal = node.getAttribute("data-ax-state-match-signal");
+    const signal = canonicalSignal(rawSignal);
+    if (!signal) return;
+    if (rawSignal !== signal) node.setAttribute("data-ax-state-match-signal", signal);
+    const type = node.getAttribute("data-ax-state-match-type") || "String";
+    const literalSource = node.getAttribute("data-ax-state-match-literals");
+    if (literalSource && !typeSchemas.has(type)) {
+      try {
+        const literals = JSON.parse(literalSource);
+        if (Array.isArray(literals)
+          && literals.length > 0
+          && literals.every((literal) => typeof literal === "string")
+          && new Set(literals).size === literals.length) {
+          typeSchemas.set(type, { name: type, literals });
+        }
+      } catch (_) {}
+    }
+    const initial = castValue(node.getAttribute("data-ax-state-match-initial"), type);
+    const entry = { node, type };
+    if (!types.has(signal)) types.set(signal, type);
+    if (!state.has(signal)) state.set(signal, initial);
+    if (!matches.has(signal)) matches.set(signal, []);
+    matches.get(signal).push(entry);
+    updateMatch(entry, state.get(signal));
+  };
+
+  const rejectExpression = (node, index, reason) => {
+    executorStats.rejectedExpressions += 1;
+    window.dispatchEvent(new CustomEvent("axonyx:expression-rejected", {
+      detail: { protocol: "ax-expression/1", index, reason },
+    }));
+    return undefined;
+  };
+
+  const decodeHex = (source) => {
+    if (typeof source !== "string" || source.length === 0 || source.length % 2 !== 0) {
+      return undefined;
+    }
+    const bytes = new Uint8Array(source.length / 2);
+    for (let index = 0; index < bytes.length; index += 1) {
+      const value = Number.parseInt(source.slice(index * 2, index * 2 + 2), 16);
+      if (!Number.isInteger(value)) return undefined;
+      bytes[index] = value;
+    }
+    return bytes;
+  };
+
+  const expressionRequest = (entry) => {
+    const values = entry.signals.map((signal, index) => {
+      if (!state.has(signal)) return undefined;
+      return encodeStateValue(state.get(signal), entry.types[index]);
+    });
+    if (values.some((value) => !value)) return undefined;
+    const length = 4 + entry.program.length + 4
+      + values.reduce((total, value) => total + value.length, 0);
+    if (length > maxStateValueBytes) return undefined;
+    const request = new Uint8Array(length);
+    const view = new DataView(request.buffer);
+    let cursor = 0;
+    view.setUint32(cursor, entry.program.length, true);
+    cursor += 4;
+    request.set(entry.program, cursor);
+    cursor += entry.program.length;
+    view.setUint32(cursor, values.length, true);
+    cursor += 4;
+    values.forEach((value) => {
+      request.set(value, cursor);
+      cursor += value.length;
+    });
+    return request;
+  };
+
+  const evaluateWasmExpression = (entry) => {
+    if (!wasmExecutor || typeof wasmExecutor.ax_state_evaluate_expression !== "function") {
+      return undefined;
+    }
+    const request = expressionRequest(entry);
+    if (!request) return undefined;
+    const capacity = wasmExecutor.ax_state_value_buffer_capacity();
+    const pointer = wasmExecutor.ax_state_value_buffer_ptr();
+    if (request.length > capacity
+      || pointer + request.length > wasmExecutor.memory.buffer.byteLength) return undefined;
+    new Uint8Array(wasmExecutor.memory.buffer, pointer, request.length).set(request);
+    const resultLength = wasmExecutor.ax_state_evaluate_expression(request.length) >>> 0;
+    if (resultLength === 0xffffffff || resultLength > capacity
+      || pointer + resultLength > wasmExecutor.memory.buffer.byteLength) return undefined;
+    return decodeStateValue(
+      new Uint8Array(wasmExecutor.memory.buffer, pointer, resultLength),
+    );
+  };
+
+  const updateExpression = (entry) => {
+    const value = evaluateWasmExpression(entry);
+    if (value === undefined) return false;
+    if (entry.target.startsWith("boolean:") && typeof value !== "boolean") {
+      rejectExpression(entry.node, entry.index, "boolean-target-type-mismatch");
+      return false;
+    }
+    if (!writeDomCapability(entry.capability, value)) return false;
+    executorStats.expressionEvaluations += 1;
+    return true;
+  };
+
+  const registerExpressions = (node) => {
+    if (node.getAttribute("data-ax-expression-protocol") !== "ax-expression/1") {
+      rejectExpression(node, -1, "invalid-protocol");
+      return;
+    }
+    const count = Number(node.getAttribute("data-ax-expression-count"));
+    if (!Number.isInteger(count) || count < 1 || count > 16) {
+      rejectExpression(node, -1, "invalid-count");
+      return;
+    }
+    for (let index = 0; index < count; index += 1) {
+      const prefix = `data-ax-expression-${index}`;
+      const program = decodeHex(node.getAttribute(`${prefix}-program`));
+      let signals;
+      let dependencyTypes;
+      let initials;
+      try {
+        signals = JSON.parse(node.getAttribute(`${prefix}-signals`) || "null");
+        dependencyTypes = JSON.parse(node.getAttribute(`${prefix}-types`) || "null");
+        initials = JSON.parse(node.getAttribute(`${prefix}-initials`) || "null");
+      } catch (_) {
+        rejectExpression(node, index, "invalid-metadata");
+        continue;
+      }
+      const target = node.getAttribute(`${prefix}-target`);
+      if (!program || program.length < 4 || program[0] !== 65 || program[1] !== 88
+        || program[2] !== 69 || program[3] !== 1) {
+        rejectExpression(node, index, "invalid-program");
+        continue;
+      }
+      if (!Array.isArray(signals) || !Array.isArray(dependencyTypes) || !Array.isArray(initials)
+        || signals.length === 0 || signals.length !== dependencyTypes.length
+        || signals.length !== initials.length
+        || signals.some((signal) => typeof signal !== "string" || !signal)
+        || dependencyTypes.some((type) => typeof type !== "string" || !type)
+        || initials.some((initial) => typeof initial !== "string")) {
+        rejectExpression(node, index, "invalid-dependencies");
+        continue;
+      }
+      const validTarget = target === "text"
+        || target?.startsWith("boolean:")
+          && expressionBooleanTargets.has(target.slice("boolean:".length));
+      if (!validTarget) {
+        rejectExpression(node, index, "unsupported-target");
+        continue;
+      }
+      signals = signals.map(canonicalSignal);
+      signals.forEach((signal, dependencyIndex) => {
+        const type = dependencyTypes[dependencyIndex];
+        if (!types.has(signal)) types.set(signal, type);
+        if (!state.has(signal)) state.set(signal, castValue(initials[dependencyIndex], type));
+      });
+      const expressionId = `expression:${index}:${signals.join("|")}`;
+      const capability = registerDomCapability(
+        node,
+        expressionId,
+        target,
+        target === "text" ? "String" : "Bool",
+        "expression",
+        true,
+      );
+      if (!capability) {
+        rejectExpression(node, index, "capability-rejected");
+        continue;
+      }
+      const entry = {
+        node,
+        index,
+        program,
+        signals,
+        types: dependencyTypes,
+        target,
+        capability,
+      };
+      expressionEntries.push(entry);
+      indexExpressionEntry(entry);
+      updateExpression(entry);
+    }
+  };
+
   const writeSignal = (signal, value, source = "client", emit = true) => {
     signal = canonicalSignal(signal);
     const type = types.get(signal) || "String";
@@ -4386,6 +4646,8 @@ fn ax_state_bridge_script() -> &'static str {
       capability.node.setAttribute("data-ax-state-source", source);
     });
     (conditions.get(signal) || []).forEach((entry) => updateCondition(entry, nextValue));
+    (matches.get(signal) || []).forEach((entry) => updateMatch(entry, nextValue));
+    new Set(expressions.get(signal) || []).forEach(updateExpression);
     persistStorageCapability(signal, nextValue, source);
     notifySubscribers(signal, nextValue, source);
     if (emit) emitPatch(signal, nextValue, source);
@@ -4776,6 +5038,8 @@ fn ax_state_bridge_script() -> &'static str {
     document.querySelectorAll("[data-ax-signal]").forEach(register);
     registerReads();
     document.querySelectorAll("[data-ax-state-if-signal]").forEach(registerCondition);
+    document.querySelectorAll("[data-ax-state-match-signal]").forEach(registerMatch);
+    document.querySelectorAll("[data-ax-expression-protocol]").forEach(registerExpressions);
   };
 
   document.addEventListener("input", (event) => {
@@ -4857,6 +5121,9 @@ fn ax_state_bridge_script() -> &'static str {
       rejectedStorageWrites: executorStats.rejectedStorageWrites,
       queuedStorageWrites: executorStats.queuedStorageWrites,
       flushedStorageWrites: executorStats.flushedStorageWrites,
+      expressionProtocol: "ax-expression/1",
+      expressionEvaluations: executorStats.expressionEvaluations,
+      rejectedExpressions: executorStats.rejectedExpressions,
     }),
     loadWasm: loadWasmExecutor,
   };
@@ -5873,6 +6140,119 @@ page Counter() {
     }
 
     #[test]
+    fn preview_compiles_reactive_expressions_for_wasm_evaluation() {
+        let html = preview_ax_page(
+            r#"
+page Counter() {
+  state count: Number = 2
+  state limit: Number = 5
+
+  return ASX {
+    <>
+      <button on:click={count += 1}>Increase</button>
+      <Copy>{count * 2}</Copy>
+      <button disabled={count >= limit}>Locked</button>
+    </>
+  }
+}
+"#,
+        )
+        .expect("reactive expression preview should render");
+
+        assert!(html.contains("<ax-expression"));
+        assert!(html.contains("data-ax-expression-protocol=\"ax-expression/1\""));
+        assert!(html.contains("data-ax-expression-0-target=\"text\""));
+        assert!(html.contains("data-ax-expression-0-target=\"boolean:disabled\""));
+        assert!(html.contains("data-ax-expression-0-program="));
+        assert!(html.contains("data-ax-expression-0-signals="));
+        assert!(html.contains("exports.ax_state_evaluate_expression"));
+        assert!(html.contains("registerExpressions"));
+        assert!(!html.contains("disabled=\"false\""));
+    }
+
+    #[test]
+    fn preview_inlines_pure_functions_into_wasm_reactive_expressions() {
+        let html = preview_ax_page(
+            r#"
+page Counter() {
+  state count: Int = 2
+  state limit: Int = 5
+  fn double(value: Int) = value * 2
+  fn reached(value: Int, maximum: Int) = value >= maximum
+
+  return ASX {
+    <>
+      <button on:click={count += 1}>Increase</button>
+      <Copy>{double(count)}</Copy>
+      <button disabled={reached(count, limit)}>Locked</button>
+    </>
+  }
+}
+"#,
+        )
+        .expect("pure reactive function preview should render");
+
+        assert!(html.contains(">4</ax-expression>"));
+        assert!(html.contains("data-ax-expression-0-target=\"text\""));
+        assert!(html.contains("data-ax-expression-0-target=\"boolean:disabled\""));
+        assert!(html.contains("data-ax-expression-0-signals="));
+        assert!(html.contains("exports.ax_state_evaluate_expression"));
+        assert!(!html.contains("disabled=\"false\""));
+    }
+
+    #[test]
+    fn preview_renders_reactive_collection_literals_for_server_and_wasm() {
+        let html = preview_ax_page(
+            r#"
+page CollectionProbe() {
+  state count: Int = 2
+  state limit: Int = 3
+  return ASX {
+    <>
+      <Copy>{count in [1, 2, 3]}</Copy>
+      <button disabled={({active: count >= limit}).active}>Locked</button>
+    </>
+  }
+}
+"#,
+        )
+        .expect("reactive collection preview should render");
+
+        assert!(html.contains(">true</ax-expression>"));
+        assert!(html.contains("data-ax-expression-0-target=\"text\""));
+        assert!(html.contains("data-ax-expression-0-target=\"boolean:disabled\""));
+        assert!(html.contains("3203001f"));
+        assert!(html.contains("33010006000000616374697665"));
+        assert!(html.contains("exports.ax_state_evaluate_expression"));
+        assert!(!html.contains("disabled=\"false\""));
+    }
+
+    #[test]
+    fn preview_emits_keyed_each_ownership_protocol_for_state_lists() {
+        let html = preview_ax_page(
+            r#"
+page Posts() {
+  state posts = [{ id: "first", title: "Hello" }, { id: "second", title: "World" }]
+  return ASX {
+    <Each items={posts} as="post" key={post.id}>
+      <Copy>{post.title}</Copy>
+    </Each>
+  }
+}
+"#,
+        )
+        .expect("keyed state each preview should render");
+
+        assert!(html.contains("<ax-state-each"));
+        assert!(html.contains("data-ax-each-protocol=\"ax-each/1\""));
+        assert!(html.contains("data-ax-each-signal=\"root:posts:1\""));
+        assert!(html.contains("data-ax-each-key=\"first\""));
+        assert!(html.contains("data-ax-each-key=\"second\""));
+        assert!(html.contains("Hello"));
+        assert!(html.contains("World"));
+    }
+
+    #[test]
     fn preview_preserves_state_dependent_if_branches_for_local_updates() {
         let html = preview_ax_page(
             r#"
@@ -5897,6 +6277,41 @@ page Counter() {
         assert!(html.contains("High value"));
         assert!(html.contains("Low value"));
         assert!(html.contains("registerCondition"));
+    }
+
+    #[test]
+    fn preview_preserves_state_dependent_match_branches_for_local_updates() {
+        let html = preview_ax_page(
+            r#"
+page ThemePreview() {
+  type Theme = "silver" | "bronze" | "gold"
+  state theme: Theme = "silver"
+  return ASX {
+    <>
+      <Button on:click={theme = "gold"}>Gold</Button>
+      <Match value={theme}>
+        <Case is="silver"><Copy>Silver preview</Copy></Case>
+        <Case is="bronze"><Copy>Bronze preview</Copy></Case>
+        <Case is="gold"><Copy>Gold preview</Copy></Case>
+        <Default><Copy>Custom preview</Copy></Default>
+      </Match>
+    </>
+  }
+}
+"#,
+        )
+        .expect("state match preview should render");
+
+        assert!(html.contains("data-ax-state-match-signal=\"root:theme:1\""));
+        assert!(html.contains("data-ax-state-match-type=\"Theme\""));
+        assert!(html.contains("data-ax-state-match-literals="));
+        assert!(html.contains("data-ax-state-match-value=\"silver\""));
+        assert!(html.contains("data-ax-state-match-value=\"gold\""));
+        assert!(html.contains("data-ax-state-match-branch=\"default\""));
+        assert!(html.contains("Silver preview"));
+        assert!(html.contains("Gold preview"));
+        assert!(html.contains("updateMatch"));
+        assert!(html.contains("registerMatch"));
     }
 
     #[test]

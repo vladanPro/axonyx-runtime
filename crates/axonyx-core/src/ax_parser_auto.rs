@@ -6,7 +6,7 @@ use crate::ax_ast_v2::prelude::*;
 use crate::ax_parser::{parse_ax, parse_expr, AxParseError};
 use crate::ax_parser_v2::{parse_ax_v2, AxParseV2Error};
 use crate::ax_semantics_v2::{validate_ax_v2_semantics, AxSemanticV2Error};
-use crate::ax_types::{AxDataContext, AxType, AxTypeParseError};
+use crate::ax_types::{format_expr, AxDataContext, AxType, AxTypeParseError};
 
 #[derive(Debug, Error)]
 pub enum AxAutoParseError {
@@ -40,6 +40,10 @@ pub enum AxConvertV2Error {
     ControlBranchMustBeLast { tag: String, branch: String },
     #[error("`<{branch}>` is only valid inside `<{tag}>`")]
     UnexpectedControlBranch { tag: String, branch: String },
+    #[error("`<Match>` only accepts `<Case>` and an optional final `<Default>` child")]
+    InvalidMatchChild,
+    #[error("`<Case>` requires `is` to be a string literal")]
+    InvalidMatchCaseValue,
     #[error("`<Head>` only accepts element children")]
     InvalidHeadChild,
     #[error("unsupported head tag `<{tag}>`")]
@@ -90,6 +94,12 @@ pub enum AxConvertV2Error {
         "invalid local state event `{expr_source}`; use `state = literal`, `state += number`, `state -= number`, or `state = !state`"
     )]
     InvalidStateEvent { expr_source: String },
+    #[error("unsupported reactive expression `{expr_source}`: {reason}")]
+    UnsupportedReactiveExpression { expr_source: String, reason: String },
+    #[error("reactive `<Each>` over state `{state}` requires `key={{item.id}}`")]
+    ReactiveEachRequiresKey { state: String },
+    #[error("`<Each>` key must be derived from its `{binding}` item binding")]
+    InvalidEachKey { binding: String },
 }
 
 pub fn looks_like_ax_v2(input: &str) -> bool {
@@ -125,6 +135,15 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
     let data_context = AxDataContext::from_v2_let_types(file)
         .map_err(|error| AxConvertV2Error::InvalidStateTypeContract { error })?;
     let state_bindings = collect_state_bindings(file, &data_context)?;
+    let functions = file
+        .functions
+        .iter()
+        .map(|function| convert_function_decl(function, &data_context))
+        .collect::<Result<Vec<_>, _>>()?;
+    let bindings = ConversionBindings {
+        states: &state_bindings,
+        functions: &functions,
+    };
 
     for binding in &file.lets {
         let mut value = parse_v2_expr(&binding.value)?;
@@ -147,28 +166,24 @@ pub fn convert_ax_v2_file(file: &AxFileV2) -> Result<AxDocument, AxConvertV2Erro
                 merge_head_element(&mut head, element)?
             }
             AxNodeV2::Element(element) => {
-                body.push(AxStatement::component(convert_element(
-                    element,
-                    &state_bindings,
-                )?));
+                body.push(AxStatement::component(convert_element(element, &bindings)?));
             }
             AxNodeV2::Text(text) => body.push(AxStatement::text(text.value.clone())),
             AxNodeV2::Expr(expr) => body.push(AxStatement::text(parse_v2_expr(&expr.source)?)),
         }
     }
+    let components = file
+        .components
+        .iter()
+        .map(|component| {
+            convert_component_decl(component, &state_bindings, &functions, &data_context)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AxDocument {
         imports: file.imports.iter().map(convert_import_decl).collect(),
-        functions: file
-            .functions
-            .iter()
-            .map(|function| convert_function_decl(function, &data_context))
-            .collect::<Result<Vec<_>, _>>()?,
-        components: file
-            .components
-            .iter()
-            .map(|component| convert_component_decl(component, &state_bindings, &data_context))
-            .collect::<Result<Vec<_>, _>>()?,
+        functions,
+        components,
         head,
         page: AxPage::with_params(
             file.page.name.clone(),
@@ -209,6 +224,7 @@ fn convert_function_decl(
 fn convert_component_decl(
     component: &AxComponentDeclV2,
     state_bindings: &BTreeMap<String, StateBindingPlan>,
+    functions: &[AxFunctionDef],
     data_context: &AxDataContext,
 ) -> Result<AxComponentDef, AxConvertV2Error> {
     let mut bindings = state_bindings.clone();
@@ -238,6 +254,7 @@ fn convert_component_decl(
             StateBindingPlan {
                 signal_id: signal.clone(),
                 ty: ty.clone(),
+                literals: data_context.literal_union(&ty).map(<[_]>::to_vec),
                 initial: state_event_literal(&initializer.value).ok_or_else(|| {
                     AxConvertV2Error::InvalidStateInitializer {
                         expr_source: state.value.clone(),
@@ -253,6 +270,10 @@ fn convert_component_decl(
         ));
     }
 
+    let conversion_bindings = ConversionBindings {
+        states: &bindings,
+        functions,
+    };
     Ok(AxComponentDef::with_states(
         component.name.clone(),
         component
@@ -261,7 +282,7 @@ fn convert_component_decl(
             .map(|param| convert_component_param_decl(param, data_context))
             .collect::<Result<Vec<_>, _>>()?,
         states,
-        convert_children(&component.body, &bindings)?,
+        convert_children(&component.body, &conversion_bindings)?,
     ))
 }
 
@@ -417,27 +438,37 @@ fn convert_head_tag(element: &AxElementNode) -> Result<AxHeadTag, AxConvertV2Err
     Ok(AxHeadTag::new(attrs))
 }
 
+#[derive(Clone, Copy)]
+struct ConversionBindings<'a> {
+    states: &'a BTreeMap<String, StateBindingPlan>,
+    functions: &'a [AxFunctionDef],
+}
+
 fn convert_element(
     element: &AxElementNode,
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<AxComponent, AxConvertV2Error> {
     if element.name == "Each" {
-        return convert_each_element(element, state_bindings);
+        return convert_each_element(element, bindings);
     }
     if element.name == "If" {
-        return convert_if_element(element, state_bindings);
+        return convert_if_element(element, bindings);
+    }
+    if element.name == "Match" {
+        return convert_match_element(element, bindings);
     }
 
     let mut component = AxComponent::new(element.name.clone());
     let mut class_attr_seen: Option<&str> = None;
 
+    let mut reactive_expression_index = 0usize;
     for attr in &element.attrs {
         match attr.name.as_str() {
             name if name.starts_with("bind:") => {
-                component = apply_state_binding_attr(component, attr, state_bindings)?;
+                component = apply_state_binding_attr(component, attr, bindings.states)?;
             }
             name if name.starts_with("on:") => {
-                component = apply_state_event_attr(component, attr, state_bindings)?;
+                component = apply_state_event_attr(component, attr, bindings.states)?;
             }
             "class" | "className" => {
                 if let Some(first) = class_attr_seen {
@@ -450,7 +481,22 @@ fn convert_element(
                 component = component.class(convert_attr_value(&attr.value)?);
             }
             "recipe" => component = component.recipe(convert_attr_value(&attr.value)?),
-            _ => component = component.prop(attr.name.clone(), convert_attr_value(&attr.value)?),
+            _ => {
+                let mut value = convert_attr_value(&attr.value)?;
+                if is_reactive_boolean_attr(&attr.name) {
+                    if let Some(plan) = compile_reactive_expression(&value, bindings)? {
+                        value = plan.expression.clone();
+                        component = apply_reactive_expression_metadata(
+                            component,
+                            reactive_expression_index,
+                            &format!("boolean:{}", attr.name),
+                            &plan,
+                        );
+                        reactive_expression_index += 1;
+                    }
+                }
+                component = component.prop(attr.name.clone(), value);
+            }
         }
     }
 
@@ -466,7 +512,7 @@ fn convert_element(
         let body = element
             .children
             .iter()
-            .map(|child| convert_child(child, state_bindings))
+            .map(|child| convert_child(child, bindings))
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(component.block(body));
     }
@@ -477,76 +523,139 @@ fn convert_element(
             AxNodeV2::Expr(expr) => {
                 let value = parse_v2_expr(&expr.source)?;
                 if let AxExpr::Identifier(name) = &value {
-                    if let Some(binding) = state_bindings.get(name) {
+                    if let Some(binding) = bindings.states.get(name) {
                         component = apply_state_read_binding(component, binding);
                     }
+                } else if let Some(plan) = compile_reactive_expression(&value, bindings)? {
+                    return Ok(
+                        component.block([AxStatement::component(reactive_text_component(&plan))])
+                    );
                 }
                 Ok(component.inline(value))
             }
-            AxNodeV2::Element(child) => Ok(component.block([AxStatement::component(
-                convert_element(child, state_bindings)?,
-            )])),
+            AxNodeV2::Element(child) => {
+                Ok(component.block([AxStatement::component(convert_element(child, bindings)?)]))
+            }
         };
     }
 
-    Ok(component.block(convert_children(&element.children, state_bindings)?))
+    Ok(component.block(convert_children(&element.children, bindings)?))
 }
 
 fn convert_children(
     children: &[AxNodeV2],
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<Vec<AxStatement>, AxConvertV2Error> {
     children
         .iter()
-        .map(|child| convert_child(child, state_bindings))
+        .map(|child| convert_child(child, bindings))
         .collect()
 }
 
 fn convert_child(
     child: &AxNodeV2,
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<AxStatement, AxConvertV2Error> {
     match child {
         AxNodeV2::Element(element) if element.name == "Each" => {
-            convert_each_statement(element, state_bindings)
+            convert_each_statement(element, bindings)
         }
         AxNodeV2::Element(element) if element.name == "If" => {
-            convert_if_statement(element, state_bindings)
+            convert_if_statement(element, bindings)
         }
-        AxNodeV2::Element(element) if element.name == "Else" || element.name == "Empty" => {
+        AxNodeV2::Element(element) if element.name == "Match" => {
+            convert_match_statement(element, bindings)
+        }
+        AxNodeV2::Element(element)
+            if matches!(element.name.as_str(), "Else" | "Empty" | "Case" | "Default") =>
+        {
             Err(AxConvertV2Error::UnexpectedControlBranch {
                 tag: "control-flow".to_string(),
                 branch: element.name.clone(),
             })
         }
-        AxNodeV2::Element(element) => Ok(AxStatement::component(convert_element(
-            element,
-            state_bindings,
-        )?)),
+        AxNodeV2::Element(element) => {
+            Ok(AxStatement::component(convert_element(element, bindings)?))
+        }
         AxNodeV2::Text(text) => Ok(AxStatement::text(text.value.clone())),
-        AxNodeV2::Expr(expr) => Ok(AxStatement::text(parse_v2_expr(&expr.source)?)),
+        AxNodeV2::Expr(expr) => {
+            let value = parse_v2_expr(&expr.source)?;
+            if let Some(plan) = compile_reactive_expression(&value, bindings)? {
+                Ok(AxStatement::component(reactive_text_component(&plan)))
+            } else {
+                Ok(AxStatement::text(value))
+            }
+        }
     }
 }
 
 fn convert_each_statement(
     element: &AxElementNode,
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<AxStatement, AxConvertV2Error> {
     let binding = control_binding_attr(element, &["as", "item"])?;
     let source = control_expr_attr(element, &["items", "in", "of"])?;
-    let (body, empty_body) = split_each_children(element, state_bindings)?;
-    Ok(AxStatement::Each(
-        AxEachBlock::new(binding, source, body).empty(empty_body),
-    ))
+    let key = optional_control_expr_attr(element, "key")?;
+    if key
+        .as_ref()
+        .is_some_and(|key| !each_key_is_rooted_at(key, &binding))
+    {
+        return Err(AxConvertV2Error::InvalidEachKey {
+            binding: binding.clone(),
+        });
+    }
+    let (body, empty_body) = split_each_children(element, bindings)?;
+    let mut each = AxEachBlock::new(binding, source.clone(), body).empty(empty_body);
+    if let Some(key) = key {
+        each = each.key(key);
+    }
+    if let AxExpr::Identifier(state) = &source {
+        if let Some(plan) = bindings.states.get(state) {
+            if each.key.is_none() {
+                return Err(AxConvertV2Error::ReactiveEachRequiresKey {
+                    state: state.clone(),
+                });
+            }
+            each = each.state_binding(AxEachStateBinding::new(
+                plan.signal_id.clone(),
+                plan.ty.clone(),
+                plan.initial.clone(),
+            ));
+        }
+    }
+    Ok(AxStatement::Each(each))
+}
+
+fn optional_control_expr_attr(
+    element: &AxElementNode,
+    name: &str,
+) -> Result<Option<AxExpr>, AxConvertV2Error> {
+    element
+        .attrs
+        .iter()
+        .find(|attr| attr.name == name)
+        .map(|attr| convert_attr_value(&attr.value))
+        .transpose()
+}
+
+fn each_key_is_rooted_at(expr: &AxExpr, binding: &str) -> bool {
+    match expr {
+        AxExpr::Identifier(name) => name == binding,
+        AxExpr::Member { object, .. } | AxExpr::OptionalMember { object, .. } => {
+            each_key_is_rooted_at(object, binding)
+        }
+        AxExpr::Index { object, .. } => each_key_is_rooted_at(object, binding),
+        _ => false,
+    }
 }
 
 fn convert_if_statement(
     element: &AxElementNode,
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<AxStatement, AxConvertV2Error> {
     let condition = control_expr_attr(element, &["when", "condition"])?;
-    let (body, else_body) = split_if_children(element, state_bindings)?;
-    if let Some(plan) = state_condition_plan(&condition, state_bindings) {
+    let (body, else_body) = split_if_children(element, bindings)?;
+    if let Some(plan) = state_condition_plan(&condition, bindings.states) {
         return Ok(AxStatement::component(state_if_component(
             plan, body, else_body,
         )));
@@ -554,6 +663,125 @@ fn convert_if_statement(
     Ok(AxStatement::If(
         AxIfBlock::new(condition, body).else_body(else_body),
     ))
+}
+
+fn convert_match_statement(
+    element: &AxElementNode,
+    bindings: &ConversionBindings<'_>,
+) -> Result<AxStatement, AxConvertV2Error> {
+    let value = control_expr_attr(element, &["value"])?;
+    let (cases, default_body) = split_match_children(element, bindings)?;
+    if let AxExpr::Identifier(name) = &value {
+        if let Some(binding) = bindings.states.get(name) {
+            return Ok(AxStatement::component(state_match_component(
+                name,
+                binding,
+                cases,
+                default_body,
+            )));
+        }
+    }
+    let mut match_block = AxMatchBlock::new(value, cases);
+    if let Some(default_body) = default_body {
+        match_block = match_block.default_body(default_body);
+    }
+    Ok(AxStatement::Match(match_block))
+}
+
+fn split_match_children(
+    element: &AxElementNode,
+    bindings: &ConversionBindings<'_>,
+) -> Result<(Vec<AxMatchCase>, Option<Vec<AxStatement>>), AxConvertV2Error> {
+    let mut cases = Vec::new();
+    let mut default_body = None;
+
+    for child in &element.children {
+        let AxNodeV2::Element(branch) = child else {
+            return Err(AxConvertV2Error::InvalidMatchChild);
+        };
+        match branch.name.as_str() {
+            "Case" => {
+                if default_body.is_some() {
+                    return Err(AxConvertV2Error::ControlBranchMustBeLast {
+                        tag: "Match".to_string(),
+                        branch: "Default".to_string(),
+                    });
+                }
+                let case_value = match control_expr_attr(branch, &["is"])? {
+                    AxExpr::String(value) => value,
+                    _ => return Err(AxConvertV2Error::InvalidMatchCaseValue),
+                };
+                cases.push(AxMatchCase::new(
+                    case_value,
+                    convert_children(&branch.children, bindings)?,
+                ));
+            }
+            "Default" => {
+                if !branch.attrs.is_empty() {
+                    return Err(AxConvertV2Error::ControlBranchAttrsNotSupported {
+                        tag: "Match".to_string(),
+                        branch: "Default".to_string(),
+                    });
+                }
+                if default_body.is_some() {
+                    return Err(AxConvertV2Error::DuplicateControlBranch {
+                        tag: "Match".to_string(),
+                        branch: "Default".to_string(),
+                    });
+                }
+                default_body = Some(convert_children(&branch.children, bindings)?);
+            }
+            _ => return Err(AxConvertV2Error::InvalidMatchChild),
+        }
+    }
+
+    Ok((cases, default_body))
+}
+
+fn state_match_component(
+    state_name: &str,
+    binding: &StateBindingPlan,
+    cases: Vec<AxMatchCase>,
+    default_body: Option<Vec<AxStatement>>,
+) -> AxComponent {
+    let initial = binding.initial.as_str();
+    let has_initial_case = cases.iter().any(|case| case.value == initial);
+    let mut branches = cases
+        .into_iter()
+        .map(|case| {
+            let active = case.value == initial;
+            let mut branch = AxComponent::new("__AxStateMatchCase")
+                .prop("case", case.value)
+                .block(case.body);
+            if !active {
+                branch = branch.prop("hidden", true);
+            }
+            AxStatement::component(branch)
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(default_body) = default_body {
+        let mut branch = AxComponent::new("__AxStateMatchDefault").block(default_body);
+        if has_initial_case {
+            branch = branch.prop("hidden", true);
+        }
+        branches.push(AxStatement::component(branch));
+    }
+
+    let mut component = AxComponent::new("__AxStateMatch")
+        .prop("data-ax-state-match-name", state_name)
+        .prop("data-ax-state-match-signal", binding.signal_id.clone())
+        .prop("data-ax-state-match-type", binding.ty.clone())
+        .prop("data-ax-state-match-initial", binding.initial.clone())
+        .block(branches);
+    if let Some(literals) = &binding.literals {
+        component = component.prop(
+            "data-ax-state-match-literals",
+            serde_json::to_string(literals)
+                .expect("serializing string literal union metadata cannot fail"),
+        );
+    }
+    component
 }
 
 fn state_if_component(
@@ -588,21 +816,28 @@ fn state_if_component(
 
 fn convert_each_element(
     element: &AxElementNode,
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<AxComponent, AxConvertV2Error> {
     Ok(AxComponent::fragment([convert_each_statement(
-        element,
-        state_bindings,
+        element, bindings,
     )?]))
 }
 
 fn convert_if_element(
     element: &AxElementNode,
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<AxComponent, AxConvertV2Error> {
     Ok(AxComponent::fragment([convert_if_statement(
-        element,
-        state_bindings,
+        element, bindings,
+    )?]))
+}
+
+fn convert_match_element(
+    element: &AxElementNode,
+    bindings: &ConversionBindings<'_>,
+) -> Result<AxComponent, AxConvertV2Error> {
+    Ok(AxComponent::fragment([convert_match_statement(
+        element, bindings,
     )?]))
 }
 
@@ -650,7 +885,7 @@ fn control_binding_attr(
 
 fn split_each_children(
     element: &AxElementNode,
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<(Vec<AxStatement>, Vec<AxStatement>), AxConvertV2Error> {
     let mut body = Vec::new();
     let mut empty_body = None;
@@ -670,9 +905,9 @@ fn split_each_children(
                         branch: "Empty".to_string(),
                     });
                 }
-                empty_body = Some(convert_children(&branch.children, state_bindings)?);
+                empty_body = Some(convert_children(&branch.children, bindings)?);
             }
-            _ => body.push(convert_child(child, state_bindings)?),
+            _ => body.push(convert_child(child, bindings)?),
         }
     }
 
@@ -681,15 +916,15 @@ fn split_each_children(
 
 fn split_if_children(
     element: &AxElementNode,
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<(Vec<AxStatement>, Vec<AxStatement>), AxConvertV2Error> {
-    split_if_children_from_slice(&element.name, &element.children, state_bindings)
+    split_if_children_from_slice(&element.name, &element.children, bindings)
 }
 
 fn split_if_children_from_slice(
     tag: &str,
     children: &[AxNodeV2],
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<(Vec<AxStatement>, Vec<AxStatement>), AxConvertV2Error> {
     let mut body = Vec::new();
     let mut index = 0;
@@ -709,13 +944,13 @@ fn split_if_children_from_slice(
                         branch: "Else".to_string(),
                     });
                 }
-                return Ok((body, convert_children(&branch.children, state_bindings)?));
+                return Ok((body, convert_children(&branch.children, bindings)?));
             }
             AxNodeV2::Element(branch) if branch.name == "ElseIf" => {
                 let condition = control_expr_attr(branch, &["when", "condition"])?;
-                let nested_body = convert_children(&branch.children, state_bindings)?;
+                let nested_body = convert_children(&branch.children, bindings)?;
                 let nested_else_body =
-                    convert_if_tail_with_state(tag, &children[index + 1..], state_bindings)?;
+                    convert_if_tail_with_state(tag, &children[index + 1..], bindings)?;
                 return Ok((
                     body,
                     vec![AxStatement::If(
@@ -724,7 +959,7 @@ fn split_if_children_from_slice(
                 ));
             }
             child => {
-                body.push(convert_child(child, state_bindings)?);
+                body.push(convert_child(child, bindings)?);
                 index += 1;
             }
         }
@@ -736,7 +971,7 @@ fn split_if_children_from_slice(
 fn convert_if_tail_with_state(
     tag: &str,
     tail: &[AxNodeV2],
-    state_bindings: &BTreeMap<String, StateBindingPlan>,
+    bindings: &ConversionBindings<'_>,
 ) -> Result<Vec<AxStatement>, AxConvertV2Error> {
     let Some(first) = tail.first() else {
         return Ok(Vec::new());
@@ -756,12 +991,12 @@ fn convert_if_tail_with_state(
                     branch: "Else".to_string(),
                 });
             }
-            convert_children(&branch.children, state_bindings)
+            convert_children(&branch.children, bindings)
         }
         AxNodeV2::Element(branch) if branch.name == "ElseIf" => {
             let condition = control_expr_attr(branch, &["when", "condition"])?;
-            let nested_body = convert_children(&branch.children, state_bindings)?;
-            let nested_else_body = convert_if_tail_with_state(tag, &tail[1..], state_bindings)?;
+            let nested_body = convert_children(&branch.children, bindings)?;
+            let nested_else_body = convert_if_tail_with_state(tag, &tail[1..], bindings)?;
             Ok(vec![AxStatement::If(
                 AxIfBlock::new(condition, nested_body).else_body(nested_else_body),
             )])
@@ -785,7 +1020,502 @@ fn convert_if_tail_with_state(
 struct StateBindingPlan {
     signal_id: String,
     ty: String,
+    literals: Option<Vec<String>>,
     initial: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReactiveExpressionPlan {
+    expression: AxExpr,
+    program: Vec<u8>,
+    signals: Vec<String>,
+    types: Vec<String>,
+    initials: Vec<String>,
+}
+
+const AX_EXPRESSION_MAGIC: &[u8; 4] = b"AXE\x01";
+const AX_EXPR_PUSH_DEPENDENCY: u8 = 0;
+const AX_EXPR_PUSH_NULL: u8 = 1;
+const AX_EXPR_PUSH_STRING: u8 = 2;
+const AX_EXPR_PUSH_BOOL: u8 = 3;
+const AX_EXPR_PUSH_FLOAT: u8 = 4;
+const AX_EXPR_PUSH_INT: u8 = 5;
+const AX_EXPR_NOT: u8 = 10;
+const AX_EXPR_NEG: u8 = 11;
+const AX_EXPR_ADD: u8 = 20;
+const AX_EXPR_SUB: u8 = 21;
+const AX_EXPR_MUL: u8 = 22;
+const AX_EXPR_DIV: u8 = 23;
+const AX_EXPR_REM: u8 = 24;
+const AX_EXPR_EQ: u8 = 25;
+const AX_EXPR_NE: u8 = 26;
+const AX_EXPR_GT: u8 = 27;
+const AX_EXPR_GE: u8 = 28;
+const AX_EXPR_LT: u8 = 29;
+const AX_EXPR_LE: u8 = 30;
+const AX_EXPR_IN: u8 = 31;
+const AX_EXPR_AND: u8 = 32;
+const AX_EXPR_OR: u8 = 33;
+const AX_EXPR_FALLBACK: u8 = 34;
+const AX_EXPR_INDEX: u8 = 40;
+const AX_EXPR_MEMBER: u8 = 41;
+const AX_EXPR_OPTIONAL_MEMBER: u8 = 42;
+const AX_EXPR_BUILD_LIST: u8 = 50;
+const AX_EXPR_BUILD_OBJECT: u8 = 51;
+const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
+
+fn is_reactive_boolean_attr(name: &str) -> bool {
+    matches!(
+        name,
+        "disabled"
+            | "checked"
+            | "selected"
+            | "hidden"
+            | "required"
+            | "readonly"
+            | "multiple"
+            | "open"
+    )
+}
+
+fn reactive_text_component(plan: &ReactiveExpressionPlan) -> AxComponent {
+    apply_reactive_expression_metadata(
+        AxComponent::new("__AxReactiveText").inline(plan.expression.clone()),
+        0,
+        "text",
+        plan,
+    )
+}
+
+fn apply_reactive_expression_metadata(
+    component: AxComponent,
+    index: usize,
+    target: &str,
+    plan: &ReactiveExpressionPlan,
+) -> AxComponent {
+    let signals = serde_json::to_string(&plan.signals)
+        .expect("serializing reactive signal metadata cannot fail");
+    let types =
+        serde_json::to_string(&plan.types).expect("serializing reactive type metadata cannot fail");
+    let initials = serde_json::to_string(&plan.initials)
+        .expect("serializing reactive initial metadata cannot fail");
+    component
+        .prop("data-ax-expression-protocol", "ax-expression/1")
+        .prop("data-ax-expression-count", (index + 1).to_string())
+        .prop(
+            format!("data-ax-expression-{index}-program"),
+            encode_hex(&plan.program),
+        )
+        .prop(format!("data-ax-expression-{index}-signals"), signals)
+        .prop(format!("data-ax-expression-{index}-types"), types)
+        .prop(format!("data-ax-expression-{index}-initials"), initials)
+        .prop(
+            format!("data-ax-expression-{index}-target"),
+            target.to_string(),
+        )
+}
+
+fn compile_reactive_expression(
+    expr: &AxExpr,
+    bindings: &ConversionBindings<'_>,
+) -> Result<Option<ReactiveExpressionPlan>, AxConvertV2Error> {
+    let directly_reactive = expression_references_state(expr, bindings.states);
+    let expanded = match expand_pure_reactive_expression(
+        expr,
+        bindings,
+        &BTreeMap::new(),
+        &mut Vec::new(),
+        &mut Vec::new(),
+    ) {
+        Ok(expanded) => expanded,
+        Err(reason) if directly_reactive => {
+            return Err(AxConvertV2Error::UnsupportedReactiveExpression {
+                expr_source: format_expr(expr),
+                reason,
+            });
+        }
+        Err(_) => return Ok(None),
+    };
+    if !expression_references_state(&expanded, bindings.states) {
+        return Ok(None);
+    }
+    let mut dependencies = Vec::<String>::new();
+    let mut program = AX_EXPRESSION_MAGIC.to_vec();
+    compile_reactive_expression_node(&expanded, bindings, &mut dependencies, &mut program)
+        .map_err(|reason| AxConvertV2Error::UnsupportedReactiveExpression {
+            expr_source: format_expr(expr),
+            reason,
+        })?;
+    let signals = dependencies
+        .iter()
+        .map(|name| bindings.states[name].signal_id.clone())
+        .collect();
+    let types = dependencies
+        .iter()
+        .map(|name| bindings.states[name].ty.clone())
+        .collect();
+    let initials = dependencies
+        .iter()
+        .map(|name| bindings.states[name].initial.clone())
+        .collect();
+    Ok(Some(ReactiveExpressionPlan {
+        expression: expanded,
+        program,
+        signals,
+        types,
+        initials,
+    }))
+}
+
+fn expand_pure_reactive_expression(
+    expr: &AxExpr,
+    bindings: &ConversionBindings<'_>,
+    locals: &BTreeMap<String, AxExpr>,
+    local_stack: &mut Vec<String>,
+    call_stack: &mut Vec<String>,
+) -> Result<AxExpr, String> {
+    Ok(match expr {
+        AxExpr::Identifier(name) if locals.contains_key(name) => {
+            if local_stack.contains(name) {
+                return Err(format!(
+                    "pure function parameter `{name}` resolves recursively"
+                ));
+            }
+            local_stack.push(name.clone());
+            let value = expand_pure_reactive_expression(
+                &locals[name],
+                bindings,
+                locals,
+                local_stack,
+                call_stack,
+            )?;
+            local_stack.pop();
+            value
+        }
+        AxExpr::Unary { op, expr } => AxExpr::Unary {
+            op: *op,
+            expr: Box::new(expand_pure_reactive_expression(
+                expr,
+                bindings,
+                locals,
+                local_stack,
+                call_stack,
+            )?),
+        },
+        AxExpr::Binary { op, left, right } => AxExpr::Binary {
+            op: *op,
+            left: Box::new(expand_pure_reactive_expression(
+                left,
+                bindings,
+                locals,
+                local_stack,
+                call_stack,
+            )?),
+            right: Box::new(expand_pure_reactive_expression(
+                right,
+                bindings,
+                locals,
+                local_stack,
+                call_stack,
+            )?),
+        },
+        AxExpr::Index { object, index } => AxExpr::Index {
+            object: Box::new(expand_pure_reactive_expression(
+                object,
+                bindings,
+                locals,
+                local_stack,
+                call_stack,
+            )?),
+            index: Box::new(expand_pure_reactive_expression(
+                index,
+                bindings,
+                locals,
+                local_stack,
+                call_stack,
+            )?),
+        },
+        AxExpr::Member { object, property } => AxExpr::Member {
+            object: Box::new(expand_pure_reactive_expression(
+                object,
+                bindings,
+                locals,
+                local_stack,
+                call_stack,
+            )?),
+            property: property.clone(),
+        },
+        AxExpr::OptionalMember { object, property } => AxExpr::OptionalMember {
+            object: Box::new(expand_pure_reactive_expression(
+                object,
+                bindings,
+                locals,
+                local_stack,
+                call_stack,
+            )?),
+            property: property.clone(),
+        },
+        AxExpr::Call { path, args } => {
+            let [name] = path.as_slice() else {
+                return Err(format!("`{}` is not a local pure function", path.join(".")));
+            };
+            let Some(function) = bindings
+                .functions
+                .iter()
+                .rev()
+                .find(|function| function.name == *name)
+            else {
+                return Err(format!("`{name}` is not a local pure function"));
+            };
+            if call_stack.contains(name) {
+                let mut cycle = call_stack.clone();
+                cycle.push(name.clone());
+                return Err(format!(
+                    "recursive pure function calls are not supported (`{}`)",
+                    cycle.join(" -> ")
+                ));
+            }
+            if args.len() > function.params.len() {
+                return Err(format!(
+                    "pure function `{name}` expects at most {} arguments, received {}",
+                    function.params.len(),
+                    args.len()
+                ));
+            }
+            let expanded_args = args
+                .iter()
+                .map(|arg| {
+                    expand_pure_reactive_expression(arg, bindings, locals, local_stack, call_stack)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            call_stack.push(name.clone());
+            let mut function_locals = BTreeMap::new();
+            for (index, param) in function.params.iter().enumerate() {
+                let value = if let Some(value) = expanded_args.get(index) {
+                    value.clone()
+                } else if let Some(default) = &param.default {
+                    expand_pure_reactive_expression(
+                        default,
+                        bindings,
+                        &function_locals,
+                        local_stack,
+                        call_stack,
+                    )?
+                } else {
+                    call_stack.pop();
+                    return Err(format!(
+                        "pure function `{name}` is missing required argument `{}`",
+                        param.name
+                    ));
+                };
+                function_locals.insert(param.name.clone(), value);
+            }
+            let result = expand_pure_reactive_expression(
+                &function.body,
+                bindings,
+                &function_locals,
+                local_stack,
+                call_stack,
+            );
+            call_stack.pop();
+            result?
+        }
+        AxExpr::List(items) => AxExpr::List(
+            items
+                .iter()
+                .map(|item| {
+                    expand_pure_reactive_expression(item, bindings, locals, local_stack, call_stack)
+                })
+                .collect::<Result<Vec<_>, _>>()?,
+        ),
+        AxExpr::Object(fields) => AxExpr::Object(
+            fields
+                .iter()
+                .map(|(name, value)| {
+                    Ok((
+                        name.clone(),
+                        expand_pure_reactive_expression(
+                            value,
+                            bindings,
+                            locals,
+                            local_stack,
+                            call_stack,
+                        )?,
+                    ))
+                })
+                .collect::<Result<BTreeMap<_, _>, String>>()?,
+        ),
+        value => value.clone(),
+    })
+}
+
+fn expression_references_state(
+    expr: &AxExpr,
+    state_bindings: &BTreeMap<String, StateBindingPlan>,
+) -> bool {
+    match expr {
+        AxExpr::Identifier(name) => state_bindings.contains_key(name),
+        AxExpr::Unary { expr, .. } => expression_references_state(expr, state_bindings),
+        AxExpr::Binary { left, right, .. } => {
+            expression_references_state(left, state_bindings)
+                || expression_references_state(right, state_bindings)
+        }
+        AxExpr::Index { object, index } => {
+            expression_references_state(object, state_bindings)
+                || expression_references_state(index, state_bindings)
+        }
+        AxExpr::Member { object, .. } | AxExpr::OptionalMember { object, .. } => {
+            expression_references_state(object, state_bindings)
+        }
+        AxExpr::Call { args, .. } => args
+            .iter()
+            .any(|arg| expression_references_state(arg, state_bindings)),
+        AxExpr::List(items) => items
+            .iter()
+            .any(|item| expression_references_state(item, state_bindings)),
+        AxExpr::Object(fields) => fields
+            .values()
+            .any(|value| expression_references_state(value, state_bindings)),
+        AxExpr::String(_) | AxExpr::Number(_) | AxExpr::Float(_) | AxExpr::Bool(_) => false,
+    }
+}
+
+fn compile_reactive_expression_node(
+    expr: &AxExpr,
+    bindings: &ConversionBindings<'_>,
+    dependencies: &mut Vec<String>,
+    program: &mut Vec<u8>,
+) -> Result<(), String> {
+    match expr {
+        AxExpr::String(value) => {
+            program.push(AX_EXPR_PUSH_STRING);
+            push_program_string(program, value)?;
+        }
+        AxExpr::Number(value) => {
+            program.push(AX_EXPR_PUSH_INT);
+            program.extend_from_slice(&value.to_le_bytes());
+        }
+        AxExpr::Float(value) => {
+            program.push(AX_EXPR_PUSH_FLOAT);
+            program.extend_from_slice(&value.get().to_le_bytes());
+        }
+        AxExpr::Bool(value) => {
+            program.push(AX_EXPR_PUSH_BOOL);
+            program.push(u8::from(*value));
+        }
+        AxExpr::Identifier(name) if name == "null" => program.push(AX_EXPR_PUSH_NULL),
+        AxExpr::Identifier(name) => {
+            if !bindings.states.contains_key(name) {
+                return Err(format!("`{name}` is not reactive state"));
+            }
+            let index = if let Some(index) = dependencies.iter().position(|item| item == name) {
+                index
+            } else {
+                dependencies.push(name.clone());
+                dependencies.len() - 1
+            };
+            let index = u16::try_from(index)
+                .map_err(|_| "reactive expression has too many dependencies".to_string())?;
+            program.push(AX_EXPR_PUSH_DEPENDENCY);
+            program.extend_from_slice(&index.to_le_bytes());
+        }
+        AxExpr::Unary { op, expr } => {
+            compile_reactive_expression_node(expr, bindings, dependencies, program)?;
+            program.push(match op {
+                AxUnaryOp::Not => AX_EXPR_NOT,
+                AxUnaryOp::Neg => AX_EXPR_NEG,
+            });
+        }
+        AxExpr::Binary { op, left, right } => {
+            compile_reactive_expression_node(left, bindings, dependencies, program)?;
+            compile_reactive_expression_node(right, bindings, dependencies, program)?;
+            program.push(match op {
+                AxBinaryOp::Add => AX_EXPR_ADD,
+                AxBinaryOp::Sub => AX_EXPR_SUB,
+                AxBinaryOp::Mul => AX_EXPR_MUL,
+                AxBinaryOp::Div => AX_EXPR_DIV,
+                AxBinaryOp::Rem => AX_EXPR_REM,
+                AxBinaryOp::Eq => AX_EXPR_EQ,
+                AxBinaryOp::Ne => AX_EXPR_NE,
+                AxBinaryOp::Gt => AX_EXPR_GT,
+                AxBinaryOp::Ge => AX_EXPR_GE,
+                AxBinaryOp::Lt => AX_EXPR_LT,
+                AxBinaryOp::Le => AX_EXPR_LE,
+                AxBinaryOp::In => AX_EXPR_IN,
+                AxBinaryOp::And => AX_EXPR_AND,
+                AxBinaryOp::Or => AX_EXPR_OR,
+                AxBinaryOp::Fallback => AX_EXPR_FALLBACK,
+            });
+        }
+        AxExpr::Index { object, index } => {
+            compile_reactive_expression_node(object, bindings, dependencies, program)?;
+            compile_reactive_expression_node(index, bindings, dependencies, program)?;
+            program.push(AX_EXPR_INDEX);
+        }
+        AxExpr::Member { object, property } | AxExpr::OptionalMember { object, property } => {
+            compile_reactive_expression_node(object, bindings, dependencies, program)?;
+            program.push(if matches!(expr, AxExpr::Member { .. }) {
+                AX_EXPR_MEMBER
+            } else {
+                AX_EXPR_OPTIONAL_MEMBER
+            });
+            push_program_string(program, property)?;
+        }
+        AxExpr::Call { path, .. } => {
+            return Err(format!(
+                "pure function `{}` could not be fully inlined",
+                path.join(".")
+            ));
+        }
+        AxExpr::List(items) => {
+            let count = reactive_collection_count(items.len(), "list")?;
+            for item in items {
+                compile_reactive_expression_node(item, bindings, dependencies, program)?;
+            }
+            program.push(AX_EXPR_BUILD_LIST);
+            program.extend_from_slice(&count.to_le_bytes());
+        }
+        AxExpr::Object(fields) => {
+            let count = reactive_collection_count(fields.len(), "object")?;
+            for value in fields.values() {
+                compile_reactive_expression_node(value, bindings, dependencies, program)?;
+            }
+            program.push(AX_EXPR_BUILD_OBJECT);
+            program.extend_from_slice(&count.to_le_bytes());
+            for name in fields.keys() {
+                push_program_string(program, name)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn reactive_collection_count(count: usize, kind: &str) -> Result<u16, String> {
+    if count > AX_EXPRESSION_COLLECTION_MAX_ITEMS {
+        return Err(format!(
+            "reactive {kind} literal exceeds the {AX_EXPRESSION_COLLECTION_MAX_ITEMS}-item limit"
+        ));
+    }
+    u16::try_from(count).map_err(|_| format!("reactive {kind} literal has too many items"))
+}
+
+fn push_program_string(program: &mut Vec<u8>, value: &str) -> Result<(), String> {
+    let length = u32::try_from(value.len())
+        .map_err(|_| "reactive expression string is too large".to_string())?;
+    program.extend_from_slice(&length.to_le_bytes());
+    program.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -921,6 +1651,7 @@ fn collect_state_bindings(
             state.name.clone(),
             StateBindingPlan {
                 signal_id: format!("root:{}:{}", state.name, index + 1),
+                literals: data_context.literal_union(&ty).map(<[_]>::to_vec),
                 ty,
                 initial: state_event_literal(&initializer.value).ok_or_else(|| {
                     AxConvertV2Error::InvalidStateInitializer {
@@ -1071,13 +1802,19 @@ fn apply_state_event_attr(
             attr: attr.name.clone(),
         });
     };
+    let set_value_matches = mutation.value_ty.as_deref().is_none_or(|value_ty| {
+        state_literal_matches_type(value_ty, &binding.ty)
+            || value_ty == "String"
+                && mutation.value.as_ref().is_some_and(|value| {
+                    binding
+                        .literals
+                        .as_ref()
+                        .is_some_and(|literals| literals.contains(value))
+                })
+    });
     if matches!(mutation.op.as_str(), "add" | "sub")
         && !matches!(binding.ty.as_str(), "Number" | "Int" | "Float")
-        || mutation.op == "set"
-            && mutation
-                .value_ty
-                .as_deref()
-                .is_some_and(|value_ty| !state_literal_matches_type(value_ty, &binding.ty))
+        || mutation.op == "set" && !set_value_matches
         || mutation.op == "toggle" && binding.ty != "Bool"
     {
         return Err(AxConvertV2Error::InvalidStateEvent {
@@ -1929,6 +2666,307 @@ page Counter() {
     }
 
     #[test]
+    fn converts_state_dependent_match_into_reactive_dom_boundary() {
+        let document = parse_ax_auto(
+            r#"
+page ThemePreview() {
+  type Theme = "silver" | "bronze" | "gold"
+  state theme: Theme = "silver"
+  return ASX {
+    <Match value={theme}>
+      <Case is="silver"><Copy>Silver</Copy></Case>
+      <Case is="gold"><Copy>Gold</Copy></Case>
+      <Default><Copy>Other</Copy></Default>
+    </Match>
+  }
+}
+"#,
+        )
+        .expect("state-dependent match should convert");
+
+        let AxStatement::Component(fragment) = &document.page.body[1] else {
+            panic!("expected return fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected return body");
+        };
+        let AxStatement::Component(state_match) = &body[0] else {
+            panic!("expected reactive state match component");
+        };
+        assert_eq!(state_match.name, "__AxStateMatch");
+        assert!(state_match.props.contains(&AxProp::new(
+            "data-ax-state-match-signal",
+            AxExpr::string("root:theme:1")
+        )));
+        assert!(state_match.props.contains(&AxProp::new(
+            "data-ax-state-match-literals",
+            AxExpr::string(r#"["silver","bronze","gold"]"#)
+        )));
+        let AxBody::Block(branches) = &state_match.body else {
+            panic!("expected match branches");
+        };
+        assert_eq!(branches.len(), 3);
+        let AxStatement::Component(gold) = &branches[1] else {
+            panic!("expected gold branch");
+        };
+        assert!(gold
+            .props
+            .contains(&AxProp::new("hidden", AxExpr::bool(true))));
+    }
+
+    #[test]
+    fn compiles_reactive_text_and_boolean_attribute_expression_metadata() {
+        let document = parse_ax_auto(
+            r#"
+page Counter() {
+  state count: Int = 2
+  state limit: Int = 5
+  return ASX {
+    <>
+      <Copy>{count * 2}</Copy>
+      <Button disabled={count >= limit}>Increase</Button>
+    </>
+  }
+}
+"#,
+        )
+        .expect("reactive expressions should compile");
+
+        let AxStatement::Component(fragment) = &document.page.body[2] else {
+            panic!("expected return fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected return body");
+        };
+        let AxStatement::Component(copy) = &body[0] else {
+            panic!("expected Copy");
+        };
+        let AxBody::Block(copy_body) = &copy.body else {
+            panic!("expected reactive text wrapper");
+        };
+        let AxStatement::Component(expression) = &copy_body[0] else {
+            panic!("expected reactive expression");
+        };
+        assert_eq!(expression.name, "__AxReactiveText");
+        assert!(expression.props.contains(&AxProp::new(
+            "data-ax-expression-0-signals",
+            AxExpr::string(r#"["root:count:1"]"#)
+        )));
+        assert!(expression.props.contains(&AxProp::new(
+            "data-ax-expression-0-target",
+            AxExpr::string("text")
+        )));
+
+        let AxStatement::Component(button) = &body[1] else {
+            panic!("expected Button");
+        };
+        assert!(button.props.contains(&AxProp::new(
+            "data-ax-expression-0-signals",
+            AxExpr::string(r#"["root:count:1","root:limit:2"]"#)
+        )));
+        assert!(button.props.contains(&AxProp::new(
+            "data-ax-expression-0-target",
+            AxExpr::string("boolean:disabled")
+        )));
+    }
+
+    #[test]
+    fn inlines_local_pure_functions_into_reactive_expression_metadata() {
+        let document = parse_ax_auto(
+            r#"
+page Counter() {
+  state count: Int = 2
+  state limit: Int = 5
+  fn double(value: Int) = value * 2
+  fn twicePlus(value: Int, extra: Int = 1) = double(value) + extra
+  fn reached(value: Int, maximum: Int) = value >= maximum
+  return ASX {
+    <>
+      <Copy>{twicePlus(count)}</Copy>
+      <Button disabled={reached(double(count), limit)}>Increase</Button>
+    </>
+  }
+}
+"#,
+        )
+        .expect("local pure functions should inline into reactive bytecode");
+
+        let AxStatement::Component(fragment) = &document.page.body[2] else {
+            panic!("expected return fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected return body");
+        };
+        let AxStatement::Component(copy) = &body[0] else {
+            panic!("expected Copy");
+        };
+        let AxBody::Block(copy_body) = &copy.body else {
+            panic!("expected reactive text wrapper");
+        };
+        let AxStatement::Component(expression) = &copy_body[0] else {
+            panic!("expected reactive expression");
+        };
+        assert!(expression.props.iter().any(|prop| {
+            prop.name == "data-ax-expression-0-program"
+                && matches!(&prop.value, AxExpr::String(value) if value.starts_with("41584501") && value.ends_with("14"))
+        }));
+        assert!(expression.props.contains(&AxProp::new(
+            "data-ax-expression-0-signals",
+            AxExpr::string(r#"["root:count:1"]"#)
+        )));
+
+        let AxStatement::Component(button) = &body[1] else {
+            panic!("expected Button");
+        };
+        assert!(button.props.contains(&AxProp::new(
+            "data-ax-expression-0-signals",
+            AxExpr::string(r#"["root:count:1","root:limit:2"]"#)
+        )));
+        assert!(button.props.contains(&AxProp::new(
+            "data-ax-expression-0-target",
+            AxExpr::string("boolean:disabled")
+        )));
+    }
+
+    #[test]
+    fn rejects_unknown_state_dependent_function_calls() {
+        let error = parse_ax_auto(
+            r#"
+page Counter() {
+  state count: Int = 2
+  return ASX { <Copy>{format(count)}</Copy> }
+}
+"#,
+        )
+        .expect_err("reactive calls should not silently become static");
+
+        assert!(matches!(
+            &error,
+            AxAutoParseError::Convert(AxConvertV2Error::UnsupportedReactiveExpression {
+                expr_source,
+                reason,
+            }) if expr_source == "format(count)" && reason.contains("not a local pure function")
+        ));
+    }
+
+    #[test]
+    fn finds_reactive_state_referenced_by_a_pure_function_default() {
+        let document = parse_ax_auto(
+            r#"
+page Counter() {
+  state count: Int = 2
+  fn next(value: Int = count) = value + 1
+  return ASX { <Copy>{next()}</Copy> }
+}
+"#,
+        )
+        .expect("pure function defaults should participate in dependency discovery");
+
+        let AxStatement::Component(copy) = &document.page.body[1] else {
+            panic!("expected Copy");
+        };
+        let AxBody::Block(body) = &copy.body else {
+            panic!("expected reactive text wrapper");
+        };
+        let AxStatement::Component(expression) = &body[0] else {
+            panic!("expected reactive expression");
+        };
+        assert!(expression.props.contains(&AxProp::new(
+            "data-ax-expression-0-signals",
+            AxExpr::string(r#"["root:count:1"]"#)
+        )));
+    }
+
+    #[test]
+    fn compiles_reactive_list_and_object_literals() {
+        let document = parse_ax_auto(
+            r#"
+page CollectionProbe() {
+  state count: Int = 2
+  state limit: Int = 3
+  return ASX {
+    <>
+      <Copy>{count in [1, 2, 3]}</Copy>
+      <button disabled={({active: count >= limit}).active}>Locked</button>
+    </>
+  }
+}
+"#,
+        )
+        .expect("reactive collection literals should compile");
+
+        let AxStatement::Component(fragment) = &document.page.body[2] else {
+            panic!("expected return fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected fragment body");
+        };
+        let AxStatement::Component(copy) = &body[0] else {
+            panic!("expected Copy");
+        };
+        let AxBody::Block(copy_body) = &copy.body else {
+            panic!("expected reactive text wrapper");
+        };
+        let AxStatement::Component(expression) = &copy_body[0] else {
+            panic!("expected reactive expression");
+        };
+        assert!(expression.props.iter().any(|prop| {
+            prop.name == "data-ax-expression-0-program"
+                && matches!(&prop.value, AxExpr::String(value) if value.ends_with("3203001f"))
+        }));
+
+        let AxStatement::Component(button) = &body[1] else {
+            panic!("expected button");
+        };
+        assert!(button.props.iter().any(|prop| {
+            prop.name == "data-ax-expression-0-program"
+                && matches!(&prop.value, AxExpr::String(value) if value.contains("33010006000000616374697665"))
+        }));
+    }
+
+    #[test]
+    fn rejects_recursive_pure_reactive_functions() {
+        let error = parse_ax_auto(
+            r#"
+page Counter() {
+  state count: Int = 2
+  fn first(value: Int) = second(value)
+  fn second(value: Int) = first(value)
+  return ASX { <Copy>{first(count)}</Copy> }
+}
+"#,
+        )
+        .expect_err("recursive pure functions should fail during reactive compilation");
+
+        assert!(matches!(
+            &error,
+            AxAutoParseError::Convert(AxConvertV2Error::UnsupportedReactiveExpression {
+                reason,
+                ..
+            }) if reason.contains("first -> second -> first")
+        ));
+    }
+
+    #[test]
+    fn rejects_literal_union_state_events_outside_the_contract() {
+        let error = parse_ax_auto(
+            r#"
+page ThemePreview() {
+  type Theme = "silver" | "gold"
+  state theme: Theme = "silver"
+  return ASX { <Button on:click={theme = "purple"}>Purple</Button> }
+}
+"#,
+        )
+        .expect_err("literal union events should enforce the declared contract");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::InvalidStateEvent { .. })
+        ));
+    }
+
+    #[test]
     fn converts_input_and_change_event_values_into_safe_metadata() {
         let document = parse_ax_auto(
             r#"
@@ -2188,6 +3226,79 @@ page Home
     }
 
     #[test]
+    fn converts_keyed_state_each_into_reactive_ownership_metadata() {
+        let document = parse_ax_auto(
+            r#"
+page Posts() {
+  state posts = [{ id: "first", title: "Hello" }]
+  return ASX {
+    <Each items={posts} as="post" key={post.id}>
+      <Card title={post.title} />
+    </Each>
+  }
+}
+"#,
+        )
+        .expect("keyed state each should convert");
+
+        let AxStatement::Component(fragment) = &document.page.body[1] else {
+            panic!("expected each fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected each body");
+        };
+        let AxStatement::Each(each) = &body[0] else {
+            panic!("expected each block");
+        };
+
+        assert_eq!(each.key, Some(AxExpr::ident("post").member("id")));
+        let state = each
+            .state_binding
+            .as_ref()
+            .expect("state each should keep bridge metadata");
+        assert_eq!(state.signal, "root:posts:1");
+        assert!(state.ty.starts_with("List<"));
+    }
+
+    #[test]
+    fn rejects_state_each_without_key() {
+        let error = parse_ax_auto(
+            r#"
+page Posts() {
+  state posts = [{ id: "first" }]
+  return ASX { <Each items={posts} as="post"><Copy>{post.id}</Copy></Each> }
+}
+"#,
+        )
+        .expect_err("state each should require stable identity");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::ReactiveEachRequiresKey { state })
+                if state == "posts"
+        ));
+    }
+
+    #[test]
+    fn rejects_each_key_not_rooted_at_item_binding() {
+        let error = parse_ax_auto(
+            r#"
+page Posts
+<Each items={posts} as="post" key={selectedId}>
+  <Copy>{post.title}</Copy>
+</Each>
+"#,
+        )
+        .expect_err("unrelated each key should fail");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::InvalidEachKey { binding })
+                if binding == "post"
+        ));
+    }
+
+    #[test]
     fn converts_else_and_empty_control_branches() {
         let document = parse_ax_auto(
             r#"
@@ -2229,6 +3340,65 @@ page Home
             panic!("expected each block");
         };
         assert_eq!(each_block.empty_body.len(), 1);
+    }
+
+    #[test]
+    fn converts_match_cases_and_default_into_runtime_block() {
+        let document = parse_ax_auto(
+            r#"
+page ThemePreview() {
+  const theme: String = "gold"
+
+  return ASX {
+    <Match value={theme}>
+      <Case is="silver"><Copy>Silver</Copy></Case>
+      <Case is="gold"><Copy>Gold</Copy></Case>
+      <Default><Copy>Custom</Copy></Default>
+    </Match>
+  }
+}
+"#,
+        )
+        .expect("match control element should parse");
+
+        let AxStatement::Component(fragment) = &document.page.body[1] else {
+            panic!("match should convert into a fragment component");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("match fragment should contain a control statement");
+        };
+        let AxStatement::Match(match_block) = &body[0] else {
+            panic!("expected match block");
+        };
+
+        assert_eq!(match_block.value, AxExpr::ident("theme"));
+        assert_eq!(
+            match_block
+                .cases
+                .iter()
+                .map(|case| case.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["silver", "gold"]
+        );
+        assert_eq!(match_block.default_body.as_deref().map(<[_]>::len), Some(1));
+    }
+
+    #[test]
+    fn rejects_non_literal_match_case_values() {
+        let error = parse_ax_auto(
+            r#"
+page ThemePreview
+<Match value={theme}>
+  <Case is={otherTheme}><Copy>Theme</Copy></Case>
+</Match>
+"#,
+        )
+        .expect_err("match cases should require literal values");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::InvalidMatchCaseValue)
+        ));
     }
 
     #[test]

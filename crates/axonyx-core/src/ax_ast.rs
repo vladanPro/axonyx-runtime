@@ -335,6 +335,7 @@ pub enum AxStatement {
     Data(AxDataBinding),
     Each(AxEachBlock),
     If(AxIfBlock),
+    Match(AxMatchBlock),
     Text(AxExpr),
     Component(AxComponent),
     Pipeline(AxPipeline),
@@ -355,6 +356,10 @@ impl AxStatement {
 
     pub fn if_block(condition: AxExpr, body: impl IntoIterator<Item = AxStatement>) -> Self {
         Self::If(AxIfBlock::new(condition, body))
+    }
+
+    pub fn match_block(value: AxExpr, cases: impl IntoIterator<Item = AxMatchCase>) -> Self {
+        Self::Match(AxMatchBlock::new(value, cases))
     }
 
     pub fn text(value: impl Into<AxExpr>) -> Self {
@@ -389,8 +394,33 @@ impl AxDataBinding {
 pub struct AxEachBlock {
     pub binding: String,
     pub source: AxExpr,
+    #[serde(default)]
+    pub key: Option<AxExpr>,
+    #[serde(default)]
+    pub state_binding: Option<AxEachStateBinding>,
     pub body: Vec<AxStatement>,
     pub empty_body: Vec<AxStatement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxEachStateBinding {
+    pub signal: String,
+    pub ty: String,
+    pub initial: String,
+}
+
+impl AxEachStateBinding {
+    pub fn new(
+        signal: impl Into<String>,
+        ty: impl Into<String>,
+        initial: impl Into<String>,
+    ) -> Self {
+        Self {
+            signal: signal.into(),
+            ty: ty.into(),
+            initial: initial.into(),
+        }
+    }
 }
 
 impl AxEachBlock {
@@ -402,9 +432,21 @@ impl AxEachBlock {
         Self {
             binding: binding.into(),
             source,
+            key: None,
+            state_binding: None,
             body: body.into_iter().collect(),
             empty_body: Vec::new(),
         }
+    }
+
+    pub fn key(mut self, key: AxExpr) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    pub fn state_binding(mut self, binding: AxEachStateBinding) -> Self {
+        self.state_binding = Some(binding);
+        self
     }
 
     pub fn empty(mut self, body: impl IntoIterator<Item = AxStatement>) -> Self {
@@ -484,6 +526,43 @@ pub struct AxIfBlock {
     pub condition: AxExpr,
     pub body: Vec<AxStatement>,
     pub else_body: Vec<AxStatement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxMatchBlock {
+    pub value: AxExpr,
+    pub cases: Vec<AxMatchCase>,
+    pub default_body: Option<Vec<AxStatement>>,
+}
+
+impl AxMatchBlock {
+    pub fn new(value: AxExpr, cases: impl IntoIterator<Item = AxMatchCase>) -> Self {
+        Self {
+            value,
+            cases: cases.into_iter().collect(),
+            default_body: None,
+        }
+    }
+
+    pub fn default_body(mut self, body: impl IntoIterator<Item = AxStatement>) -> Self {
+        self.default_body = Some(body.into_iter().collect());
+        self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxMatchCase {
+    pub value: String,
+    pub body: Vec<AxStatement>,
+}
+
+impl AxMatchCase {
+    pub fn new(value: impl Into<String>, body: impl IntoIterator<Item = AxStatement>) -> Self {
+        Self {
+            value: value.into(),
+            body: body.into_iter().collect(),
+        }
+    }
 }
 
 impl AxIfBlock {
@@ -781,6 +860,7 @@ pub mod prelude {
     pub use super::AxDocument;
     pub use super::AxEachBlock;
     pub use super::AxEachStage;
+    pub use super::AxEachStateBinding;
     pub use super::AxExpr;
     pub use super::AxFloat;
     pub use super::AxFunctionDef;
@@ -789,6 +869,8 @@ pub mod prelude {
     pub use super::AxIfBlock;
     pub use super::AxImport;
     pub use super::AxImportBinding;
+    pub use super::AxMatchBlock;
+    pub use super::AxMatchCase;
     pub use super::AxPage;
     pub use super::AxPipeline;
     pub use super::AxPipelineStage;
