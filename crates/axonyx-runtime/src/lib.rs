@@ -6171,6 +6171,36 @@ page Counter() {
     }
 
     #[test]
+    fn preview_inlines_pure_functions_into_wasm_reactive_expressions() {
+        let html = preview_ax_page(
+            r#"
+page Counter() {
+  state count: Int = 2
+  state limit: Int = 5
+  fn double(value: Int) = value * 2
+  fn reached(value: Int, maximum: Int) = value >= maximum
+
+  return ASX {
+    <>
+      <button on:click={count += 1}>Increase</button>
+      <Copy>{double(count)}</Copy>
+      <button disabled={reached(count, limit)}>Locked</button>
+    </>
+  }
+}
+"#,
+        )
+        .expect("pure reactive function preview should render");
+
+        assert!(html.contains(">4</ax-expression>"));
+        assert!(html.contains("data-ax-expression-0-target=\"text\""));
+        assert!(html.contains("data-ax-expression-0-target=\"boolean:disabled\""));
+        assert!(html.contains("data-ax-expression-0-signals="));
+        assert!(html.contains("exports.ax_state_evaluate_expression"));
+        assert!(!html.contains("disabled=\"false\""));
+    }
+
+    #[test]
     fn preview_preserves_state_dependent_if_branches_for_local_updates() {
         let html = preview_ax_page(
             r#"
