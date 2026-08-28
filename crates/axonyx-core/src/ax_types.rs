@@ -985,6 +985,9 @@ impl AxTypeChecker {
                 match self.context.bind_each_item(&block.binding, &block.source) {
                     Ok(each_context) => {
                         let mut body_checker = self.fork(each_context);
+                        if let Some(key) = &block.key {
+                            body_checker.check_expr(key, format!("{location}.each.key"));
+                        }
                         body_checker.check_statements(&block.body, &format!("{location}.each"));
                         self.errors.extend(body_checker.errors);
 
