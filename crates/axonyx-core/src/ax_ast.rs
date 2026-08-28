@@ -394,8 +394,33 @@ impl AxDataBinding {
 pub struct AxEachBlock {
     pub binding: String,
     pub source: AxExpr,
+    #[serde(default)]
+    pub key: Option<AxExpr>,
+    #[serde(default)]
+    pub state_binding: Option<AxEachStateBinding>,
     pub body: Vec<AxStatement>,
     pub empty_body: Vec<AxStatement>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxEachStateBinding {
+    pub signal: String,
+    pub ty: String,
+    pub initial: String,
+}
+
+impl AxEachStateBinding {
+    pub fn new(
+        signal: impl Into<String>,
+        ty: impl Into<String>,
+        initial: impl Into<String>,
+    ) -> Self {
+        Self {
+            signal: signal.into(),
+            ty: ty.into(),
+            initial: initial.into(),
+        }
+    }
 }
 
 impl AxEachBlock {
@@ -407,9 +432,21 @@ impl AxEachBlock {
         Self {
             binding: binding.into(),
             source,
+            key: None,
+            state_binding: None,
             body: body.into_iter().collect(),
             empty_body: Vec::new(),
         }
+    }
+
+    pub fn key(mut self, key: AxExpr) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    pub fn state_binding(mut self, binding: AxEachStateBinding) -> Self {
+        self.state_binding = Some(binding);
+        self
     }
 
     pub fn empty(mut self, body: impl IntoIterator<Item = AxStatement>) -> Self {
@@ -823,6 +860,7 @@ pub mod prelude {
     pub use super::AxDocument;
     pub use super::AxEachBlock;
     pub use super::AxEachStage;
+    pub use super::AxEachStateBinding;
     pub use super::AxExpr;
     pub use super::AxFloat;
     pub use super::AxFunctionDef;

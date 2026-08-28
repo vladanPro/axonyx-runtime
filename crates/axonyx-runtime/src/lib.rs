@@ -6228,6 +6228,31 @@ page CollectionProbe() {
     }
 
     #[test]
+    fn preview_emits_keyed_each_ownership_protocol_for_state_lists() {
+        let html = preview_ax_page(
+            r#"
+page Posts() {
+  state posts = [{ id: "first", title: "Hello" }, { id: "second", title: "World" }]
+  return ASX {
+    <Each items={posts} as="post" key={post.id}>
+      <Copy>{post.title}</Copy>
+    </Each>
+  }
+}
+"#,
+        )
+        .expect("keyed state each preview should render");
+
+        assert!(html.contains("<ax-state-each"));
+        assert!(html.contains("data-ax-each-protocol=\"ax-each/1\""));
+        assert!(html.contains("data-ax-each-signal=\"root:posts:1\""));
+        assert!(html.contains("data-ax-each-key=\"first\""));
+        assert!(html.contains("data-ax-each-key=\"second\""));
+        assert!(html.contains("Hello"));
+        assert!(html.contains("World"));
+    }
+
+    #[test]
     fn preview_preserves_state_dependent_if_branches_for_local_updates() {
         let html = preview_ax_page(
             r#"

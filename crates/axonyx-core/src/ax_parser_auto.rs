@@ -96,6 +96,10 @@ pub enum AxConvertV2Error {
     InvalidStateEvent { expr_source: String },
     #[error("unsupported reactive expression `{expr_source}`: {reason}")]
     UnsupportedReactiveExpression { expr_source: String, reason: String },
+    #[error("reactive `<Each>` over state `{state}` requires `key={{item.id}}`")]
+    ReactiveEachRequiresKey { state: String },
+    #[error("`<Each>` key must be derived from its `{binding}` item binding")]
+    InvalidEachKey { binding: String },
 }
 
 pub fn looks_like_ax_v2(input: &str) -> bool {
@@ -591,10 +595,58 @@ fn convert_each_statement(
 ) -> Result<AxStatement, AxConvertV2Error> {
     let binding = control_binding_attr(element, &["as", "item"])?;
     let source = control_expr_attr(element, &["items", "in", "of"])?;
+    let key = optional_control_expr_attr(element, "key")?;
+    if key
+        .as_ref()
+        .is_some_and(|key| !each_key_is_rooted_at(key, &binding))
+    {
+        return Err(AxConvertV2Error::InvalidEachKey {
+            binding: binding.clone(),
+        });
+    }
     let (body, empty_body) = split_each_children(element, bindings)?;
-    Ok(AxStatement::Each(
-        AxEachBlock::new(binding, source, body).empty(empty_body),
-    ))
+    let mut each = AxEachBlock::new(binding, source.clone(), body).empty(empty_body);
+    if let Some(key) = key {
+        each = each.key(key);
+    }
+    if let AxExpr::Identifier(state) = &source {
+        if let Some(plan) = bindings.states.get(state) {
+            if each.key.is_none() {
+                return Err(AxConvertV2Error::ReactiveEachRequiresKey {
+                    state: state.clone(),
+                });
+            }
+            each = each.state_binding(AxEachStateBinding::new(
+                plan.signal_id.clone(),
+                plan.ty.clone(),
+                plan.initial.clone(),
+            ));
+        }
+    }
+    Ok(AxStatement::Each(each))
+}
+
+fn optional_control_expr_attr(
+    element: &AxElementNode,
+    name: &str,
+) -> Result<Option<AxExpr>, AxConvertV2Error> {
+    element
+        .attrs
+        .iter()
+        .find(|attr| attr.name == name)
+        .map(|attr| convert_attr_value(&attr.value))
+        .transpose()
+}
+
+fn each_key_is_rooted_at(expr: &AxExpr, binding: &str) -> bool {
+    match expr {
+        AxExpr::Identifier(name) => name == binding,
+        AxExpr::Member { object, .. } | AxExpr::OptionalMember { object, .. } => {
+            each_key_is_rooted_at(object, binding)
+        }
+        AxExpr::Index { object, .. } => each_key_is_rooted_at(object, binding),
+        _ => false,
+    }
 }
 
 fn convert_if_statement(
@@ -3171,6 +3223,79 @@ page Home
             if_block.condition,
             AxExpr::ident("post").member("published")
         );
+    }
+
+    #[test]
+    fn converts_keyed_state_each_into_reactive_ownership_metadata() {
+        let document = parse_ax_auto(
+            r#"
+page Posts() {
+  state posts = [{ id: "first", title: "Hello" }]
+  return ASX {
+    <Each items={posts} as="post" key={post.id}>
+      <Card title={post.title} />
+    </Each>
+  }
+}
+"#,
+        )
+        .expect("keyed state each should convert");
+
+        let AxStatement::Component(fragment) = &document.page.body[1] else {
+            panic!("expected each fragment");
+        };
+        let AxBody::Block(body) = &fragment.body else {
+            panic!("expected each body");
+        };
+        let AxStatement::Each(each) = &body[0] else {
+            panic!("expected each block");
+        };
+
+        assert_eq!(each.key, Some(AxExpr::ident("post").member("id")));
+        let state = each
+            .state_binding
+            .as_ref()
+            .expect("state each should keep bridge metadata");
+        assert_eq!(state.signal, "root:posts:1");
+        assert!(state.ty.starts_with("List<"));
+    }
+
+    #[test]
+    fn rejects_state_each_without_key() {
+        let error = parse_ax_auto(
+            r#"
+page Posts() {
+  state posts = [{ id: "first" }]
+  return ASX { <Each items={posts} as="post"><Copy>{post.id}</Copy></Each> }
+}
+"#,
+        )
+        .expect_err("state each should require stable identity");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::ReactiveEachRequiresKey { state })
+                if state == "posts"
+        ));
+    }
+
+    #[test]
+    fn rejects_each_key_not_rooted_at_item_binding() {
+        let error = parse_ax_auto(
+            r#"
+page Posts
+<Each items={posts} as="post" key={selectedId}>
+  <Copy>{post.title}</Copy>
+</Each>
+"#,
+        )
+        .expect_err("unrelated each key should fail");
+
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::InvalidEachKey { binding })
+                if binding == "post"
+        ));
     }
 
     #[test]

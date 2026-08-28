@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 
@@ -114,6 +114,10 @@ pub enum AxLowerError {
     UnsupportedExpression { message: String },
     #[error("`each` requires a list source")]
     EachRequiresList,
+    #[error("`each` key must resolve to a string, number, float, or boolean")]
+    InvalidEachKey,
+    #[error("duplicate `each` key `{key}`")]
+    DuplicateEachKey { key: String },
     #[error("failed to parse imported component from `{import_path}`: {message}")]
     ImportedComponentParse {
         import_path: String,
@@ -217,7 +221,78 @@ fn lower_statements(
                     return Err(AxLowerError::EachRequiresList);
                 };
 
-                if items.is_empty() {
+                if let Some(key_expr) = &block.key {
+                    let mut each_children = Vec::new();
+                    let mut keys = BTreeSet::new();
+                    if items.is_empty() {
+                        let mut nested = scope.clone();
+                        let empty = lower_statements(
+                            &block.empty_body,
+                            functions,
+                            imports,
+                            components,
+                            &mut nested,
+                            resolver,
+                            import_resolver,
+                            slot_context,
+                        )?;
+                        if !empty.is_empty() {
+                            each_children.push(element_with_attrs(
+                                "ax-each-empty",
+                                vec![attr("style", "display: contents")],
+                                empty,
+                            ));
+                        }
+                    } else {
+                        for item in items {
+                            let mut nested = scope.clone();
+                            nested.insert(block.binding.clone(), item);
+                            let key_value = eval_expr(key_expr, functions, &nested, resolver)?;
+                            let (key_identity, key_display) = each_key_identity(&key_value)?;
+                            if !keys.insert(key_identity.clone()) {
+                                return Err(AxLowerError::DuplicateEachKey { key: key_display });
+                            }
+                            nested.insert(
+                                AX_RENDER_PATH.to_string(),
+                                AxValue::String(format!(
+                                    "{statement_render_path}.key{}",
+                                    stable_key_hash(&key_identity)
+                                )),
+                            );
+                            let item_children = lower_statements(
+                                &block.body,
+                                functions,
+                                imports,
+                                components,
+                                &mut nested,
+                                resolver,
+                                import_resolver,
+                                slot_context,
+                            )?;
+                            each_children.push(element_with_attrs(
+                                "ax-each-item",
+                                vec![
+                                    attr("style", "display: contents"),
+                                    attr("data-ax-each-key", key_display),
+                                ],
+                                item_children,
+                            ));
+                        }
+                    }
+                    let mut attrs = vec![
+                        attr("style", "display: contents"),
+                        attr("data-ax-each-protocol", "ax-each/1"),
+                        attr("data-ax-each-binding", block.binding.clone()),
+                    ];
+                    if let Some(binding) = &block.state_binding {
+                        attrs.extend([
+                            attr("data-ax-each-signal", binding.signal.clone()),
+                            attr("data-ax-each-type", binding.ty.clone()),
+                            attr("data-ax-each-initial", binding.initial.clone()),
+                        ]);
+                    }
+                    nodes.push(element_with_attrs("ax-state-each", attrs, each_children));
+                } else if items.is_empty() {
                     let mut nested = scope.clone();
                     nodes.extend(lower_statements(
                         &block.empty_body,
@@ -783,6 +858,29 @@ fn eval_props(
         );
     }
     Ok(props)
+}
+
+fn each_key_identity(value: &AxValue) -> Result<(String, String), AxLowerError> {
+    let (kind, display) = match value {
+        AxValue::String(value) => ("string", value.clone()),
+        AxValue::Number(value) => ("number", value.to_string()),
+        AxValue::Float(value) => ("float", value.get().to_string()),
+        AxValue::Bool(value) => ("bool", value.to_string()),
+        AxValue::Null | AxValue::Record(_) | AxValue::List(_) => {
+            return Err(AxLowerError::InvalidEachKey);
+        }
+    };
+    Ok((format!("{kind}:{display}"), display))
+}
+
+fn stable_key_hash(key: &str) -> String {
+    let hash = key
+        .as_bytes()
+        .iter()
+        .fold(0xcbf29ce484222325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
+        });
+    format!("{hash:016x}")
 }
 
 fn render_path(scope: &BTreeMap<String, AxValue>) -> String {
@@ -2295,6 +2393,99 @@ component ThemePicker() {
         };
 
         assert_eq!(children.len(), 1);
+    }
+
+    #[test]
+    fn keyed_each_emits_stable_ownership_boundaries() {
+        let document = AxDocument::page(
+            "Posts",
+            [AxStatement::Each(
+                AxEachBlock::new(
+                    "post",
+                    AxExpr::ident("posts"),
+                    [AxStatement::component(
+                        AxComponent::new("Copy").inline(AxExpr::ident("post").member("title")),
+                    )],
+                )
+                .key(AxExpr::ident("post").member("id"))
+                .state_binding(AxEachStateBinding::new(
+                    "page:posts",
+                    "List<Post>",
+                    "[]",
+                )),
+            )],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert(
+            "posts".to_string(),
+            AxValue::list([
+                AxValue::record([
+                    ("id", AxValue::from("first")),
+                    ("title", AxValue::from("Hello")),
+                ]),
+                AxValue::record([
+                    ("id", AxValue::from("second")),
+                    ("title", AxValue::from("World")),
+                ]),
+            ]),
+        );
+
+        let node = lower_document_with_scope(&document, scope, &resolver)
+            .expect("keyed each should lower");
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element {
+            tag,
+            attrs,
+            children,
+        } = &children[0]
+        else {
+            panic!("expected each ownership root");
+        };
+
+        assert_eq!(*tag, "ax-state-each");
+        assert!(attrs
+            .iter()
+            .any(|attr| { attr.name == "data-ax-each-protocol" && attr.value == "ax-each/1" }));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-ax-each-signal" && attr.value == "page:posts"));
+        assert_eq!(children.len(), 2);
+        assert!(matches!(
+            &children[0],
+            AxNode::Element { tag, attrs, .. }
+                if *tag == "ax-each-item"
+                    && attrs.iter().any(|attr| attr.name == "data-ax-each-key" && attr.value == "first")
+        ));
+    }
+
+    #[test]
+    fn keyed_each_rejects_duplicate_keys() {
+        let document = AxDocument::page(
+            "Posts",
+            [AxStatement::Each(
+                AxEachBlock::new("post", AxExpr::ident("posts"), [])
+                    .key(AxExpr::ident("post").member("id")),
+            )],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert(
+            "posts".to_string(),
+            AxValue::list([
+                AxValue::record([("id", AxValue::from("same"))]),
+                AxValue::record([("id", AxValue::from("same"))]),
+            ]),
+        );
+
+        assert_eq!(
+            lower_document_with_scope(&document, scope, &resolver),
+            Err(AxLowerError::DuplicateEachKey {
+                key: "same".to_string()
+            })
+        );
     }
 
     #[test]
