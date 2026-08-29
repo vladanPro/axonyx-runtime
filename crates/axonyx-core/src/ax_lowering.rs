@@ -224,6 +224,7 @@ fn lower_statements(
                 if let Some(key_expr) = &block.key {
                     let mut each_children = Vec::new();
                     let mut keys = BTreeSet::new();
+                    let mut key_kind = None;
                     if items.is_empty() {
                         let mut nested = scope.clone();
                         let empty = lower_statements(
@@ -249,6 +250,17 @@ fn lower_statements(
                             nested.insert(block.binding.clone(), item);
                             let key_value = eval_expr(key_expr, functions, &nested, resolver)?;
                             let (key_identity, key_display) = each_key_identity(&key_value)?;
+                            let current_kind = key_identity
+                                .split_once(':')
+                                .map(|(kind, _)| kind.to_string())
+                                .ok_or(AxLowerError::InvalidEachKey)?;
+                            if key_kind
+                                .as_ref()
+                                .is_some_and(|expected| expected != &current_kind)
+                            {
+                                return Err(AxLowerError::InvalidEachKey);
+                            }
+                            key_kind.get_or_insert(current_kind);
                             if !keys.insert(key_identity.clone()) {
                                 return Err(AxLowerError::DuplicateEachKey { key: key_display });
                             }
@@ -274,6 +286,7 @@ fn lower_statements(
                                 vec![
                                     attr("style", "display: contents"),
                                     attr("data-ax-each-key", key_display),
+                                    attr("data-ax-each-key-id", key_identity),
                                 ],
                                 item_children,
                             ));
@@ -283,6 +296,11 @@ fn lower_statements(
                         attr("style", "display: contents"),
                         attr("data-ax-each-protocol", "ax-each/1"),
                         attr("data-ax-each-binding", block.binding.clone()),
+                        attr("data-ax-each-key-kind", key_kind.unwrap_or_default()),
+                        attr(
+                            "data-ax-each-key-path",
+                            each_key_path(key_expr, &block.binding).unwrap_or_default(),
+                        ),
                     ];
                     if let Some(binding) = &block.state_binding {
                         attrs.extend([
@@ -871,6 +889,23 @@ fn each_key_identity(value: &AxValue) -> Result<(String, String), AxLowerError> 
         }
     };
     Ok((format!("{kind}:{display}"), display))
+}
+
+fn each_key_path(expr: &AxExpr, binding: &str) -> Option<String> {
+    fn collect(expr: &AxExpr, parts: &mut Vec<String>) -> Option<String> {
+        match expr {
+            AxExpr::Identifier(name) => Some(name.clone()),
+            AxExpr::Member { object, property } | AxExpr::OptionalMember { object, property } => {
+                let root = collect(object, parts)?;
+                parts.push(property.clone());
+                Some(root)
+            }
+            _ => None,
+        }
+    }
+
+    let mut parts = Vec::new();
+    (collect(expr, &mut parts)?.as_str() == binding).then(|| parts.join("."))
 }
 
 fn stable_key_hash(key: &str) -> String {
@@ -2452,13 +2487,36 @@ component ThemePicker() {
         assert!(attrs
             .iter()
             .any(|attr| attr.name == "data-ax-each-signal" && attr.value == "page:posts"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-ax-each-key-path" && attr.value == "id"));
+        assert!(attrs
+            .iter()
+            .any(|attr| attr.name == "data-ax-each-key-kind" && attr.value == "string"));
         assert_eq!(children.len(), 2);
         assert!(matches!(
             &children[0],
             AxNode::Element { tag, attrs, .. }
                 if *tag == "ax-each-item"
                     && attrs.iter().any(|attr| attr.name == "data-ax-each-key" && attr.value == "first")
+                    && attrs.iter().any(|attr| attr.name == "data-ax-each-key-id" && attr.value == "string:first")
         ));
+    }
+
+    #[test]
+    fn derives_nested_and_primitive_each_key_paths() {
+        assert_eq!(
+            each_key_path(&AxExpr::ident("post").member("meta").member("slug"), "post"),
+            Some("meta.slug".to_string())
+        );
+        assert_eq!(
+            each_key_path(&AxExpr::ident("tag"), "tag"),
+            Some(String::new())
+        );
+        assert_eq!(
+            each_key_path(&AxExpr::ident("other").member("id"), "post"),
+            None
+        );
     }
 
     #[test]

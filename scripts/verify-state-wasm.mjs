@@ -22,6 +22,10 @@ assert(
   typeof wasm.ax_state_evaluate_expression === "function",
   "expression evaluator export is missing",
 );
+assert(
+  typeof wasm.ax_state_reconcile_keys === "function",
+  "keyed Each reconciliation export is missing",
+);
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -109,4 +113,36 @@ assert(
   "expression evaluator returned the wrong result",
 );
 
-console.log(`Axonyx state WASM ABI v3 + expression/1 passed (${bytes.length} bytes).`);
+const stringFrame = (value) => {
+  const encoded = encoder.encode(value);
+  return frame(1, u32(encoded.length), encoded);
+};
+const stringListFrame = (values) => frame(6, u32(values.length), ...values.map(stringFrame));
+const reconcileObjectFrame = (oldKeys, nextKeys) => {
+  const entries = [
+    ["next", stringListFrame(nextKeys)],
+    ["old", stringListFrame(oldKeys)],
+  ];
+  return frame(
+    7,
+    u32(entries.length),
+    ...entries.flatMap(([name, value]) => {
+      const encoded = encoder.encode(name);
+      return [u32(encoded.length), encoded, value];
+    }),
+  );
+};
+const reconcileRequest = reconcileObjectFrame(
+  ["string:a", "string:b", "string:c"],
+  ["string:c", "string:a", "string:d"],
+);
+new Uint8Array(wasm.memory.buffer, valuePointer, reconcileRequest.length).set(reconcileRequest);
+const reconcileLength = wasm.ax_state_reconcile_keys(reconcileRequest.length) >>> 0;
+assert(reconcileLength !== 0xffffffff, "keyed Each reconciliation rejected a valid request");
+const reconcileResult = new Uint8Array(wasm.memory.buffer, valuePointer, reconcileLength);
+assert(
+  reconcileResult[0] === 65 && reconcileResult[1] === 88 && reconcileResult[3] === 7,
+  "keyed Each reconciliation returned an invalid object frame",
+);
+
+console.log(`Axonyx state WASM ABI v3 + expression/1 + ax-each/1 passed (${bytes.length} bytes).`);
