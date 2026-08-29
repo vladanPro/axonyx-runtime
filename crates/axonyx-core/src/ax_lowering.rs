@@ -8,6 +8,9 @@ use crate::prelude::*;
 
 const AX_RENDER_PATH: &str = "__ax_render_path";
 const AX_COMPONENT_INSTANCE_PATH: &str = "__ax_component_instance_path";
+const AX_EACH_RENDER_BINDING: &str = "__ax_each_render_binding";
+const AX_EACH_RENDER_PARAM_PREFIX: &str = "__ax_each_render_param:";
+const AX_EACH_RENDER_UNSUPPORTED: &str = "__ax_each_render_unsupported";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxValue {
@@ -202,6 +205,7 @@ fn lower_statements(
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
     let mut nodes = Vec::new();
+    let render_was_unsupported = !each_render_scope_is_supported(scope);
 
     let parent_render_path = render_path(scope);
     for (statement_index, statement) in statements.iter().enumerate() {
@@ -214,8 +218,19 @@ fn lower_statements(
             AxStatement::Data(binding) => {
                 let value = eval_expr(&binding.value, functions, scope, resolver)?;
                 scope.insert(binding.name.clone(), value);
+                if let Some(path) = each_render_path(&binding.value, scope) {
+                    scope.insert(
+                        format!("{AX_EACH_RENDER_PARAM_PREFIX}{}", binding.name),
+                        AxValue::String(path),
+                    );
+                } else if expr_references_each_item(&binding.value, scope) {
+                    mark_each_render_unsupported(scope);
+                }
             }
             AxStatement::Each(block) => {
+                if expr_references_each_item(&block.source, scope) {
+                    mark_each_render_unsupported(scope);
+                }
                 let source = eval_expr(&block.source, functions, scope, resolver)?;
                 let AxValue::List(items) = source else {
                     return Err(AxLowerError::EachRequiresList);
@@ -223,6 +238,7 @@ fn lower_statements(
 
                 if let Some(key_expr) = &block.key {
                     let mut each_children = Vec::new();
+                    let mut render_template = None;
                     let mut keys = BTreeSet::new();
                     let mut key_kind = None;
                     if items.is_empty() {
@@ -248,6 +264,10 @@ fn lower_statements(
                         for item in items {
                             let mut nested = scope.clone();
                             nested.insert(block.binding.clone(), item);
+                            nested.insert(
+                                AX_EACH_RENDER_BINDING.to_string(),
+                                AxValue::String(block.binding.clone()),
+                            );
                             let key_value = eval_expr(key_expr, functions, &nested, resolver)?;
                             let (key_identity, key_display) = each_key_identity(&key_value)?;
                             let current_kind = key_identity
@@ -281,6 +301,12 @@ fn lower_statements(
                                 import_resolver,
                                 slot_context,
                             )?;
+                            if render_template.is_none()
+                                && each_render_scope_is_supported(&nested)
+                                && each_render_template_is_safe(&item_children)
+                            {
+                                render_template = Some(item_children.clone());
+                            }
                             each_children.push(element_with_attrs(
                                 "ax-each-item",
                                 vec![
@@ -292,6 +318,13 @@ fn lower_statements(
                             ));
                         }
                     }
+                    if let Some(template_children) = render_template {
+                        each_children.push(element_with_attrs(
+                            "template",
+                            vec![attr("data-ax-each-render-protocol", "ax-each-render/1")],
+                            template_children,
+                        ));
+                    }
                     let mut attrs = vec![
                         attr("style", "display: contents"),
                         attr("data-ax-each-protocol", "ax-each/1"),
@@ -300,6 +333,16 @@ fn lower_statements(
                         attr(
                             "data-ax-each-key-path",
                             each_key_path(key_expr, &block.binding).unwrap_or_default(),
+                        ),
+                        attr(
+                            "data-ax-each-render-status",
+                            if each_children.iter().any(|node| {
+                                matches!(node, AxNode::Element { tag, .. } if *tag == "template")
+                            }) {
+                                "ready"
+                            } else {
+                                "fallback"
+                            },
                         ),
                     ];
                     if let Some(binding) = &block.state_binding {
@@ -344,6 +387,9 @@ fn lower_statements(
                 }
             }
             AxStatement::If(block) => {
+                if expr_references_each_item(&block.condition, scope) {
+                    mark_each_render_unsupported(scope);
+                }
                 let condition = eval_expr(&block.condition, functions, scope, resolver)?;
                 let body = if is_truthy(&condition) {
                     &block.body
@@ -372,6 +418,9 @@ fn lower_statements(
                 }
             }
             AxStatement::Match(block) => {
+                if expr_references_each_item(&block.value, scope) {
+                    mark_each_render_unsupported(scope);
+                }
                 let value = eval_expr(&block.value, functions, scope, resolver)?.as_string();
                 let body = block
                     .cases
@@ -399,9 +448,7 @@ fn lower_statements(
                 }
             }
             AxStatement::Text(expr) => {
-                nodes.push(text(
-                    eval_expr(expr, functions, scope, resolver)?.as_string(),
-                ));
+                nodes.push(lower_each_render_text(expr, functions, scope, resolver)?);
             }
             AxStatement::Component(component) => {
                 nodes.extend(lower_component_nodes(
@@ -416,6 +463,9 @@ fn lower_statements(
                 )?);
             }
             AxStatement::Pipeline(pipeline) => {
+                if expr_references_each_item(&pipeline.source, scope) {
+                    mark_each_render_unsupported(scope);
+                }
                 nodes.push(lower_pipeline(
                     pipeline,
                     functions,
@@ -434,6 +484,16 @@ fn lower_statements(
         AX_RENDER_PATH.to_string(),
         AxValue::String(parent_render_path),
     );
+    if !render_was_unsupported
+        && !each_render_scope_is_supported(scope)
+        && scope.contains_key(AX_EACH_RENDER_BINDING)
+    {
+        nodes.push(element_with_attrs(
+            "ax-each-render-unsupported",
+            vec![attr("hidden", "true")],
+            vec![],
+        ));
+    }
 
     Ok(nodes)
 }
@@ -556,7 +616,7 @@ fn lower_component_node(
     let mut props = eval_props(component, functions, scope, resolver)?;
     let mut attrs = style_attrs(&component.style, functions, scope, resolver)?;
 
-    let node = match component.name.as_str() {
+    let mut node = match component.name.as_str() {
         name if resolve_import(imports, name).is_some() => {
             let import_decl = resolve_import(imports, name).expect("checked above");
             attrs.insert(0, attr("data-component", component.name.clone()));
@@ -682,10 +742,24 @@ fn lower_component_node(
             push_remaining_props(&mut attrs, props);
             let mut body = Vec::new();
             if let Some(title) = title {
+                let title_node = component_prop_expr(component, &["title"])
+                    .and_then(|expr| each_render_path(expr, scope))
+                    .map(|path| {
+                        element_with_attrs(
+                            "ax-each-value",
+                            vec![
+                                attr("style", "display: contents"),
+                                attr("data-ax-each-render-target", "text"),
+                                attr("data-ax-each-render-path", path),
+                            ],
+                            vec![text(title.clone())],
+                        )
+                    })
+                    .unwrap_or_else(|| text(title));
                 body.push(element_with_attrs(
                     "h2",
                     vec![attr("class", "ax-card__title")],
-                    vec![text(title)],
+                    vec![title_node],
                 ));
             }
             body.extend(children);
@@ -777,6 +851,7 @@ fn lower_component_node(
         }
     };
 
+    attach_each_render_attributes(&mut node, component, scope);
     Ok(node)
 }
 
@@ -792,9 +867,9 @@ fn lower_component_children(
 ) -> Result<Vec<AxNode>, AxLowerError> {
     match &component.body {
         AxBody::Empty => Ok(Vec::new()),
-        AxBody::Inline(expr) => Ok(vec![text(
-            eval_expr(expr, functions, scope, resolver)?.as_string(),
-        )]),
+        AxBody::Inline(expr) => Ok(vec![lower_each_render_text(
+            expr, functions, scope, resolver,
+        )?]),
         AxBody::Block(body) => {
             let mut nested = scope.clone();
             lower_statements(
@@ -809,6 +884,128 @@ fn lower_component_children(
             )
         }
     }
+}
+
+fn component_prop_expr<'a>(component: &'a AxComponent, names: &[&str]) -> Option<&'a AxExpr> {
+    names.iter().find_map(|name| {
+        component
+            .props
+            .iter()
+            .find(|prop| prop.name == *name)
+            .map(|prop| &prop.value)
+    })
+}
+
+fn attach_each_render_attributes(
+    node: &mut AxNode,
+    component: &AxComponent,
+    scope: &mut BTreeMap<String, AxValue>,
+) {
+    let AxNode::Element { attrs, .. } = node else {
+        return;
+    };
+    let mut bindings = Vec::new();
+
+    for prop in &component.props {
+        let Some(path) = each_render_path(&prop.value, scope) else {
+            if expr_references_each_item(&prop.value, scope) {
+                mark_each_render_unsupported(scope);
+            }
+            continue;
+        };
+        let Some(target) = each_render_attribute_target(&component.name, &prop.name) else {
+            if !(component.name == "Card" && prop.name == "title") {
+                mark_each_render_unsupported(scope);
+            }
+            continue;
+        };
+        if matches!(
+            target.as_str(),
+            "href" | "src" | "action" | "formaction" | "style"
+        ) || target.to_ascii_lowercase().starts_with("on")
+        {
+            mark_each_render_unsupported(scope);
+            continue;
+        }
+        let is_boolean = is_html_boolean_attr(&target);
+        if !is_boolean && !attrs.iter().any(|attr| attr.name == target) {
+            mark_each_render_unsupported(scope);
+            continue;
+        }
+        let mode = if is_boolean { "boolean" } else { "attribute" };
+        bindings.push(serde_json::json!({
+            "target": target,
+            "path": path,
+            "mode": mode,
+        }));
+    }
+
+    if component
+        .style
+        .class
+        .as_ref()
+        .is_some_and(|expr| expr_references_each_item(expr, scope))
+    {
+        mark_each_render_unsupported(scope);
+    }
+    if let Some(path) = component
+        .style
+        .recipe
+        .as_ref()
+        .and_then(|expr| each_render_path(expr, scope))
+    {
+        bindings.push(serde_json::json!({
+            "target": "data-recipe",
+            "path": path,
+            "mode": "attribute",
+        }));
+    } else if component
+        .style
+        .recipe
+        .as_ref()
+        .is_some_and(|expr| expr_references_each_item(expr, scope))
+    {
+        mark_each_render_unsupported(scope);
+    }
+
+    if !bindings.is_empty() {
+        attrs.push(attr(
+            "data-ax-each-render-attrs",
+            serde_json::to_string(&bindings).expect("render bindings serialize"),
+        ));
+    }
+}
+
+fn each_render_attribute_target(component: &str, prop: &str) -> Option<String> {
+    if matches!(
+        prop,
+        "behavior"
+            | "behavior_target"
+            | "behaviorTarget"
+            | "behavior_action"
+            | "behaviorAction"
+            | "behavior_value"
+            | "behaviorValue"
+            | "html"
+            | "content"
+            | "as"
+            | "tag"
+    ) {
+        return None;
+    }
+
+    let target = match (component, prop) {
+        ("Card", "title") => return None,
+        ("Container", "max" | "max_width") => "data-max".to_string(),
+        ("Grid", "cols") => "data-cols".to_string(),
+        ("Grid", "gap") => "data-gap".to_string(),
+        (_, name) if is_native_html_tag(component) => name.to_string(),
+        ("Button", name @ ("type" | "name" | "value" | "form")) => name.to_string(),
+        (_, name) if name.starts_with("data-") || name.starts_with("aria-") => name.to_string(),
+        (_, name @ ("id" | "role" | "tabindex")) => name.to_string(),
+        (_, name) => format!("data-{name}"),
+    };
+    Some(target)
 }
 
 fn lower_pipeline(
@@ -906,6 +1103,130 @@ fn each_key_path(expr: &AxExpr, binding: &str) -> Option<String> {
 
     let mut parts = Vec::new();
     (collect(expr, &mut parts)?.as_str() == binding).then(|| parts.join("."))
+}
+
+fn each_render_path(expr: &AxExpr, scope: &BTreeMap<String, AxValue>) -> Option<String> {
+    fn collect(expr: &AxExpr, parts: &mut Vec<String>) -> Option<String> {
+        match expr {
+            AxExpr::Identifier(name) => Some(name.clone()),
+            AxExpr::Member { object, property } | AxExpr::OptionalMember { object, property } => {
+                let root = collect(object, parts)?;
+                parts.push(property.clone());
+                Some(root)
+            }
+            _ => None,
+        }
+    }
+
+    let mut parts = Vec::new();
+    let root = collect(expr, &mut parts)?;
+    let binding = scope.get(AX_EACH_RENDER_BINDING)?.as_string();
+    if root == binding {
+        return Some(parts.join("."));
+    }
+
+    let inherited = scope
+        .get(&format!("{AX_EACH_RENDER_PARAM_PREFIX}{root}"))?
+        .as_string();
+    let suffix = parts.join(".");
+    Some(match (inherited.is_empty(), suffix.is_empty()) {
+        (true, true) => String::new(),
+        (true, false) => suffix,
+        (false, true) => inherited,
+        (false, false) => format!("{inherited}.{suffix}"),
+    })
+}
+
+fn expr_references_each_item(expr: &AxExpr, scope: &BTreeMap<String, AxValue>) -> bool {
+    match expr {
+        AxExpr::Identifier(name) => {
+            scope
+                .get(AX_EACH_RENDER_BINDING)
+                .is_some_and(|binding| binding.as_string() == *name)
+                || scope.contains_key(&format!("{AX_EACH_RENDER_PARAM_PREFIX}{name}"))
+        }
+        AxExpr::List(items) => items
+            .iter()
+            .any(|item| expr_references_each_item(item, scope)),
+        AxExpr::Object(fields) => fields
+            .values()
+            .any(|value| expr_references_each_item(value, scope)),
+        AxExpr::Unary { expr, .. } => expr_references_each_item(expr, scope),
+        AxExpr::Binary { left, right, .. } => {
+            expr_references_each_item(left, scope) || expr_references_each_item(right, scope)
+        }
+        AxExpr::Index { object, index } => {
+            expr_references_each_item(object, scope) || expr_references_each_item(index, scope)
+        }
+        AxExpr::Member { object, .. } | AxExpr::OptionalMember { object, .. } => {
+            expr_references_each_item(object, scope)
+        }
+        AxExpr::Call { args, .. } => args.iter().any(|arg| expr_references_each_item(arg, scope)),
+        AxExpr::String(_) | AxExpr::Number(_) | AxExpr::Float(_) | AxExpr::Bool(_) => false,
+    }
+}
+
+fn mark_each_render_unsupported(scope: &mut BTreeMap<String, AxValue>) {
+    if scope.contains_key(AX_EACH_RENDER_BINDING) {
+        scope.insert(AX_EACH_RENDER_UNSUPPORTED.to_string(), AxValue::Bool(true));
+    }
+}
+
+fn each_render_scope_is_supported(scope: &BTreeMap<String, AxValue>) -> bool {
+    !matches!(
+        scope.get(AX_EACH_RENDER_UNSUPPORTED),
+        Some(AxValue::Bool(true))
+    )
+}
+
+fn lower_each_render_text(
+    expr: &AxExpr,
+    functions: &[AxFunctionDef],
+    scope: &mut BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+) -> Result<AxNode, AxLowerError> {
+    let value = eval_expr(expr, functions, scope, resolver)?.as_string();
+    let Some(path) = each_render_path(expr, scope) else {
+        if expr_references_each_item(expr, scope) {
+            mark_each_render_unsupported(scope);
+        }
+        return Ok(text(value));
+    };
+
+    Ok(element_with_attrs(
+        "ax-each-value",
+        vec![
+            attr("style", "display: contents"),
+            attr("data-ax-each-render-target", "text"),
+            attr("data-ax-each-render-path", path),
+        ],
+        vec![text(value)],
+    ))
+}
+
+fn each_render_template_is_safe(nodes: &[AxNode]) -> bool {
+    nodes.iter().all(|node| match node {
+        AxNode::Text(_) => true,
+        AxNode::RawHtml(_) => false,
+        AxNode::Element {
+            tag,
+            attrs,
+            children,
+        } => {
+            !matches!(*tag, "template" | "ax-each-render-unsupported")
+                && attrs.iter().all(|attr| {
+                    !matches!(
+                        attr.name,
+                        "data-ax-signal"
+                            | "data-ax-state-name"
+                            | "data-ax-behavior"
+                            | "data-ax-expression-protocol"
+                    ) && !attr.name.starts_with("data-ax-on-")
+                        && !attr.name.starts_with("data-ax-state-")
+                })
+                && each_render_template_is_safe(children)
+        }
+    })
 }
 
 fn stable_key_hash(key: &str) -> String {
@@ -1407,6 +1728,7 @@ fn lower_local_component_nodes(
         AX_COMPONENT_INSTANCE_PATH.to_string(),
         AxValue::String(render_path(scope)),
     );
+    propagate_each_render_params(component, scope, &mut component_scope);
 
     for param in &component_def.params {
         let value = if let Some(value) = props.get(&param.name) {
@@ -1484,6 +1806,21 @@ fn component_passthrough_attrs(
         .collect()
 }
 
+fn propagate_each_render_params(
+    component: &AxComponent,
+    source_scope: &BTreeMap<String, AxValue>,
+    target_scope: &mut BTreeMap<String, AxValue>,
+) {
+    for prop in &component.props {
+        if let Some(path) = each_render_path(&prop.value, source_scope) {
+            target_scope.insert(
+                format!("{AX_EACH_RENDER_PARAM_PREFIX}{}", prop.name),
+                AxValue::String(path),
+            );
+        }
+    }
+}
+
 fn apply_attrs_to_first_element(nodes: &mut [AxNode], incoming: Vec<Attribute>) {
     if incoming.is_empty() {
         return;
@@ -1554,6 +1891,7 @@ fn lower_imported_component_nodes(
     }
 
     let mut imported_scope = scope.clone();
+    propagate_each_render_params(component, scope, &mut imported_scope);
     apply_params_to_scope(
         &document.page.params,
         &mut imported_scope,
@@ -2493,13 +2831,35 @@ component ThemePicker() {
         assert!(attrs
             .iter()
             .any(|attr| attr.name == "data-ax-each-key-kind" && attr.value == "string"));
-        assert_eq!(children.len(), 2);
+        assert_eq!(children.len(), 3);
         assert!(matches!(
             &children[0],
             AxNode::Element { tag, attrs, .. }
                 if *tag == "ax-each-item"
                     && attrs.iter().any(|attr| attr.name == "data-ax-each-key" && attr.value == "first")
                     && attrs.iter().any(|attr| attr.name == "data-ax-each-key-id" && attr.value == "string:first")
+        ));
+        assert!(matches!(
+            &children[2],
+            AxNode::Element { tag, attrs, children }
+                if *tag == "template"
+                    && attrs.iter().any(|attr| {
+                        attr.name == "data-ax-each-render-protocol"
+                            && attr.value == "ax-each-render/1"
+                    })
+                    && matches!(
+                        children.as_slice(),
+                        [AxNode::Element { children, .. }]
+                            if matches!(
+                                children.as_slice(),
+                                [AxNode::Element { tag, attrs, .. }]
+                                    if *tag == "ax-each-value"
+                                        && attrs.iter().any(|attr| {
+                                            attr.name == "data-ax-each-render-path"
+                                                && attr.value == "title"
+                                        })
+                            )
+                    )
         ));
     }
 
@@ -2517,6 +2877,191 @@ component ThemePicker() {
             each_key_path(&AxExpr::ident("other").member("id"), "post"),
             None
         );
+    }
+
+    #[test]
+    fn keyed_each_describes_safe_item_attribute_writes() {
+        let document = AxDocument::page(
+            "Posts",
+            [AxStatement::Each(
+                AxEachBlock::new(
+                    "post",
+                    AxExpr::ident("posts"),
+                    [AxStatement::component(
+                        AxComponent::new("button")
+                            .prop("title", AxExpr::ident("post").member("title"))
+                            .prop("disabled", AxExpr::ident("post").member("disabled"))
+                            .inline(AxExpr::ident("post").member("title")),
+                    )],
+                )
+                .key(AxExpr::ident("post").member("id"))
+                .state_binding(AxEachStateBinding::new(
+                    "page:posts",
+                    "List<Post>",
+                    "[]",
+                )),
+            )],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert(
+            "posts".to_string(),
+            AxValue::list([AxValue::record([
+                ("id", AxValue::from("first")),
+                ("title", AxValue::from("Hello")),
+                ("disabled", AxValue::from(false)),
+            ])]),
+        );
+
+        let node = lower_document_with_scope(&document, scope, &resolver)
+            .expect("safe keyed attributes should lower");
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element {
+            children, attrs, ..
+        } = &children[0]
+        else {
+            panic!("expected each root");
+        };
+        assert!(attrs
+            .iter()
+            .any(|attr| { attr.name == "data-ax-each-render-status" && attr.value == "ready" }));
+        let AxNode::Element { children, .. } = &children[0] else {
+            panic!("expected first item");
+        };
+        let AxNode::Element { attrs, .. } = &children[0] else {
+            panic!("expected native button");
+        };
+        let program = attrs
+            .iter()
+            .find(|attr| attr.name == "data-ax-each-render-attrs")
+            .expect("attribute render program should be emitted");
+        assert!(program.value.contains("\"target\":\"title\""));
+        assert!(program.value.contains("\"path\":\"disabled\""));
+        assert!(program.value.contains("\"mode\":\"boolean\""));
+    }
+
+    #[test]
+    fn keyed_each_falls_back_for_item_dependent_structure() {
+        let document = AxDocument::page(
+            "Posts",
+            [AxStatement::Each(
+                AxEachBlock::new(
+                    "post",
+                    AxExpr::ident("posts"),
+                    [AxStatement::if_block(
+                        AxExpr::ident("post").member("published"),
+                        [AxStatement::component(
+                            AxComponent::new("Copy").inline("Published"),
+                        )],
+                    )],
+                )
+                .key(AxExpr::ident("post").member("id"))
+                .state_binding(AxEachStateBinding::new(
+                    "page:posts",
+                    "List<Post>",
+                    "[]",
+                )),
+            )],
+        );
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert(
+            "posts".to_string(),
+            AxValue::list([AxValue::record([
+                ("id", AxValue::from("first")),
+                ("published", AxValue::from(true)),
+            ])]),
+        );
+
+        let node = lower_document_with_scope(&document, scope, &resolver)
+            .expect("unsupported keyed structure should still render initially");
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element {
+            children, attrs, ..
+        } = &children[0]
+        else {
+            panic!("expected each root");
+        };
+        assert!(attrs
+            .iter()
+            .any(|attr| { attr.name == "data-ax-each-render-status" && attr.value == "fallback" }));
+        assert!(!children
+            .iter()
+            .any(|node| matches!(node, AxNode::Element { tag, .. } if *tag == "template")));
+    }
+
+    #[test]
+    fn keyed_each_preserves_paths_through_stateless_local_components() {
+        let mut document = AxDocument::page(
+            "Posts",
+            [AxStatement::Each(
+                AxEachBlock::new(
+                    "post",
+                    AxExpr::ident("posts"),
+                    [AxStatement::component(
+                        AxComponent::new("PostTitle").prop("post", AxExpr::ident("post")),
+                    )],
+                )
+                .key(AxExpr::ident("post").member("id"))
+                .state_binding(AxEachStateBinding::new(
+                    "page:posts",
+                    "List<Post>",
+                    "[]",
+                )),
+            )],
+        );
+        document.components.push(AxComponentDef::new(
+            "PostTitle",
+            [AxComponentParamDef::new("post")],
+            [AxStatement::component(
+                AxComponent::new("Copy").inline(AxExpr::ident("post").member("title")),
+            )],
+        ));
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let mut scope = BTreeMap::new();
+        scope.insert(
+            "posts".to_string(),
+            AxValue::list([AxValue::record([
+                ("id", AxValue::from("first")),
+                ("title", AxValue::from("Nested")),
+            ])]),
+        );
+
+        let node = lower_document_with_scope(&document, scope, &resolver)
+            .expect("stateless nested component should lower");
+        fn has_title_path(node: &AxNode) -> bool {
+            match node {
+                AxNode::Element {
+                    attrs, children, ..
+                } => {
+                    attrs.iter().any(|attr| {
+                        attr.name == "data-ax-each-render-path" && attr.value == "title"
+                    }) || children.iter().any(has_title_path)
+                }
+                AxNode::Text(_) | AxNode::RawHtml(_) => false,
+            }
+        }
+
+        let AxNode::Element { children, .. } = node else {
+            panic!("expected page root");
+        };
+        let AxNode::Element {
+            children, attrs, ..
+        } = &children[0]
+        else {
+            panic!("expected each root");
+        };
+        assert!(attrs
+            .iter()
+            .any(|attr| { attr.name == "data-ax-each-render-status" && attr.value == "ready" }));
+        assert!(children.iter().any(|node| {
+            matches!(node, AxNode::Element { tag, .. } if *tag == "template")
+                && has_title_path(node)
+        }));
     }
 
     #[test]

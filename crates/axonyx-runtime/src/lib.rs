@@ -3769,6 +3769,7 @@ fn ax_state_bridge_script() -> &'static str {
       if (typeof exports.ax_state_apply_value !== "function") return false;
       if (typeof exports.ax_state_evaluate_expression !== "function") return false;
       if (typeof exports.ax_state_reconcile_keys !== "function") return false;
+      if (typeof exports.ax_state_render_each !== "function") return false;
       if (typeof exports.ax_state_value_buffer_ptr !== "function") return false;
       if (typeof exports.ax_state_value_buffer_capacity !== "function") return false;
       if (!(exports.memory instanceof WebAssembly.Memory)) return false;
@@ -4720,14 +4721,162 @@ fn ax_state_bridge_script() -> &'static str {
     return false;
   };
 
+  const eachRenderValue = (item, path) => {
+    let value = item;
+    if (!path) return { ok: true, value };
+    for (const part of path.split(".")) {
+      if (!value || typeof value !== "object" || !Object.hasOwn(value, part)) {
+        return { ok: false };
+      }
+      value = value[part];
+    }
+    return { ok: true, value };
+  };
+
+  const eachRenderScalar = (value) => {
+    if (value === null || value === undefined) return { ok: true, value: "" };
+    if (["string", "number", "boolean"].includes(typeof value)) {
+      return { ok: true, value: String(value) };
+    }
+    return { ok: false };
+  };
+
+  const safeEachUrl = (target, value) => {
+    if (!["href", "src", "action", "formaction"].includes(target)) return true;
+    const normalized = value.trim().toLowerCase();
+    return normalized.startsWith("/") || normalized.startsWith("./")
+      || normalized.startsWith("../") || normalized.startsWith("#")
+      || normalized.startsWith("https://") || normalized.startsWith("http://")
+      || normalized.startsWith("mailto:") || normalized.startsWith("tel:");
+  };
+
+  const eachRenderNodes = (root) => {
+    const nodes = [];
+    if (root?.matches?.("[data-ax-each-render-target], [data-ax-each-render-attrs]")) {
+      nodes.push(root);
+    }
+    if (typeof root?.querySelectorAll === "function") {
+      nodes.push(...root.querySelectorAll(
+        "[data-ax-each-render-target], [data-ax-each-render-attrs]",
+      ));
+    }
+    return nodes;
+  };
+
+  const resolveEachRenderValues = (item, paths) => {
+    if (!wasmExecutor || typeof wasmExecutor.ax_state_render_each !== "function") {
+      const resolved = paths.map((path) => eachRenderValue(item, path));
+      return resolved.every((entry) => entry.ok)
+        ? resolved.map((entry) => entry.value)
+        : undefined;
+    }
+    const bytes = encodeStateValue({ item, paths }, "Unknown");
+    const capacity = wasmExecutor.ax_state_value_buffer_capacity();
+    const pointer = wasmExecutor.ax_state_value_buffer_ptr();
+    if (!bytes || bytes.length > capacity
+      || pointer + bytes.length > wasmExecutor.memory.buffer.byteLength) {
+      return undefined;
+    }
+    new Uint8Array(wasmExecutor.memory.buffer, pointer, bytes.length).set(bytes);
+    const resultLength = wasmExecutor.ax_state_render_each(bytes.length) >>> 0;
+    if (resultLength === 0xffffffff || resultLength > capacity) return undefined;
+    const values = decodeStateValue(
+      new Uint8Array(wasmExecutor.memory.buffer, pointer, resultLength),
+    );
+    return Array.isArray(values) && values.length === paths.length ? values : undefined;
+  };
+
+  const planEachRenderWrites = (root, item) => {
+    const capabilities = [];
+    for (const node of eachRenderNodes(root)) {
+      if (node.getAttribute("data-ax-each-render-target") === "text") {
+        capabilities.push({
+          node,
+          mode: "text",
+          path: node.getAttribute("data-ax-each-render-path") || "",
+        });
+      }
+
+      const rawAttrs = node.getAttribute("data-ax-each-render-attrs");
+      if (!rawAttrs) continue;
+      let bindings;
+      try {
+        bindings = JSON.parse(rawAttrs);
+      } catch {
+        return undefined;
+      }
+      if (!Array.isArray(bindings)) return undefined;
+      for (const binding of bindings) {
+        if (!binding || typeof binding.target !== "string"
+          || typeof binding.path !== "string"
+          || !["attribute", "boolean"].includes(binding.mode)
+          || binding.target.toLowerCase().startsWith("on")) {
+          return undefined;
+        }
+        capabilities.push({
+          node,
+          mode: binding.mode,
+          target: binding.target,
+          path: binding.path,
+        });
+      }
+    }
+    const values = resolveEachRenderValues(item, capabilities.map((entry) => entry.path));
+    if (!values) return undefined;
+
+    const writes = [];
+    for (let index = 0; index < capabilities.length; index += 1) {
+      const capability = capabilities[index];
+      const value = values[index];
+      if (capability.mode === "boolean") {
+        if (typeof value !== "boolean") return undefined;
+        writes.push({ ...capability, value });
+        continue;
+      }
+      const scalar = eachRenderScalar(value);
+      if (!scalar.ok
+        || capability.mode === "attribute"
+          && !safeEachUrl(capability.target, scalar.value)) {
+        return undefined;
+      }
+      writes.push({ ...capability, value: scalar.value });
+    }
+    return writes;
+  };
+
+  const commitEachRenderWrites = (writes) => {
+    writes.forEach((write) => {
+      if (write.mode === "text") {
+        write.node.textContent = write.value;
+      } else if (write.mode === "boolean") {
+        if (write.value) write.node.setAttribute(write.target, "");
+        else write.node.removeAttribute(write.target);
+      } else {
+        write.node.setAttribute(write.target, write.value);
+        if (write.target === "value" && "value" in write.node) write.node.value = write.value;
+      }
+    });
+  };
+
+  const createEachItem = (entry, key, item) => {
+    if (!entry.template?.content || typeof document.createElement !== "function") return undefined;
+    const fragment = entry.template.content.cloneNode(true);
+    const writes = planEachRenderWrites(fragment, item);
+    if (!writes) return undefined;
+    const node = document.createElement("ax-each-item");
+    node.setAttribute("style", "display: contents");
+    node.setAttribute("data-ax-each-key-id", key);
+    node.setAttribute("data-ax-each-key", key.slice(key.indexOf(":") + 1));
+    node.append(fragment);
+    commitEachRenderWrites(writes);
+    return node;
+  };
+
   const reconcileEach = (entry, nextValue) => {
     const oldKeys = eachKeys(entry.items, entry.keyPath, entry.keyKind);
     const nextKeys = eachKeys(nextValue, entry.keyPath, entry.keyKind);
     if (!oldKeys || !nextKeys) return rejectEach(entry, "invalid-or-duplicate-key", nextValue);
     const plan = planEachReconciliation(oldKeys, nextKeys);
-    if (plan.inserted.length > 0) {
-      return requireEachRefresh(entry, "item-render-program-required", nextValue, plan);
-    }
     if (nextKeys.length === 0 && !entry.emptyNode) {
       return requireEachRefresh(entry, "empty-render-program-required", nextValue, plan);
     }
@@ -4737,12 +4886,34 @@ fn ax_state_bridge_script() -> &'static str {
     const changed = plan.order.some((key) => (
       !stateValuesEqual(oldItems.get(key), nextItems.get(key), "Unknown")
     ));
-    if (changed) return requireEachRefresh(entry, "item-update-program-required", nextValue, plan);
-
+    if (!entry.renderReady && (changed || plan.inserted.length > 0)) {
+      return requireEachRefresh(
+        entry,
+        plan.inserted.length > 0
+          ? "item-render-program-required"
+          : "item-update-program-required",
+        nextValue,
+        plan,
+      );
+    }
     const nodes = new Map(entry.itemsNodes.map((node) => [node.getAttribute("data-ax-each-key-id"), node]));
+    const pendingWrites = [];
+    for (const key of plan.order) {
+      if (stateValuesEqual(oldItems.get(key), nextItems.get(key), "Unknown")) continue;
+      const writes = planEachRenderWrites(nodes.get(key), nextItems.get(key));
+      if (!writes) return requireEachRefresh(entry, "item-update-program-required", nextValue, plan);
+      pendingWrites.push(writes);
+    }
+    for (const key of plan.inserted) {
+      const node = createEachItem(entry, key, nextItems.get(key));
+      if (!node) return requireEachRefresh(entry, "item-render-program-required", nextValue, plan);
+      nodes.set(key, node);
+    }
+
     plan.removed.forEach((key) => nodes.get(key)?.remove());
-    let anchor = entry.emptyNode || null;
-    [...plan.order].reverse().forEach((key) => {
+    pendingWrites.forEach(commitEachRenderWrites);
+    let anchor = entry.emptyNode || entry.template || null;
+    [...nextKeys].reverse().forEach((key) => {
       const node = nodes.get(key);
       if (node) {
         entry.node.insertBefore(node, anchor);
@@ -4776,9 +4947,13 @@ fn ax_state_bridge_script() -> &'static str {
       type,
       keyPath: node.getAttribute("data-ax-each-key-path") || "",
       keyKind: node.getAttribute("data-ax-each-key-kind") || "",
+      renderReady: node.getAttribute("data-ax-each-render-status") === "ready",
       items: Array.isArray(items) ? items : [],
       itemsNodes,
       emptyNode: Array.from(node.children).find((child) => child.matches("ax-each-empty")),
+      template: Array.from(node.children).find((child) => (
+        child.matches("template[data-ax-each-render-protocol='ax-each-render/1']")
+      )),
     };
     const domKeys = itemsNodes.map((child) => child.getAttribute("data-ax-each-key-id"));
     const initialKeys = eachKeys(entry.items, entry.keyPath, entry.keyKind);
@@ -6424,6 +6599,10 @@ page Posts() {
         assert!(html.contains("data-ax-each-key=\"first\""));
         assert!(html.contains("data-ax-each-key-id=\"string:first\""));
         assert!(html.contains("data-ax-each-key=\"second\""));
+        assert!(html.contains("data-ax-each-render-protocol=\"ax-each-render/1\""));
+        assert!(html.contains("data-ax-each-render-status=\"ready\""));
+        assert!(html.contains("data-ax-each-render-target=\"text\""));
+        assert!(html.contains("data-ax-each-render-path=\"title\""));
         assert!(html.contains("ax_state_reconcile_keys"));
         assert!(html.contains("axonyx:each-refresh-required"));
         assert!(html.contains("Hello"));

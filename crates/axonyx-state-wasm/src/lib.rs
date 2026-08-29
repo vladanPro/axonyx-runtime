@@ -19,6 +19,7 @@ pub const AX_STATE_VALUE_FRAME_VERSION: u8 = 1;
 pub const AX_STATE_VALUE_MAX_DEPTH: usize = 32;
 pub const AX_EXPRESSION_PROGRAM_VERSION: u8 = 1;
 const AX_EACH_RECONCILE_MAX_KEYS: usize = 4096;
+const AX_EACH_RENDER_MAX_PATHS: usize = 256;
 const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
 const AX_EXPRESSION_STACK_MAX_VALUES: usize = 4096;
 
@@ -184,6 +185,74 @@ pub extern "C" fn ax_state_reconcile_keys(request_len: u32) -> u32 {
     encoded.len() as u32
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn ax_state_render_each(request_len: u32) -> u32 {
+    let Ok(request_len) = usize::try_from(request_len) else {
+        return AX_STATE_STRING_ERROR;
+    };
+    if request_len > AX_STATE_VALUE_CAPACITY {
+        return AX_STATE_STRING_ERROR;
+    }
+
+    let request = unsafe { std::slice::from_raw_parts(ax_state_value_buffer_ptr(), request_len) };
+    let Some((value, consumed)) = decode_expr_value(request, 0) else {
+        return AX_STATE_STRING_ERROR;
+    };
+    if consumed != request.len() {
+        return AX_STATE_STRING_ERROR;
+    }
+    let Some(values) = render_each_request(value) else {
+        return AX_STATE_STRING_ERROR;
+    };
+    let mut encoded = Vec::new();
+    if encode_expr_value(&values, &mut encoded, 0).is_none()
+        || encoded.len() > AX_STATE_VALUE_CAPACITY
+    {
+        return AX_STATE_STRING_ERROR;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), ax_state_value_buffer_ptr(), encoded.len());
+    }
+    encoded.len() as u32
+}
+
+fn render_each_request(value: ExprValue) -> Option<ExprValue> {
+    let ExprValue::Object(mut fields) = value else {
+        return None;
+    };
+    let item_index = fields.iter().position(|(name, _)| name == "item")?;
+    let (_, item) = fields.remove(item_index);
+    let paths = take_render_paths(&mut fields)?;
+    if !fields.is_empty() || paths.len() > AX_EACH_RENDER_MAX_PATHS {
+        return None;
+    }
+
+    paths
+        .iter()
+        .map(|path| resolve_each_path(&item, path))
+        .collect::<Option<Vec<_>>>()
+        .map(ExprValue::List)
+}
+
+fn resolve_each_path(item: &ExprValue, path: &str) -> Option<ExprValue> {
+    if path.is_empty() {
+        return Some(item.clone());
+    }
+    let mut value = item;
+    let mut segments = 0;
+    for part in path.split('.') {
+        segments += 1;
+        if part.is_empty() || segments > AX_STATE_VALUE_MAX_DEPTH {
+            return None;
+        }
+        let ExprValue::Object(fields) = value else {
+            return None;
+        };
+        value = &fields.iter().find(|(name, _)| name == part)?.1;
+    }
+    Some(value.clone())
+}
+
 fn reconcile_key_request(value: ExprValue) -> Option<ExprValue> {
     let ExprValue::Object(mut fields) = value else {
         return None;
@@ -238,6 +307,21 @@ fn take_string_list(fields: &mut Vec<(String, ExprValue)>, name: &str) -> Option
         .into_iter()
         .map(|value| match value {
             ExprValue::String(value) if !value.is_empty() => Some(value),
+            _ => None,
+        })
+        .collect()
+}
+
+fn take_render_paths(fields: &mut Vec<(String, ExprValue)>) -> Option<Vec<String>> {
+    let index = fields.iter().position(|(field, _)| field == "paths")?;
+    let (_, value) = fields.remove(index);
+    let ExprValue::List(values) = value else {
+        return None;
+    };
+    values
+        .into_iter()
+        .map(|value| match value {
+            ExprValue::String(value) => Some(value),
             _ => None,
         })
         .collect()
@@ -1032,6 +1116,49 @@ mod tests {
                 ),
             ]))
         );
+    }
+
+    #[test]
+    fn resolves_bounded_each_item_render_paths() {
+        let request = ExprValue::Object(vec![
+            (
+                "item".to_string(),
+                ExprValue::Object(vec![
+                    ("title".to_string(), string_value("Hello")),
+                    (
+                        "meta".to_string(),
+                        ExprValue::Object(vec![("featured".to_string(), ExprValue::Bool(true))]),
+                    ),
+                ]),
+            ),
+            (
+                "paths".to_string(),
+                ExprValue::List(vec![string_value("title"), string_value("meta.featured")]),
+            ),
+        ]);
+
+        assert_eq!(
+            render_each_request(request),
+            Some(ExprValue::List(vec![
+                string_value("Hello"),
+                ExprValue::Bool(true),
+            ]))
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_each_item_render_paths() {
+        let request = ExprValue::Object(vec![
+            (
+                "item".to_string(),
+                ExprValue::Object(vec![("title".to_string(), string_value("Hello"))]),
+            ),
+            (
+                "paths".to_string(),
+                ExprValue::List(vec![string_value("missing")]),
+            ),
+        ]);
+        assert_eq!(render_each_request(request), None);
     }
 
     #[test]
