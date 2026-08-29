@@ -1,0 +1,11 @@
+{
+  "name": "axonyx-runtime-browser-tests",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:reactive-each": "node scripts/verify-reactive-each-browser.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}
