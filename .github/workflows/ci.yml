@@ -34,6 +34,15 @@ jobs:
       - name: Verify typed browser state bridge
         run: node scripts/verify-state-bridge.mjs
 
+      - name: Install browser test dependencies
+        run: npm ci
+
+      - name: Audit browser test dependencies
+        run: npm audit --audit-level=high
+
+      - name: Verify Reactive Each in Chromium
+        run: npm run test:reactive-each
+
       - name: Package axonyx-macros
         run: cargo package -p axonyx-macros --allow-dirty --no-verify
 
@@ -45,6 +54,7 @@ jobs:
             echo
             echo "- \`cargo test --workspace\` passed."
             echo "- Typed \`List<Optional<Post>>\` state crossed the browser/WASM bridge."
+            echo "- Reactive \`Each\` insert/update/remove/reorder passed in Chromium without requests or VDOM replacement."
             echo "- \`cargo package -p axonyx-macros --allow-dirty --no-verify\` passed."
             echo "- \`axonyx-core\` and \`axonyx-runtime\` are validated after publish order and crates.io propagation."
             echo "- Expected publish order: \`axonyx-macros\` -> \`axonyx-core\` -> \`axonyx-runtime\`."

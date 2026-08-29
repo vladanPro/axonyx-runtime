@@ -4916,7 +4916,7 @@ fn ax_state_bridge_script() -> &'static str {
     [...nextKeys].reverse().forEach((key) => {
       const node = nodes.get(key);
       if (node) {
-        entry.node.insertBefore(node, anchor);
+        if (node.nextSibling !== anchor) entry.node.insertBefore(node, anchor);
         anchor = node;
       }
     });
