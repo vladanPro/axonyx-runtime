@@ -26,6 +26,10 @@ assert(
   typeof wasm.ax_state_reconcile_keys === "function",
   "keyed Each reconciliation export is missing",
 );
+assert(
+  typeof wasm.ax_state_render_each === "function",
+  "keyed Each render-program export is missing",
+);
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder("utf-8", { fatal: true });
@@ -145,4 +149,28 @@ assert(
   "keyed Each reconciliation returned an invalid object frame",
 );
 
-console.log(`Axonyx state WASM ABI v3 + expression/1 + ax-each/1 passed (${bytes.length} bytes).`);
+const objectValueFrame = (entries) => frame(
+  7,
+  u32(entries.length),
+  ...entries.flatMap(([name, value]) => {
+    const encoded = encoder.encode(name);
+    return [u32(encoded.length), encoded, value];
+  }),
+);
+const renderRequest = objectValueFrame([
+  ["item", objectValueFrame([
+    ["title", stringFrame("Hello")],
+    ["visible", frame(2, Uint8Array.from([1]))],
+  ])],
+  ["paths", stringListFrame(["title", "visible"])],
+]);
+new Uint8Array(wasm.memory.buffer, valuePointer, renderRequest.length).set(renderRequest);
+const renderLength = wasm.ax_state_render_each(renderRequest.length) >>> 0;
+assert(renderLength !== 0xffffffff, "keyed Each render program rejected valid paths");
+const renderResult = new Uint8Array(wasm.memory.buffer, valuePointer, renderLength);
+assert(
+  renderResult[0] === 65 && renderResult[1] === 88 && renderResult[3] === 6,
+  "keyed Each render program returned an invalid value list",
+);
+
+console.log(`Axonyx state WASM ABI v3 + expression/1 + ax-each/1 + ax-each-render/1 passed (${bytes.length} bytes).`);
