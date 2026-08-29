@@ -3121,6 +3121,7 @@ fn render_preview_document_chunks(document: &AxDocument, root: &AxNode) -> Vec<V
         || body.contains("data-ax-state-if-signal=")
         || body.contains("data-ax-state-match-signal=")
         || body.contains("data-ax-expression-protocol=")
+        || body.contains("data-ax-each-signal=")
     {
         ax_state_bridge_script()
     } else {
@@ -3531,6 +3532,7 @@ fn ax_state_bridge_script() -> &'static str {
   const matches = new Map();
   const expressions = new Map();
   const expressionEntries = [];
+  const eachBindings = new Map();
   const domCapabilities = new WeakMap();
   const validDomCapabilities = new WeakSet();
   const domCapabilityList = [];
@@ -3579,6 +3581,9 @@ fn ax_state_bridge_script() -> &'static str {
     flushedStorageWrites: 0,
     expressionEvaluations: 0,
     rejectedExpressions: 0,
+    reconciledEachLists: 0,
+    rejectedEachLists: 0,
+    eachRefreshesRequired: 0,
   };
   const localOperationCode = Object.freeze({ set: 0, add: 1, sub: 2, toggle: 3 });
   const stringLikeTypes = new Set(["String", "DateTime", "Date", "Time", "Uuid"]);
@@ -3763,6 +3768,7 @@ fn ax_state_bridge_script() -> &'static str {
       if (typeof exports.ax_state_string_buffer_capacity !== "function") return false;
       if (typeof exports.ax_state_apply_value !== "function") return false;
       if (typeof exports.ax_state_evaluate_expression !== "function") return false;
+      if (typeof exports.ax_state_reconcile_keys !== "function") return false;
       if (typeof exports.ax_state_value_buffer_ptr !== "function") return false;
       if (typeof exports.ax_state_value_buffer_capacity !== "function") return false;
       if (!(exports.memory instanceof WebAssembly.Memory)) return false;
@@ -4294,6 +4300,8 @@ fn ax_state_bridge_script() -> &'static str {
       moveSignalBucket(subscribers, alias, signal);
       moveSignalBucket(conditions, alias, signal);
       moveSignalBucket(matches, alias, signal);
+      moveSignalBucket(eachBindings, alias, signal);
+      (eachBindings.get(signal) || []).forEach((entry) => { entry.signal = signal; });
       if (state.has(alias) && !state.has(signal)) state.set(signal, state.get(alias));
       if (types.has(alias) && !types.has(signal)) types.set(signal, types.get(alias));
       document.querySelectorAll(`[data-ax-signal="${alias}"]`).forEach((node) => {
@@ -4626,6 +4634,165 @@ fn ax_state_bridge_script() -> &'static str {
     }
   };
 
+  const eachKeyIdentity = (value, expectedKind = "") => {
+    if (typeof value === "string" && (!expectedKind || expectedKind === "string")) {
+      return `string:${value}`;
+    }
+    if (typeof value === "boolean" && (!expectedKind || expectedKind === "bool")) {
+      return `bool:${value}`;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const kind = expectedKind || (Number.isSafeInteger(value) ? "number" : "float");
+      if (kind === "number" && Number.isSafeInteger(value) || kind === "float") {
+        return `${kind}:${value}`;
+      }
+    }
+    return undefined;
+  };
+
+  const eachItemKey = (item, path, keyKind) => {
+    if (!path) return eachKeyIdentity(item, keyKind);
+    let value = item;
+    for (const part of path.split(".")) {
+      if (!value || typeof value !== "object" || !Object.hasOwn(value, part)) return undefined;
+      value = value[part];
+    }
+    return eachKeyIdentity(value, keyKind);
+  };
+
+  const eachKeys = (items, path, keyKind) => {
+    if (!Array.isArray(items)) return undefined;
+    const keys = items.map((item) => eachItemKey(item, path, keyKind));
+    if (keys.some((key) => !key) || new Set(keys).size !== keys.length) return undefined;
+    return keys;
+  };
+
+  const fallbackEachPlan = (oldKeys, nextKeys) => {
+    const oldSet = new Set(oldKeys);
+    const nextSet = new Set(nextKeys);
+    return {
+      removed: oldKeys.filter((key) => !nextSet.has(key)),
+      inserted: nextKeys.filter((key) => !oldSet.has(key)),
+      order: nextKeys.filter((key) => oldSet.has(key)),
+    };
+  };
+
+  const planEachReconciliation = (oldKeys, nextKeys) => {
+    if (!wasmExecutor || typeof wasmExecutor.ax_state_reconcile_keys !== "function") {
+      return fallbackEachPlan(oldKeys, nextKeys);
+    }
+    const bytes = encodeStateValue({ old: oldKeys, next: nextKeys }, "Unknown");
+    const capacity = wasmExecutor.ax_state_value_buffer_capacity();
+    const pointer = wasmExecutor.ax_state_value_buffer_ptr();
+    if (!bytes || bytes.length > capacity
+      || pointer + bytes.length > wasmExecutor.memory.buffer.byteLength) {
+      return fallbackEachPlan(oldKeys, nextKeys);
+    }
+    new Uint8Array(wasmExecutor.memory.buffer, pointer, bytes.length).set(bytes);
+    const resultLength = wasmExecutor.ax_state_reconcile_keys(bytes.length) >>> 0;
+    if (resultLength === 0xffffffff || resultLength > capacity) {
+      return fallbackEachPlan(oldKeys, nextKeys);
+    }
+    const plan = decodeStateValue(
+      new Uint8Array(wasmExecutor.memory.buffer, pointer, resultLength),
+    );
+    return plan && Array.isArray(plan.removed) && Array.isArray(plan.inserted)
+      && Array.isArray(plan.order)
+      ? plan
+      : fallbackEachPlan(oldKeys, nextKeys);
+  };
+
+  const rejectEach = (entry, reason, nextValue) => {
+    executorStats.rejectedEachLists += 1;
+    entry.node.setAttribute("data-ax-each-status", "rejected");
+    window.dispatchEvent(new CustomEvent("axonyx:each-rejected", {
+      detail: { protocol: "ax-each/1", signal: entry.signal, reason, value: nextValue },
+    }));
+    return false;
+  };
+
+  const requireEachRefresh = (entry, reason, nextValue, plan) => {
+    executorStats.eachRefreshesRequired += 1;
+    entry.node.setAttribute("data-ax-each-status", "refresh-required");
+    window.dispatchEvent(new CustomEvent("axonyx:each-refresh-required", {
+      detail: { protocol: "ax-each/1", signal: entry.signal, reason, value: nextValue, plan },
+    }));
+    return false;
+  };
+
+  const reconcileEach = (entry, nextValue) => {
+    const oldKeys = eachKeys(entry.items, entry.keyPath, entry.keyKind);
+    const nextKeys = eachKeys(nextValue, entry.keyPath, entry.keyKind);
+    if (!oldKeys || !nextKeys) return rejectEach(entry, "invalid-or-duplicate-key", nextValue);
+    const plan = planEachReconciliation(oldKeys, nextKeys);
+    if (plan.inserted.length > 0) {
+      return requireEachRefresh(entry, "item-render-program-required", nextValue, plan);
+    }
+    if (nextKeys.length === 0 && !entry.emptyNode) {
+      return requireEachRefresh(entry, "empty-render-program-required", nextValue, plan);
+    }
+
+    const oldItems = new Map(oldKeys.map((key, index) => [key, entry.items[index]]));
+    const nextItems = new Map(nextKeys.map((key, index) => [key, nextValue[index]]));
+    const changed = plan.order.some((key) => (
+      !stateValuesEqual(oldItems.get(key), nextItems.get(key), "Unknown")
+    ));
+    if (changed) return requireEachRefresh(entry, "item-update-program-required", nextValue, plan);
+
+    const nodes = new Map(entry.itemsNodes.map((node) => [node.getAttribute("data-ax-each-key-id"), node]));
+    plan.removed.forEach((key) => nodes.get(key)?.remove());
+    let anchor = entry.emptyNode || null;
+    [...plan.order].reverse().forEach((key) => {
+      const node = nodes.get(key);
+      if (node) {
+        entry.node.insertBefore(node, anchor);
+        anchor = node;
+      }
+    });
+    if (entry.emptyNode) entry.emptyNode.hidden = nextKeys.length !== 0;
+    entry.items = nextValue;
+    entry.itemsNodes = Array.from(entry.node.children)
+      .filter((node) => node.matches("ax-each-item[data-ax-each-key-id]"));
+    entry.node.setAttribute("data-ax-each-status", "reconciled");
+    executorStats.reconciledEachLists += 1;
+    window.dispatchEvent(new CustomEvent("axonyx:each-reconciled", {
+      detail: { protocol: "ax-each/1", signal: entry.signal, plan },
+    }));
+    return true;
+  };
+
+  const registerEach = (node) => {
+    if (node.getAttribute("data-ax-each-protocol") !== "ax-each/1") return;
+    const rawSignal = node.getAttribute("data-ax-each-signal");
+    if (!rawSignal) return;
+    const signal = canonicalSignal(rawSignal);
+    const type = node.getAttribute("data-ax-each-type") || "Unknown";
+    const items = castValue(node.getAttribute("data-ax-each-initial") || "[]", type);
+    const itemsNodes = Array.from(node.children)
+      .filter((child) => child.matches("ax-each-item[data-ax-each-key-id]"));
+    const entry = {
+      node,
+      signal,
+      type,
+      keyPath: node.getAttribute("data-ax-each-key-path") || "",
+      keyKind: node.getAttribute("data-ax-each-key-kind") || "",
+      items: Array.isArray(items) ? items : [],
+      itemsNodes,
+      emptyNode: Array.from(node.children).find((child) => child.matches("ax-each-empty")),
+    };
+    const domKeys = itemsNodes.map((child) => child.getAttribute("data-ax-each-key-id"));
+    const initialKeys = eachKeys(entry.items, entry.keyPath, entry.keyKind);
+    if (!initialKeys || domKeys.length !== initialKeys.length
+      || domKeys.some((key, index) => key !== initialKeys[index])) {
+      rejectEach(entry, "initial-dom-key-mismatch", entry.items);
+      return;
+    }
+    if (!types.has(signal)) types.set(signal, type);
+    if (!state.has(signal)) state.set(signal, entry.items);
+    if (!eachBindings.has(signal)) eachBindings.set(signal, []);
+    eachBindings.get(signal).push(entry);
+  };
+
   const writeSignal = (signal, value, source = "client", emit = true) => {
     signal = canonicalSignal(signal);
     const type = types.get(signal) || "String";
@@ -4638,6 +4805,7 @@ fn ax_state_bridge_script() -> &'static str {
       return state.get(signal);
     }
     state.set(signal, nextValue);
+    (eachBindings.get(signal) || []).forEach((entry) => reconcileEach(entry, nextValue));
     (bindings.get(signal) || []).forEach((capability) => {
       writeDomCapability(capability, nextValue);
     });
@@ -5040,6 +5208,7 @@ fn ax_state_bridge_script() -> &'static str {
     document.querySelectorAll("[data-ax-state-if-signal]").forEach(registerCondition);
     document.querySelectorAll("[data-ax-state-match-signal]").forEach(registerMatch);
     document.querySelectorAll("[data-ax-expression-protocol]").forEach(registerExpressions);
+    document.querySelectorAll("ax-state-each[data-ax-each-protocol]").forEach(registerEach);
   };
 
   document.addEventListener("input", (event) => {
@@ -5124,6 +5293,10 @@ fn ax_state_bridge_script() -> &'static str {
       expressionProtocol: "ax-expression/1",
       expressionEvaluations: executorStats.expressionEvaluations,
       rejectedExpressions: executorStats.rejectedExpressions,
+      eachProtocol: "ax-each/1",
+      reconciledEachLists: executorStats.reconciledEachLists,
+      rejectedEachLists: executorStats.rejectedEachLists,
+      eachRefreshesRequired: executorStats.eachRefreshesRequired,
     }),
     loadWasm: loadWasmExecutor,
   };
@@ -6246,8 +6419,13 @@ page Posts() {
         assert!(html.contains("<ax-state-each"));
         assert!(html.contains("data-ax-each-protocol=\"ax-each/1\""));
         assert!(html.contains("data-ax-each-signal=\"root:posts:1\""));
+        assert!(html.contains("data-ax-each-key-path=\"id\""));
+        assert!(html.contains("data-ax-each-key-kind=\"string\""));
         assert!(html.contains("data-ax-each-key=\"first\""));
+        assert!(html.contains("data-ax-each-key-id=\"string:first\""));
         assert!(html.contains("data-ax-each-key=\"second\""));
+        assert!(html.contains("ax_state_reconcile_keys"));
+        assert!(html.contains("axonyx:each-refresh-required"));
         assert!(html.contains("Hello"));
         assert!(html.contains("World"));
     }

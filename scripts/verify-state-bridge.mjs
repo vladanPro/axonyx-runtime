@@ -18,6 +18,56 @@ const storage = () => ({
   setItem: () => {},
 });
 
+class FakeElement {
+  constructor(tag, attrs = {}, children = []) {
+    this.tag = tag;
+    this.attrs = new Map(Object.entries(attrs));
+    this.children = children;
+    this.hidden = false;
+    children.forEach((child) => { child.parent = this; });
+  }
+
+  getAttribute(name) { return this.attrs.get(name) ?? null; }
+  setAttribute(name, value) { this.attrs.set(name, String(value)); }
+  matches(selector) {
+    if (selector === "ax-each-empty") return this.tag === "ax-each-empty";
+    if (selector === "ax-each-item[data-ax-each-key-id]") {
+      return this.tag === "ax-each-item" && this.attrs.has("data-ax-each-key-id");
+    }
+    return false;
+  }
+  remove() {
+    if (!this.parent) return;
+    this.parent.children = this.parent.children.filter((child) => child !== this);
+    this.parent = undefined;
+  }
+  insertBefore(node, anchor) {
+    if (node.parent) node.parent.children = node.parent.children.filter((child) => child !== node);
+    const index = anchor ? this.children.indexOf(anchor) : this.children.length;
+    this.children.splice(index < 0 ? this.children.length : index, 0, node);
+    node.parent = this;
+  }
+}
+
+const firstEachItem = new FakeElement("ax-each-item", {
+  "data-ax-each-key-id": "string:first",
+});
+const secondEachItem = new FakeElement("ax-each-item", {
+  "data-ax-each-key-id": "string:second",
+});
+const eachRoot = new FakeElement("ax-state-each", {
+  "data-ax-each-protocol": "ax-each/1",
+  "data-ax-each-signal": "page:probe:items:1",
+  "data-ax-each-type": "List<EachItem>",
+  "data-ax-each-initial": JSON.stringify([
+    { id: "first", title: "First" },
+    { id: "second", title: "Second" },
+  ]),
+  "data-ax-each-key-path": "id",
+  "data-ax-each-key-kind": "string",
+}, [firstEachItem, secondEachItem]);
+const dispatchedEvents = [];
+
 globalThis.CustomEvent = class CustomEvent {
   constructor(type, options = {}) {
     this.type = type;
@@ -26,14 +76,19 @@ globalThis.CustomEvent = class CustomEvent {
 };
 globalThis.document = {
   readyState: "complete",
-  querySelectorAll: () => [],
+  querySelectorAll: (selector) => (
+    selector === "ax-state-each[data-ax-each-protocol]" ? [eachRoot] : []
+  ),
   addEventListener: () => {},
 };
 globalThis.window = {
   WebAssembly,
   localStorage: storage(),
   sessionStorage: storage(),
-  dispatchEvent: () => true,
+  dispatchEvent: (event) => {
+    dispatchedEvents.push(event);
+    return true;
+  },
 };
 globalThis.fetch = async () => ({
   ok: true,
@@ -62,6 +117,13 @@ state.hydrateManifest({
       ],
     },
     { name: "Theme", literals: ["silver", "bronze", "gold"] },
+    {
+      name: "EachItem",
+      fields: [
+        { name: "id", ty: "String", optional: false },
+        { name: "title", ty: "String", optional: false },
+      ],
+    },
   ],
   files: [{
     file: "app/posts/page.asx",
@@ -131,4 +193,32 @@ assert(state.diagnostics().wasmOperations === 2, "typed state did not execute th
 assert(state.get("page:posts:items:1")[0].title === "First", "record list changed in transport");
 assert(state.get("page:posts:ratio:2") === 0.75, "Float arithmetic changed in WASM transport");
 
-console.log("Axonyx typed state bridge passed (records and Float via WASM ABI 3).");
+state.set("page:probe:items:1", [
+  { id: "second", title: "Second" },
+  { id: "first", title: "First" },
+]);
+assert(
+  eachRoot.children[0] === secondEachItem && eachRoot.children[1] === firstEachItem,
+  "keyed Each did not reorder existing DOM ownership boundaries",
+);
+assert(
+  eachRoot.getAttribute("data-ax-each-status") === "reconciled",
+  "keyed Each did not report a reconciled state",
+);
+
+state.set("page:probe:items:1", [
+  { id: "second", title: "Second" },
+  { id: "first", title: "First" },
+  { id: "third", title: "Third" },
+]);
+assert(eachRoot.children.length === 2, "unsupported keyed insert partially changed the DOM");
+assert(
+  eachRoot.getAttribute("data-ax-each-status") === "refresh-required",
+  "unsupported keyed insert did not request the compiler render program",
+);
+assert(
+  dispatchedEvents.some((event) => event.type === "axonyx:each-refresh-required"),
+  "unsupported keyed insert did not emit its fallback event",
+);
+
+console.log("Axonyx typed state bridge + keyed Each reconciliation passed.");
