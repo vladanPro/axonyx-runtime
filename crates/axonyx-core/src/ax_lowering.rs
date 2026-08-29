@@ -165,16 +165,16 @@ pub fn lower_document_with_scope_and_imports(
         &document.functions,
         resolver,
     )?;
-    let children = lower_statements(
-        &document.page.body,
-        &document.functions,
-        &document.imports,
-        &document.components,
-        &mut scope,
+    let context = LoweringContext {
+        sources: LoweringSources {
+            functions: &document.functions,
+            imports: &document.imports,
+            components: &document.components,
+        },
         resolver,
         import_resolver,
-        None,
-    )?;
+    };
+    let children = lower_statements(&document.page.body, &context, &mut scope, None)?;
 
     Ok(element_with_attrs(
         "main",
@@ -186,24 +186,33 @@ pub fn lower_document_with_scope_and_imports(
     ))
 }
 
-struct SlotContext<'a> {
-    body: &'a [AxStatement],
+#[derive(Clone, Copy)]
+struct LoweringSources<'a> {
     functions: &'a [AxFunctionDef],
     imports: &'a [AxImport],
     components: &'a [AxComponentDef],
+}
+
+struct LoweringContext<'a> {
+    sources: LoweringSources<'a>,
+    resolver: &'a dyn AxDataResolver,
+    import_resolver: &'a dyn AxImportResolver,
+}
+
+struct SlotContext<'a> {
+    body: &'a [AxStatement],
+    sources: LoweringSources<'a>,
     parent: Option<&'a SlotContext<'a>>,
 }
 
 fn lower_statements(
     statements: &[AxStatement],
-    functions: &[AxFunctionDef],
-    imports: &[AxImport],
-    components: &[AxComponentDef],
+    context: &LoweringContext<'_>,
     scope: &mut BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
-    import_resolver: &impl AxImportResolver,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
+    let functions = context.sources.functions;
+    let resolver = context.resolver;
     let mut nodes = Vec::new();
     let render_was_unsupported = !each_render_scope_is_supported(scope);
 
@@ -245,12 +254,8 @@ fn lower_statements(
                         let mut nested = scope.clone();
                         let empty = lower_statements(
                             &block.empty_body,
-                            functions,
-                            imports,
-                            components,
+                            context,
                             &mut nested,
-                            resolver,
-                            import_resolver,
                             slot_context,
                         )?;
                         if !empty.is_empty() {
@@ -291,16 +296,8 @@ fn lower_statements(
                                     stable_key_hash(&key_identity)
                                 )),
                             );
-                            let item_children = lower_statements(
-                                &block.body,
-                                functions,
-                                imports,
-                                components,
-                                &mut nested,
-                                resolver,
-                                import_resolver,
-                                slot_context,
-                            )?;
+                            let item_children =
+                                lower_statements(&block.body, context, &mut nested, slot_context)?;
                             if render_template.is_none()
                                 && each_render_scope_is_supported(&nested)
                                 && each_render_template_is_safe(&item_children)
@@ -357,12 +354,8 @@ fn lower_statements(
                     let mut nested = scope.clone();
                     nodes.extend(lower_statements(
                         &block.empty_body,
-                        functions,
-                        imports,
-                        components,
+                        context,
                         &mut nested,
-                        resolver,
-                        import_resolver,
                         slot_context,
                     )?);
                 } else {
@@ -375,12 +368,8 @@ fn lower_statements(
                         );
                         nodes.extend(lower_statements(
                             &block.body,
-                            functions,
-                            imports,
-                            components,
+                            context,
                             &mut nested,
-                            resolver,
-                            import_resolver,
                             slot_context,
                         )?);
                     }
@@ -405,16 +394,7 @@ fn lower_statements(
                             if is_truthy(&condition) { 1 } else { 0 }
                         )),
                     );
-                    nodes.extend(lower_statements(
-                        body,
-                        functions,
-                        imports,
-                        components,
-                        &mut nested,
-                        resolver,
-                        import_resolver,
-                        slot_context,
-                    )?);
+                    nodes.extend(lower_statements(body, context, &mut nested, slot_context)?);
                 }
             }
             AxStatement::Match(block) => {
@@ -435,16 +415,7 @@ fn lower_statements(
                         AX_RENDER_PATH.to_string(),
                         AxValue::String(format!("{statement_render_path}.match")),
                     );
-                    nodes.extend(lower_statements(
-                        body,
-                        functions,
-                        imports,
-                        components,
-                        &mut nested,
-                        resolver,
-                        import_resolver,
-                        slot_context,
-                    )?);
+                    nodes.extend(lower_statements(body, context, &mut nested, slot_context)?);
                 }
             }
             AxStatement::Text(expr) => {
@@ -453,12 +424,8 @@ fn lower_statements(
             AxStatement::Component(component) => {
                 nodes.extend(lower_component_nodes(
                     component,
-                    functions,
-                    imports,
-                    components,
+                    context,
                     scope,
-                    resolver,
-                    import_resolver,
                     slot_context,
                 )?);
             }
@@ -466,16 +433,7 @@ fn lower_statements(
                 if expr_references_each_item(&pipeline.source, scope) {
                     mark_each_render_unsupported(scope);
                 }
-                nodes.push(lower_pipeline(
-                    pipeline,
-                    functions,
-                    imports,
-                    components,
-                    scope,
-                    resolver,
-                    import_resolver,
-                    slot_context,
-                )?);
+                nodes.push(lower_pipeline(pipeline, context, scope, slot_context)?);
             }
         }
     }
@@ -500,80 +458,68 @@ fn lower_statements(
 
 fn lower_component_nodes(
     component: &AxComponent,
-    functions: &[AxFunctionDef],
-    imports: &[AxImport],
-    components: &[AxComponentDef],
+    context: &LoweringContext<'_>,
     scope: &mut BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
-    import_resolver: &impl AxImportResolver,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
+    let LoweringSources {
+        imports,
+        components,
+        ..
+    } = context.sources;
+    let resolver = context.resolver;
     if component.name == "Slot" {
         let Some(slot_context) = slot_context else {
             return Ok(Vec::new());
         };
-        let requested_slot = slot_name_expr(component, slot_context.functions, scope, resolver)?;
+        let requested_slot =
+            slot_name_expr(component, slot_context.sources.functions, scope, resolver)?;
         let selected_body = select_slot_statements(
             slot_context.body,
             requested_slot.as_deref(),
-            slot_context.functions,
+            slot_context.sources.functions,
             scope,
             resolver,
         )?;
         let mut nested = scope.clone();
+        let slot_lowering = LoweringContext {
+            sources: slot_context.sources,
+            resolver: context.resolver,
+            import_resolver: context.import_resolver,
+        };
         return lower_statements(
             &selected_body,
-            slot_context.functions,
-            slot_context.imports,
-            slot_context.components,
+            &slot_lowering,
             &mut nested,
-            resolver,
-            import_resolver,
             slot_context.parent,
         );
     }
 
     if component.name == "Fragment" {
-        return lower_component_children(
-            component,
-            functions,
-            imports,
-            components,
-            scope,
-            resolver,
-            import_resolver,
-            slot_context,
-        );
+        return lower_component_children(component, context, scope, slot_context);
     }
 
     if let Some(component_def) = resolve_component(components, &component.name) {
         return lower_local_component_nodes(
             component,
             component_def,
-            functions,
-            imports,
-            components,
-            functions,
-            imports,
-            components,
+            context,
+            context.sources,
             scope,
-            resolver,
-            import_resolver,
             slot_context,
         );
     }
 
     if let Some(import_decl) = resolve_import(imports, &component.name) {
-        if let Some(import_source) = import_resolver.resolve_import_source(import_decl.source) {
+        if let Some(import_source) = context
+            .import_resolver
+            .resolve_import_source(import_decl.source)
+        {
             return lower_imported_component_nodes(
                 component,
                 import_decl,
-                functions,
-                imports,
-                components,
+                context,
                 scope,
-                resolver,
-                import_resolver,
                 &import_source,
                 slot_context,
             );
@@ -582,36 +528,23 @@ fn lower_component_nodes(
 
     Ok(vec![lower_component_node(
         component,
-        functions,
-        imports,
-        components,
+        context,
         scope,
-        resolver,
-        import_resolver,
         slot_context,
     )?])
 }
 
 fn lower_component_node(
     component: &AxComponent,
-    functions: &[AxFunctionDef],
-    imports: &[AxImport],
-    components: &[AxComponentDef],
+    context: &LoweringContext<'_>,
     scope: &mut BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
-    import_resolver: &impl AxImportResolver,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<AxNode, AxLowerError> {
-    let children = lower_component_children(
-        component,
-        functions,
-        imports,
-        components,
-        scope,
-        resolver,
-        import_resolver,
-        slot_context,
-    )?;
+    let LoweringSources {
+        functions, imports, ..
+    } = context.sources;
+    let resolver = context.resolver;
+    let children = lower_component_children(component, context, scope, slot_context)?;
 
     let mut props = eval_props(component, functions, scope, resolver)?;
     let mut attrs = style_attrs(&component.style, functions, scope, resolver)?;
@@ -857,14 +790,12 @@ fn lower_component_node(
 
 fn lower_component_children(
     component: &AxComponent,
-    functions: &[AxFunctionDef],
-    imports: &[AxImport],
-    components: &[AxComponentDef],
+    context: &LoweringContext<'_>,
     scope: &mut BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
-    import_resolver: &impl AxImportResolver,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
+    let functions = context.sources.functions;
+    let resolver = context.resolver;
     match &component.body {
         AxBody::Empty => Ok(Vec::new()),
         AxBody::Inline(expr) => Ok(vec![lower_each_render_text(
@@ -872,16 +803,7 @@ fn lower_component_children(
         )?]),
         AxBody::Block(body) => {
             let mut nested = scope.clone();
-            lower_statements(
-                body,
-                functions,
-                imports,
-                components,
-                &mut nested,
-                resolver,
-                import_resolver,
-                slot_context,
-            )
+            lower_statements(body, context, &mut nested, slot_context)
         }
     }
 }
@@ -1010,14 +932,12 @@ fn each_render_attribute_target(component: &str, prop: &str) -> Option<String> {
 
 fn lower_pipeline(
     pipeline: &AxPipeline,
-    functions: &[AxFunctionDef],
-    imports: &[AxImport],
-    components: &[AxComponentDef],
+    context: &LoweringContext<'_>,
     scope: &mut BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
-    import_resolver: &impl AxImportResolver,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<AxNode, AxLowerError> {
+    let functions = context.sources.functions;
+    let resolver = context.resolver;
     let source = eval_expr(&pipeline.source, functions, scope, resolver)?;
     let source_text = source.as_string();
 
@@ -1043,12 +963,8 @@ fn lower_pipeline(
                 let mut nested_scope = scope.clone();
                 children.extend(lower_component_nodes(
                     component,
-                    functions,
-                    imports,
-                    components,
+                    context,
                     &mut nested_scope,
-                    resolver,
-                    import_resolver,
                     slot_context,
                 )?);
             }
@@ -1062,7 +978,7 @@ fn eval_props(
     component: &AxComponent,
     functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
+    resolver: &dyn AxDataResolver,
 ) -> Result<BTreeMap<String, AxValue>, AxLowerError> {
     let mut props = BTreeMap::new();
     for prop in &component.props {
@@ -1183,7 +1099,7 @@ fn lower_each_render_text(
     expr: &AxExpr,
     functions: &[AxFunctionDef],
     scope: &mut BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
+    resolver: &dyn AxDataResolver,
 ) -> Result<AxNode, AxLowerError> {
     let value = eval_expr(expr, functions, scope, resolver)?.as_string();
     let Some(path) = each_render_path(expr, scope) else {
@@ -1281,7 +1197,7 @@ fn style_attrs(
     style: &AxStyle,
     functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
+    resolver: &dyn AxDataResolver,
 ) -> Result<Vec<Attribute>, AxLowerError> {
     let mut attrs = Vec::new();
     if let Some(recipe) = &style.recipe {
@@ -1316,7 +1232,7 @@ fn eval_expr(
     expr: &AxExpr,
     functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
+    resolver: &dyn AxDataResolver,
 ) -> Result<AxValue, AxLowerError> {
     match expr {
         AxExpr::String(value) => Ok(AxValue::String(value.clone())),
@@ -1621,7 +1537,7 @@ fn eval_function_call(
     args: &[AxValue],
     functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
+    resolver: &dyn AxDataResolver,
 ) -> Result<AxValue, AxLowerError> {
     let mut function_scope = scope.clone();
 
@@ -1710,17 +1626,13 @@ fn resolve_component<'a>(
 fn lower_local_component_nodes(
     component: &AxComponent,
     component_def: &AxComponentDef,
-    functions: &[AxFunctionDef],
-    imports: &[AxImport],
-    components: &[AxComponentDef],
-    slot_functions: &[AxFunctionDef],
-    slot_imports: &[AxImport],
-    slot_components: &[AxComponentDef],
+    context: &LoweringContext<'_>,
+    slot_sources: LoweringSources<'_>,
     scope: &mut BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
-    import_resolver: &impl AxImportResolver,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
+    let functions = context.sources.functions;
+    let resolver = context.resolver;
     let props = eval_props(component, functions, scope, resolver)?;
     let passthrough_attrs = component_passthrough_attrs(&props, component_def);
     let mut component_scope = scope.clone();
@@ -1767,20 +1679,14 @@ fn lower_local_component_nodes(
     let slot_body = component_children_to_statements(component);
     let slot_context = SlotContext {
         body: &slot_body,
-        functions: slot_functions,
-        imports: slot_imports,
-        components: slot_components,
+        sources: slot_sources,
         parent: slot_context,
     };
 
     let mut nodes = lower_statements(
         &component_def.body,
-        functions,
-        imports,
-        components,
+        context,
         &mut component_scope,
-        resolver,
-        import_resolver,
         Some(&slot_context),
     )?;
     apply_attrs_to_first_element(&mut nodes, passthrough_attrs);
@@ -1837,27 +1743,21 @@ fn apply_attrs_to_first_element(nodes: &mut [AxNode], incoming: Vec<Attribute>) 
 fn lower_imported_component_nodes(
     component: &AxComponent,
     import_decl: ResolvedImport<'_>,
-    functions: &[AxFunctionDef],
-    imports: &[AxImport],
-    components: &[AxComponentDef],
+    context: &LoweringContext<'_>,
     scope: &mut BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
-    import_resolver: &impl AxImportResolver,
     import_source: &str,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Vec<AxNode>, AxLowerError> {
+    let functions = context.sources.functions;
+    let resolver = context.resolver;
     let document = match parse_ax_auto(import_source) {
         Ok(document) => document,
         Err(page_error) => {
             if let Some(nodes) = lower_imported_component_only_nodes(
                 component,
                 &import_decl,
-                functions,
-                imports,
-                components,
+                context,
                 scope,
-                resolver,
-                import_resolver,
                 import_source,
                 slot_context,
             )? {
@@ -1874,18 +1774,21 @@ fn lower_imported_component_nodes(
         resolve_component(&document.components, &import_decl.binding.imported)
             .or_else(|| resolve_component(&document.components, &import_decl.binding.local))
     {
+        let imported_context = LoweringContext {
+            sources: LoweringSources {
+                functions: &document.functions,
+                imports: &document.imports,
+                components: &document.components,
+            },
+            resolver: context.resolver,
+            import_resolver: context.import_resolver,
+        };
         return lower_local_component_nodes(
             component,
             component_def,
-            &document.functions,
-            &document.imports,
-            &document.components,
-            functions,
-            imports,
-            components,
+            &imported_context,
+            context.sources,
             scope,
-            resolver,
-            import_resolver,
             slot_context,
         );
     }
@@ -1918,20 +1821,23 @@ fn lower_imported_component_nodes(
     let slot_body = component_children_to_statements(component);
     let slot_context = SlotContext {
         body: &slot_body,
-        functions,
-        imports,
-        components,
+        sources: context.sources,
         parent: slot_context,
     };
 
+    let imported_context = LoweringContext {
+        sources: LoweringSources {
+            functions: &document.functions,
+            imports: &document.imports,
+            components: &document.components,
+        },
+        resolver: context.resolver,
+        import_resolver: context.import_resolver,
+    };
     lower_statements(
         &document.page.body,
-        &document.functions,
-        &document.imports,
-        &document.components,
+        &imported_context,
         &mut imported_scope,
-        resolver,
-        import_resolver,
         Some(&slot_context),
     )
 }
@@ -1939,12 +1845,8 @@ fn lower_imported_component_nodes(
 fn lower_imported_component_only_nodes(
     component: &AxComponent,
     import_decl: &ResolvedImport<'_>,
-    functions: &[AxFunctionDef],
-    imports: &[AxImport],
-    components: &[AxComponentDef],
+    context: &LoweringContext<'_>,
     scope: &mut BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
-    import_resolver: &impl AxImportResolver,
     import_source: &str,
     slot_context: Option<&SlotContext<'_>>,
 ) -> Result<Option<Vec<AxNode>>, AxLowerError> {
@@ -1958,18 +1860,21 @@ fn lower_imported_component_only_nodes(
         return Ok(None);
     };
 
+    let imported_context = LoweringContext {
+        sources: LoweringSources {
+            functions: &document.functions,
+            imports: &document.imports,
+            components: &document.components,
+        },
+        resolver: context.resolver,
+        import_resolver: context.import_resolver,
+    };
     lower_local_component_nodes(
         component,
         component_def,
-        &document.functions,
-        &document.imports,
-        &document.components,
-        functions,
-        imports,
-        components,
+        &imported_context,
+        context.sources,
         scope,
-        resolver,
-        import_resolver,
         slot_context,
     )
     .map(Some)
@@ -2013,7 +1918,7 @@ fn apply_params_to_scope(
     params: &[AxComponentParamDef],
     scope: &mut BTreeMap<String, AxValue>,
     functions: &[AxFunctionDef],
-    resolver: &impl AxDataResolver,
+    resolver: &dyn AxDataResolver,
 ) -> Result<(), AxLowerError> {
     for param in params {
         if scope.contains_key(&param.name) {
@@ -2043,7 +1948,7 @@ fn slot_name_expr(
     component: &AxComponent,
     functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
+    resolver: &dyn AxDataResolver,
 ) -> Result<Option<String>, AxLowerError> {
     for prop in &component.props {
         if prop.name == "name" || prop.name == "slot" {
@@ -2061,7 +1966,7 @@ fn select_slot_statements(
     requested_slot: Option<&str>,
     functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
+    resolver: &dyn AxDataResolver,
 ) -> Result<Vec<AxStatement>, AxLowerError> {
     let mut selected = Vec::new();
 
@@ -2079,7 +1984,7 @@ fn slot_statement_matches(
     requested_slot: Option<&str>,
     functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
+    resolver: &dyn AxDataResolver,
 ) -> Result<bool, AxLowerError> {
     let statement_slot = statement_slot_name(statement, functions, scope, resolver)?;
 
@@ -2093,7 +1998,7 @@ fn statement_slot_name(
     statement: &AxStatement,
     functions: &[AxFunctionDef],
     scope: &BTreeMap<String, AxValue>,
-    resolver: &impl AxDataResolver,
+    resolver: &dyn AxDataResolver,
 ) -> Result<Option<String>, AxLowerError> {
     let AxStatement::Component(component) = statement else {
         return Ok(None);

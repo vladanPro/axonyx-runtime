@@ -21,12 +21,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.82.0
+          components: clippy
 
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Run workspace tests
         run: cargo test --workspace
+
+      - name: Run strict Clippy lint gate
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Verify bundled state WASM ABI
         run: node scripts/verify-state-wasm.mjs

@@ -1361,14 +1361,14 @@ fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     match fallback {
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
             if let Some(message) = render_error_call_message(expr) {
-                return format!(
+                format!(
                     "        let __ax_error_message = ({message}).to_string();\n        let __ax_error_value = json!(&__ax_error_message);\n        return Ok(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect));\n"
-                );
+                )
             } else {
                 let value = format!("json!({})", render_borrowed_expr(expr));
-                return format!(
+                format!(
                     "        let __ax_error_value = {value};\n        let __ax_error_message = __ax_error_value.get(\"message\").or_else(|| __ax_error_value.get(\"error\")).and_then(Value::as_str).unwrap_or(\"Action requirement failed.\").to_string();\n        return Ok(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect));\n"
-                );
+                )
             }
         }
         Some(AxReturnPlan::Redirect { target, .. }) => {
