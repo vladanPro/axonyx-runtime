@@ -1684,8 +1684,8 @@ fn find_top_level_persist(source: &str) -> Option<usize> {
                     .chars()
                     .next_back()
                     .is_some_and(char::is_whitespace);
-                if rest.starts_with("persist") {
-                    let after_is_space = rest["persist".len()..]
+                if let Some(after_persist) = rest.strip_prefix("persist") {
+                    let after_is_space = after_persist
                         .chars()
                         .next()
                         .is_some_and(char::is_whitespace);

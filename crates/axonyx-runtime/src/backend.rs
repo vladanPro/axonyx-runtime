@@ -19,7 +19,7 @@ pub enum AxRuntimeError {
     #[error("runtime operation failed: {message}")]
     Message { message: String },
     #[error("runtime database operation failed: {error}")]
-    Database { error: AxDbError },
+    Database { error: Box<AxDbError> },
 }
 
 impl AxRuntimeError {
@@ -30,7 +30,9 @@ impl AxRuntimeError {
     }
 
     pub fn database(error: AxDbError) -> Self {
-        Self::Database { error }
+        Self::Database {
+            error: Box::new(error),
+        }
     }
 
     pub fn public_error_payload(&self) -> Value {

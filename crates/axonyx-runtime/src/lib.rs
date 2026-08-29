@@ -204,6 +204,8 @@ pub fn ax_page_route_definition(
     ))
 }
 
+// Compatibility facade keeps route sources explicit; grouping them would break the public API.
+#[allow(clippy::too_many_arguments)]
 pub fn ax_page_route_definition_with_backend(
     method: impl Into<String>,
     path: impl Into<String>,
@@ -566,19 +568,18 @@ pub fn preview_ax_route_stream_response_with_backend_and_imports(
         &BTreeMap::new(),
         &parse_preview_query_fields(request_target),
     );
+    let resolve_context = PreviewResolveContext {
+        handlers: &handlers,
+        cache: &cache,
+        env: &env,
+        runtime: None,
+        request_target,
+        route_scope: &route_scope,
+        store,
+    };
     let resolver_error = RefCell::new(None);
     let resolver = |path: &[String], args: &[AxValue]| -> Option<AxValue> {
-        match preview_resolve_call(
-            &handlers,
-            &cache,
-            &env,
-            None,
-            request_target,
-            &route_scope,
-            store,
-            path,
-            args,
-        ) {
+        match preview_resolve_call(&resolve_context, path, args) {
             Ok(value) => value,
             Err(error) => {
                 let mut slot = resolver_error.borrow_mut();
@@ -634,6 +635,8 @@ pub fn preview_ax_route_with_request_context(
     )
 }
 
+// Compatibility facade mirrors the generated route inputs without an opaque options bag.
+#[allow(clippy::too_many_arguments)]
 pub fn preview_ax_route_with_request_context_and_imports(
     layout_sources: &[&str],
     loader_sources: &[&str],
@@ -657,6 +660,8 @@ pub fn preview_ax_route_with_request_context_and_imports(
     )
 }
 
+// Compatibility facade mirrors the generated route inputs without an opaque options bag.
+#[allow(clippy::too_many_arguments)]
 pub fn preview_ax_route_with_request_context_and_runtime_and_imports(
     layout_sources: &[&str],
     loader_sources: &[&str],
@@ -681,6 +686,8 @@ pub fn preview_ax_route_with_request_context_and_runtime_and_imports(
     )
 }
 
+// Internal counterpart intentionally matches the public compatibility facade above.
+#[allow(clippy::too_many_arguments)]
 fn preview_ax_route_with_request_context_runtime_and_imports(
     layout_sources: &[&str],
     loader_sources: &[&str],
@@ -711,19 +718,18 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
     };
     let route_scope =
         build_preview_route_scope(route_params, &parse_preview_query_fields(request_target));
+    let resolve_context = PreviewResolveContext {
+        handlers: &handlers,
+        cache: &cache,
+        env,
+        runtime,
+        request_target,
+        route_scope: &route_scope,
+        store,
+    };
     let resolver_error = RefCell::new(None);
     let resolver = |path: &[String], args: &[AxValue]| -> Option<AxValue> {
-        match preview_resolve_call(
-            &handlers,
-            &cache,
-            env,
-            runtime,
-            request_target,
-            &route_scope,
-            store,
-            path,
-            args,
-        ) {
+        match preview_resolve_call(&resolve_context, path, args) {
             Ok(value) => value,
             Err(error) => {
                 let mut slot = resolver_error.borrow_mut();
@@ -936,17 +942,31 @@ fn collect_preview_functions(
     }
 }
 
+struct PreviewResolveContext<'a> {
+    handlers: &'a PreviewHandlers,
+    cache: &'a RefCell<BTreeMap<String, AxValue>>,
+    env: &'a backend::AxEnv,
+    runtime: Option<&'a dyn backend::AxBackendRuntime>,
+    request_target: &'a str,
+    route_scope: &'a BTreeMap<String, AxValue>,
+    store: &'a AxPreviewStore,
+}
+
 fn preview_resolve_call(
-    handlers: &PreviewHandlers,
-    cache: &RefCell<BTreeMap<String, AxValue>>,
-    env: &backend::AxEnv,
-    runtime: Option<&dyn backend::AxBackendRuntime>,
-    request_target: &str,
-    route_scope: &BTreeMap<String, AxValue>,
-    store: &AxPreviewStore,
+    context: &PreviewResolveContext<'_>,
     path: &[String],
     args: &[AxValue],
 ) -> Result<Option<AxValue>, PreviewError> {
+    let PreviewResolveContext {
+        handlers,
+        cache,
+        env,
+        runtime,
+        request_target,
+        route_scope,
+        store,
+    } = context;
+    let runtime = *runtime;
     if path == ["load".to_string()] {
         let [AxValue::String(loader_name)] = args else {
             return Err(PreviewError::Runtime {
