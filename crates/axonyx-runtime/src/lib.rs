@@ -149,8 +149,11 @@ pub fn render_compiled_page_fragment(
             message: format!("failed to decode compiled page AST: {error}"),
         }
     })?;
-    let scope =
-        build_preview_route_scope(route_params, &parse_preview_query_fields(request_target));
+    let scope = build_preview_route_scope(
+        request_target,
+        route_params,
+        &parse_preview_query_fields(request_target),
+    );
     let resolver = |path: &[String], args: &[AxValue]| {
         let args = args.iter().map(preview_value_to_json).collect::<Vec<_>>();
         path.last()
@@ -204,6 +207,8 @@ pub fn ax_page_route_definition(
     ))
 }
 
+// Compatibility facade keeps route sources explicit; grouping them would break the public API.
+#[allow(clippy::too_many_arguments)]
 pub fn ax_page_route_definition_with_backend(
     method: impl Into<String>,
     path: impl Into<String>,
@@ -563,22 +568,22 @@ pub fn preview_ax_route_stream_response_with_backend_and_imports(
     let cache = RefCell::new(BTreeMap::new());
     let env = backend::AxEnv::from_env();
     let route_scope = build_preview_route_scope(
+        request_target,
         &BTreeMap::new(),
         &parse_preview_query_fields(request_target),
     );
+    let resolve_context = PreviewResolveContext {
+        handlers: &handlers,
+        cache: &cache,
+        env: &env,
+        runtime: None,
+        request_target,
+        route_scope: &route_scope,
+        store,
+    };
     let resolver_error = RefCell::new(None);
     let resolver = |path: &[String], args: &[AxValue]| -> Option<AxValue> {
-        match preview_resolve_call(
-            &handlers,
-            &cache,
-            &env,
-            None,
-            request_target,
-            &route_scope,
-            store,
-            path,
-            args,
-        ) {
+        match preview_resolve_call(&resolve_context, path, args) {
             Ok(value) => value,
             Err(error) => {
                 let mut slot = resolver_error.borrow_mut();
@@ -634,6 +639,8 @@ pub fn preview_ax_route_with_request_context(
     )
 }
 
+// Compatibility facade mirrors the generated route inputs without an opaque options bag.
+#[allow(clippy::too_many_arguments)]
 pub fn preview_ax_route_with_request_context_and_imports(
     layout_sources: &[&str],
     loader_sources: &[&str],
@@ -657,6 +664,8 @@ pub fn preview_ax_route_with_request_context_and_imports(
     )
 }
 
+// Compatibility facade mirrors the generated route inputs without an opaque options bag.
+#[allow(clippy::too_many_arguments)]
 pub fn preview_ax_route_with_request_context_and_runtime_and_imports(
     layout_sources: &[&str],
     loader_sources: &[&str],
@@ -681,6 +690,8 @@ pub fn preview_ax_route_with_request_context_and_runtime_and_imports(
     )
 }
 
+// Internal counterpart intentionally matches the public compatibility facade above.
+#[allow(clippy::too_many_arguments)]
 fn preview_ax_route_with_request_context_runtime_and_imports(
     layout_sources: &[&str],
     loader_sources: &[&str],
@@ -709,21 +720,23 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
         fallback_env = backend::AxEnv::from_env();
         &fallback_env
     };
-    let route_scope =
-        build_preview_route_scope(route_params, &parse_preview_query_fields(request_target));
+    let route_scope = build_preview_route_scope(
+        request_target,
+        route_params,
+        &parse_preview_query_fields(request_target),
+    );
+    let resolve_context = PreviewResolveContext {
+        handlers: &handlers,
+        cache: &cache,
+        env,
+        runtime,
+        request_target,
+        route_scope: &route_scope,
+        store,
+    };
     let resolver_error = RefCell::new(None);
     let resolver = |path: &[String], args: &[AxValue]| -> Option<AxValue> {
-        match preview_resolve_call(
-            &handlers,
-            &cache,
-            env,
-            runtime,
-            request_target,
-            &route_scope,
-            store,
-            path,
-            args,
-        ) {
+        match preview_resolve_call(&resolve_context, path, args) {
             Ok(value) => value,
             Err(error) => {
                 let mut slot = resolver_error.borrow_mut();
@@ -936,17 +949,31 @@ fn collect_preview_functions(
     }
 }
 
+struct PreviewResolveContext<'a> {
+    handlers: &'a PreviewHandlers,
+    cache: &'a RefCell<BTreeMap<String, AxValue>>,
+    env: &'a backend::AxEnv,
+    runtime: Option<&'a dyn backend::AxBackendRuntime>,
+    request_target: &'a str,
+    route_scope: &'a BTreeMap<String, AxValue>,
+    store: &'a AxPreviewStore,
+}
+
 fn preview_resolve_call(
-    handlers: &PreviewHandlers,
-    cache: &RefCell<BTreeMap<String, AxValue>>,
-    env: &backend::AxEnv,
-    runtime: Option<&dyn backend::AxBackendRuntime>,
-    request_target: &str,
-    route_scope: &BTreeMap<String, AxValue>,
-    store: &AxPreviewStore,
+    context: &PreviewResolveContext<'_>,
     path: &[String],
     args: &[AxValue],
 ) -> Result<Option<AxValue>, PreviewError> {
+    let PreviewResolveContext {
+        handlers,
+        cache,
+        env,
+        runtime,
+        request_target,
+        route_scope,
+        store,
+    } = context;
+    let runtime = *runtime;
     if path == ["load".to_string()] {
         let [AxValue::String(loader_name)] = args else {
             return Err(PreviewError::Runtime {
@@ -2770,20 +2797,40 @@ fn preview_json_to_value(value: serde_json::Value) -> AxValue {
 }
 
 fn build_preview_route_scope(
+    request_target: &str,
     route_params: &BTreeMap<String, String>,
     query: &BTreeMap<String, String>,
 ) -> BTreeMap<String, AxValue> {
+    let params = AxValue::Record(
+        route_params
+            .iter()
+            .map(|(key, value)| (key.clone(), AxValue::String(value.clone())))
+            .collect(),
+    );
+    let path = request_target
+        .split(['?', '#'])
+        .next()
+        .filter(|path| !path.is_empty())
+        .unwrap_or("/");
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let section = segments.next().unwrap_or_default();
+    let subsection = segments.next().unwrap_or_default();
+
     BTreeMap::from([
-        (
-            "params".to_string(),
-            AxValue::Record(
-                route_params
-                    .iter()
-                    .map(|(key, value)| (key.clone(), AxValue::String(value.clone())))
-                    .collect(),
-            ),
-        ),
+        ("params".to_string(), params.clone()),
         ("query".to_string(), build_preview_query_record(query)),
+        (
+            "route".to_string(),
+            AxValue::Record(BTreeMap::from([
+                ("path".to_string(), AxValue::String(path.to_string())),
+                ("section".to_string(), AxValue::String(section.to_string())),
+                (
+                    "subsection".to_string(),
+                    AxValue::String(subsection.to_string()),
+                ),
+                ("params".to_string(), params),
+            ])),
+        ),
     ])
 }
 
@@ -2899,6 +2946,7 @@ fn parse_preview_query_fields(request_target: &str) -> BTreeMap<String, String> 
     let Some((_, query)) = request_target.split_once('?') else {
         return fields;
     };
+    let query = query.split('#').next().unwrap_or_default();
 
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -3121,6 +3169,7 @@ fn render_preview_document_chunks(document: &AxDocument, root: &AxNode) -> Vec<V
         || body.contains("data-ax-state-if-signal=")
         || body.contains("data-ax-state-match-signal=")
         || body.contains("data-ax-expression-protocol=")
+        || body.contains("data-ax-each-signal=")
     {
         ax_state_bridge_script()
     } else {
@@ -3531,6 +3580,7 @@ fn ax_state_bridge_script() -> &'static str {
   const matches = new Map();
   const expressions = new Map();
   const expressionEntries = [];
+  const eachBindings = new Map();
   const domCapabilities = new WeakMap();
   const validDomCapabilities = new WeakSet();
   const domCapabilityList = [];
@@ -3579,6 +3629,9 @@ fn ax_state_bridge_script() -> &'static str {
     flushedStorageWrites: 0,
     expressionEvaluations: 0,
     rejectedExpressions: 0,
+    reconciledEachLists: 0,
+    rejectedEachLists: 0,
+    eachRefreshesRequired: 0,
   };
   const localOperationCode = Object.freeze({ set: 0, add: 1, sub: 2, toggle: 3 });
   const stringLikeTypes = new Set(["String", "DateTime", "Date", "Time", "Uuid"]);
@@ -3763,6 +3816,8 @@ fn ax_state_bridge_script() -> &'static str {
       if (typeof exports.ax_state_string_buffer_capacity !== "function") return false;
       if (typeof exports.ax_state_apply_value !== "function") return false;
       if (typeof exports.ax_state_evaluate_expression !== "function") return false;
+      if (typeof exports.ax_state_reconcile_keys !== "function") return false;
+      if (typeof exports.ax_state_render_each !== "function") return false;
       if (typeof exports.ax_state_value_buffer_ptr !== "function") return false;
       if (typeof exports.ax_state_value_buffer_capacity !== "function") return false;
       if (!(exports.memory instanceof WebAssembly.Memory)) return false;
@@ -4294,6 +4349,8 @@ fn ax_state_bridge_script() -> &'static str {
       moveSignalBucket(subscribers, alias, signal);
       moveSignalBucket(conditions, alias, signal);
       moveSignalBucket(matches, alias, signal);
+      moveSignalBucket(eachBindings, alias, signal);
+      (eachBindings.get(signal) || []).forEach((entry) => { entry.signal = signal; });
       if (state.has(alias) && !state.has(signal)) state.set(signal, state.get(alias));
       if (types.has(alias) && !types.has(signal)) types.set(signal, types.get(alias));
       document.querySelectorAll(`[data-ax-signal="${alias}"]`).forEach((node) => {
@@ -4626,6 +4683,339 @@ fn ax_state_bridge_script() -> &'static str {
     }
   };
 
+  const eachKeyIdentity = (value, expectedKind = "") => {
+    if (typeof value === "string" && (!expectedKind || expectedKind === "string")) {
+      return `string:${value}`;
+    }
+    if (typeof value === "boolean" && (!expectedKind || expectedKind === "bool")) {
+      return `bool:${value}`;
+    }
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const kind = expectedKind || (Number.isSafeInteger(value) ? "number" : "float");
+      if (kind === "number" && Number.isSafeInteger(value) || kind === "float") {
+        return `${kind}:${value}`;
+      }
+    }
+    return undefined;
+  };
+
+  const eachItemKey = (item, path, keyKind) => {
+    if (!path) return eachKeyIdentity(item, keyKind);
+    let value = item;
+    for (const part of path.split(".")) {
+      if (!value || typeof value !== "object" || !Object.hasOwn(value, part)) return undefined;
+      value = value[part];
+    }
+    return eachKeyIdentity(value, keyKind);
+  };
+
+  const eachKeys = (items, path, keyKind) => {
+    if (!Array.isArray(items)) return undefined;
+    const keys = items.map((item) => eachItemKey(item, path, keyKind));
+    if (keys.some((key) => !key) || new Set(keys).size !== keys.length) return undefined;
+    return keys;
+  };
+
+  const fallbackEachPlan = (oldKeys, nextKeys) => {
+    const oldSet = new Set(oldKeys);
+    const nextSet = new Set(nextKeys);
+    return {
+      removed: oldKeys.filter((key) => !nextSet.has(key)),
+      inserted: nextKeys.filter((key) => !oldSet.has(key)),
+      order: nextKeys.filter((key) => oldSet.has(key)),
+    };
+  };
+
+  const planEachReconciliation = (oldKeys, nextKeys) => {
+    if (!wasmExecutor || typeof wasmExecutor.ax_state_reconcile_keys !== "function") {
+      return fallbackEachPlan(oldKeys, nextKeys);
+    }
+    const bytes = encodeStateValue({ old: oldKeys, next: nextKeys }, "Unknown");
+    const capacity = wasmExecutor.ax_state_value_buffer_capacity();
+    const pointer = wasmExecutor.ax_state_value_buffer_ptr();
+    if (!bytes || bytes.length > capacity
+      || pointer + bytes.length > wasmExecutor.memory.buffer.byteLength) {
+      return fallbackEachPlan(oldKeys, nextKeys);
+    }
+    new Uint8Array(wasmExecutor.memory.buffer, pointer, bytes.length).set(bytes);
+    const resultLength = wasmExecutor.ax_state_reconcile_keys(bytes.length) >>> 0;
+    if (resultLength === 0xffffffff || resultLength > capacity) {
+      return fallbackEachPlan(oldKeys, nextKeys);
+    }
+    const plan = decodeStateValue(
+      new Uint8Array(wasmExecutor.memory.buffer, pointer, resultLength),
+    );
+    return plan && Array.isArray(plan.removed) && Array.isArray(plan.inserted)
+      && Array.isArray(plan.order)
+      ? plan
+      : fallbackEachPlan(oldKeys, nextKeys);
+  };
+
+  const rejectEach = (entry, reason, nextValue) => {
+    executorStats.rejectedEachLists += 1;
+    entry.node.setAttribute("data-ax-each-status", "rejected");
+    window.dispatchEvent(new CustomEvent("axonyx:each-rejected", {
+      detail: { protocol: "ax-each/1", signal: entry.signal, reason, value: nextValue },
+    }));
+    return false;
+  };
+
+  const requireEachRefresh = (entry, reason, nextValue, plan) => {
+    executorStats.eachRefreshesRequired += 1;
+    entry.node.setAttribute("data-ax-each-status", "refresh-required");
+    window.dispatchEvent(new CustomEvent("axonyx:each-refresh-required", {
+      detail: { protocol: "ax-each/1", signal: entry.signal, reason, value: nextValue, plan },
+    }));
+    return false;
+  };
+
+  const eachRenderValue = (item, path) => {
+    let value = item;
+    if (!path) return { ok: true, value };
+    for (const part of path.split(".")) {
+      if (!value || typeof value !== "object" || !Object.hasOwn(value, part)) {
+        return { ok: false };
+      }
+      value = value[part];
+    }
+    return { ok: true, value };
+  };
+
+  const eachRenderScalar = (value) => {
+    if (value === null || value === undefined) return { ok: true, value: "" };
+    if (["string", "number", "boolean"].includes(typeof value)) {
+      return { ok: true, value: String(value) };
+    }
+    return { ok: false };
+  };
+
+  const safeEachUrl = (target, value) => {
+    if (!["href", "src", "action", "formaction"].includes(target)) return true;
+    const normalized = value.trim().toLowerCase();
+    return normalized.startsWith("/") || normalized.startsWith("./")
+      || normalized.startsWith("../") || normalized.startsWith("#")
+      || normalized.startsWith("https://") || normalized.startsWith("http://")
+      || normalized.startsWith("mailto:") || normalized.startsWith("tel:");
+  };
+
+  const eachRenderNodes = (root) => {
+    const nodes = [];
+    if (root?.matches?.("[data-ax-each-render-target], [data-ax-each-render-attrs]")) {
+      nodes.push(root);
+    }
+    if (typeof root?.querySelectorAll === "function") {
+      nodes.push(...root.querySelectorAll(
+        "[data-ax-each-render-target], [data-ax-each-render-attrs]",
+      ));
+    }
+    return nodes;
+  };
+
+  const resolveEachRenderValues = (item, paths) => {
+    if (!wasmExecutor || typeof wasmExecutor.ax_state_render_each !== "function") {
+      const resolved = paths.map((path) => eachRenderValue(item, path));
+      return resolved.every((entry) => entry.ok)
+        ? resolved.map((entry) => entry.value)
+        : undefined;
+    }
+    const bytes = encodeStateValue({ item, paths }, "Unknown");
+    const capacity = wasmExecutor.ax_state_value_buffer_capacity();
+    const pointer = wasmExecutor.ax_state_value_buffer_ptr();
+    if (!bytes || bytes.length > capacity
+      || pointer + bytes.length > wasmExecutor.memory.buffer.byteLength) {
+      return undefined;
+    }
+    new Uint8Array(wasmExecutor.memory.buffer, pointer, bytes.length).set(bytes);
+    const resultLength = wasmExecutor.ax_state_render_each(bytes.length) >>> 0;
+    if (resultLength === 0xffffffff || resultLength > capacity) return undefined;
+    const values = decodeStateValue(
+      new Uint8Array(wasmExecutor.memory.buffer, pointer, resultLength),
+    );
+    return Array.isArray(values) && values.length === paths.length ? values : undefined;
+  };
+
+  const planEachRenderWrites = (root, item) => {
+    const capabilities = [];
+    for (const node of eachRenderNodes(root)) {
+      if (node.getAttribute("data-ax-each-render-target") === "text") {
+        capabilities.push({
+          node,
+          mode: "text",
+          path: node.getAttribute("data-ax-each-render-path") || "",
+        });
+      }
+
+      const rawAttrs = node.getAttribute("data-ax-each-render-attrs");
+      if (!rawAttrs) continue;
+      let bindings;
+      try {
+        bindings = JSON.parse(rawAttrs);
+      } catch {
+        return undefined;
+      }
+      if (!Array.isArray(bindings)) return undefined;
+      for (const binding of bindings) {
+        if (!binding || typeof binding.target !== "string"
+          || typeof binding.path !== "string"
+          || !["attribute", "boolean"].includes(binding.mode)
+          || binding.target.toLowerCase().startsWith("on")) {
+          return undefined;
+        }
+        capabilities.push({
+          node,
+          mode: binding.mode,
+          target: binding.target,
+          path: binding.path,
+        });
+      }
+    }
+    const values = resolveEachRenderValues(item, capabilities.map((entry) => entry.path));
+    if (!values) return undefined;
+
+    const writes = [];
+    for (let index = 0; index < capabilities.length; index += 1) {
+      const capability = capabilities[index];
+      const value = values[index];
+      if (capability.mode === "boolean") {
+        if (typeof value !== "boolean") return undefined;
+        writes.push({ ...capability, value });
+        continue;
+      }
+      const scalar = eachRenderScalar(value);
+      if (!scalar.ok
+        || capability.mode === "attribute"
+          && !safeEachUrl(capability.target, scalar.value)) {
+        return undefined;
+      }
+      writes.push({ ...capability, value: scalar.value });
+    }
+    return writes;
+  };
+
+  const commitEachRenderWrites = (writes) => {
+    writes.forEach((write) => {
+      if (write.mode === "text") {
+        write.node.textContent = write.value;
+      } else if (write.mode === "boolean") {
+        if (write.value) write.node.setAttribute(write.target, "");
+        else write.node.removeAttribute(write.target);
+      } else {
+        write.node.setAttribute(write.target, write.value);
+        if (write.target === "value" && "value" in write.node) write.node.value = write.value;
+      }
+    });
+  };
+
+  const createEachItem = (entry, key, item) => {
+    if (!entry.template?.content || typeof document.createElement !== "function") return undefined;
+    const fragment = entry.template.content.cloneNode(true);
+    const writes = planEachRenderWrites(fragment, item);
+    if (!writes) return undefined;
+    const node = document.createElement("ax-each-item");
+    node.setAttribute("style", "display: contents");
+    node.setAttribute("data-ax-each-key-id", key);
+    node.setAttribute("data-ax-each-key", key.slice(key.indexOf(":") + 1));
+    node.append(fragment);
+    commitEachRenderWrites(writes);
+    return node;
+  };
+
+  const reconcileEach = (entry, nextValue) => {
+    const oldKeys = eachKeys(entry.items, entry.keyPath, entry.keyKind);
+    const nextKeys = eachKeys(nextValue, entry.keyPath, entry.keyKind);
+    if (!oldKeys || !nextKeys) return rejectEach(entry, "invalid-or-duplicate-key", nextValue);
+    const plan = planEachReconciliation(oldKeys, nextKeys);
+    if (nextKeys.length === 0 && !entry.emptyNode) {
+      return requireEachRefresh(entry, "empty-render-program-required", nextValue, plan);
+    }
+
+    const oldItems = new Map(oldKeys.map((key, index) => [key, entry.items[index]]));
+    const nextItems = new Map(nextKeys.map((key, index) => [key, nextValue[index]]));
+    const changed = plan.order.some((key) => (
+      !stateValuesEqual(oldItems.get(key), nextItems.get(key), "Unknown")
+    ));
+    if (!entry.renderReady && (changed || plan.inserted.length > 0)) {
+      return requireEachRefresh(
+        entry,
+        plan.inserted.length > 0
+          ? "item-render-program-required"
+          : "item-update-program-required",
+        nextValue,
+        plan,
+      );
+    }
+    const nodes = new Map(entry.itemsNodes.map((node) => [node.getAttribute("data-ax-each-key-id"), node]));
+    const pendingWrites = [];
+    for (const key of plan.order) {
+      if (stateValuesEqual(oldItems.get(key), nextItems.get(key), "Unknown")) continue;
+      const writes = planEachRenderWrites(nodes.get(key), nextItems.get(key));
+      if (!writes) return requireEachRefresh(entry, "item-update-program-required", nextValue, plan);
+      pendingWrites.push(writes);
+    }
+    for (const key of plan.inserted) {
+      const node = createEachItem(entry, key, nextItems.get(key));
+      if (!node) return requireEachRefresh(entry, "item-render-program-required", nextValue, plan);
+      nodes.set(key, node);
+    }
+
+    plan.removed.forEach((key) => nodes.get(key)?.remove());
+    pendingWrites.forEach(commitEachRenderWrites);
+    let anchor = entry.emptyNode || entry.template || null;
+    [...nextKeys].reverse().forEach((key) => {
+      const node = nodes.get(key);
+      if (node) {
+        if (node.nextSibling !== anchor) entry.node.insertBefore(node, anchor);
+        anchor = node;
+      }
+    });
+    if (entry.emptyNode) entry.emptyNode.hidden = nextKeys.length !== 0;
+    entry.items = nextValue;
+    entry.itemsNodes = Array.from(entry.node.children)
+      .filter((node) => node.matches("ax-each-item[data-ax-each-key-id]"));
+    entry.node.setAttribute("data-ax-each-status", "reconciled");
+    executorStats.reconciledEachLists += 1;
+    window.dispatchEvent(new CustomEvent("axonyx:each-reconciled", {
+      detail: { protocol: "ax-each/1", signal: entry.signal, plan },
+    }));
+    return true;
+  };
+
+  const registerEach = (node) => {
+    if (node.getAttribute("data-ax-each-protocol") !== "ax-each/1") return;
+    const rawSignal = node.getAttribute("data-ax-each-signal");
+    if (!rawSignal) return;
+    const signal = canonicalSignal(rawSignal);
+    const type = node.getAttribute("data-ax-each-type") || "Unknown";
+    const items = castValue(node.getAttribute("data-ax-each-initial") || "[]", type);
+    const itemsNodes = Array.from(node.children)
+      .filter((child) => child.matches("ax-each-item[data-ax-each-key-id]"));
+    const entry = {
+      node,
+      signal,
+      type,
+      keyPath: node.getAttribute("data-ax-each-key-path") || "",
+      keyKind: node.getAttribute("data-ax-each-key-kind") || "",
+      renderReady: node.getAttribute("data-ax-each-render-status") === "ready",
+      items: Array.isArray(items) ? items : [],
+      itemsNodes,
+      emptyNode: Array.from(node.children).find((child) => child.matches("ax-each-empty")),
+      template: Array.from(node.children).find((child) => (
+        child.matches("template[data-ax-each-render-protocol='ax-each-render/1']")
+      )),
+    };
+    const domKeys = itemsNodes.map((child) => child.getAttribute("data-ax-each-key-id"));
+    const initialKeys = eachKeys(entry.items, entry.keyPath, entry.keyKind);
+    if (!initialKeys || domKeys.length !== initialKeys.length
+      || domKeys.some((key, index) => key !== initialKeys[index])) {
+      rejectEach(entry, "initial-dom-key-mismatch", entry.items);
+      return;
+    }
+    if (!types.has(signal)) types.set(signal, type);
+    if (!state.has(signal)) state.set(signal, entry.items);
+    if (!eachBindings.has(signal)) eachBindings.set(signal, []);
+    eachBindings.get(signal).push(entry);
+  };
+
   const writeSignal = (signal, value, source = "client", emit = true) => {
     signal = canonicalSignal(signal);
     const type = types.get(signal) || "String";
@@ -4638,6 +5028,7 @@ fn ax_state_bridge_script() -> &'static str {
       return state.get(signal);
     }
     state.set(signal, nextValue);
+    (eachBindings.get(signal) || []).forEach((entry) => reconcileEach(entry, nextValue));
     (bindings.get(signal) || []).forEach((capability) => {
       writeDomCapability(capability, nextValue);
     });
@@ -5040,6 +5431,7 @@ fn ax_state_bridge_script() -> &'static str {
     document.querySelectorAll("[data-ax-state-if-signal]").forEach(registerCondition);
     document.querySelectorAll("[data-ax-state-match-signal]").forEach(registerMatch);
     document.querySelectorAll("[data-ax-expression-protocol]").forEach(registerExpressions);
+    document.querySelectorAll("ax-state-each[data-ax-each-protocol]").forEach(registerEach);
   };
 
   document.addEventListener("input", (event) => {
@@ -5124,6 +5516,10 @@ fn ax_state_bridge_script() -> &'static str {
       expressionProtocol: "ax-expression/1",
       expressionEvaluations: executorStats.expressionEvaluations,
       rejectedExpressions: executorStats.rejectedExpressions,
+      eachProtocol: "ax-each/1",
+      reconciledEachLists: executorStats.reconciledEachLists,
+      rejectedEachLists: executorStats.rejectedEachLists,
+      eachRefreshesRequired: executorStats.eachRefreshesRequired,
     }),
     loadWasm: loadWasmExecutor,
   };
@@ -6246,8 +6642,17 @@ page Posts() {
         assert!(html.contains("<ax-state-each"));
         assert!(html.contains("data-ax-each-protocol=\"ax-each/1\""));
         assert!(html.contains("data-ax-each-signal=\"root:posts:1\""));
+        assert!(html.contains("data-ax-each-key-path=\"id\""));
+        assert!(html.contains("data-ax-each-key-kind=\"string\""));
         assert!(html.contains("data-ax-each-key=\"first\""));
+        assert!(html.contains("data-ax-each-key-id=\"string:first\""));
         assert!(html.contains("data-ax-each-key=\"second\""));
+        assert!(html.contains("data-ax-each-render-protocol=\"ax-each-render/1\""));
+        assert!(html.contains("data-ax-each-render-status=\"ready\""));
+        assert!(html.contains("data-ax-each-render-target=\"text\""));
+        assert!(html.contains("data-ax-each-render-path=\"title\""));
+        assert!(html.contains("ax_state_reconcile_keys"));
+        assert!(html.contains("axonyx:each-refresh-required"));
         assert!(html.contains("Hello"));
         assert!(html.contains("World"));
     }
@@ -8027,6 +8432,92 @@ page Post
         assert!(html.contains("draft-preview"));
         assert!(html.contains("Draft Preview"));
         assert!(!html.contains("Hello Axonyx"));
+    }
+
+    #[test]
+    fn previews_canonical_route_context_in_modern_asx() {
+        let store = AxPreviewStore::default();
+        let html = preview_ax_route_with_request_context(
+            &[],
+            &[],
+            &[],
+            r#"
+page RouteProbe() {
+  return ASX {
+    <>
+      <Copy>{route.path}</Copy>
+      <Copy>{route.section}</Copy>
+      <Copy>{route.subsection}</Copy>
+      <Copy>{route.params.slug}</Copy>
+      <Copy>{query.mode}</Copy>
+    </>
+  }
+}
+"#,
+            "/docs/getting-started?mode=preview#intro",
+            &BTreeMap::from([("slug".to_string(), "getting-started".to_string())]),
+            &store,
+        )
+        .expect("page should render with canonical route context");
+
+        assert!(html.contains("/docs/getting-started"));
+        assert!(html.contains(">docs</p>"));
+        assert!(html.contains(">getting-started</p>"));
+        assert!(html.contains(">preview</p>"));
+    }
+
+    #[test]
+    fn root_route_context_uses_stable_empty_segments() {
+        let scope = build_preview_route_scope("/?mode=home", &BTreeMap::new(), &BTreeMap::new());
+        let Some(AxValue::Record(route)) = scope.get("route") else {
+            panic!("route context should be a record");
+        };
+
+        assert_eq!(route.get("path"), Some(&AxValue::String("/".to_string())));
+        assert_eq!(route.get("section"), Some(&AxValue::String(String::new())));
+        assert_eq!(
+            route.get("subsection"),
+            Some(&AxValue::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn route_context_drives_props_on_imported_shell_components() {
+        let store = AxPreviewStore::default();
+        let import_resolver = |source: &str| {
+            (source == "@/ActiveLink.asx").then(|| {
+                r#"
+component ActiveLink(active = false) {
+  render ASX {
+    <a data-active={active}><Slot /></a>
+  }
+}
+"#
+                .to_string()
+            })
+        };
+        let html = preview_ax_route_with_request_context_and_imports(
+            &[],
+            &[],
+            &[],
+            r#"
+import { ActiveLink } from "@/ActiveLink.asx"
+
+page DocsShell() {
+  return ASX {
+    <ActiveLink active={route.section == "docs"}>{route.subsection}</ActiveLink>
+  }
+}
+"#,
+            "/docs/runtime",
+            &BTreeMap::new(),
+            &store,
+            &import_resolver,
+        )
+        .expect("route context should flow through imported component props");
+
+        assert!(html.contains("data-active=\"true\""));
+        assert!(html.contains(">runtime</a>"));
     }
 
     #[test]

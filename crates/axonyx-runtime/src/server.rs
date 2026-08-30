@@ -61,11 +61,11 @@ pub struct AxHttpRequest {
 pub struct AxAuth;
 
 impl AxAuth {
-    pub fn bearer<'a>(request: &'a AxHttpRequest) -> Option<&'a str> {
+    pub fn bearer(request: &AxHttpRequest) -> Option<&str> {
         request.bearer_token()
     }
 
-    pub fn session<'a>(request: &'a AxHttpRequest) -> Option<&'a str> {
+    pub fn session(request: &AxHttpRequest) -> Option<&str> {
         request.cookie_value("session")
     }
 
@@ -1331,6 +1331,10 @@ impl AxBody {
         }
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn is_streaming(&self) -> bool {
         matches!(self, Self::Chunks(_))
     }
@@ -1350,9 +1354,11 @@ impl AxBody {
     }
 }
 
+type AxChunkIter<'a> = std::iter::Map<std::slice::Iter<'a, Vec<u8>>, fn(&'a Vec<u8>) -> &'a [u8]>;
+
 pub enum AxBodyChunks<'a> {
     Fixed(std::iter::Once<&'a [u8]>),
-    Chunks(std::iter::Map<std::slice::Iter<'a, Vec<u8>>, fn(&'a Vec<u8>) -> &'a [u8]>),
+    Chunks(AxChunkIter<'a>),
 }
 
 impl<'a> Iterator for AxBodyChunks<'a> {

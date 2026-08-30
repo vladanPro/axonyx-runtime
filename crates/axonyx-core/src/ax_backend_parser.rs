@@ -632,7 +632,7 @@ impl Parser {
         let text = line.text.as_str();
 
         if let Some(value) = text.strip_prefix("return ") {
-            return self.parse_return_statements(&value.to_string(), line, indent);
+            return self.parse_return_statements(value, &line, indent);
         }
 
         Ok(vec![self.parse_statement(indent)?])
@@ -836,7 +836,7 @@ impl Parser {
     fn parse_return_statements(
         &mut self,
         value: &str,
-        line: BackendLine,
+        line: &BackendLine,
         indent: usize,
     ) -> Result<Vec<AxBackendStmt>, AxBackendParseError> {
         let value = value.trim();
@@ -1587,10 +1587,10 @@ fn split_top_level_query_segments(input: &str) -> Vec<&str> {
     result
 }
 
-fn parse_fluent_call<'a>(
-    input: &'a str,
+fn parse_fluent_call(
+    input: &str,
     line: usize,
-) -> Result<Option<(&'a str, &'a str)>, AxBackendParseError> {
+) -> Result<Option<(&str, &str)>, AxBackendParseError> {
     let Some(open_index) = find_call_open(input) else {
         return Ok(None);
     };
@@ -1609,10 +1609,10 @@ fn parse_fluent_call<'a>(
     )))
 }
 
-fn parse_object_fields<'a>(
-    input: &'a str,
+fn parse_object_fields(
+    input: &str,
     line: usize,
-) -> Result<Vec<(String, &'a str)>, AxBackendParseError> {
+) -> Result<Vec<(String, &str)>, AxBackendParseError> {
     let input = input.trim();
     let Some(inner) = input
         .strip_prefix('{')

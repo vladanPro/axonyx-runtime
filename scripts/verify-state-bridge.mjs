@@ -18,6 +18,139 @@ const storage = () => ({
   setItem: () => {},
 });
 
+class FakeElement {
+  constructor(tag, attrs = {}, children = []) {
+    this.tag = tag;
+    this.attrs = new Map(Object.entries(attrs));
+    this.children = children;
+    this.hidden = false;
+    this.textContent = "";
+    children.forEach((child) => { child.parent = this; });
+  }
+
+  getAttribute(name) { return this.attrs.get(name) ?? null; }
+  setAttribute(name, value) { this.attrs.set(name, String(value)); }
+  removeAttribute(name) { this.attrs.delete(name); }
+  matches(selector) {
+    if (selector === "ax-each-empty") return this.tag === "ax-each-empty";
+    if (selector === "ax-each-item[data-ax-each-key-id]") {
+      return this.tag === "ax-each-item" && this.attrs.has("data-ax-each-key-id");
+    }
+    if (selector === "template[data-ax-each-render-protocol='ax-each-render/1']") {
+      return this.tag === "template"
+        && this.attrs.get("data-ax-each-render-protocol") === "ax-each-render/1";
+    }
+    if (selector === "[data-ax-each-render-target], [data-ax-each-render-attrs]") {
+      return this.attrs.has("data-ax-each-render-target")
+        || this.attrs.has("data-ax-each-render-attrs");
+    }
+    return false;
+  }
+  querySelectorAll(selector) {
+    return this.children.flatMap((child) => [
+      ...(child.matches?.(selector) ? [child] : []),
+      ...(child.querySelectorAll?.(selector) || []),
+    ]);
+  }
+  cloneNode(deep = false) {
+    const clone = new FakeElement(
+      this.tag,
+      Object.fromEntries(this.attrs),
+      deep ? this.children.map((child) => child.cloneNode(true)) : [],
+    );
+    clone.textContent = this.textContent;
+    return clone;
+  }
+  append(child) {
+    const appended = child.tag === "#fragment" ? [...child.children] : [child];
+    appended.forEach((node) => {
+      this.children.push(node);
+      node.parent = this;
+    });
+    if (child.tag === "#fragment") child.children = [];
+  }
+  remove() {
+    if (!this.parent) return;
+    this.parent.children = this.parent.children.filter((child) => child !== this);
+    this.parent = undefined;
+  }
+  insertBefore(node, anchor) {
+    if (node.parent) node.parent.children = node.parent.children.filter((child) => child !== node);
+    const index = anchor ? this.children.indexOf(anchor) : this.children.length;
+    this.children.splice(index < 0 ? this.children.length : index, 0, node);
+    node.parent = this;
+  }
+}
+
+class FakeTemplate extends FakeElement {
+  constructor(children) {
+    super("template", { "data-ax-each-render-protocol": "ax-each-render/1" });
+    this.content = new FakeElement("#fragment", {}, children);
+  }
+}
+
+const renderTitle = (value) => {
+  const node = new FakeElement("ax-each-value", {
+    "data-ax-each-render-target": "text",
+    "data-ax-each-render-path": "title",
+  });
+  node.textContent = value;
+  return node;
+};
+
+const renderAttributes = (title, disabled) => {
+  const node = new FakeElement("button", {
+    title,
+    "data-ax-each-render-attrs": JSON.stringify([
+      { target: "title", path: "title", mode: "attribute" },
+      { target: "disabled", path: "disabled", mode: "boolean" },
+    ]),
+  });
+  if (disabled) node.setAttribute("disabled", "");
+  return node;
+};
+
+const firstEachItem = new FakeElement("ax-each-item", {
+  "data-ax-each-key-id": "string:first",
+}, [renderTitle("First"), renderAttributes("First", false)]);
+const secondEachItem = new FakeElement("ax-each-item", {
+  "data-ax-each-key-id": "string:second",
+}, [renderTitle("Second"), renderAttributes("Second", false)]);
+secondEachItem.children[0].focused = true;
+const eachTemplate = new FakeTemplate([
+  renderTitle("First"),
+  renderAttributes("First", false),
+]);
+const eachRoot = new FakeElement("ax-state-each", {
+  "data-ax-each-protocol": "ax-each/1",
+  "data-ax-each-signal": "page:probe:items:1",
+  "data-ax-each-type": "List<EachItem>",
+  "data-ax-each-initial": JSON.stringify([
+    { id: "first", title: "First", disabled: false },
+    { id: "second", title: "Second", disabled: false },
+  ]),
+  "data-ax-each-key-path": "id",
+  "data-ax-each-key-kind": "string",
+  "data-ax-each-render-status": "ready",
+}, [firstEachItem, secondEachItem, eachTemplate]);
+const fallbackText = new FakeElement("span");
+fallbackText.textContent = "Published";
+const fallbackItem = new FakeElement("ax-each-item", {
+  "data-ax-each-key-id": "string:fallback",
+}, [fallbackText]);
+const fallbackEachRoot = new FakeElement("ax-state-each", {
+  "data-ax-each-protocol": "ax-each/1",
+  "data-ax-each-signal": "page:probe:fallback:1",
+  "data-ax-each-type": "List<EachItem>",
+  "data-ax-each-initial": JSON.stringify([
+    { id: "fallback", title: "Published", disabled: false },
+  ]),
+  "data-ax-each-key-path": "id",
+  "data-ax-each-key-kind": "string",
+  "data-ax-each-render-status": "fallback",
+}, [fallbackItem]);
+const dispatchedEvents = [];
+
 globalThis.CustomEvent = class CustomEvent {
   constructor(type, options = {}) {
     this.type = type;
@@ -26,14 +159,22 @@ globalThis.CustomEvent = class CustomEvent {
 };
 globalThis.document = {
   readyState: "complete",
-  querySelectorAll: () => [],
+  querySelectorAll: (selector) => (
+    selector === "ax-state-each[data-ax-each-protocol]"
+      ? [eachRoot, fallbackEachRoot]
+      : []
+  ),
   addEventListener: () => {},
+  createElement: (tag) => new FakeElement(tag),
 };
 globalThis.window = {
   WebAssembly,
   localStorage: storage(),
   sessionStorage: storage(),
-  dispatchEvent: () => true,
+  dispatchEvent: (event) => {
+    dispatchedEvents.push(event);
+    return true;
+  },
 };
 globalThis.fetch = async () => ({
   ok: true,
@@ -62,6 +203,14 @@ state.hydrateManifest({
       ],
     },
     { name: "Theme", literals: ["silver", "bronze", "gold"] },
+    {
+      name: "EachItem",
+      fields: [
+        { name: "id", ty: "String", optional: false },
+        { name: "title", ty: "String", optional: false },
+        { name: "disabled", ty: "Bool", optional: false },
+      ],
+    },
   ],
   files: [{
     file: "app/posts/page.asx",
@@ -131,4 +280,85 @@ assert(state.diagnostics().wasmOperations === 2, "typed state did not execute th
 assert(state.get("page:posts:items:1")[0].title === "First", "record list changed in transport");
 assert(state.get("page:posts:ratio:2") === 0.75, "Float arithmetic changed in WASM transport");
 
-console.log("Axonyx typed state bridge passed (records and Float via WASM ABI 3).");
+state.set("page:probe:items:1", [
+  { id: "second", title: "Second", disabled: false },
+  { id: "first", title: "First", disabled: false },
+]);
+assert(
+  eachRoot.children[0] === secondEachItem && eachRoot.children[1] === firstEachItem,
+  "keyed Each did not reorder existing DOM ownership boundaries",
+);
+assert(
+  eachRoot.getAttribute("data-ax-each-status") === "reconciled",
+  "keyed Each did not report a reconciled state",
+);
+
+state.set("page:probe:items:1", [
+  { id: "second", title: "Second updated", disabled: true },
+  { id: "first", title: "<strong>Still text</strong>", disabled: false },
+]);
+assert(eachRoot.children[0] === secondEachItem, "same-key update replaced its DOM owner");
+assert(secondEachItem.children[0].focused, "same-key update lost component-local focus state");
+assert(
+  secondEachItem.children[0].textContent === "Second updated",
+  "same-key update did not write the changed item text",
+);
+assert(
+  firstEachItem.children[0].textContent === "<strong>Still text</strong>",
+  "item text was interpreted as markup instead of literal text",
+);
+assert(
+  secondEachItem.children[1].getAttribute("title") === "Second updated"
+    && secondEachItem.children[1].getAttribute("disabled") === "",
+  "same-key update did not apply safe attribute and boolean writes",
+);
+
+state.set("page:probe:items:1", [
+  { id: "second", title: "Second updated", disabled: true },
+  { id: "first", title: "<strong>Still text</strong>", disabled: false },
+  { id: "third", title: "Third", disabled: false },
+]);
+assert(eachRoot.children.length === 4, "keyed insert did not preserve items plus template");
+assert(
+  eachRoot.children[2].getAttribute("data-ax-each-key-id") === "string:third",
+  "keyed insert did not create the new item in collection order",
+);
+assert(
+  eachRoot.children[2].children[0].textContent === "Third",
+  "keyed insert did not apply the compiler render program",
+);
+
+eachTemplate.content.children[0].setAttribute("data-ax-each-render-path", "missing");
+state.set("page:probe:items:1", [
+  { id: "second", title: "Second updated", disabled: true },
+  { id: "first", title: "<strong>Still text</strong>", disabled: false },
+  { id: "third", title: "Third", disabled: false },
+  { id: "fourth", title: "Fourth", disabled: false },
+]);
+assert(eachRoot.children.length === 4, "invalid render program partially inserted an item");
+assert(
+  eachRoot.getAttribute("data-ax-each-status") === "refresh-required",
+  "invalid render program did not request deterministic refresh fallback",
+);
+assert(
+  dispatchedEvents.some((event) => (
+    event.type === "axonyx:each-refresh-required"
+      && event.detail.reason === "item-render-program-required"
+  )),
+  "invalid render program did not emit its fallback reason",
+);
+
+state.set("page:probe:fallback:1", [
+  { id: "fallback", title: "Draft", disabled: false },
+]);
+assert(
+  fallbackEachRoot.children[0] === fallbackItem
+    && fallbackText.textContent === "Published",
+  "unsupported same-key item update partially changed its DOM",
+);
+assert(
+  fallbackEachRoot.getAttribute("data-ax-each-status") === "refresh-required",
+  "unsupported same-key item update did not require refresh",
+);
+
+console.log("Axonyx typed state bridge + keyed Each reconciliation passed.");
