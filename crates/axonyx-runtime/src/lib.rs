@@ -149,8 +149,11 @@ pub fn render_compiled_page_fragment(
             message: format!("failed to decode compiled page AST: {error}"),
         }
     })?;
-    let scope =
-        build_preview_route_scope(route_params, &parse_preview_query_fields(request_target));
+    let scope = build_preview_route_scope(
+        request_target,
+        route_params,
+        &parse_preview_query_fields(request_target),
+    );
     let resolver = |path: &[String], args: &[AxValue]| {
         let args = args.iter().map(preview_value_to_json).collect::<Vec<_>>();
         path.last()
@@ -565,6 +568,7 @@ pub fn preview_ax_route_stream_response_with_backend_and_imports(
     let cache = RefCell::new(BTreeMap::new());
     let env = backend::AxEnv::from_env();
     let route_scope = build_preview_route_scope(
+        request_target,
         &BTreeMap::new(),
         &parse_preview_query_fields(request_target),
     );
@@ -716,8 +720,11 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
         fallback_env = backend::AxEnv::from_env();
         &fallback_env
     };
-    let route_scope =
-        build_preview_route_scope(route_params, &parse_preview_query_fields(request_target));
+    let route_scope = build_preview_route_scope(
+        request_target,
+        route_params,
+        &parse_preview_query_fields(request_target),
+    );
     let resolve_context = PreviewResolveContext {
         handlers: &handlers,
         cache: &cache,
@@ -2790,20 +2797,40 @@ fn preview_json_to_value(value: serde_json::Value) -> AxValue {
 }
 
 fn build_preview_route_scope(
+    request_target: &str,
     route_params: &BTreeMap<String, String>,
     query: &BTreeMap<String, String>,
 ) -> BTreeMap<String, AxValue> {
+    let params = AxValue::Record(
+        route_params
+            .iter()
+            .map(|(key, value)| (key.clone(), AxValue::String(value.clone())))
+            .collect(),
+    );
+    let path = request_target
+        .split(['?', '#'])
+        .next()
+        .filter(|path| !path.is_empty())
+        .unwrap_or("/");
+    let mut segments = path.split('/').filter(|segment| !segment.is_empty());
+    let section = segments.next().unwrap_or_default();
+    let subsection = segments.next().unwrap_or_default();
+
     BTreeMap::from([
-        (
-            "params".to_string(),
-            AxValue::Record(
-                route_params
-                    .iter()
-                    .map(|(key, value)| (key.clone(), AxValue::String(value.clone())))
-                    .collect(),
-            ),
-        ),
+        ("params".to_string(), params.clone()),
         ("query".to_string(), build_preview_query_record(query)),
+        (
+            "route".to_string(),
+            AxValue::Record(BTreeMap::from([
+                ("path".to_string(), AxValue::String(path.to_string())),
+                ("section".to_string(), AxValue::String(section.to_string())),
+                (
+                    "subsection".to_string(),
+                    AxValue::String(subsection.to_string()),
+                ),
+                ("params".to_string(), params),
+            ])),
+        ),
     ])
 }
 
@@ -2919,6 +2946,7 @@ fn parse_preview_query_fields(request_target: &str) -> BTreeMap<String, String> 
     let Some((_, query)) = request_target.split_once('?') else {
         return fields;
     };
+    let query = query.split('#').next().unwrap_or_default();
 
     for pair in query.split('&') {
         if pair.is_empty() {
@@ -8404,6 +8432,92 @@ page Post
         assert!(html.contains("draft-preview"));
         assert!(html.contains("Draft Preview"));
         assert!(!html.contains("Hello Axonyx"));
+    }
+
+    #[test]
+    fn previews_canonical_route_context_in_modern_asx() {
+        let store = AxPreviewStore::default();
+        let html = preview_ax_route_with_request_context(
+            &[],
+            &[],
+            &[],
+            r#"
+page RouteProbe() {
+  return ASX {
+    <>
+      <Copy>{route.path}</Copy>
+      <Copy>{route.section}</Copy>
+      <Copy>{route.subsection}</Copy>
+      <Copy>{route.params.slug}</Copy>
+      <Copy>{query.mode}</Copy>
+    </>
+  }
+}
+"#,
+            "/docs/getting-started?mode=preview#intro",
+            &BTreeMap::from([("slug".to_string(), "getting-started".to_string())]),
+            &store,
+        )
+        .expect("page should render with canonical route context");
+
+        assert!(html.contains("/docs/getting-started"));
+        assert!(html.contains(">docs</p>"));
+        assert!(html.contains(">getting-started</p>"));
+        assert!(html.contains(">preview</p>"));
+    }
+
+    #[test]
+    fn root_route_context_uses_stable_empty_segments() {
+        let scope = build_preview_route_scope("/?mode=home", &BTreeMap::new(), &BTreeMap::new());
+        let Some(AxValue::Record(route)) = scope.get("route") else {
+            panic!("route context should be a record");
+        };
+
+        assert_eq!(route.get("path"), Some(&AxValue::String("/".to_string())));
+        assert_eq!(route.get("section"), Some(&AxValue::String(String::new())));
+        assert_eq!(
+            route.get("subsection"),
+            Some(&AxValue::String(String::new()))
+        );
+    }
+
+    #[test]
+    fn route_context_drives_props_on_imported_shell_components() {
+        let store = AxPreviewStore::default();
+        let import_resolver = |source: &str| {
+            (source == "@/ActiveLink.asx").then(|| {
+                r#"
+component ActiveLink(active = false) {
+  render ASX {
+    <a data-active={active}><Slot /></a>
+  }
+}
+"#
+                .to_string()
+            })
+        };
+        let html = preview_ax_route_with_request_context_and_imports(
+            &[],
+            &[],
+            &[],
+            r#"
+import { ActiveLink } from "@/ActiveLink.asx"
+
+page DocsShell() {
+  return ASX {
+    <ActiveLink active={route.section == "docs"}>{route.subsection}</ActiveLink>
+  }
+}
+"#,
+            "/docs/runtime",
+            &BTreeMap::new(),
+            &store,
+            &import_resolver,
+        )
+        .expect("route context should flow through imported component props");
+
+        assert!(html.contains("data-active=\"true\""));
+        assert!(html.contains(">runtime</a>"));
     }
 
     #[test]
