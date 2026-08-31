@@ -4,6 +4,18 @@ All notable changes to the Axonyx runtime workspace will be documented in this f
 
 The format is intentionally simple while the project is still early-stage.
 
+## Unreleased
+
+### Added
+
+- production Postgres TLS through Rustls
+- verified TLS by default with optional `sslrootcert` provider CA support
+- explicit `sslmode=require` compatibility for encrypted pooler connections
+
+### Changed
+
+- reject Postgres `sslmode=prefer` and `sslmode=allow` because they can fall back to plaintext
+
 ## 0.1.12 - 2026-05-30
 
 ### Added

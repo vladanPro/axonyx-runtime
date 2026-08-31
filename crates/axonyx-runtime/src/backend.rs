@@ -15,10 +15,13 @@ use bytes::BytesMut;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 use postgres::Client;
-use postgres_native_tls::MakeTlsConnector;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
+use std::io::BufReader;
+use std::path::PathBuf;
+use std::sync::Arc;
 use thiserror::Error;
+use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -1772,6 +1775,58 @@ fn postgres_execute_mutation(
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AxPostgresTlsMode {
+    Disable,
+    Require,
+    VerifyFull,
+}
+
+#[derive(Debug)]
+struct AxPostgresRequireVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for AxPostgresRequireVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        vec![
+            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
+            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
+            rustls::SignatureScheme::RSA_PSS_SHA512,
+            rustls::SignatureScheme::RSA_PSS_SHA384,
+            rustls::SignatureScheme::RSA_PSS_SHA256,
+            rustls::SignatureScheme::ED25519,
+        ]
+    }
+}
+
 fn postgres_open_connection(url: &Option<String>, resource: &str) -> AxRuntimeResult<Client> {
     let Some(url) = url else {
         return Err(AxRuntimeError::database(
@@ -1782,19 +1837,179 @@ fn postgres_open_connection(url: &Option<String>, resource: &str) -> AxRuntimeRe
         ));
     };
 
-    let connector = native_tls::TlsConnector::builder()
-        .build()
-        .map(MakeTlsConnector::new)
+    let (connection_url, tls_mode, root_cert) = postgres_tls_settings(url, resource)?;
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = rustls::ClientConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
         .map_err(|error| {
             AxRuntimeError::database(
                 AxDbError::new(AxDbErrorCode::ConnectionFailed)
                     .with_driver(AxDatabaseDriver::Postgres)
                     .with_resource(resource)
-                    .with_detail(format!("failed to initialize postgres TLS: {error}")),
+                    .with_detail(format!("failed to initialize postgres rustls: {error}")),
             )
         })?;
+    let config = match tls_mode {
+        AxPostgresTlsMode::Require => builder
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AxPostgresRequireVerifier))
+            .with_no_client_auth(),
+        AxPostgresTlsMode::Disable | AxPostgresTlsMode::VerifyFull => builder
+            .with_root_certificates(postgres_root_store(root_cert.as_ref(), resource)?)
+            .with_no_client_auth(),
+    };
+    let connector = MakeRustlsConnect::new(config);
 
-    Client::connect(url, connector).map_err(|error| postgres_runtime_error(resource, error))
+    Client::connect(&connection_url, connector)
+        .map_err(|error| postgres_runtime_error(resource, error))
+}
+
+fn postgres_tls_settings(
+    connection_url: &str,
+    resource: &str,
+) -> AxRuntimeResult<(String, AxPostgresTlsMode, Option<PathBuf>)> {
+    let (base, query) = connection_url
+        .split_once('?')
+        .map_or((connection_url, ""), |(base, query)| (base, query));
+    if !base.starts_with("postgres://") && !base.starts_with("postgresql://") {
+        return Err(postgres_connection_config_error(
+            resource,
+            "postgres connection must use a postgres:// or postgresql:// URL",
+        ));
+    }
+    let mut mode = AxPostgresTlsMode::VerifyFull;
+    let mut root_cert = None;
+    let mut retained = Vec::new();
+
+    for part in query.split('&').filter(|part| !part.is_empty()) {
+        let (key, value) = part.split_once('=').unwrap_or((part, ""));
+        match key {
+            "sslmode" => {
+                mode = match value {
+                    "disable" => AxPostgresTlsMode::Disable,
+                    "require" => AxPostgresTlsMode::Require,
+                    "verify-full" => AxPostgresTlsMode::VerifyFull,
+                    "prefer" | "allow" => {
+                        return Err(postgres_connection_config_error(
+                            resource,
+                            "sslmode=prefer/allow can fall back to plaintext; use disable, require, or verify-full",
+                        ));
+                    }
+                    value => {
+                        return Err(postgres_connection_config_error(
+                            resource,
+                            format!("unsupported postgres sslmode `{value}`"),
+                        ));
+                    }
+                };
+            }
+            "sslrootcert" => {
+                root_cert = Some(PathBuf::from(postgres_percent_decode(value, resource)?))
+            }
+            _ => retained.push(part.to_string()),
+        }
+    }
+
+    if root_cert.is_some() && mode != AxPostgresTlsMode::VerifyFull {
+        return Err(postgres_connection_config_error(
+            resource,
+            "sslrootcert requires sslmode=verify-full",
+        ));
+    }
+
+    if mode != AxPostgresTlsMode::Disable {
+        retained.push("sslmode=require".to_string());
+    } else {
+        retained.push("sslmode=disable".to_string());
+    }
+
+    Ok((format!("{base}?{}", retained.join("&")), mode, root_cert))
+}
+
+fn postgres_percent_decode(value: &str, resource: &str) -> AxRuntimeResult<String> {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' {
+            if index + 2 >= bytes.len() {
+                return Err(postgres_connection_config_error(
+                    resource,
+                    "invalid percent encoding in postgres sslrootcert",
+                ));
+            }
+            let hex = std::str::from_utf8(&bytes[index + 1..index + 3]).map_err(|_| {
+                postgres_connection_config_error(
+                    resource,
+                    "invalid percent encoding in postgres sslrootcert",
+                )
+            })?;
+            decoded.push(u8::from_str_radix(hex, 16).map_err(|_| {
+                postgres_connection_config_error(
+                    resource,
+                    "invalid percent encoding in postgres sslrootcert",
+                )
+            })?);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    String::from_utf8(decoded).map_err(|_| {
+        postgres_connection_config_error(resource, "postgres sslrootcert is not valid UTF-8")
+    })
+}
+
+fn postgres_root_store(
+    root_cert: Option<&PathBuf>,
+    resource: &str,
+) -> AxRuntimeResult<rustls::RootCertStore> {
+    let mut roots =
+        rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let Some(path) = root_cert else {
+        return Ok(roots);
+    };
+
+    let file = std::fs::File::open(path).map_err(|error| {
+        postgres_connection_config_error(
+            resource,
+            format!("failed to open postgres sslrootcert: {error}"),
+        )
+    })?;
+    let mut reader = BufReader::new(file);
+    let certificates = rustls_pemfile::certs(&mut reader)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            postgres_connection_config_error(
+                resource,
+                format!("failed to parse postgres sslrootcert: {error}"),
+            )
+        })?;
+    if certificates.is_empty() {
+        return Err(postgres_connection_config_error(
+            resource,
+            "postgres sslrootcert contains no PEM certificates",
+        ));
+    }
+    for certificate in certificates {
+        roots.add(certificate).map_err(|error| {
+            postgres_connection_config_error(
+                resource,
+                format!("invalid certificate in postgres sslrootcert: {error}"),
+            )
+        })?;
+    }
+    Ok(roots)
+}
+
+fn postgres_connection_config_error(resource: &str, detail: impl Into<String>) -> AxRuntimeError {
+    AxRuntimeError::database(
+        AxDbError::new(AxDbErrorCode::ConnectionFailed)
+            .with_driver(AxDatabaseDriver::Postgres)
+            .with_resource(resource)
+            .with_detail(detail),
+    )
 }
 
 fn postgres_json_query(sql: &str) -> String {
@@ -2818,6 +3033,63 @@ mod tests {
         assert_eq!(error.code, "db.connection_failed");
         assert_eq!(error.resource.as_deref(), Some("posts"));
         assert!(!error.public_payload().to_string().contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn postgres_tls_defaults_to_verified_encryption() {
+        let (url, mode, root_cert) =
+            postgres_tls_settings("postgresql://user:secret@db.example.com:5432/app", "posts")
+                .expect("postgres URL should parse");
+
+        assert_eq!(mode, AxPostgresTlsMode::VerifyFull);
+        assert_eq!(root_cert, None);
+        assert!(url.contains("sslmode=require"));
+    }
+
+    #[test]
+    fn postgres_tls_supports_explicit_require_mode() {
+        let (url, mode, root_cert) = postgres_tls_settings(
+            "postgresql://user:secret@db.example.com:5432/app?application_name=axonyx&sslmode=require",
+            "posts",
+        )
+        .expect("postgres URL should parse");
+
+        assert_eq!(mode, AxPostgresTlsMode::Require);
+        assert_eq!(root_cert, None);
+        assert!(url.contains("application_name=axonyx"));
+        assert_eq!(url.matches("sslmode=require").count(), 1);
+    }
+
+    #[test]
+    fn postgres_tls_extracts_verify_full_root_certificate() {
+        let (url, mode, root_cert) = postgres_tls_settings(
+            "postgresql://user:secret@db.example.com:5432/app?sslmode=verify-full&sslrootcert=C%3A%5Ccerts%5Cprod-ca.crt",
+            "posts",
+        )
+        .expect("postgres URL should parse");
+
+        assert_eq!(mode, AxPostgresTlsMode::VerifyFull);
+        assert_eq!(root_cert, Some(PathBuf::from(r"C:\certs\prod-ca.crt")));
+        assert!(url.contains("sslmode=require"));
+        assert!(!url.contains("sslrootcert"));
+    }
+
+    #[test]
+    fn postgres_tls_rejects_plaintext_fallback_modes() {
+        let error = postgres_tls_settings(
+            "postgresql://user:secret@db.example.com:5432/app?sslmode=prefer",
+            "posts",
+        )
+        .expect_err("plaintext fallback must be rejected");
+
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.connection_failed");
+        assert!(error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("fall back to plaintext")));
     }
 
     #[test]

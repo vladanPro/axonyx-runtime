@@ -74,6 +74,11 @@ AX_SECRET_DB_DIALECT=postgres
 AX_SECRET_DB_TRANSPORT=direct
 ```
 
+Postgres connections are encrypted and certificate-verified by default. For a provider with a
+private CA, use `sslmode=verify-full&sslrootcert=/path/to/provider-ca.crt`. The explicit
+`sslmode=require` compatibility mode still encrypts traffic, but does not verify the server
+certificate or hostname. `prefer` and `allow` are rejected because they can fall back to plaintext.
+
 ## Data Transport Direction
 
 The runtime keeps data access contracts transport-aware:
