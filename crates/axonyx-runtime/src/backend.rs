@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::error::Error as StdError;
 use std::fs;
 use std::path::Path;
 
@@ -10,9 +11,15 @@ use axonyx_core::ax_sql_prelude::{
     compile_delete_plan_to_sql, compile_insert_plan_to_sql, compile_query_plan_to_sql,
     compile_update_plan_to_sql, AxSqlDialect, AxSqlParam,
 };
+use bytes::BytesMut;
+use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
+use postgres::types::{to_sql_checked, IsNull, ToSql, Type};
+use postgres::Client;
+use postgres_native_tls::MakeTlsConnector;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
+use uuid::Uuid;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AxRuntimeError {
@@ -228,11 +235,18 @@ fn classify_driver_error(driver: AxDatabaseDriver, detail: &str) -> AxDbErrorCod
                 || normalized.contains("check violation")
             {
                 AxDbErrorCode::ConstraintViolation
+            } else if normalized.contains("error serializing parameter")
+                || normalized.contains("cannot be encoded as postgres type")
+            {
+                AxDbErrorCode::InvalidQuery
             } else if normalized.contains("timeout") {
                 AxDbErrorCode::Timeout
             } else if normalized.contains("connection refused")
                 || normalized.contains("could not connect")
                 || normalized.contains("connection error")
+                || normalized.contains("error connecting to server")
+                || normalized.contains("tls handshake")
+                || normalized.contains("certificate")
             {
                 AxDbErrorCode::ConnectionFailed
             } else {
@@ -1255,9 +1269,26 @@ fn direct_load_plan(
         url: url.clone(),
     };
 
-    if driver == AxDatabaseDriver::Sqlite {
-        return sqlite_execute_query(url, &request.collection, &execution.sql, &execution.params)
+    match driver {
+        AxDatabaseDriver::Sqlite => {
+            return sqlite_execute_query(
+                url,
+                &request.collection,
+                &execution.sql,
+                &execution.params,
+            )
             .map(|value| apply_query_mode(request.mode, value));
+        }
+        AxDatabaseDriver::Postgres => {
+            return postgres_execute_query(
+                url,
+                &request.collection,
+                &execution.sql,
+                &execution.params,
+            )
+            .map(|value| apply_query_mode(request.mode, value));
+        }
+        AxDatabaseDriver::MySql | AxDatabaseDriver::Memory => {}
     }
 
     Ok(apply_query_mode(
@@ -1294,8 +1325,14 @@ fn direct_raw_query_plan(
         url: url.clone(),
     };
 
-    if driver == AxDatabaseDriver::Sqlite {
-        return sqlite_execute_query(url, "raw_sql", &execution.sql, &execution.params);
+    match driver {
+        AxDatabaseDriver::Sqlite => {
+            return sqlite_execute_query(url, "raw_sql", &execution.sql, &execution.params);
+        }
+        AxDatabaseDriver::Postgres => {
+            return postgres_execute_query(url, "raw_sql", &execution.sql, &execution.params);
+        }
+        AxDatabaseDriver::MySql | AxDatabaseDriver::Memory => {}
     }
 
     Ok(json!({
@@ -1349,14 +1386,26 @@ fn direct_insert_plan(
         url: url.clone(),
     };
 
-    if driver == AxDatabaseDriver::Sqlite {
-        return sqlite_execute_mutation(
-            url,
-            "insert",
-            &request.collection,
-            &execution.sql,
-            &execution.params,
-        );
+    match driver {
+        AxDatabaseDriver::Sqlite => {
+            return sqlite_execute_mutation(
+                url,
+                "insert",
+                &request.collection,
+                &execution.sql,
+                &execution.params,
+            );
+        }
+        AxDatabaseDriver::Postgres => {
+            return postgres_execute_mutation(
+                url,
+                "insert",
+                &request.collection,
+                &execution.sql,
+                &execution.params,
+            );
+        }
+        AxDatabaseDriver::MySql | AxDatabaseDriver::Memory => {}
     }
 
     Ok(json!({
@@ -1401,14 +1450,26 @@ fn direct_update_plan(
         url: url.clone(),
     };
 
-    if driver == AxDatabaseDriver::Sqlite {
-        return sqlite_execute_mutation(
-            url,
-            "update",
-            &request.collection,
-            &execution.sql,
-            &execution.params,
-        );
+    match driver {
+        AxDatabaseDriver::Sqlite => {
+            return sqlite_execute_mutation(
+                url,
+                "update",
+                &request.collection,
+                &execution.sql,
+                &execution.params,
+            );
+        }
+        AxDatabaseDriver::Postgres => {
+            return postgres_execute_mutation(
+                url,
+                "update",
+                &request.collection,
+                &execution.sql,
+                &execution.params,
+            );
+        }
+        AxDatabaseDriver::MySql | AxDatabaseDriver::Memory => {}
     }
 
     Ok(json!({
@@ -1450,14 +1511,26 @@ fn direct_delete_plan(
         url: url.clone(),
     };
 
-    if driver == AxDatabaseDriver::Sqlite {
-        return sqlite_execute_mutation(
-            url,
-            "delete",
-            &request.collection,
-            &execution.sql,
-            &execution.params,
-        );
+    match driver {
+        AxDatabaseDriver::Sqlite => {
+            return sqlite_execute_mutation(
+                url,
+                "delete",
+                &request.collection,
+                &execution.sql,
+                &execution.params,
+            );
+        }
+        AxDatabaseDriver::Postgres => {
+            return postgres_execute_mutation(
+                url,
+                "delete",
+                &request.collection,
+                &execution.sql,
+                &execution.params,
+            );
+        }
+        AxDatabaseDriver::MySql | AxDatabaseDriver::Memory => {}
     }
 
     Ok(json!({
@@ -1637,6 +1710,241 @@ fn sqlite_runtime_error(resource: &str, error: rusqlite::Error) -> AxRuntimeErro
         resource,
         error.to_string(),
     ))
+}
+
+fn postgres_execute_query(
+    url: &Option<String>,
+    resource: &str,
+    sql: &str,
+    params: &[Value],
+) -> AxRuntimeResult<Value> {
+    let mut client = postgres_open_connection(url, resource)?;
+    let wrapped_sql = postgres_json_query(sql);
+    let params = params
+        .iter()
+        .cloned()
+        .map(AxPostgresParam)
+        .collect::<Vec<_>>();
+    let param_refs = params
+        .iter()
+        .map(|value| value as &(dyn ToSql + Sync))
+        .collect::<Vec<_>>();
+    let rows = client
+        .query(&wrapped_sql, &param_refs)
+        .map_err(|error| postgres_runtime_error(resource, error))?;
+
+    rows.into_iter()
+        .map(|row| {
+            row.try_get::<_, Value>(0)
+                .map_err(|error| postgres_runtime_error(resource, error))
+        })
+        .collect::<AxRuntimeResult<Vec<_>>>()
+        .map(Value::Array)
+}
+
+fn postgres_execute_mutation(
+    url: &Option<String>,
+    action: &str,
+    resource: &str,
+    sql: &str,
+    params: &[Value],
+) -> AxRuntimeResult<Value> {
+    let mut client = postgres_open_connection(url, resource)?;
+    let params = params
+        .iter()
+        .cloned()
+        .map(AxPostgresParam)
+        .collect::<Vec<_>>();
+    let param_refs = params
+        .iter()
+        .map(|value| value as &(dyn ToSql + Sync))
+        .collect::<Vec<_>>();
+    let changes = client
+        .execute(sql, &param_refs)
+        .map_err(|error| postgres_runtime_error(resource, error))?;
+
+    Ok(json!({
+        "ok": true,
+        "driver": "postgres",
+        "action": action,
+        "resource": resource,
+        "changes": changes,
+    }))
+}
+
+fn postgres_open_connection(url: &Option<String>, resource: &str) -> AxRuntimeResult<Client> {
+    let Some(url) = url else {
+        return Err(AxRuntimeError::database(
+            AxDbError::new(AxDbErrorCode::ConnectionFailed)
+                .with_driver(AxDatabaseDriver::Postgres)
+                .with_resource(resource)
+                .with_detail("missing postgres database url"),
+        ));
+    };
+
+    let connector = native_tls::TlsConnector::builder()
+        .build()
+        .map(MakeTlsConnector::new)
+        .map_err(|error| {
+            AxRuntimeError::database(
+                AxDbError::new(AxDbErrorCode::ConnectionFailed)
+                    .with_driver(AxDatabaseDriver::Postgres)
+                    .with_resource(resource)
+                    .with_detail(format!("failed to initialize postgres TLS: {error}")),
+            )
+        })?;
+
+    Client::connect(url, connector).map_err(|error| postgres_runtime_error(resource, error))
+}
+
+fn postgres_json_query(sql: &str) -> String {
+    let sql = sql.trim().trim_end_matches(';').trim();
+    format!("select row_to_json(\"__ax_row\") from ({sql}) as \"__ax_row\"")
+}
+
+fn postgres_runtime_error(resource: &str, error: postgres::Error) -> AxRuntimeError {
+    let detail = if let Some(db_error) = error.as_db_error() {
+        format!("{}: {}", db_error.code().code(), db_error.message())
+    } else {
+        let mut detail = error.to_string();
+        let mut source = error.source();
+        while let Some(current) = source {
+            detail.push_str(": ");
+            detail.push_str(&current.to_string());
+            source = current.source();
+        }
+        detail
+    };
+    AxRuntimeError::database(AxDbError::from_driver_detail(
+        AxDatabaseDriver::Postgres,
+        resource,
+        detail,
+    ))
+}
+
+#[derive(Debug)]
+struct AxPostgresParam(Value);
+
+impl ToSql for AxPostgresParam {
+    fn to_sql(
+        &self,
+        ty: &Type,
+        out: &mut BytesMut,
+    ) -> Result<IsNull, Box<dyn StdError + Sync + Send>> {
+        match &self.0 {
+            Value::Null => Ok(IsNull::Yes),
+            Value::Bool(value) => value.to_sql(ty, out),
+            Value::Number(value) => postgres_number_to_sql(value, ty, out),
+            Value::String(value) => postgres_string_to_sql(value, ty, out),
+            Value::Array(_) | Value::Object(_) if matches!(*ty, Type::JSON | Type::JSONB) => {
+                self.0.to_sql(ty, out)
+            }
+            Value::Array(values) if *ty == Type::BYTEA => values
+                .iter()
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .and_then(|value| u8::try_from(value).ok())
+                        .ok_or_else(|| postgres_param_error("bytea arrays require values 0..255"))
+                })
+                .collect::<Result<Vec<_>, _>>()?
+                .to_sql(ty, out),
+            Value::Array(_) | Value::Object(_) => Err(postgres_param_error(&format!(
+                "Axonyx JSON value cannot be encoded as postgres type {ty}"
+            ))),
+        }
+    }
+
+    fn accepts(_ty: &Type) -> bool {
+        true
+    }
+
+    to_sql_checked!();
+}
+
+fn postgres_number_to_sql(
+    value: &serde_json::Number,
+    ty: &Type,
+    out: &mut BytesMut,
+) -> Result<IsNull, Box<dyn StdError + Sync + Send>> {
+    match *ty {
+        Type::INT2 => i16::try_from(number_i64(value)?)
+            .map_err(postgres_box_error)?
+            .to_sql(ty, out),
+        Type::INT4 => i32::try_from(number_i64(value)?)
+            .map_err(postgres_box_error)?
+            .to_sql(ty, out),
+        Type::INT8 => number_i64(value)?.to_sql(ty, out),
+        Type::OID => u32::try_from(number_u64(value)?)
+            .map_err(postgres_box_error)?
+            .to_sql(ty, out),
+        Type::FLOAT4 => (number_f64(value)? as f32).to_sql(ty, out),
+        Type::FLOAT8 => number_f64(value)?.to_sql(ty, out),
+        _ => Err(postgres_param_error(&format!(
+            "Axonyx number cannot be encoded as postgres type {ty}"
+        ))),
+    }
+}
+
+fn postgres_string_to_sql(
+    value: &str,
+    ty: &Type,
+    out: &mut BytesMut,
+) -> Result<IsNull, Box<dyn StdError + Sync + Send>> {
+    match *ty {
+        Type::VARCHAR | Type::TEXT | Type::BPCHAR | Type::NAME | Type::UNKNOWN => {
+            value.to_sql(ty, out)
+        }
+        Type::UUID => Uuid::parse_str(value)?.to_sql(ty, out),
+        Type::DATE => NaiveDate::parse_from_str(value, "%Y-%m-%d")?.to_sql(ty, out),
+        Type::TIME => NaiveTime::parse_from_str(value, "%H:%M:%S%.f")?.to_sql(ty, out),
+        Type::TIMESTAMP => parse_postgres_timestamp(value)?.to_sql(ty, out),
+        Type::TIMESTAMPTZ => DateTime::parse_from_rfc3339(value)?.to_sql(ty, out),
+        Type::JSON | Type::JSONB => serde_json::from_str::<Value>(value)?.to_sql(ty, out),
+        Type::BYTEA => value.as_bytes().to_sql(ty, out),
+        _ => Err(postgres_param_error(&format!(
+            "Axonyx string cannot be encoded as postgres type {ty}"
+        ))),
+    }
+}
+
+fn parse_postgres_timestamp(value: &str) -> Result<NaiveDateTime, Box<dyn StdError + Sync + Send>> {
+    NaiveDateTime::parse_from_str(value, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(value, "%Y-%m-%d %H:%M:%S%.f"))
+        .map_err(postgres_box_error)
+}
+
+fn number_i64(value: &serde_json::Number) -> Result<i64, Box<dyn StdError + Sync + Send>> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|value| i64::try_from(value).ok()))
+        .ok_or_else(|| postgres_param_error("postgres integer parameter is out of i64 range"))
+}
+
+fn number_u64(value: &serde_json::Number) -> Result<u64, Box<dyn StdError + Sync + Send>> {
+    value
+        .as_u64()
+        .ok_or_else(|| postgres_param_error("postgres unsigned parameter must be non-negative"))
+}
+
+fn number_f64(value: &serde_json::Number) -> Result<f64, Box<dyn StdError + Sync + Send>> {
+    value
+        .as_f64()
+        .ok_or_else(|| postgres_param_error("invalid postgres floating-point parameter"))
+}
+
+fn postgres_param_error(message: &str) -> Box<dyn StdError + Sync + Send> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        message.to_string(),
+    ))
+}
+
+fn postgres_box_error<E>(error: E) -> Box<dyn StdError + Sync + Send>
+where
+    E: StdError + Sync + Send + 'static,
+{
+    Box::new(error)
 }
 
 fn validate_raw_select_sql(driver: &AxDatabaseDriver, sql: &str) -> AxRuntimeResult<()> {
@@ -2167,11 +2475,24 @@ mod tests {
             "posts",
             "statement timeout after 2000ms",
         );
+        let postgres_tls = AxDbError::from_driver_detail(
+            AxDatabaseDriver::Postgres,
+            "posts",
+            "TLS handshake failed: invalid certificate",
+        );
+        let postgres_param = AxDbError::from_driver_detail(
+            AxDatabaseDriver::Postgres,
+            "posts",
+            "error serializing parameter 0: Axonyx number cannot be encoded as postgres type numeric",
+        );
 
         assert_eq!(sqlite.code, "db.connection_failed");
         assert_eq!(sqlite.status, 503);
         assert_eq!(postgres.code, "db.timeout");
         assert_eq!(postgres.status, 503);
+        assert_eq!(postgres_tls.code, "db.connection_failed");
+        assert_eq!(postgres_param.code, "db.invalid_query");
+        assert_eq!(postgres_param.status, 400);
     }
 
     #[test]
@@ -2316,84 +2637,74 @@ mod tests {
 
     #[test]
     fn direct_transport_emits_sql_execution_plan() {
-        let env = AxEnv::new()
-            .with_secret("db_dialect", "postgres")
-            .with_secret("db_url", "postgres://local/axonyx");
-        let runtime = runtime_from_env(env).expect("runtime should initialize");
+        let request = AxQueryRequest {
+            collection: "posts".to_string(),
+            filters: vec![AxQueryFilterRequest {
+                field: "status".to_string(),
+                op: AxQueryFilterOp::Eq,
+                value: json!("published"),
+            }],
+            orders: vec![AxQueryOrderRequest {
+                field: "created_at".to_string(),
+                direction: AxQueryOrderDirection::Desc,
+            }],
+            limit: Some(12),
+            offset: None,
+            mode: AxQueryMode::Many,
+        };
+        let plan =
+            compile_query_plan_to_sql(&query_request_to_plan(&request), AxSqlDialect::Postgres)
+                .expect("postgres query should compile");
 
-        let value = runtime
-            .load(&AxQueryRequest {
-                collection: "posts".to_string(),
-                filters: vec![AxQueryFilterRequest {
-                    field: "status".to_string(),
-                    op: AxQueryFilterOp::Eq,
-                    value: json!("published"),
-                }],
-                orders: vec![AxQueryOrderRequest {
-                    field: "created_at".to_string(),
-                    direction: AxQueryOrderDirection::Desc,
-                }],
-                limit: Some(12),
-                offset: None,
-                mode: AxQueryMode::Many,
-            })
-            .expect("query should execute");
-
-        assert_eq!(value["transport"], "direct");
-        assert_eq!(value["execution"]["dialect"], "postgres");
         assert_eq!(
-            value["execution"]["sql"],
+            plan.sql,
             r#"select * from "posts" where "status" = $1 order by "created_at" desc limit 12"#
         );
-        assert_eq!(value["execution"]["params"][0], json!("published"));
+        assert_eq!(sql_params_to_json(&plan.params), vec![json!("published")]);
     }
 
     #[test]
     fn direct_transport_emits_extended_filter_sql_plan() {
-        let env = AxEnv::new()
-            .with_secret("db_dialect", "postgres")
-            .with_secret("db_url", "postgres://local/axonyx");
-        let runtime = runtime_from_env(env).expect("runtime should initialize");
-
-        let value = runtime
-            .load(&AxQueryRequest {
-                collection: "posts".to_string(),
-                filters: vec![
-                    AxQueryFilterRequest {
-                        field: "archived".to_string(),
-                        op: AxQueryFilterOp::Ne,
-                        value: json!(true),
-                    },
-                    AxQueryFilterRequest {
-                        field: "status".to_string(),
-                        op: AxQueryFilterOp::In,
-                        value: json!(["published", "featured"]),
-                    },
-                    AxQueryFilterRequest {
-                        field: "deleted_at".to_string(),
-                        op: AxQueryFilterOp::IsNull,
-                        value: json!(true),
-                    },
-                    AxQueryFilterRequest {
-                        field: "published_at".to_string(),
-                        op: AxQueryFilterOp::IsNotNull,
-                        value: json!(true),
-                    },
-                ],
-                orders: Vec::new(),
-                limit: None,
-                offset: None,
-                mode: AxQueryMode::Many,
-            })
-            .expect("query should execute");
+        let request = AxQueryRequest {
+            collection: "posts".to_string(),
+            filters: vec![
+                AxQueryFilterRequest {
+                    field: "archived".to_string(),
+                    op: AxQueryFilterOp::Ne,
+                    value: json!(true),
+                },
+                AxQueryFilterRequest {
+                    field: "status".to_string(),
+                    op: AxQueryFilterOp::In,
+                    value: json!(["published", "featured"]),
+                },
+                AxQueryFilterRequest {
+                    field: "deleted_at".to_string(),
+                    op: AxQueryFilterOp::IsNull,
+                    value: json!(true),
+                },
+                AxQueryFilterRequest {
+                    field: "published_at".to_string(),
+                    op: AxQueryFilterOp::IsNotNull,
+                    value: json!(true),
+                },
+            ],
+            orders: Vec::new(),
+            limit: None,
+            offset: None,
+            mode: AxQueryMode::Many,
+        };
+        let plan =
+            compile_query_plan_to_sql(&query_request_to_plan(&request), AxSqlDialect::Postgres)
+                .expect("postgres query should compile");
 
         assert_eq!(
-            value["execution"]["sql"],
+            plan.sql,
             r#"select * from "posts" where "archived" != $1 and "status" in ($2, $3) and "deleted_at" is null and "published_at" is not null"#
         );
         assert_eq!(
-            value["execution"]["params"],
-            json!([true, "published", "featured"])
+            sql_params_to_json(&plan.params),
+            vec![json!(true), json!("published"), json!("featured")]
         );
     }
 
@@ -2425,54 +2736,167 @@ mod tests {
 
     #[test]
     fn direct_update_emits_where_clause_when_filters_exist() {
-        let env = AxEnv::new()
-            .with_secret("db_dialect", "postgres")
-            .with_secret("db_url", "postgres://local/axonyx");
-        let runtime = runtime_from_env(env).expect("runtime should initialize");
-
-        let value = runtime
-            .update(&AxUpdateRequest {
-                collection: "posts".to_string(),
-                fields: BTreeMap::from([("title".to_string(), json!("Hello"))]),
-                filters: vec![AxQueryFilterRequest {
-                    field: "id".to_string(),
-                    op: AxQueryFilterOp::Eq,
-                    value: json!(7),
-                }],
-            })
-            .expect("update should execute");
+        let fields = BTreeMap::from([("title".to_string(), json!("Hello"))]);
+        let filters = vec![AxQueryFilterRequest {
+            field: "id".to_string(),
+            op: AxQueryFilterOp::Eq,
+            value: json!(7),
+        }];
+        let plan = compile_update_plan_to_sql(
+            "posts",
+            &fields_to_assignment_plans(&fields),
+            &query_filters_to_plan(&filters),
+            AxSqlDialect::Postgres,
+        )
+        .expect("postgres update should compile");
 
         assert_eq!(
-            value["execution"]["sql"],
+            plan.sql,
             r#"update "posts" set "title" = $1 where "id" = $2"#
         );
-        assert_eq!(value["execution"]["params"][0], json!("Hello"));
-        assert_eq!(value["execution"]["params"][1], json!(7));
+        assert_eq!(
+            sql_params_to_json(&plan.params),
+            vec![json!("Hello"), json!(7)]
+        );
     }
 
     #[test]
     fn direct_delete_emits_where_clause_when_filters_exist() {
-        let env = AxEnv::new()
-            .with_secret("db_dialect", "postgres")
-            .with_secret("db_url", "postgres://local/axonyx");
-        let runtime = runtime_from_env(env).expect("runtime should initialize");
+        let filters = vec![AxQueryFilterRequest {
+            field: "id".to_string(),
+            op: AxQueryFilterOp::Eq,
+            value: json!(7),
+        }];
+        let plan = compile_delete_plan_to_sql(
+            "posts",
+            &query_filters_to_plan(&filters),
+            AxSqlDialect::Postgres,
+        )
+        .expect("postgres delete should compile");
 
-        let value = runtime
-            .delete(&AxDeleteRequest {
-                collection: "posts".to_string(),
-                filters: vec![AxQueryFilterRequest {
-                    field: "id".to_string(),
-                    op: AxQueryFilterOp::Eq,
-                    value: json!(7),
-                }],
-            })
-            .expect("delete should execute");
+        assert_eq!(plan.sql, r#"delete from "posts" where "id" = $1"#);
+        assert_eq!(sql_params_to_json(&plan.params), vec![json!(7)]);
+    }
 
+    #[test]
+    fn postgres_query_wraps_rows_as_json_without_trailing_semicolon() {
         assert_eq!(
-            value["execution"]["sql"],
-            r#"delete from "posts" where "id" = $1"#
+            postgres_json_query("select id, title from posts;"),
+            "select row_to_json(\"__ax_row\") from (select id, title from posts) as \"__ax_row\""
         );
-        assert_eq!(value["execution"]["params"][0], json!(7));
+    }
+
+    #[test]
+    fn postgres_parameters_follow_expected_scalar_types() {
+        for (value, ty) in [
+            (json!(7), Type::INT4),
+            (json!(9), Type::INT8),
+            (json!(1.5), Type::FLOAT8),
+            (json!(true), Type::BOOL),
+            (json!("published"), Type::TEXT),
+            (json!("2026-08-31"), Type::DATE),
+        ] {
+            let mut output = BytesMut::new();
+            AxPostgresParam(value)
+                .to_sql(&ty, &mut output)
+                .expect("supported postgres parameter should encode");
+        }
+    }
+
+    #[test]
+    fn postgres_connection_failures_use_public_database_error() {
+        let error = match postgres_open_connection(
+            &Some("postgres://127.0.0.1:1/axonyx?connect_timeout=1".to_string()),
+            "posts",
+        ) {
+            Ok(_) => panic!("closed local port should fail"),
+            Err(error) => error,
+        };
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.connection_failed");
+        assert_eq!(error.resource.as_deref(), Some("posts"));
+        assert!(!error.public_payload().to_string().contains("127.0.0.1"));
+    }
+
+    #[test]
+    fn postgres_live_query_runs_when_test_url_is_configured() {
+        let Ok(url) = std::env::var("AXONYX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let table = format!("axonyx_runtime_test_{}", std::process::id());
+        let mut admin = postgres_open_connection(&Some(url.clone()), &table)
+            .expect("postgres test connection should open");
+        admin
+            .batch_execute(&format!(
+                "drop table if exists \"{table}\"; create table \"{table}\" (id serial primary key, title text not null unique, published boolean not null default false)"
+            ))
+            .expect("postgres test table should create");
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "postgres")
+                .with_secret("db_url", &url),
+        )
+        .expect("postgres runtime should initialize");
+
+        let result = (|| -> AxRuntimeResult<()> {
+            let value = runtime.query(&AxRawSqlRequest {
+                sql: "select $1::integer as value".to_string(),
+                params: vec![json!(7)],
+            })?;
+            assert_eq!(value, json!([{ "value": 7 }]));
+
+            let inserted = runtime.insert(&AxInsertRequest {
+                collection: table.clone(),
+                fields: BTreeMap::from([
+                    ("title".to_string(), json!("Foundry")),
+                    ("published".to_string(), json!(false)),
+                ]),
+            })?;
+            assert_eq!(inserted["changes"], 1);
+
+            let rows = runtime.load(&AxQueryRequest {
+                collection: table.clone(),
+                filters: vec![AxQueryFilterRequest {
+                    field: "title".to_string(),
+                    op: AxQueryFilterOp::Eq,
+                    value: json!("Foundry"),
+                }],
+                orders: Vec::new(),
+                limit: None,
+                offset: None,
+                mode: AxQueryMode::Many,
+            })?;
+            assert_eq!(rows[0]["published"], false);
+
+            let updated = runtime.update(&AxUpdateRequest {
+                collection: table.clone(),
+                fields: BTreeMap::from([("published".to_string(), json!(true))]),
+                filters: vec![AxQueryFilterRequest {
+                    field: "title".to_string(),
+                    op: AxQueryFilterOp::Eq,
+                    value: json!("Foundry"),
+                }],
+            })?;
+            assert_eq!(updated["changes"], 1);
+
+            let deleted = runtime.delete(&AxDeleteRequest {
+                collection: table.clone(),
+                filters: vec![AxQueryFilterRequest {
+                    field: "title".to_string(),
+                    op: AxQueryFilterOp::Eq,
+                    value: json!("Foundry"),
+                }],
+            })?;
+            assert_eq!(deleted["changes"], 1);
+            Ok(())
+        })();
+
+        admin
+            .batch_execute(&format!("drop table if exists \"{table}\""))
+            .expect("postgres test table should clean up");
+        result.expect("live postgres CRUD should execute");
     }
 
     #[test]
