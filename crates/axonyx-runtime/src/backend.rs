@@ -15,11 +15,14 @@ use bytes::BytesMut;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 use postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 use postgres::Client;
+use r2d2::{Pool, PooledConnection};
+use r2d2_postgres::PostgresConnectionManager;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::BufReader;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use thiserror::Error;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
@@ -58,6 +61,9 @@ impl AxRuntimeError {
 }
 
 pub type AxRuntimeResult<T> = Result<T, AxRuntimeError>;
+
+pub const DEFAULT_DB_POOL_MAX_SIZE: u32 = 10;
+pub const DEFAULT_DB_POOL_TIMEOUT_MS: u64 = 5_000;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxDbErrorCode {
@@ -495,6 +501,8 @@ pub struct AxDatabaseConfig {
     pub url: Option<String>,
     pub api_url: Option<String>,
     pub api_key: Option<String>,
+    pub pool_max_size: u32,
+    pub pool_timeout_ms: u64,
 }
 
 impl AxDatabaseConfig {
@@ -645,12 +653,52 @@ impl AxEnv {
                 .get("data_api_key")
                 .cloned()
                 .or_else(|| self.secret.get("supabase_service_role_key").cloned()),
+            pool_max_size: self.database_pool_max_size()?,
+            pool_timeout_ms: self.database_pool_timeout_ms()?,
         })
+    }
+
+    pub fn database_pool_max_size(&self) -> AxRuntimeResult<u32> {
+        parse_positive_env_value(
+            self.secret
+                .get("db_pool_max_size")
+                .or_else(|| self.secret.get("database_pool_max_size")),
+            "DB_POOL_MAX_SIZE",
+            DEFAULT_DB_POOL_MAX_SIZE,
+        )
+    }
+
+    pub fn database_pool_timeout_ms(&self) -> AxRuntimeResult<u64> {
+        parse_positive_env_value(
+            self.secret
+                .get("db_pool_timeout_ms")
+                .or_else(|| self.secret.get("database_pool_timeout_ms")),
+            "DB_POOL_TIMEOUT_MS",
+            DEFAULT_DB_POOL_TIMEOUT_MS,
+        )
     }
 
     pub fn sql_dialect(&self) -> AxRuntimeResult<Option<AxSqlDialect>> {
         Ok(self.database_driver()?.sql_dialect())
     }
+}
+
+fn parse_positive_env_value<T>(value: Option<&String>, name: &str, default: T) -> AxRuntimeResult<T>
+where
+    T: Copy + From<u8> + std::str::FromStr + PartialOrd,
+{
+    let Some(value) = value else {
+        return Ok(default);
+    };
+    let parsed = value.parse::<T>().map_err(|_| {
+        AxRuntimeError::message(format!("{name} must be a positive integer, got `{value}`"))
+    })?;
+    if parsed < T::from(1) {
+        return Err(AxRuntimeError::message(format!(
+            "{name} must be a positive integer, got `{value}`"
+        )));
+    }
+    Ok(parsed)
 }
 
 fn normalize_env_key(key: &str) -> String {
@@ -690,7 +738,7 @@ pub trait AxRuntimeEnvAccess {
     fn env(&self) -> &AxEnv;
 }
 
-pub trait AxDatabaseAdapter {
+pub trait AxDatabaseAdapter: Send + Sync {
     fn driver(&self) -> AxDatabaseDriver;
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value>;
     fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value>;
@@ -816,12 +864,89 @@ impl<A> AxMessenger for AxDatabaseRuntime<A> {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+type AxPostgresManager = PostgresConnectionManager<MakeRustlsConnect>;
+type AxPostgresPool = Pool<AxPostgresManager>;
+type AxPooledPostgresConnection = PooledConnection<AxPostgresManager>;
+
+#[derive(Clone)]
 pub struct PostgresAdapter {
     pub url: Option<String>,
     pub transport: AxDataTransport,
     pub api_url: Option<String>,
+    pub pool_max_size: u32,
+    pub pool_timeout_ms: u64,
+    pool: Arc<OnceLock<AxPostgresPool>>,
 }
+
+impl std::fmt::Debug for PostgresAdapter {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PostgresAdapter")
+            .field("url", &self.url)
+            .field("transport", &self.transport)
+            .field("api_url", &self.api_url)
+            .field("pool_max_size", &self.pool_max_size)
+            .field("pool_timeout_ms", &self.pool_timeout_ms)
+            .field("pool_initialized", &self.pool.get().is_some())
+            .finish()
+    }
+}
+
+impl PostgresAdapter {
+    pub fn new(
+        url: Option<String>,
+        transport: AxDataTransport,
+        api_url: Option<String>,
+        pool_max_size: u32,
+        pool_timeout_ms: u64,
+    ) -> Self {
+        Self {
+            url,
+            transport,
+            api_url,
+            pool_max_size,
+            pool_timeout_ms,
+            pool: Arc::new(OnceLock::new()),
+        }
+    }
+
+    fn direct_pool(&self, resource: &str) -> AxRuntimeResult<Option<&AxPostgresPool>> {
+        if self.transport != AxDataTransport::Direct {
+            return Ok(None);
+        }
+
+        if self.pool.get().is_none() {
+            let pool = postgres_create_pool(
+                &self.url,
+                resource,
+                self.pool_max_size,
+                self.pool_timeout_ms,
+            )?;
+            let _ = self.pool.set(pool);
+        }
+
+        self.pool.get().map(Some).ok_or_else(|| {
+            AxRuntimeError::database(
+                AxDbError::new(AxDbErrorCode::ConnectionFailed)
+                    .with_driver(AxDatabaseDriver::Postgres)
+                    .with_resource(resource)
+                    .with_detail("postgres pool failed to initialize"),
+            )
+        })
+    }
+}
+
+impl PartialEq for PostgresAdapter {
+    fn eq(&self, other: &Self) -> bool {
+        self.url == other.url
+            && self.transport == other.transport
+            && self.api_url == other.api_url
+            && self.pool_max_size == other.pool_max_size
+            && self.pool_timeout_ms == other.pool_timeout_ms
+    }
+}
+
+impl Eq for PostgresAdapter {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MySqlAdapter {
@@ -851,6 +976,7 @@ impl AxDatabaseAdapter for PostgresAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            self.direct_pool(&request.collection)?,
             request,
         )
     }
@@ -861,6 +987,7 @@ impl AxDatabaseAdapter for PostgresAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            self.direct_pool("raw_sql")?,
             request,
         )
     }
@@ -871,6 +998,7 @@ impl AxDatabaseAdapter for PostgresAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            self.direct_pool(&request.collection)?,
             request,
         )
     }
@@ -881,6 +1009,7 @@ impl AxDatabaseAdapter for PostgresAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            self.direct_pool(&request.collection)?,
             request,
         )
     }
@@ -891,6 +1020,7 @@ impl AxDatabaseAdapter for PostgresAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            self.direct_pool(&request.collection)?,
             request,
         )
     }
@@ -907,6 +1037,7 @@ impl AxDatabaseAdapter for MySqlAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            None,
             request,
         )
     }
@@ -917,6 +1048,7 @@ impl AxDatabaseAdapter for MySqlAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            None,
             request,
         )
     }
@@ -927,6 +1059,7 @@ impl AxDatabaseAdapter for MySqlAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            None,
             request,
         )
     }
@@ -937,6 +1070,7 @@ impl AxDatabaseAdapter for MySqlAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            None,
             request,
         )
     }
@@ -947,6 +1081,7 @@ impl AxDatabaseAdapter for MySqlAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            None,
             request,
         )
     }
@@ -963,6 +1098,7 @@ impl AxDatabaseAdapter for SqliteAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            None,
             request,
         )
     }
@@ -973,6 +1109,7 @@ impl AxDatabaseAdapter for SqliteAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            None,
             request,
         )
     }
@@ -983,6 +1120,7 @@ impl AxDatabaseAdapter for SqliteAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            None,
             request,
         )
     }
@@ -993,6 +1131,7 @@ impl AxDatabaseAdapter for SqliteAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            None,
             request,
         )
     }
@@ -1003,6 +1142,7 @@ impl AxDatabaseAdapter for SqliteAdapter {
             self.transport,
             &self.url,
             &self.api_url,
+            None,
             request,
         )
     }
@@ -1076,11 +1216,13 @@ impl AxDatabaseAdapter for MemoryAdapter {
 
 pub fn adapter_from_config(config: &AxDatabaseConfig) -> Box<dyn AxDatabaseAdapter> {
     match config.driver {
-        AxDatabaseDriver::Postgres => Box::new(PostgresAdapter {
-            url: config.url.clone(),
-            transport: config.transport,
-            api_url: config.api_url.clone(),
-        }),
+        AxDatabaseDriver::Postgres => Box::new(PostgresAdapter::new(
+            config.url.clone(),
+            config.transport,
+            config.api_url.clone(),
+            config.pool_max_size,
+            config.pool_timeout_ms,
+        )),
         AxDatabaseDriver::MySql => Box::new(MySqlAdapter {
             url: config.url.clone(),
             transport: config.transport,
@@ -1159,10 +1301,11 @@ fn dispatch_load(
     transport: AxDataTransport,
     url: &Option<String>,
     api_url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
     request: &AxQueryRequest,
 ) -> AxRuntimeResult<Value> {
     match transport {
-        AxDataTransport::Direct => direct_load_plan(driver, url, request),
+        AxDataTransport::Direct => direct_load_plan(driver, url, postgres_pool, request),
         AxDataTransport::Api => api_load_plan(driver, api_url, request),
     }
 }
@@ -1172,10 +1315,11 @@ fn dispatch_raw_query(
     transport: AxDataTransport,
     url: &Option<String>,
     api_url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
     request: &AxRawSqlRequest,
 ) -> AxRuntimeResult<Value> {
     match transport {
-        AxDataTransport::Direct => direct_raw_query_plan(driver, url, request),
+        AxDataTransport::Direct => direct_raw_query_plan(driver, url, postgres_pool, request),
         AxDataTransport::Api => api_raw_query_plan(driver, api_url, request),
     }
 }
@@ -1185,10 +1329,11 @@ fn dispatch_insert(
     transport: AxDataTransport,
     url: &Option<String>,
     api_url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
     request: &AxInsertRequest,
 ) -> AxRuntimeResult<Value> {
     match transport {
-        AxDataTransport::Direct => direct_insert_plan(driver, url, request),
+        AxDataTransport::Direct => direct_insert_plan(driver, url, postgres_pool, request),
         AxDataTransport::Api => api_mutation_plan(
             driver,
             api_url,
@@ -1205,10 +1350,11 @@ fn dispatch_update(
     transport: AxDataTransport,
     url: &Option<String>,
     api_url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
     request: &AxUpdateRequest,
 ) -> AxRuntimeResult<Value> {
     match transport {
-        AxDataTransport::Direct => direct_update_plan(driver, url, request),
+        AxDataTransport::Direct => direct_update_plan(driver, url, postgres_pool, request),
         AxDataTransport::Api => api_mutation_plan(
             driver,
             api_url,
@@ -1225,10 +1371,11 @@ fn dispatch_delete(
     transport: AxDataTransport,
     url: &Option<String>,
     api_url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
     request: &AxDeleteRequest,
 ) -> AxRuntimeResult<Value> {
     match transport {
-        AxDataTransport::Direct => direct_delete_plan(driver, url, request),
+        AxDataTransport::Direct => direct_delete_plan(driver, url, postgres_pool, request),
         AxDataTransport::Api => api_delete_plan(driver, api_url, request),
     }
 }
@@ -1236,6 +1383,7 @@ fn dispatch_delete(
 fn direct_load_plan(
     driver: AxDatabaseDriver,
     url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
     request: &AxQueryRequest,
 ) -> AxRuntimeResult<Value> {
     let Some(dialect) = driver.sql_dialect() else {
@@ -1284,6 +1432,7 @@ fn direct_load_plan(
         }
         AxDatabaseDriver::Postgres => {
             return postgres_execute_query(
+                postgres_pool,
                 url,
                 &request.collection,
                 &execution.sql,
@@ -1307,6 +1456,7 @@ fn direct_load_plan(
 fn direct_raw_query_plan(
     driver: AxDatabaseDriver,
     url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
     request: &AxRawSqlRequest,
 ) -> AxRuntimeResult<Value> {
     validate_raw_select_sql(&driver, &request.sql)?;
@@ -1333,7 +1483,13 @@ fn direct_raw_query_plan(
             return sqlite_execute_query(url, "raw_sql", &execution.sql, &execution.params);
         }
         AxDatabaseDriver::Postgres => {
-            return postgres_execute_query(url, "raw_sql", &execution.sql, &execution.params);
+            return postgres_execute_query(
+                postgres_pool,
+                url,
+                "raw_sql",
+                &execution.sql,
+                &execution.params,
+            );
         }
         AxDatabaseDriver::MySql | AxDatabaseDriver::Memory => {}
     }
@@ -1359,6 +1515,7 @@ fn apply_query_mode(mode: AxQueryMode, value: Value) -> Value {
 fn direct_insert_plan(
     driver: AxDatabaseDriver,
     url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
     request: &AxInsertRequest,
 ) -> AxRuntimeResult<Value> {
     let Some(dialect) = driver.sql_dialect() else {
@@ -1401,6 +1558,7 @@ fn direct_insert_plan(
         }
         AxDatabaseDriver::Postgres => {
             return postgres_execute_mutation(
+                postgres_pool,
                 url,
                 "insert",
                 &request.collection,
@@ -1422,6 +1580,7 @@ fn direct_insert_plan(
 fn direct_update_plan(
     driver: AxDatabaseDriver,
     url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
     request: &AxUpdateRequest,
 ) -> AxRuntimeResult<Value> {
     let Some(dialect) = driver.sql_dialect() else {
@@ -1465,6 +1624,7 @@ fn direct_update_plan(
         }
         AxDatabaseDriver::Postgres => {
             return postgres_execute_mutation(
+                postgres_pool,
                 url,
                 "update",
                 &request.collection,
@@ -1486,6 +1646,7 @@ fn direct_update_plan(
 fn direct_delete_plan(
     driver: AxDatabaseDriver,
     url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
     request: &AxDeleteRequest,
 ) -> AxRuntimeResult<Value> {
     let Some(dialect) = driver.sql_dialect() else {
@@ -1526,6 +1687,7 @@ fn direct_delete_plan(
         }
         AxDatabaseDriver::Postgres => {
             return postgres_execute_mutation(
+                postgres_pool,
                 url,
                 "delete",
                 &request.collection,
@@ -1716,63 +1878,105 @@ fn sqlite_runtime_error(resource: &str, error: rusqlite::Error) -> AxRuntimeErro
 }
 
 fn postgres_execute_query(
+    pool: Option<&AxPostgresPool>,
     url: &Option<String>,
     resource: &str,
     sql: &str,
     params: &[Value],
 ) -> AxRuntimeResult<Value> {
-    let mut client = postgres_open_connection(url, resource)?;
-    let wrapped_sql = postgres_json_query(sql);
-    let params = params
-        .iter()
-        .cloned()
-        .map(AxPostgresParam)
-        .collect::<Vec<_>>();
-    let param_refs = params
-        .iter()
-        .map(|value| value as &(dyn ToSql + Sync))
-        .collect::<Vec<_>>();
-    let rows = client
-        .query(&wrapped_sql, &param_refs)
-        .map_err(|error| postgres_runtime_error(resource, error))?;
+    postgres_with_client(pool, url, resource, |client| {
+        let wrapped_sql = postgres_json_query(sql);
+        let params = params
+            .iter()
+            .cloned()
+            .map(AxPostgresParam)
+            .collect::<Vec<_>>();
+        let param_refs = params
+            .iter()
+            .map(|value| value as &(dyn ToSql + Sync))
+            .collect::<Vec<_>>();
+        let rows = client
+            .query(&wrapped_sql, &param_refs)
+            .map_err(|error| postgres_runtime_error(resource, error))?;
 
-    rows.into_iter()
-        .map(|row| {
-            row.try_get::<_, Value>(0)
-                .map_err(|error| postgres_runtime_error(resource, error))
-        })
-        .collect::<AxRuntimeResult<Vec<_>>>()
-        .map(Value::Array)
+        rows.into_iter()
+            .map(|row| {
+                row.try_get::<_, Value>(0)
+                    .map_err(|error| postgres_runtime_error(resource, error))
+            })
+            .collect::<AxRuntimeResult<Vec<_>>>()
+            .map(Value::Array)
+    })
 }
 
 fn postgres_execute_mutation(
+    pool: Option<&AxPostgresPool>,
     url: &Option<String>,
     action: &str,
     resource: &str,
     sql: &str,
     params: &[Value],
 ) -> AxRuntimeResult<Value> {
-    let mut client = postgres_open_connection(url, resource)?;
-    let params = params
-        .iter()
-        .cloned()
-        .map(AxPostgresParam)
-        .collect::<Vec<_>>();
-    let param_refs = params
-        .iter()
-        .map(|value| value as &(dyn ToSql + Sync))
-        .collect::<Vec<_>>();
-    let changes = client
-        .execute(sql, &param_refs)
-        .map_err(|error| postgres_runtime_error(resource, error))?;
+    postgres_with_client(pool, url, resource, |client| {
+        let params = params
+            .iter()
+            .cloned()
+            .map(AxPostgresParam)
+            .collect::<Vec<_>>();
+        let param_refs = params
+            .iter()
+            .map(|value| value as &(dyn ToSql + Sync))
+            .collect::<Vec<_>>();
+        let changes = client
+            .execute(sql, &param_refs)
+            .map_err(|error| postgres_runtime_error(resource, error))?;
 
-    Ok(json!({
-        "ok": true,
-        "driver": "postgres",
-        "action": action,
-        "resource": resource,
-        "changes": changes,
-    }))
+        Ok(json!({
+            "ok": true,
+            "driver": "postgres",
+            "action": action,
+            "resource": resource,
+            "changes": changes,
+        }))
+    })
+}
+
+fn postgres_with_client<T>(
+    pool: Option<&AxPostgresPool>,
+    url: &Option<String>,
+    resource: &str,
+    operation: impl FnOnce(&mut Client) -> AxRuntimeResult<T>,
+) -> AxRuntimeResult<T> {
+    match pool {
+        Some(pool) => {
+            let mut client = postgres_pool_connection(pool, resource)?;
+            operation(&mut client)
+        }
+        None => {
+            let mut client = postgres_open_connection(url, resource)?;
+            operation(&mut client)
+        }
+    }
+}
+
+fn postgres_pool_connection(
+    pool: &AxPostgresPool,
+    resource: &str,
+) -> AxRuntimeResult<AxPooledPostgresConnection> {
+    pool.get().map_err(|error| {
+        let state = pool.state();
+        let code = if state.connections >= pool.max_size() && state.idle_connections == 0 {
+            AxDbErrorCode::Timeout
+        } else {
+            AxDbErrorCode::ConnectionFailed
+        };
+        AxRuntimeError::database(
+            AxDbError::new(code)
+                .with_driver(AxDatabaseDriver::Postgres)
+                .with_resource(resource)
+                .with_detail(error.to_string()),
+        )
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1828,6 +2032,37 @@ impl rustls::client::danger::ServerCertVerifier for AxPostgresRequireVerifier {
 }
 
 fn postgres_open_connection(url: &Option<String>, resource: &str) -> AxRuntimeResult<Client> {
+    let (connection_url, connector) = postgres_connection_parts(url, resource)?;
+
+    Client::connect(&connection_url, connector)
+        .map_err(|error| postgres_runtime_error(resource, error))
+}
+
+fn postgres_create_pool(
+    url: &Option<String>,
+    resource: &str,
+    max_size: u32,
+    timeout_ms: u64,
+) -> AxRuntimeResult<AxPostgresPool> {
+    let (connection_url, connector) = postgres_connection_parts(url, resource)?;
+    let config = connection_url
+        .parse::<postgres::Config>()
+        .map_err(|error| {
+            postgres_connection_config_error(resource, format!("invalid postgres URL: {error}"))
+        })?;
+    let manager = PostgresConnectionManager::new(config, connector);
+
+    Ok(Pool::builder()
+        .max_size(max_size)
+        .min_idle(Some(0))
+        .connection_timeout(Duration::from_millis(timeout_ms))
+        .build_unchecked(manager))
+}
+
+fn postgres_connection_parts(
+    url: &Option<String>,
+    resource: &str,
+) -> AxRuntimeResult<(String, MakeRustlsConnect)> {
     let Some(url) = url else {
         return Err(AxRuntimeError::database(
             AxDbError::new(AxDbErrorCode::ConnectionFailed)
@@ -1860,8 +2095,7 @@ fn postgres_open_connection(url: &Option<String>, resource: &str) -> AxRuntimeRe
     };
     let connector = MakeRustlsConnect::new(config);
 
-    Client::connect(&connection_url, connector)
-        .map_err(|error| postgres_runtime_error(resource, error))
+    Ok((connection_url, connector))
 }
 
 fn postgres_tls_settings(
@@ -2799,6 +3033,8 @@ mod tests {
                 url: Some("mysql://root:root@localhost:3306/axonyx".to_string()),
                 api_url: None,
                 api_key: None,
+                pool_max_size: DEFAULT_DB_POOL_MAX_SIZE,
+                pool_timeout_ms: DEFAULT_DB_POOL_TIMEOUT_MS,
             }
         );
     }
@@ -2819,8 +3055,62 @@ mod tests {
                 url: Some("sqlite://data/app.db".to_string()),
                 api_url: None,
                 api_key: None,
+                pool_max_size: DEFAULT_DB_POOL_MAX_SIZE,
+                pool_timeout_ms: DEFAULT_DB_POOL_TIMEOUT_MS,
             }
         );
+    }
+
+    #[test]
+    fn env_resolves_database_pool_defaults_and_overrides() {
+        let defaults = AxEnv::new()
+            .database_config()
+            .expect("default database config should resolve");
+        assert_eq!(defaults.pool_max_size, DEFAULT_DB_POOL_MAX_SIZE);
+        assert_eq!(defaults.pool_timeout_ms, DEFAULT_DB_POOL_TIMEOUT_MS);
+
+        let configured = AxEnv::new()
+            .with_secret("db_pool_max_size", "24")
+            .with_secret("db_pool_timeout_ms", "1250")
+            .database_config()
+            .expect("configured database pool should resolve");
+        assert_eq!(configured.pool_max_size, 24);
+        assert_eq!(configured.pool_timeout_ms, 1_250);
+    }
+
+    #[test]
+    fn env_rejects_invalid_database_pool_values() {
+        for (key, value, name) in [
+            ("db_pool_max_size", "0", "DB_POOL_MAX_SIZE"),
+            ("db_pool_timeout_ms", "soon", "DB_POOL_TIMEOUT_MS"),
+        ] {
+            let error = AxEnv::new()
+                .with_secret(key, value)
+                .database_config()
+                .expect_err("invalid database pool config should fail");
+            assert!(error.to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn postgres_pool_is_lazy_and_uses_runtime_limits() {
+        let adapter = PostgresAdapter::new(
+            Some("postgres://127.0.0.1:1/axonyx?sslmode=disable".to_string()),
+            AxDataTransport::Direct,
+            None,
+            3,
+            75,
+        );
+
+        assert!(adapter.pool.get().is_none());
+        let pool = adapter
+            .direct_pool("posts")
+            .expect("pool configuration should initialize")
+            .expect("direct postgres should provide a pool");
+
+        assert_eq!(pool.max_size(), 3);
+        assert_eq!(pool.connection_timeout(), Duration::from_millis(75));
+        assert_eq!(pool.state().connections, 0);
     }
 
     #[test]
@@ -3108,7 +3398,8 @@ mod tests {
         let runtime = runtime_from_env(
             AxEnv::new()
                 .with_secret("db_dialect", "postgres")
-                .with_secret("db_url", &url),
+                .with_secret("db_url", &url)
+                .with_secret("db_pool_max_size", "1"),
         )
         .expect("postgres runtime should initialize");
 
@@ -3118,6 +3409,16 @@ mod tests {
                 params: vec![json!(7)],
             })?;
             assert_eq!(value, json!([{ "value": 7 }]));
+
+            let first_backend = runtime.query(&AxRawSqlRequest {
+                sql: "select pg_backend_pid()::bigint as pid".to_string(),
+                params: Vec::new(),
+            })?;
+            let second_backend = runtime.query(&AxRawSqlRequest {
+                sql: "select pg_backend_pid()::bigint as pid".to_string(),
+                params: Vec::new(),
+            })?;
+            assert_eq!(first_backend[0]["pid"], second_backend[0]["pid"]);
 
             let inserted = runtime.insert(&AxInsertRequest {
                 collection: table.clone(),
@@ -3507,6 +3808,8 @@ mod tests {
             url: None,
             api_url: None,
             api_key: None,
+            pool_max_size: DEFAULT_DB_POOL_MAX_SIZE,
+            pool_timeout_ms: DEFAULT_DB_POOL_TIMEOUT_MS,
         };
 
         let error = config
@@ -3526,6 +3829,8 @@ mod tests {
             url: None,
             api_url: None,
             api_key: None,
+            pool_max_size: DEFAULT_DB_POOL_MAX_SIZE,
+            pool_timeout_ms: DEFAULT_DB_POOL_TIMEOUT_MS,
         };
 
         let error = config
