@@ -649,7 +649,16 @@ async fn axum_compiled_handler(
     request: axum::http::Request<axum::body::Body>,
 ) -> axum::response::Response {
     match axum_request_to_axonyx_with_limit(request, state.body_limit).await {
-        Ok(request) => axonyx_response_to_axum((state.handler)(request)),
+        Ok(request) => {
+            let handler = state.handler.clone();
+            match tokio::task::spawn_blocking(move || handler(request)).await {
+                Ok(response) => axonyx_response_to_axum(response),
+                Err(error) => {
+                    eprintln!("Axonyx compiled handler task failed: {error}");
+                    axonyx_response_to_axum(AxHttpResponse::text(500, "Internal Server Error"))
+                }
+            }
+        }
         Err(error) => axonyx_response_to_axum(AxHttpResponse::text(400, error.to_string())),
     }
 }
@@ -1971,5 +1980,37 @@ mod tests {
         let handler: AxCompiledHandler =
             std::sync::Arc::new(|request| AxHttpResponse::text(200, request.target));
         let _router = axum_router_from_compiled_handler(handler, 4096);
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn axum_compiled_handler_isolates_sync_work_from_async_worker() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let caller = std::thread::current().id();
+        let ran_off_worker = std::sync::Arc::new(AtomicBool::new(false));
+        let observed = ran_off_worker.clone();
+        let handler: AxCompiledHandler = std::sync::Arc::new(move |_| {
+            observed.store(std::thread::current().id() != caller, Ordering::SeqCst);
+            AxHttpResponse::text(200, "ok")
+        });
+        let state = AxCompiledHandlerState {
+            handler,
+            body_limit: 4096,
+        };
+        let request = axum::http::Request::builder()
+            .uri("/")
+            .body(axum::body::Body::empty())
+            .expect("Axum request should build");
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime should build");
+
+        let response =
+            runtime.block_on(axum_compiled_handler(axum::extract::State(state), request));
+
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        assert!(ran_off_worker.load(Ordering::SeqCst));
     }
 }
