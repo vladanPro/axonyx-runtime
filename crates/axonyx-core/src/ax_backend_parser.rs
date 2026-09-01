@@ -34,6 +34,8 @@ pub enum AxBackendParseError {
     InvalidTypeDeclaration { line: usize },
     #[error("invalid mutation at line {line}")]
     InvalidMutation { line: usize },
+    #[error("invalid transaction at line {line}; transaction blocks may contain only database mutations")]
+    InvalidTransaction { line: usize },
     #[error("invalid assignment at line {line}")]
     InvalidAssignment { line: usize },
     #[error("invalid response header at line {line}")]
@@ -646,6 +648,10 @@ impl Parser {
             return self.parse_data_binding();
         }
 
+        if text == "transaction {" {
+            return self.parse_transaction(indent);
+        }
+
         if text.starts_with("insert ") {
             return self.parse_mutation(indent, true);
         }
@@ -831,6 +837,32 @@ impl Parser {
         }
 
         Err(AxBackendParseError::InvalidBlock { line: line.line })
+    }
+
+    fn parse_transaction(&mut self, indent: usize) -> Result<AxBackendStmt, AxBackendParseError> {
+        let line = self
+            .current()
+            .expect("transaction statement line exists")
+            .clone();
+        self.pos += 1;
+        let operations = self.parse_body(indent + 2)?;
+        self.consume_block_brace(true, indent)?;
+
+        if operations.is_empty() {
+            return Err(AxBackendParseError::InvalidTransaction { line: line.line });
+        }
+
+        let operations = operations
+            .into_iter()
+            .map(|operation| match operation {
+                AxBackendStmt::Insert(mutation) => Ok(AxTransactionOperation::Insert(mutation)),
+                AxBackendStmt::Update(mutation) => Ok(AxTransactionOperation::Update(mutation)),
+                AxBackendStmt::Delete(mutation) => Ok(AxTransactionOperation::Delete(mutation)),
+                _ => Err(AxBackendParseError::InvalidTransaction { line: line.line }),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        Ok(AxBackendStmt::transaction(operations))
     }
 
     fn parse_return_statements(
@@ -3442,6 +3474,60 @@ action PublishPost(id: string) {
             action.body[3],
             AxBackendStmt::r#return(AxExpr::call(["ok"], [AxExpr::ident("post")]))
         );
+    }
+
+    #[test]
+    fn parses_atomic_transaction_mutation_block() {
+        let document = parse_backend_ax(
+            r#"
+action publishPost(id: String, title: String) {
+  transaction {
+    db.posts.where({ id: input.id }).update({ title: input.title, status: "published" })
+    db.audit.insert({ post_id: input.id, event: "published" })
+    db.drafts.where({ post_id: input.id }).delete()
+  }
+  return ok()
+}
+"#,
+        )
+        .expect("transaction block should parse");
+
+        let AxBackendBlock::Action(action) = &document.blocks[0] else {
+            panic!("expected action block");
+        };
+        let AxBackendStmt::Transaction(transaction) = &action.body[0] else {
+            panic!("expected transaction statement");
+        };
+        assert_eq!(transaction.operations.len(), 3);
+        assert!(matches!(
+            transaction.operations[0],
+            AxTransactionOperation::Update(_)
+        ));
+        assert!(matches!(
+            transaction.operations[1],
+            AxTransactionOperation::Insert(_)
+        ));
+        assert!(matches!(
+            transaction.operations[2],
+            AxTransactionOperation::Delete(_)
+        ));
+    }
+
+    #[test]
+    fn rejects_non_database_work_inside_transaction_block() {
+        let error = parse_backend_ax(
+            r#"
+action publishPost() {
+  transaction {
+    guard(true, "ok")
+  }
+  return ok()
+}
+"#,
+        )
+        .expect_err("transaction should contain only database mutations");
+
+        assert_eq!(error, AxBackendParseError::InvalidTransaction { line: 3 });
     }
 
     #[test]

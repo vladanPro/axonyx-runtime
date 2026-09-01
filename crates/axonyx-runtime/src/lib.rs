@@ -12,7 +12,8 @@ use axonyx_core::ax_backend_lowering::AxBackendLowerError;
 use axonyx_core::ax_backend_lowering_prelude::{
     lower_backend_document, AxFieldPlan, AxFunctionPlan, AxHandlerKind, AxHandlerPlan,
     AxHookPhasePlan, AxQueryFilterOpPlan, AxQueryModePlan, AxQueryOrderDirectionPlan, AxQueryPlan,
-    AxQuerySourcePlan, AxReturnPlan, AxRustExpr, AxStepPlan, AxValuePlan,
+    AxQuerySourcePlan, AxReturnPlan, AxRustExpr, AxStepPlan, AxTransactionOperationPlan,
+    AxValuePlan,
 };
 use axonyx_core::ax_backend_parser::AxBackendParseError;
 use axonyx_core::ax_backend_parser_prelude::parse_backend_ax;
@@ -1159,6 +1160,7 @@ fn execute_preview_loader(
                 return eval_preview_return_with_functions(value, &scope, env, functions)
             }
             AxStepPlan::Insert { .. }
+            | AxStepPlan::Transaction { .. }
             | AxStepPlan::Update { .. }
             | AxStepPlan::Delete { .. }
             | AxStepPlan::Revalidate { .. }
@@ -1216,6 +1218,7 @@ fn execute_preview_function(
                 return eval_preview_return_with_functions(value, &scope, env, functions)
             }
             AxStepPlan::Insert { .. }
+            | AxStepPlan::Transaction { .. }
             | AxStepPlan::Update { .. }
             | AxStepPlan::Delete { .. }
             | AxStepPlan::Revalidate { .. }
@@ -1330,6 +1333,15 @@ fn execute_preview_action(
                         .push(AxValue::Record(record));
                 }
                 push_preview_auto_invalidation(&mut invalidations, collection.clone());
+            }
+            AxStepPlan::Transaction { operations } => {
+                execute_preview_transaction(operations, &scope, env, runtime, store, functions)?;
+                for operation in operations {
+                    push_preview_auto_invalidation(
+                        &mut invalidations,
+                        preview_transaction_collection(operation).to_string(),
+                    );
+                }
             }
             AxStepPlan::Update {
                 collection,
@@ -1516,6 +1528,10 @@ fn execute_preview_route(
                         .ensure_collection(collection)
                         .push(AxValue::Record(record));
                 }
+            }
+            AxStepPlan::Transaction { operations } => {
+                let functions = BTreeMap::new();
+                execute_preview_transaction(operations, &scope, env, runtime, store, &functions)?;
             }
             AxStepPlan::Update {
                 collection,
@@ -2361,6 +2377,183 @@ fn sample_preview_collection_items(collection: &str) -> Vec<AxValue> {
                 ),
             ]),
         ],
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PreparedPreviewTransactionOperation {
+    Insert {
+        collection: String,
+        fields: BTreeMap<String, AxValue>,
+    },
+    Update {
+        collection: String,
+        fields: BTreeMap<String, AxValue>,
+        filters: Vec<PreviewFilter>,
+    },
+    Delete {
+        collection: String,
+        filters: Vec<PreviewFilter>,
+    },
+}
+
+fn execute_preview_transaction(
+    operations: &[AxTransactionOperationPlan],
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
+    store: &mut AxPreviewStore,
+    functions: &BTreeMap<String, AxFunctionPlan>,
+) -> Result<(), PreviewError> {
+    if operations.is_empty() {
+        return Err(PreviewError::Runtime {
+            message: "transaction requires at least one database operation".to_string(),
+        });
+    }
+
+    let prepared = operations
+        .iter()
+        .map(|operation| prepare_preview_transaction_operation(operation, scope, env, functions))
+        .collect::<Result<Vec<_>, PreviewError>>()?;
+
+    if let Some(runtime) = runtime {
+        runtime.transaction(&backend::AxTransactionRequest {
+            operations: prepared
+                .iter()
+                .map(preview_transaction_runtime_operation)
+                .collect(),
+        })?;
+        return Ok(());
+    }
+
+    let mut pending = store.clone();
+    for operation in &prepared {
+        apply_preview_transaction_operation(operation, &mut pending);
+    }
+    *store = pending;
+    Ok(())
+}
+
+fn prepare_preview_transaction_operation(
+    operation: &AxTransactionOperationPlan,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
+) -> Result<PreparedPreviewTransactionOperation, PreviewError> {
+    Ok(match operation {
+        AxTransactionOperationPlan::Insert { collection, fields } => {
+            PreparedPreviewTransactionOperation::Insert {
+                collection: collection.clone(),
+                fields: eval_preview_fields_with_functions(fields, scope, env, functions)?,
+            }
+        }
+        AxTransactionOperationPlan::Update {
+            collection,
+            fields,
+            filters,
+        } => PreparedPreviewTransactionOperation::Update {
+            collection: collection.clone(),
+            fields: eval_preview_fields_with_functions(fields, scope, env, functions)?,
+            filters: eval_preview_filters_with_functions(filters, scope, env, functions)?,
+        },
+        AxTransactionOperationPlan::Delete {
+            collection,
+            filters,
+        } => PreparedPreviewTransactionOperation::Delete {
+            collection: collection.clone(),
+            filters: eval_preview_filters_with_functions(filters, scope, env, functions)?,
+        },
+    })
+}
+
+fn preview_transaction_runtime_operation(
+    operation: &PreparedPreviewTransactionOperation,
+) -> backend::AxTransactionOperation {
+    match operation {
+        PreparedPreviewTransactionOperation::Insert { collection, fields } => {
+            backend::AxTransactionOperation::Insert(backend::AxInsertRequest {
+                collection: collection.clone(),
+                fields: preview_fields_to_json(fields),
+            })
+        }
+        PreparedPreviewTransactionOperation::Update {
+            collection,
+            fields,
+            filters,
+        } => backend::AxTransactionOperation::Update(backend::AxUpdateRequest {
+            collection: collection.clone(),
+            fields: preview_fields_to_json(fields),
+            filters: preview_filters_to_runtime(filters),
+        }),
+        PreparedPreviewTransactionOperation::Delete {
+            collection,
+            filters,
+        } => backend::AxTransactionOperation::Delete(backend::AxDeleteRequest {
+            collection: collection.clone(),
+            filters: preview_filters_to_runtime(filters),
+        }),
+    }
+}
+
+fn preview_fields_to_json(
+    fields: &BTreeMap<String, AxValue>,
+) -> BTreeMap<String, serde_json::Value> {
+    fields
+        .iter()
+        .map(|(key, value)| (key.clone(), preview_value_to_json(value)))
+        .collect()
+}
+
+fn preview_filters_to_runtime(filters: &[PreviewFilter]) -> Vec<backend::AxQueryFilterRequest> {
+    filters
+        .iter()
+        .map(|filter| backend::AxQueryFilterRequest {
+            field: filter.field.clone(),
+            op: preview_filter_op_to_runtime(filter.op),
+            value: preview_value_to_json(&filter.value),
+        })
+        .collect()
+}
+
+fn apply_preview_transaction_operation(
+    operation: &PreparedPreviewTransactionOperation,
+    store: &mut AxPreviewStore,
+) {
+    match operation {
+        PreparedPreviewTransactionOperation::Insert { collection, fields } => {
+            let mut record = fields.clone();
+            assign_preview_id(&mut record, store.collection_items(collection).len());
+            store
+                .ensure_collection(collection)
+                .push(AxValue::Record(record));
+        }
+        PreparedPreviewTransactionOperation::Update {
+            collection,
+            fields,
+            filters,
+        } => {
+            for item in store.ensure_collection(collection).iter_mut() {
+                if preview_record_matches_all(item, filters) {
+                    apply_preview_fields(item, fields);
+                }
+            }
+        }
+        PreparedPreviewTransactionOperation::Delete {
+            collection,
+            filters,
+        } => {
+            store
+                .ensure_collection(collection)
+                .retain(|item| !preview_record_matches_all(item, filters));
+        }
+    }
+}
+
+fn preview_transaction_collection(operation: &AxTransactionOperationPlan) -> &str {
+    match operation {
+        AxTransactionOperationPlan::Insert { collection, .. }
+        | AxTransactionOperationPlan::Update { collection, .. }
+        | AxTransactionOperationPlan::Delete { collection, .. } => collection,
     }
 }
 
@@ -7360,6 +7553,62 @@ page Posts
         .expect("page should render with mutated store");
 
         assert!(html.contains("Axonyx Forms"));
+    }
+
+    #[test]
+    fn preview_action_transaction_commits_all_mutations_and_invalidations() {
+        let mut store = AxPreviewStore::default()
+            .with_collection("posts", Vec::new())
+            .with_collection("audit", Vec::new());
+
+        let result = execute_preview_action_sources(
+            &[r#"
+action publishPost(title: string) {
+  transaction {
+    db.posts.insert({ title: input.title, status: "published" })
+    db.audit.insert({ event: "post.published" })
+  }
+  return ok()
+}
+"#],
+            "publishPost",
+            &BTreeMap::from([("title".to_string(), "Atomic Axonyx".to_string())]),
+            &mut store,
+        )
+        .expect("transaction should execute");
+
+        assert_eq!(store.collection_items("posts").len(), 1);
+        assert_eq!(store.collection_items("audit").len(), 1);
+        assert_eq!(result.invalidations.len(), 2);
+        assert_eq!(result.invalidations[0].target, "posts");
+        assert_eq!(result.invalidations[1].target, "audit");
+    }
+
+    #[test]
+    fn preview_action_transaction_does_not_commit_before_all_values_are_valid() {
+        let mut store = AxPreviewStore::default()
+            .with_collection("posts", Vec::new())
+            .with_collection("audit", Vec::new());
+
+        let error = execute_preview_action_sources(
+            &[r#"
+action publishPost(title: string) {
+  transaction {
+    db.posts.insert({ title: input.title })
+    db.audit.insert({ event: missingHelper() })
+  }
+  return ok()
+}
+"#],
+            "publishPost",
+            &BTreeMap::from([("title".to_string(), "Must roll back".to_string())]),
+            &mut store,
+        )
+        .expect_err("invalid transaction value should fail");
+
+        assert!(error.to_string().contains("missingHelper"));
+        assert!(store.collection_items("posts").is_empty());
+        assert!(store.collection_items("audit").is_empty());
     }
 
     #[test]
