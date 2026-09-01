@@ -17,12 +17,13 @@ use postgres::types::{to_sql_checked, IsNull, ToSql, Type};
 use postgres::Client;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use thiserror::Error;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
@@ -72,6 +73,8 @@ pub enum AxDbErrorCode {
     ConstraintViolation,
     InvalidQuery,
     UnsupportedOperation,
+    MigrationConflict,
+    MigrationChecksumMismatch,
     ConnectionFailed,
     Timeout,
     DriverError,
@@ -85,6 +88,8 @@ impl AxDbErrorCode {
             Self::ConstraintViolation => "db.constraint_violation",
             Self::InvalidQuery => "db.invalid_query",
             Self::UnsupportedOperation => "db.unsupported_operation",
+            Self::MigrationConflict => "db.migration_conflict",
+            Self::MigrationChecksumMismatch => "db.migration_checksum_mismatch",
             Self::ConnectionFailed => "db.connection_failed",
             Self::Timeout => "db.timeout",
             Self::DriverError => "db.driver_error",
@@ -98,6 +103,12 @@ impl AxDbErrorCode {
             Self::ConstraintViolation => "Database constraint failed.",
             Self::InvalidQuery => "Database query is invalid.",
             Self::UnsupportedOperation => "Database operation is not supported.",
+            Self::MigrationConflict => {
+                "Database migration state conflicts with the requested operation."
+            }
+            Self::MigrationChecksumMismatch => {
+                "Applied database migration checksum does not match the local file."
+            }
             Self::ConnectionFailed => "Database connection failed.",
             Self::Timeout => "Database operation timed out.",
             Self::DriverError => "Database operation failed.",
@@ -107,7 +118,10 @@ impl AxDbErrorCode {
     pub fn status(&self) -> u16 {
         match self {
             Self::UnknownResource | Self::InvalidQuery => 400,
-            Self::UniqueViolation | Self::ConstraintViolation => 409,
+            Self::UniqueViolation
+            | Self::ConstraintViolation
+            | Self::MigrationConflict
+            | Self::MigrationChecksumMismatch => 409,
             Self::UnsupportedOperation => 501,
             Self::ConnectionFailed | Self::Timeout => 503,
             Self::DriverError => 500,
@@ -393,6 +407,24 @@ impl AxTransactionOperation {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AxTransactionRequest {
     pub operations: Vec<AxTransactionOperation>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxMigration {
+    pub version: String,
+    pub name: String,
+    pub checksum: String,
+    pub up_sql: String,
+    pub down_sql: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxAppliedMigration {
+    pub version: String,
+    pub name: String,
+    pub checksum: String,
+    pub applied_at: String,
+    pub execution_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -779,6 +811,17 @@ pub trait AxDatabaseAdapter: Send + Sync {
             .unwrap_or("transaction");
         Err(unsupported_transaction_error(self.driver(), resource))
     }
+    fn migration_history(&self) -> AxRuntimeResult<Vec<AxAppliedMigration>> {
+        Err(unsupported_migration_error(self.driver()))
+    }
+    fn apply_migration(&self, migration: &AxMigration) -> AxRuntimeResult<AxAppliedMigration> {
+        let _ = migration;
+        Err(unsupported_migration_error(self.driver()))
+    }
+    fn rollback_migration(&self, migration: &AxMigration) -> AxRuntimeResult<()> {
+        let _ = migration;
+        Err(unsupported_migration_error(self.driver()))
+    }
 }
 
 impl<T> AxDatabaseAdapter for Box<T>
@@ -812,6 +855,18 @@ where
     fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
         (**self).transaction(request)
     }
+
+    fn migration_history(&self) -> AxRuntimeResult<Vec<AxAppliedMigration>> {
+        (**self).migration_history()
+    }
+
+    fn apply_migration(&self, migration: &AxMigration) -> AxRuntimeResult<AxAppliedMigration> {
+        (**self).apply_migration(migration)
+    }
+
+    fn rollback_migration(&self, migration: &AxMigration) -> AxRuntimeResult<()> {
+        (**self).rollback_migration(migration)
+    }
 }
 
 pub trait AxQueryExecutor {
@@ -835,6 +890,12 @@ pub trait AxMutationExecutor {
                 .with_detail("this backend runtime does not support atomic transactions"),
         ))
     }
+}
+
+pub trait AxMigrationExecutor {
+    fn migration_history(&self) -> AxRuntimeResult<Vec<AxAppliedMigration>>;
+    fn apply_migration(&self, migration: &AxMigration) -> AxRuntimeResult<AxAppliedMigration>;
+    fn rollback_migration(&self, migration: &AxMigration) -> AxRuntimeResult<()>;
 }
 
 pub trait AxRevalidator {
@@ -903,6 +964,23 @@ where
 
     fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
         self.adapter.transaction(request)
+    }
+}
+
+impl<A> AxMigrationExecutor for AxDatabaseRuntime<A>
+where
+    A: AxDatabaseAdapter,
+{
+    fn migration_history(&self) -> AxRuntimeResult<Vec<AxAppliedMigration>> {
+        self.adapter.migration_history()
+    }
+
+    fn apply_migration(&self, migration: &AxMigration) -> AxRuntimeResult<AxAppliedMigration> {
+        self.adapter.apply_migration(migration)
+    }
+
+    fn rollback_migration(&self, migration: &AxMigration) -> AxRuntimeResult<()> {
+        self.adapter.rollback_migration(migration)
     }
 }
 
@@ -1089,6 +1167,29 @@ impl AxDatabaseAdapter for PostgresAdapter {
             request,
         )
     }
+
+    fn migration_history(&self) -> AxRuntimeResult<Vec<AxAppliedMigration>> {
+        ensure_direct_migration_transport(self.driver(), self.transport)?;
+        postgres_migration_history(self.direct_pool("_axonyx_migrations")?, &self.url)
+    }
+
+    fn apply_migration(&self, migration: &AxMigration) -> AxRuntimeResult<AxAppliedMigration> {
+        ensure_direct_migration_transport(self.driver(), self.transport)?;
+        postgres_apply_migration(
+            self.direct_pool("_axonyx_migrations")?,
+            &self.url,
+            migration,
+        )
+    }
+
+    fn rollback_migration(&self, migration: &AxMigration) -> AxRuntimeResult<()> {
+        ensure_direct_migration_transport(self.driver(), self.transport)?;
+        postgres_rollback_migration(
+            self.direct_pool("_axonyx_migrations")?,
+            &self.url,
+            migration,
+        )
+    }
 }
 
 impl AxDatabaseAdapter for MySqlAdapter {
@@ -1214,6 +1315,21 @@ impl AxDatabaseAdapter for SqliteAdapter {
 
     fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
         dispatch_transaction(self.driver(), self.transport, &self.url, None, request)
+    }
+
+    fn migration_history(&self) -> AxRuntimeResult<Vec<AxAppliedMigration>> {
+        ensure_direct_migration_transport(self.driver(), self.transport)?;
+        sqlite_migration_history(&self.url)
+    }
+
+    fn apply_migration(&self, migration: &AxMigration) -> AxRuntimeResult<AxAppliedMigration> {
+        ensure_direct_migration_transport(self.driver(), self.transport)?;
+        sqlite_apply_migration(&self.url, migration)
+    }
+
+    fn rollback_migration(&self, migration: &AxMigration) -> AxRuntimeResult<()> {
+        ensure_direct_migration_transport(self.driver(), self.transport)?;
+        sqlite_rollback_migration(&self.url, migration)
     }
 }
 
@@ -2001,6 +2117,408 @@ fn sqlite_execute_transaction(
     Ok(results)
 }
 
+const AXONYX_MIGRATIONS_RESOURCE: &str = "_axonyx_migrations";
+
+fn ensure_direct_migration_transport(
+    driver: AxDatabaseDriver,
+    transport: AxDataTransport,
+) -> AxRuntimeResult<()> {
+    if transport == AxDataTransport::Direct {
+        return Ok(());
+    }
+    Err(unsupported_migration_error(driver))
+}
+
+fn unsupported_migration_error(driver: AxDatabaseDriver) -> AxRuntimeError {
+    AxRuntimeError::database(
+        AxDbError::new(AxDbErrorCode::UnsupportedOperation)
+            .with_driver(driver)
+            .with_resource(AXONYX_MIGRATIONS_RESOURCE)
+            .with_detail("database migrations require direct SQLite or Postgres transport"),
+    )
+}
+
+fn validate_migration(migration: &AxMigration) -> AxRuntimeResult<()> {
+    let valid_version = !migration.version.is_empty()
+        && migration
+            .version
+            .chars()
+            .all(|ch| ch.is_ascii_digit() || matches!(ch, '_' | '-'));
+    let valid_name = !migration.name.is_empty()
+        && migration
+            .name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'));
+    let valid_checksum = migration.checksum.len() == 64
+        && migration.checksum.chars().all(|ch| ch.is_ascii_hexdigit());
+
+    if !valid_version || !valid_name || !valid_checksum {
+        return Err(migration_error(
+            AxDbErrorCode::InvalidQuery,
+            &migration.version,
+            "migration version, name, or SHA-256 checksum is invalid",
+        ));
+    }
+    if !migration_sql_has_executable_statement(&migration.up_sql)
+        || !migration_sql_has_executable_statement(&migration.down_sql)
+    {
+        return Err(migration_error(
+            AxDbErrorCode::InvalidQuery,
+            &migration.version,
+            "migration requires non-empty up.sql and down.sql",
+        ));
+    }
+    reject_migration_transaction_control(&migration.version, &migration.up_sql)?;
+    reject_migration_transaction_control(&migration.version, &migration.down_sql)
+}
+
+fn migration_sql_has_executable_statement(sql: &str) -> bool {
+    sql.lines()
+        .map(|line| line.split_once("--").map_or(line, |(code, _)| code))
+        .any(|line| !line.trim().is_empty())
+}
+
+fn reject_migration_transaction_control(version: &str, sql: &str) -> AxRuntimeResult<()> {
+    for keywords in migration_statement_prefixes(sql) {
+        let first = keywords.first().map(String::as_str).unwrap_or_default();
+        let second = keywords.get(1).map(String::as_str).unwrap_or_default();
+        if matches!(
+            first,
+            "begin" | "commit" | "rollback" | "savepoint" | "release" | "abort"
+        ) || matches!(
+            (first, second),
+            ("start", "transaction") | ("set", "transaction")
+        ) {
+            return Err(migration_error(
+                AxDbErrorCode::InvalidQuery,
+                version,
+                "migration SQL must not manage transactions directly",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn migration_statement_prefixes(sql: &str) -> Vec<Vec<String>> {
+    let bytes = sql.as_bytes();
+    let mut statements = Vec::new();
+    let mut keywords = Vec::new();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if bytes[index..].starts_with(b"--") {
+            index += 2;
+            while index < bytes.len() && bytes[index] != b'\n' {
+                index += 1;
+            }
+            continue;
+        }
+        if bytes[index..].starts_with(b"/*") {
+            index += 2;
+            let mut depth = 1_u32;
+            while index < bytes.len() && depth > 0 {
+                if bytes[index..].starts_with(b"/*") {
+                    depth += 1;
+                    index += 2;
+                } else if bytes[index..].starts_with(b"*/") {
+                    depth -= 1;
+                    index += 2;
+                } else {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if matches!(bytes[index], b'\'' | b'"') {
+            let quote = bytes[index];
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == quote {
+                    if bytes.get(index + 1) == Some(&quote) {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if bytes[index] == b'$' {
+            let tag_end = bytes[index + 1..]
+                .iter()
+                .position(|byte| *byte == b'$')
+                .map(|offset| index + 1 + offset);
+            if let Some(tag_end) = tag_end.filter(|tag_end| {
+                bytes[index + 1..*tag_end]
+                    .iter()
+                    .all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            }) {
+                let delimiter = &sql[index..=tag_end];
+                let body_start = tag_end + 1;
+                if let Some(close) = sql[body_start..].find(delimiter) {
+                    index = body_start + close + delimiter.len();
+                    continue;
+                }
+            }
+        }
+        if bytes[index] == b';' {
+            if !keywords.is_empty() {
+                statements.push(std::mem::take(&mut keywords));
+            }
+            index += 1;
+            continue;
+        }
+        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            if keywords.len() < 2 {
+                keywords.push(sql[start..index].to_ascii_lowercase());
+            }
+            continue;
+        }
+        index += 1;
+    }
+
+    if !keywords.is_empty() {
+        statements.push(keywords);
+    }
+    statements
+}
+
+fn migration_error(
+    code: AxDbErrorCode,
+    version: &str,
+    detail: impl Into<String>,
+) -> AxRuntimeError {
+    AxRuntimeError::database(
+        AxDbError::new(code)
+            .with_resource(AXONYX_MIGRATIONS_RESOURCE)
+            .with_field(version)
+            .with_detail(detail),
+    )
+}
+
+fn sqlite_ensure_migrations_table(
+    connection: &rusqlite::Connection,
+) -> Result<(), rusqlite::Error> {
+    connection.execute_batch(
+        r#"
+create table if not exists _axonyx_migrations (
+  version text primary key,
+  name text not null,
+  checksum text not null,
+  applied_at text not null default current_timestamp,
+  execution_ms integer not null
+)
+"#,
+    )
+}
+
+fn sqlite_migrations_table_exists(
+    connection: &rusqlite::Connection,
+) -> Result<bool, rusqlite::Error> {
+    connection.query_row(
+        "select exists(select 1 from sqlite_master where type = 'table' and name = '_axonyx_migrations')",
+        [],
+        |row| row.get(0),
+    )
+}
+
+fn sqlite_migration_history(url: &Option<String>) -> AxRuntimeResult<Vec<AxAppliedMigration>> {
+    ensure_persistent_sqlite_migration_url(url)?;
+    let connection = sqlite_open_connection(url, AXONYX_MIGRATIONS_RESOURCE)?;
+    if !sqlite_migrations_table_exists(&connection)
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?
+    {
+        return Ok(Vec::new());
+    }
+    let mut statement = connection
+        .prepare(
+            "select version, name, checksum, applied_at, execution_ms from _axonyx_migrations order by version asc",
+        )
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok(AxAppliedMigration {
+                version: row.get(0)?,
+                name: row.get(1)?,
+                checksum: row.get(2)?,
+                applied_at: row.get(3)?,
+                execution_ms: row.get::<_, u64>(4)?,
+            })
+        })
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))
+}
+
+fn sqlite_apply_migration(
+    url: &Option<String>,
+    migration: &AxMigration,
+) -> AxRuntimeResult<AxAppliedMigration> {
+    validate_migration(migration)?;
+    ensure_persistent_sqlite_migration_url(url)?;
+    let mut connection = sqlite_open_connection(url, AXONYX_MIGRATIONS_RESOURCE)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+    sqlite_ensure_migrations_table(&transaction)
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+
+    let existing = transaction
+        .query_row(
+            "select checksum from _axonyx_migrations where version = ?1",
+            [&migration.version],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+    if let Some(checksum) = existing {
+        let code = if checksum == migration.checksum {
+            AxDbErrorCode::MigrationConflict
+        } else {
+            AxDbErrorCode::MigrationChecksumMismatch
+        };
+        return Err(migration_error(
+            code,
+            &migration.version,
+            "migration version is already present in database history",
+        ));
+    }
+
+    let started = Instant::now();
+    transaction
+        .execute_batch(&migration.up_sql)
+        .map_err(|error| sqlite_runtime_error(&migration.version, error))?;
+    let execution_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+    transaction
+        .execute(
+            "insert into _axonyx_migrations (version, name, checksum, execution_ms) values (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                migration.version,
+                migration.name,
+                migration.checksum,
+                execution_ms
+            ],
+        )
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+    let applied_at = transaction
+        .query_row(
+            "select applied_at from _axonyx_migrations where version = ?1",
+            [&migration.version],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+    transaction
+        .commit()
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+
+    Ok(AxAppliedMigration {
+        version: migration.version.clone(),
+        name: migration.name.clone(),
+        checksum: migration.checksum.clone(),
+        applied_at,
+        execution_ms,
+    })
+}
+
+fn sqlite_rollback_migration(url: &Option<String>, migration: &AxMigration) -> AxRuntimeResult<()> {
+    validate_migration(migration)?;
+    ensure_persistent_sqlite_migration_url(url)?;
+    let mut connection = sqlite_open_connection(url, AXONYX_MIGRATIONS_RESOURCE)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+    if !sqlite_migrations_table_exists(&transaction)
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?
+    {
+        return Err(migration_error(
+            AxDbErrorCode::MigrationConflict,
+            &migration.version,
+            "database migration history is empty",
+        ));
+    }
+    let latest = transaction
+        .query_row(
+            "select version, checksum from _axonyx_migrations order by version desc limit 1",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+    validate_rollback_target(
+        migration,
+        latest.as_ref().map(|(v, c)| (v.as_str(), c.as_str())),
+    )?;
+
+    transaction
+        .execute_batch(&migration.down_sql)
+        .map_err(|error| sqlite_runtime_error(&migration.version, error))?;
+    transaction
+        .execute(
+            "delete from _axonyx_migrations where version = ?1",
+            [&migration.version],
+        )
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+    transaction
+        .commit()
+        .map_err(|error| sqlite_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))
+}
+
+fn ensure_persistent_sqlite_migration_url(url: &Option<String>) -> AxRuntimeResult<()> {
+    if url
+        .as_deref()
+        .is_some_and(|url| sqlite_database_path(url) == ":memory:")
+    {
+        return Err(migration_error(
+            AxDbErrorCode::InvalidQuery,
+            AXONYX_MIGRATIONS_RESOURCE,
+            "database migrations require a persistent SQLite file",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_rollback_target(
+    migration: &AxMigration,
+    latest: Option<(&str, &str)>,
+) -> AxRuntimeResult<()> {
+    let Some((version, checksum)) = latest else {
+        return Err(migration_error(
+            AxDbErrorCode::MigrationConflict,
+            &migration.version,
+            "database migration history is empty",
+        ));
+    };
+    if version != migration.version {
+        return Err(migration_error(
+            AxDbErrorCode::MigrationConflict,
+            &migration.version,
+            format!("only latest migration `{version}` can be rolled back"),
+        ));
+    }
+    if checksum != migration.checksum {
+        return Err(migration_error(
+            AxDbErrorCode::MigrationChecksumMismatch,
+            &migration.version,
+            "local migration differs from the applied migration",
+        ));
+    }
+    Ok(())
+}
+
 fn sqlite_open_connection(
     url: &Option<String>,
     resource: &str,
@@ -2211,6 +2729,174 @@ fn postgres_execute_transaction(
             .commit()
             .map_err(|error| postgres_runtime_error(resource, error))?;
         Ok(results)
+    })
+}
+
+fn postgres_ensure_migrations_table(
+    client: &mut impl postgres::GenericClient,
+) -> Result<(), postgres::Error> {
+    client.batch_execute(
+        r#"
+create table if not exists _axonyx_migrations (
+  version text primary key,
+  name text not null,
+  checksum text not null,
+  applied_at timestamptz not null default now(),
+  execution_ms bigint not null
+)
+"#,
+    )
+}
+
+fn postgres_migrations_table_exists(
+    client: &mut impl postgres::GenericClient,
+) -> Result<bool, postgres::Error> {
+    client
+        .query_one("select to_regclass('_axonyx_migrations') is not null", &[])
+        .map(|row| row.get(0))
+}
+
+fn postgres_migration_history(
+    pool: Option<&AxPostgresPool>,
+    url: &Option<String>,
+) -> AxRuntimeResult<Vec<AxAppliedMigration>> {
+    postgres_with_client(pool, url, AXONYX_MIGRATIONS_RESOURCE, |client| {
+        if !postgres_migrations_table_exists(client)
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?
+        {
+            return Ok(Vec::new());
+        }
+        client
+            .query(
+                "select version, name, checksum, applied_at::text, execution_ms from _axonyx_migrations order by version asc",
+                &[],
+            )
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?
+            .into_iter()
+            .map(|row| {
+                let execution_ms = row.get::<_, i64>(4);
+                Ok(AxAppliedMigration {
+                    version: row.get(0),
+                    name: row.get(1),
+                    checksum: row.get(2),
+                    applied_at: row.get(3),
+                    execution_ms: u64::try_from(execution_ms).map_err(|_| {
+                        migration_error(
+                            AxDbErrorCode::DriverError,
+                            AXONYX_MIGRATIONS_RESOURCE,
+                            "stored migration execution time is negative",
+                        )
+                    })?,
+                })
+            })
+            .collect()
+    })
+}
+
+fn postgres_apply_migration(
+    pool: Option<&AxPostgresPool>,
+    url: &Option<String>,
+    migration: &AxMigration,
+) -> AxRuntimeResult<AxAppliedMigration> {
+    validate_migration(migration)?;
+    postgres_with_client(pool, url, AXONYX_MIGRATIONS_RESOURCE, |client| {
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+        postgres_ensure_migrations_table(&mut transaction)
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+        let existing = transaction
+            .query_opt(
+                "select checksum from _axonyx_migrations where version = $1",
+                &[&migration.version],
+            )
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+        if let Some(row) = existing {
+            let checksum = row.get::<_, String>(0);
+            let code = if checksum == migration.checksum {
+                AxDbErrorCode::MigrationConflict
+            } else {
+                AxDbErrorCode::MigrationChecksumMismatch
+            };
+            return Err(migration_error(
+                code,
+                &migration.version,
+                "migration version is already present in database history",
+            ));
+        }
+
+        let started = Instant::now();
+        transaction
+            .batch_execute(&migration.up_sql)
+            .map_err(|error| postgres_runtime_error(&migration.version, error))?;
+        let execution_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let stored_execution_ms = i64::try_from(execution_ms).unwrap_or(i64::MAX);
+        let row = transaction
+            .query_one(
+                "insert into _axonyx_migrations (version, name, checksum, execution_ms) values ($1, $2, $3, $4) returning applied_at::text",
+                &[&migration.version, &migration.name, &migration.checksum, &stored_execution_ms],
+            )
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+        let applied_at = row.get(0);
+        transaction
+            .commit()
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+
+        Ok(AxAppliedMigration {
+            version: migration.version.clone(),
+            name: migration.name.clone(),
+            checksum: migration.checksum.clone(),
+            applied_at,
+            execution_ms,
+        })
+    })
+}
+
+fn postgres_rollback_migration(
+    pool: Option<&AxPostgresPool>,
+    url: &Option<String>,
+    migration: &AxMigration,
+) -> AxRuntimeResult<()> {
+    validate_migration(migration)?;
+    postgres_with_client(pool, url, AXONYX_MIGRATIONS_RESOURCE, |client| {
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+        if !postgres_migrations_table_exists(&mut transaction)
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?
+        {
+            return Err(migration_error(
+                AxDbErrorCode::MigrationConflict,
+                &migration.version,
+                "database migration history is empty",
+            ));
+        }
+        let latest = transaction
+            .query_opt(
+                "select version, checksum from _axonyx_migrations order by version desc limit 1",
+                &[],
+            )
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)));
+        validate_rollback_target(
+            migration,
+            latest
+                .as_ref()
+                .map(|(version, checksum)| (version.as_str(), checksum.as_str())),
+        )?;
+
+        transaction
+            .batch_execute(&migration.down_sql)
+            .map_err(|error| postgres_runtime_error(&migration.version, error))?;
+        transaction
+            .execute(
+                "delete from _axonyx_migrations where version = $1",
+                &[&migration.version],
+            )
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))?;
+        transaction
+            .commit()
+            .map_err(|error| postgres_runtime_error(AXONYX_MIGRATIONS_RESOURCE, error))
     })
 }
 
@@ -2966,6 +3652,7 @@ pub mod prelude {
     pub use super::lazy_runtime_from_env;
     pub use super::ok_payload;
     pub use super::runtime_from_env;
+    pub use super::AxAppliedMigration;
     pub use super::AxBackendRuntime;
     pub use super::AxDataTransport;
     pub use super::AxDatabaseAdapter;
@@ -2979,6 +3666,8 @@ pub mod prelude {
     pub use super::AxInsertRequest;
     pub use super::AxLoaderContext;
     pub use super::AxMessenger;
+    pub use super::AxMigration;
+    pub use super::AxMigrationExecutor;
     pub use super::AxMutationExecutor;
     pub use super::AxQueryExecutor;
     pub use super::AxQueryFilterOp;
@@ -4124,6 +4813,231 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_migrations_apply_in_order_and_only_latest_can_roll_back() {
+        let (_path, url) = temp_sqlite_database("migrations_order");
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+        let first = test_migration(
+            "20260901_001",
+            "create_posts",
+            'a',
+            "create table posts (id integer primary key, title text not null);",
+            "drop table posts;",
+        );
+        let second = test_migration(
+            "20260901_002",
+            "create_audit",
+            'b',
+            "create table audit (id integer primary key, event text not null);",
+            "drop table audit;",
+        );
+
+        runtime
+            .apply_migration(&first)
+            .expect("first migration should apply");
+        runtime
+            .apply_migration(&second)
+            .expect("second migration should apply");
+        let history = runtime.migration_history().expect("history should load");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].version, first.version);
+        assert_eq!(history[1].version, second.version);
+
+        let error = runtime
+            .rollback_migration(&first)
+            .expect_err("non-latest migration must not roll back");
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.migration_conflict");
+
+        runtime
+            .rollback_migration(&second)
+            .expect("latest migration should roll back");
+        let tables = runtime
+            .query(&AxRawSqlRequest {
+                sql: "select name from sqlite_master where type = 'table' and name = 'audit'"
+                    .to_string(),
+                params: Vec::new(),
+            })
+            .expect("table state should load");
+        assert_eq!(tables, json!([]));
+        assert_eq!(
+            runtime
+                .migration_history()
+                .expect("history should reload")
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn sqlite_migration_history_is_read_only_before_first_apply() {
+        let (path, url) = temp_sqlite_database("migration_history_read_only");
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+
+        assert!(runtime
+            .migration_history()
+            .expect("empty history should load")
+            .is_empty());
+
+        let connection = rusqlite::Connection::open(path).expect("sqlite should open");
+        let tracking_tables: i64 = connection
+            .query_row(
+                "select count(*) from sqlite_master where type = 'table' and name = '_axonyx_migrations'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("tracking table count should load");
+        assert_eq!(tracking_tables, 0);
+    }
+
+    #[test]
+    fn sqlite_migration_rejects_changed_applied_checksum() {
+        let (_path, url) = temp_sqlite_database("migration_checksum");
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+        let migration = test_migration(
+            "20260901_001",
+            "create_posts",
+            'a',
+            "create table posts (id integer primary key);",
+            "drop table posts;",
+        );
+        runtime
+            .apply_migration(&migration)
+            .expect("migration should apply");
+        let changed = AxMigration {
+            checksum: "b".repeat(64),
+            ..migration
+        };
+
+        let error = runtime
+            .apply_migration(&changed)
+            .expect_err("changed migration should fail");
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.migration_checksum_mismatch");
+    }
+
+    #[test]
+    fn sqlite_failed_migration_rolls_back_schema_and_history() {
+        let (_path, url) = temp_sqlite_database("migration_atomic_failure");
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+        let migration = test_migration(
+            "20260901_001",
+            "broken",
+            'a',
+            "create table partial_write (id integer primary key); invalid migration sql;",
+            "drop table partial_write;",
+        );
+
+        runtime
+            .apply_migration(&migration)
+            .expect_err("invalid migration should fail");
+        let tables = runtime
+            .query(&AxRawSqlRequest {
+                sql:
+                    "select name from sqlite_master where type = 'table' and name = 'partial_write'"
+                        .to_string(),
+                params: Vec::new(),
+            })
+            .expect("table state should load");
+        assert_eq!(tables, json!([]));
+        assert!(runtime
+            .migration_history()
+            .expect("history should load")
+            .is_empty());
+    }
+
+    #[test]
+    fn migration_rejects_author_managed_transaction_control() {
+        let migration = test_migration(
+            "20260901_001",
+            "unsafe_transaction",
+            'a',
+            "begin; create table posts (id integer primary key); commit;",
+            "drop table posts;",
+        );
+
+        let error = validate_migration(&migration).expect_err("transaction SQL should fail");
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.invalid_query");
+    }
+
+    #[test]
+    fn migration_transaction_guard_handles_comments_literals_and_postgres_blocks() {
+        let safe = test_migration(
+            "20260901_001",
+            "safe_literals",
+            'a',
+            "insert into audit (message) values ('ok; rollback later');\n\
+             create function demo() returns void as $$ begin perform 1; commit; end $$ language plpgsql;",
+            "drop function demo; drop table audit;",
+        );
+        validate_migration(&safe).expect("transaction words in literals should be safe");
+
+        for sql in [
+            "/* migration comment */ commit;",
+            "-- migration comment\nstart transaction;",
+            "set transaction isolation level serializable;",
+            "abort;",
+        ] {
+            let migration =
+                test_migration("20260901_002", "unsafe_transaction", 'b', sql, "select 1;");
+            let error = validate_migration(&migration)
+                .expect_err("author transaction control should be rejected");
+            let AxRuntimeError::Database { error } = error else {
+                panic!("expected database error");
+            };
+            assert_eq!(error.code, "db.invalid_query");
+        }
+    }
+
+    #[test]
+    fn sqlite_migrations_reject_ephemeral_memory_databases() {
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", ":memory:"),
+        )
+        .expect("runtime should initialize");
+
+        let error = runtime
+            .migration_history()
+            .expect_err("ephemeral migration history should fail");
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.invalid_query");
+        assert!(error
+            .detail
+            .as_deref()
+            .is_some_and(|detail| detail.contains("persistent SQLite file")));
+    }
+
+    #[test]
     fn sqlite_direct_errors_use_db_translator() {
         let (_path, url) = temp_sqlite_database("errors");
         seed_sqlite_posts(&url);
@@ -4309,6 +5223,22 @@ mod tests {
 
         assert!(runtime.env().public.is_empty());
         assert!(runtime.env().secret.is_empty());
+    }
+
+    fn test_migration(
+        version: &str,
+        name: &str,
+        checksum_char: char,
+        up_sql: &str,
+        down_sql: &str,
+    ) -> AxMigration {
+        AxMigration {
+            version: version.to_string(),
+            name: name.to_string(),
+            checksum: checksum_char.to_string().repeat(64),
+            up_sql: up_sql.to_string(),
+            down_sql: down_sql.to_string(),
+        }
     }
 
     fn temp_sqlite_database(name: &str) -> (std::path::PathBuf, String) {
