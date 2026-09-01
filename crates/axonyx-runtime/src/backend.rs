@@ -71,6 +71,7 @@ pub enum AxDbErrorCode {
     UniqueViolation,
     ConstraintViolation,
     InvalidQuery,
+    UnsupportedOperation,
     ConnectionFailed,
     Timeout,
     DriverError,
@@ -83,6 +84,7 @@ impl AxDbErrorCode {
             Self::UniqueViolation => "db.unique_violation",
             Self::ConstraintViolation => "db.constraint_violation",
             Self::InvalidQuery => "db.invalid_query",
+            Self::UnsupportedOperation => "db.unsupported_operation",
             Self::ConnectionFailed => "db.connection_failed",
             Self::Timeout => "db.timeout",
             Self::DriverError => "db.driver_error",
@@ -95,6 +97,7 @@ impl AxDbErrorCode {
             Self::UniqueViolation => "Record already exists.",
             Self::ConstraintViolation => "Database constraint failed.",
             Self::InvalidQuery => "Database query is invalid.",
+            Self::UnsupportedOperation => "Database operation is not supported.",
             Self::ConnectionFailed => "Database connection failed.",
             Self::Timeout => "Database operation timed out.",
             Self::DriverError => "Database operation failed.",
@@ -105,6 +108,7 @@ impl AxDbErrorCode {
         match self {
             Self::UnknownResource | Self::InvalidQuery => 400,
             Self::UniqueViolation | Self::ConstraintViolation => 409,
+            Self::UnsupportedOperation => 501,
             Self::ConnectionFailed | Self::Timeout => 503,
             Self::DriverError => 500,
         }
@@ -367,6 +371,28 @@ pub struct AxUpdateRequest {
 pub struct AxDeleteRequest {
     pub collection: String,
     pub filters: Vec<AxQueryFilterRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum AxTransactionOperation {
+    Insert(AxInsertRequest),
+    Update(AxUpdateRequest),
+    Delete(AxDeleteRequest),
+}
+
+impl AxTransactionOperation {
+    pub fn resource(&self) -> &str {
+        match self {
+            Self::Insert(request) => &request.collection,
+            Self::Update(request) => &request.collection,
+            Self::Delete(request) => &request.collection,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AxTransactionRequest {
+    pub operations: Vec<AxTransactionOperation>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -745,6 +771,14 @@ pub trait AxDatabaseAdapter: Send + Sync {
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value>;
     fn update(&self, request: &AxUpdateRequest) -> AxRuntimeResult<Value>;
     fn delete(&self, request: &AxDeleteRequest) -> AxRuntimeResult<Value>;
+    fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
+        let resource = request
+            .operations
+            .first()
+            .map(AxTransactionOperation::resource)
+            .unwrap_or("transaction");
+        Err(unsupported_transaction_error(self.driver(), resource))
+    }
 }
 
 impl<T> AxDatabaseAdapter for Box<T>
@@ -774,6 +808,10 @@ where
     fn delete(&self, request: &AxDeleteRequest) -> AxRuntimeResult<Value> {
         (**self).delete(request)
     }
+
+    fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
+        (**self).transaction(request)
+    }
 }
 
 pub trait AxQueryExecutor {
@@ -785,6 +823,18 @@ pub trait AxMutationExecutor {
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value>;
     fn update(&self, request: &AxUpdateRequest) -> AxRuntimeResult<Value>;
     fn delete(&self, request: &AxDeleteRequest) -> AxRuntimeResult<Value>;
+    fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
+        let resource = request
+            .operations
+            .first()
+            .map(AxTransactionOperation::resource)
+            .unwrap_or("transaction");
+        Err(AxRuntimeError::database(
+            AxDbError::new(AxDbErrorCode::UnsupportedOperation)
+                .with_resource(resource)
+                .with_detail("this backend runtime does not support atomic transactions"),
+        ))
+    }
 }
 
 pub trait AxRevalidator {
@@ -849,6 +899,10 @@ where
 
     fn delete(&self, request: &AxDeleteRequest) -> AxRuntimeResult<Value> {
         self.adapter.delete(request)
+    }
+
+    fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
+        self.adapter.transaction(request)
     }
 }
 
@@ -1024,6 +1078,17 @@ impl AxDatabaseAdapter for PostgresAdapter {
             request,
         )
     }
+
+    fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
+        let resource = transaction_resource(request)?;
+        dispatch_transaction(
+            self.driver(),
+            self.transport,
+            &self.url,
+            self.direct_pool(resource)?,
+            request,
+        )
+    }
 }
 
 impl AxDatabaseAdapter for MySqlAdapter {
@@ -1145,6 +1210,10 @@ impl AxDatabaseAdapter for SqliteAdapter {
             None,
             request,
         )
+    }
+
+    fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
+        dispatch_transaction(self.driver(), self.transport, &self.url, None, request)
     }
 }
 
@@ -1378,6 +1447,53 @@ fn dispatch_delete(
         AxDataTransport::Direct => direct_delete_plan(driver, url, postgres_pool, request),
         AxDataTransport::Api => api_delete_plan(driver, api_url, request),
     }
+}
+
+fn dispatch_transaction(
+    driver: AxDatabaseDriver,
+    transport: AxDataTransport,
+    url: &Option<String>,
+    postgres_pool: Option<&AxPostgresPool>,
+    request: &AxTransactionRequest,
+) -> AxRuntimeResult<Vec<Value>> {
+    let resource = transaction_resource(request)?;
+    if transport != AxDataTransport::Direct {
+        return Err(unsupported_transaction_error(driver, resource));
+    }
+
+    let operations = prepare_transaction_operations(driver.clone(), request)?;
+    match driver {
+        AxDatabaseDriver::Sqlite => sqlite_execute_transaction(url, &operations),
+        AxDatabaseDriver::Postgres => {
+            postgres_execute_transaction(postgres_pool, url, resource, &operations)
+        }
+        AxDatabaseDriver::MySql | AxDatabaseDriver::Memory => {
+            Err(unsupported_transaction_error(driver, resource))
+        }
+    }
+}
+
+fn transaction_resource(request: &AxTransactionRequest) -> AxRuntimeResult<&str> {
+    request
+        .operations
+        .first()
+        .map(AxTransactionOperation::resource)
+        .ok_or_else(|| {
+            AxRuntimeError::database(
+                AxDbError::new(AxDbErrorCode::InvalidQuery)
+                    .with_resource("transaction")
+                    .with_detail("database transaction requires at least one operation"),
+            )
+        })
+}
+
+fn unsupported_transaction_error(driver: AxDatabaseDriver, resource: &str) -> AxRuntimeError {
+    AxRuntimeError::database(
+        AxDbError::new(AxDbErrorCode::UnsupportedOperation)
+            .with_driver(driver)
+            .with_resource(resource)
+            .with_detail("atomic transactions require the direct SQLite or Postgres transport"),
+    )
 }
 
 fn direct_load_plan(
@@ -1706,6 +1822,86 @@ fn direct_delete_plan(
     }))
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct AxPreparedTransactionOperation {
+    action: &'static str,
+    resource: String,
+    sql: String,
+    params: Vec<Value>,
+}
+
+fn prepare_transaction_operations(
+    driver: AxDatabaseDriver,
+    request: &AxTransactionRequest,
+) -> AxRuntimeResult<Vec<AxPreparedTransactionOperation>> {
+    let Some(dialect) = driver.sql_dialect() else {
+        return Err(unsupported_transaction_error(
+            driver,
+            transaction_resource(request)?,
+        ));
+    };
+
+    request
+        .operations
+        .iter()
+        .map(|operation| match operation {
+            AxTransactionOperation::Insert(request) => {
+                let fields = fields_to_assignment_plans(&request.fields);
+                let plan = compile_insert_plan_to_sql(&request.collection, &fields, dialect)
+                    .map_err(|error| {
+                        AxRuntimeError::database(AxDbError::invalid_query(
+                            driver.clone(),
+                            request.collection.clone(),
+                            error.to_string(),
+                        ))
+                    })?;
+                Ok(AxPreparedTransactionOperation {
+                    action: "insert",
+                    resource: request.collection.clone(),
+                    sql: plan.sql,
+                    params: sql_params_to_json(&plan.params),
+                })
+            }
+            AxTransactionOperation::Update(request) => {
+                let fields = fields_to_assignment_plans(&request.fields);
+                let filters = query_filters_to_plan(&request.filters);
+                let plan =
+                    compile_update_plan_to_sql(&request.collection, &fields, &filters, dialect)
+                        .map_err(|error| {
+                            AxRuntimeError::database(AxDbError::invalid_query(
+                                driver.clone(),
+                                request.collection.clone(),
+                                error.to_string(),
+                            ))
+                        })?;
+                Ok(AxPreparedTransactionOperation {
+                    action: "update",
+                    resource: request.collection.clone(),
+                    sql: plan.sql,
+                    params: sql_params_to_json(&plan.params),
+                })
+            }
+            AxTransactionOperation::Delete(request) => {
+                let filters = query_filters_to_plan(&request.filters);
+                let plan = compile_delete_plan_to_sql(&request.collection, &filters, dialect)
+                    .map_err(|error| {
+                        AxRuntimeError::database(AxDbError::invalid_query(
+                            driver.clone(),
+                            request.collection.clone(),
+                            error.to_string(),
+                        ))
+                    })?;
+                Ok(AxPreparedTransactionOperation {
+                    action: "delete",
+                    resource: request.collection.clone(),
+                    sql: plan.sql,
+                    params: sql_params_to_json(&plan.params),
+                })
+            }
+        })
+        .collect()
+}
+
 fn sql_params_to_json(params: &[AxSqlParam]) -> Vec<Value> {
     params
         .iter()
@@ -1768,6 +1964,41 @@ fn sqlite_execute_mutation(
         "changes": changes,
         "last_insert_rowid": connection.last_insert_rowid(),
     }))
+}
+
+fn sqlite_execute_transaction(
+    url: &Option<String>,
+    operations: &[AxPreparedTransactionOperation],
+) -> AxRuntimeResult<Vec<Value>> {
+    let resource = operations
+        .first()
+        .map(|operation| operation.resource.as_str())
+        .unwrap_or("transaction");
+    let mut connection = sqlite_open_connection(url, resource)?;
+    let transaction = connection
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| sqlite_runtime_error(resource, error))?;
+    let mut results = Vec::with_capacity(operations.len());
+
+    for operation in operations {
+        let params = json_params_to_sqlite(&operation.params)?;
+        let changes = transaction
+            .execute(&operation.sql, rusqlite::params_from_iter(params))
+            .map_err(|error| sqlite_runtime_error(&operation.resource, error))?;
+        results.push(json!({
+            "ok": true,
+            "driver": "sqlite",
+            "action": operation.action,
+            "resource": operation.resource,
+            "changes": changes,
+            "last_insert_rowid": transaction.last_insert_rowid(),
+        }));
+    }
+
+    transaction
+        .commit()
+        .map_err(|error| sqlite_runtime_error(resource, error))?;
+    Ok(results)
 }
 
 fn sqlite_open_connection(
@@ -1938,6 +2169,48 @@ fn postgres_execute_mutation(
             "resource": resource,
             "changes": changes,
         }))
+    })
+}
+
+fn postgres_execute_transaction(
+    pool: Option<&AxPostgresPool>,
+    url: &Option<String>,
+    resource: &str,
+    operations: &[AxPreparedTransactionOperation],
+) -> AxRuntimeResult<Vec<Value>> {
+    postgres_with_client(pool, url, resource, |client| {
+        let mut transaction = client
+            .transaction()
+            .map_err(|error| postgres_runtime_error(resource, error))?;
+        let mut results = Vec::with_capacity(operations.len());
+
+        for operation in operations {
+            let params = operation
+                .params
+                .iter()
+                .cloned()
+                .map(AxPostgresParam)
+                .collect::<Vec<_>>();
+            let param_refs = params
+                .iter()
+                .map(|value| value as &(dyn ToSql + Sync))
+                .collect::<Vec<_>>();
+            let changes = transaction
+                .execute(&operation.sql, &param_refs)
+                .map_err(|error| postgres_runtime_error(&operation.resource, error))?;
+            results.push(json!({
+                "ok": true,
+                "driver": "postgres",
+                "action": operation.action,
+                "resource": operation.resource,
+                "changes": changes,
+            }));
+        }
+
+        transaction
+            .commit()
+            .map_err(|error| postgres_runtime_error(resource, error))?;
+        Ok(results)
     })
 }
 
@@ -2720,6 +2993,8 @@ pub mod prelude {
     pub use super::AxRuntimeError;
     pub use super::AxRuntimeResult;
     pub use super::AxSendRequest;
+    pub use super::AxTransactionOperation;
+    pub use super::AxTransactionRequest;
     pub use super::AxUpdateRequest;
     pub use super::MemoryAdapter;
     pub use super::MySqlAdapter;
@@ -3463,6 +3738,62 @@ mod tests {
                 }],
             })?;
             assert_eq!(deleted["changes"], 1);
+
+            let transaction_results = runtime.transaction(&AxTransactionRequest {
+                operations: vec![
+                    AxTransactionOperation::Insert(AxInsertRequest {
+                        collection: table.clone(),
+                        fields: BTreeMap::from([
+                            ("title".to_string(), json!("Transaction A")),
+                            ("published".to_string(), json!(false)),
+                        ]),
+                    }),
+                    AxTransactionOperation::Insert(AxInsertRequest {
+                        collection: table.clone(),
+                        fields: BTreeMap::from([
+                            ("title".to_string(), json!("Transaction B")),
+                            ("published".to_string(), json!(true)),
+                        ]),
+                    }),
+                ],
+            })?;
+            assert_eq!(transaction_results.len(), 2);
+
+            let rollback_error = runtime.transaction(&AxTransactionRequest {
+                operations: vec![
+                    AxTransactionOperation::Insert(AxInsertRequest {
+                        collection: table.clone(),
+                        fields: BTreeMap::from([
+                            ("title".to_string(), json!("Must Roll Back")),
+                            ("published".to_string(), json!(false)),
+                        ]),
+                    }),
+                    AxTransactionOperation::Insert(AxInsertRequest {
+                        collection: table.clone(),
+                        fields: BTreeMap::from([
+                            ("title".to_string(), json!("Transaction A")),
+                            ("published".to_string(), json!(false)),
+                        ]),
+                    }),
+                ],
+            });
+            assert!(matches!(
+                rollback_error,
+                Err(AxRuntimeError::Database { .. })
+            ));
+            let rolled_back = runtime.load(&AxQueryRequest {
+                collection: table.clone(),
+                filters: vec![AxQueryFilterRequest {
+                    field: "title".to_string(),
+                    op: AxQueryFilterOp::Eq,
+                    value: json!("Must Roll Back"),
+                }],
+                orders: Vec::new(),
+                limit: None,
+                offset: None,
+                mode: AxQueryMode::Many,
+            })?;
+            assert_eq!(rolled_back, json!([]));
             Ok(())
         })();
 
@@ -3678,6 +4009,118 @@ mod tests {
             })
             .expect("sqlite delete should execute");
         assert_eq!(deleted["changes"], json!(1));
+    }
+
+    #[test]
+    fn sqlite_transaction_commits_all_mutations() {
+        let (_path, url) = temp_sqlite_database("transaction_commit");
+        seed_sqlite_posts(&url);
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+
+        let results = runtime
+            .transaction(&AxTransactionRequest {
+                operations: vec![
+                    AxTransactionOperation::Insert(AxInsertRequest {
+                        collection: "posts".to_string(),
+                        fields: BTreeMap::from([
+                            ("title".to_string(), json!("First")),
+                            ("slug".to_string(), json!("first")),
+                            ("status".to_string(), json!("draft")),
+                        ]),
+                    }),
+                    AxTransactionOperation::Insert(AxInsertRequest {
+                        collection: "posts".to_string(),
+                        fields: BTreeMap::from([
+                            ("title".to_string(), json!("Second")),
+                            ("slug".to_string(), json!("second")),
+                            ("status".to_string(), json!("published")),
+                        ]),
+                    }),
+                ],
+            })
+            .expect("sqlite transaction should commit");
+
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|result| result["changes"] == json!(1)));
+        let rows = runtime
+            .query(&AxRawSqlRequest {
+                sql: "select slug from posts where slug in (?, ?) order by slug".to_string(),
+                params: vec![json!("first"), json!("second")],
+            })
+            .expect("committed rows should be readable");
+        assert_eq!(rows, json!([{ "slug": "first" }, { "slug": "second" }]));
+    }
+
+    #[test]
+    fn sqlite_transaction_rolls_back_every_mutation_after_failure() {
+        let (_path, url) = temp_sqlite_database("transaction_rollback");
+        seed_sqlite_posts(&url);
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+
+        let error = runtime
+            .transaction(&AxTransactionRequest {
+                operations: vec![
+                    AxTransactionOperation::Insert(AxInsertRequest {
+                        collection: "posts".to_string(),
+                        fields: BTreeMap::from([
+                            ("title".to_string(), json!("Must roll back")),
+                            ("slug".to_string(), json!("rolled-back")),
+                            ("status".to_string(), json!("draft")),
+                        ]),
+                    }),
+                    AxTransactionOperation::Insert(AxInsertRequest {
+                        collection: "posts".to_string(),
+                        fields: BTreeMap::from([
+                            ("title".to_string(), json!("Duplicate")),
+                            ("slug".to_string(), json!("hello")),
+                            ("status".to_string(), json!("draft")),
+                        ]),
+                    }),
+                ],
+            })
+            .expect_err("duplicate slug should roll back the transaction");
+
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.unique_violation");
+        let rows = runtime
+            .query(&AxRawSqlRequest {
+                sql: "select slug from posts where slug = ?".to_string(),
+                params: vec![json!("rolled-back")],
+            })
+            .expect("rollback state should be readable");
+        assert_eq!(rows, json!([]));
+    }
+
+    #[test]
+    fn transaction_rejects_empty_operation_lists() {
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", ":memory:"),
+        )
+        .expect("runtime should initialize");
+
+        let error = runtime
+            .transaction(&AxTransactionRequest {
+                operations: Vec::new(),
+            })
+            .expect_err("empty transaction should fail");
+        let AxRuntimeError::Database { error } = error else {
+            panic!("expected database error");
+        };
+        assert_eq!(error.code, "db.invalid_query");
     }
 
     #[test]

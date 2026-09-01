@@ -937,6 +937,25 @@ fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -
         AxStepPlan::Let { binding, value } => {
             format!("    let {binding} = {};\n", render_value_plan(value))
         }
+        AxStepPlan::Transaction { operations } => {
+            let rendered = operations
+                .iter()
+                .map(render_transaction_operation)
+                .collect::<Vec<_>>()
+                .join(",\n");
+            let mut output = format!(
+                "    runtime.transaction(&AxTransactionRequest {{\n        operations: vec![\n{rendered}\n        ],\n    }})?;\n"
+            );
+            if action_response {
+                for resource in operations.iter().map(transaction_operation_resource) {
+                    output.push_str(&format!(
+                        "    __ax_push_invalidation(&mut __ax_invalidations, {:?}.to_string(), false);\n",
+                        resource
+                    ));
+                }
+            }
+            output
+        }
         AxStepPlan::Insert { collection, fields } => {
             let invalidation = if action_response {
                 format!(
@@ -1060,6 +1079,42 @@ fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -
             target,
             render_borrowed_expr(payload)
         ),
+    }
+}
+
+fn render_transaction_operation(operation: &AxTransactionOperationPlan) -> String {
+    match operation {
+        AxTransactionOperationPlan::Insert { collection, fields } => format!(
+            "            AxTransactionOperation::Insert(AxInsertRequest {{ collection: {:?}.to_string(), fields: {} }})",
+            collection,
+            render_fields_map(fields)
+        ),
+        AxTransactionOperationPlan::Update {
+            collection,
+            fields,
+            filters,
+        } => format!(
+            "            AxTransactionOperation::Update(AxUpdateRequest {{ collection: {:?}.to_string(), fields: {}, filters: {} }})",
+            collection,
+            render_fields_map(fields),
+            render_query_filters(filters)
+        ),
+        AxTransactionOperationPlan::Delete {
+            collection,
+            filters,
+        } => format!(
+            "            AxTransactionOperation::Delete(AxDeleteRequest {{ collection: {:?}.to_string(), filters: {} }})",
+            collection,
+            render_query_filters(filters)
+        ),
+    }
+}
+
+fn transaction_operation_resource(operation: &AxTransactionOperationPlan) -> &str {
+    match operation {
+        AxTransactionOperationPlan::Insert { collection, .. }
+        | AxTransactionOperationPlan::Update { collection, .. }
+        | AxTransactionOperationPlan::Delete { collection, .. } => collection,
     }
 }
 
@@ -1667,6 +1722,31 @@ export type Settings {
         assert!(error
             .to_string()
             .contains("duplicate backend type declaration `Post`"));
+    }
+
+    #[test]
+    fn compiles_transaction_block_into_one_runtime_request() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action publishPost(id: String, title: String) {
+  transaction {
+    db.posts.where({ id: input.id }).update({ title: input.title, status: "published" })
+    db.audit.insert({ post_id: input.id, event: "published" })
+    db.drafts.where({ post_id: input.id }).delete()
+  }
+  return ok()
+}
+"#,
+        )
+        .expect("transaction action should compile");
+
+        assert!(module.contains("runtime.transaction(&AxTransactionRequest"));
+        assert!(module.contains("AxTransactionOperation::Update(AxUpdateRequest"));
+        assert!(module.contains("AxTransactionOperation::Insert(AxInsertRequest"));
+        assert!(module.contains("AxTransactionOperation::Delete(AxDeleteRequest"));
+        assert!(module.contains("\"posts\".to_string(), false"));
+        assert!(module.contains("\"audit\".to_string(), false"));
+        assert!(module.contains("\"drafts\".to_string(), false"));
     }
 
     #[test]
