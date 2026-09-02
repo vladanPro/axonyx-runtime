@@ -65,6 +65,11 @@ pub type AxRuntimeResult<T> = Result<T, AxRuntimeError>;
 
 pub const DEFAULT_DB_POOL_MAX_SIZE: u32 = 10;
 pub const DEFAULT_DB_POOL_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_DB_QUERY_TIMEOUT_MS: u64 = 5_000;
+pub const DEFAULT_DB_READ_RETRY_ATTEMPTS: u32 = 1;
+pub const DEFAULT_DB_READ_RETRY_BACKOFF_MS: u64 = 50;
+pub const DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS: u64 = 5_000;
+pub const MAX_DB_READ_RETRY_ATTEMPTS: u32 = 5;
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxDbErrorCode {
@@ -244,9 +249,11 @@ fn classify_driver_error(driver: AxDatabaseDriver, detail: &str) -> AxDbErrorCod
                 AxDbErrorCode::ConstraintViolation
             } else if normalized.contains("no such column") {
                 AxDbErrorCode::InvalidQuery
-            } else if normalized.contains("unable to open database file")
-                || normalized.contains("database is locked")
+            } else if normalized.contains("database is locked")
+                || normalized.contains("database is busy")
             {
+                AxDbErrorCode::Timeout
+            } else if normalized.contains("unable to open database file") {
                 AxDbErrorCode::ConnectionFailed
             } else {
                 AxDbErrorCode::DriverError
@@ -561,6 +568,26 @@ pub struct AxDatabaseConfig {
     pub api_key: Option<String>,
     pub pool_max_size: u32,
     pub pool_timeout_ms: u64,
+    pub policy: AxDatabasePolicy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AxDatabasePolicy {
+    pub query_timeout_ms: u64,
+    pub read_retry_attempts: u32,
+    pub read_retry_backoff_ms: u64,
+    pub sqlite_busy_timeout_ms: u64,
+}
+
+impl Default for AxDatabasePolicy {
+    fn default() -> Self {
+        Self {
+            query_timeout_ms: DEFAULT_DB_QUERY_TIMEOUT_MS,
+            read_retry_attempts: DEFAULT_DB_READ_RETRY_ATTEMPTS,
+            read_retry_backoff_ms: DEFAULT_DB_READ_RETRY_BACKOFF_MS,
+            sqlite_busy_timeout_ms: DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
+        }
+    }
 }
 
 impl AxDatabaseConfig {
@@ -713,7 +740,48 @@ impl AxEnv {
                 .or_else(|| self.secret.get("supabase_service_role_key").cloned()),
             pool_max_size: self.database_pool_max_size()?,
             pool_timeout_ms: self.database_pool_timeout_ms()?,
+            policy: self.database_policy()?,
         })
+    }
+
+    pub fn database_policy(&self) -> AxRuntimeResult<AxDatabasePolicy> {
+        let policy = AxDatabasePolicy {
+            query_timeout_ms: parse_positive_env_value(
+                self.secret
+                    .get("db_query_timeout_ms")
+                    .or_else(|| self.secret.get("database_query_timeout_ms")),
+                "DB_QUERY_TIMEOUT_MS",
+                DEFAULT_DB_QUERY_TIMEOUT_MS,
+            )?,
+            read_retry_attempts: parse_non_negative_env_value(
+                self.secret
+                    .get("db_read_retry_attempts")
+                    .or_else(|| self.secret.get("database_read_retry_attempts")),
+                "DB_READ_RETRY_ATTEMPTS",
+                DEFAULT_DB_READ_RETRY_ATTEMPTS,
+            )?,
+            read_retry_backoff_ms: parse_positive_env_value(
+                self.secret
+                    .get("db_read_retry_backoff_ms")
+                    .or_else(|| self.secret.get("database_read_retry_backoff_ms")),
+                "DB_READ_RETRY_BACKOFF_MS",
+                DEFAULT_DB_READ_RETRY_BACKOFF_MS,
+            )?,
+            sqlite_busy_timeout_ms: parse_positive_env_value(
+                self.secret
+                    .get("db_sqlite_busy_timeout_ms")
+                    .or_else(|| self.secret.get("database_sqlite_busy_timeout_ms")),
+                "DB_SQLITE_BUSY_TIMEOUT_MS",
+                DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
+            )?,
+        };
+        if policy.read_retry_attempts > MAX_DB_READ_RETRY_ATTEMPTS {
+            return Err(AxRuntimeError::message(format!(
+                "DB_READ_RETRY_ATTEMPTS must be between 0 and {MAX_DB_READ_RETRY_ATTEMPTS}, got `{}`",
+                policy.read_retry_attempts
+            )));
+        }
+        Ok(policy)
     }
 
     pub fn database_pool_max_size(&self) -> AxRuntimeResult<u32> {
@@ -757,6 +825,25 @@ where
         )));
     }
     Ok(parsed)
+}
+
+fn parse_non_negative_env_value<T>(
+    value: Option<&String>,
+    name: &str,
+    default: T,
+) -> AxRuntimeResult<T>
+where
+    T: Copy + std::str::FromStr,
+{
+    let Some(value) = value else {
+        return Ok(default);
+    };
+
+    value.trim().parse::<T>().map_err(|_| {
+        AxRuntimeError::message(format!(
+            "{name} must be a non-negative integer; received `{value}`"
+        ))
+    })
 }
 
 fn normalize_env_key(key: &str) -> String {
@@ -1032,6 +1119,20 @@ type AxPostgresManager = PostgresConnectionManager<MakeRustlsConnect>;
 type AxPostgresPool = Pool<AxPostgresManager>;
 type AxPooledPostgresConnection = PooledConnection<AxPostgresManager>;
 
+#[derive(Debug)]
+struct AxPostgresConnectionCustomizer {
+    query_timeout_ms: u64,
+}
+
+impl r2d2::CustomizeConnection<Client, postgres::Error> for AxPostgresConnectionCustomizer {
+    fn on_acquire(&self, client: &mut Client) -> Result<(), postgres::Error> {
+        client.batch_execute(&format!(
+            "set statement_timeout = {}",
+            self.query_timeout_ms
+        ))
+    }
+}
+
 #[derive(Clone)]
 pub struct PostgresAdapter {
     pub url: Option<String>,
@@ -1039,6 +1140,7 @@ pub struct PostgresAdapter {
     pub api_url: Option<String>,
     pub pool_max_size: u32,
     pub pool_timeout_ms: u64,
+    pub policy: AxDatabasePolicy,
     pool: Arc<OnceLock<AxPostgresPool>>,
 }
 
@@ -1051,6 +1153,7 @@ impl std::fmt::Debug for PostgresAdapter {
             .field("api_url", &self.api_url)
             .field("pool_max_size", &self.pool_max_size)
             .field("pool_timeout_ms", &self.pool_timeout_ms)
+            .field("policy", &self.policy)
             .field("pool_initialized", &self.pool.get().is_some())
             .finish()
     }
@@ -1063,6 +1166,7 @@ impl PostgresAdapter {
         api_url: Option<String>,
         pool_max_size: u32,
         pool_timeout_ms: u64,
+        policy: AxDatabasePolicy,
     ) -> Self {
         Self {
             url,
@@ -1070,6 +1174,7 @@ impl PostgresAdapter {
             api_url,
             pool_max_size,
             pool_timeout_ms,
+            policy,
             pool: Arc::new(OnceLock::new()),
         }
     }
@@ -1085,6 +1190,7 @@ impl PostgresAdapter {
                 resource,
                 self.pool_max_size,
                 self.pool_timeout_ms,
+                self.policy.query_timeout_ms,
             )?;
             let _ = self.pool.set(pool);
         }
@@ -1107,6 +1213,7 @@ impl PartialEq for PostgresAdapter {
             && self.api_url == other.api_url
             && self.pool_max_size == other.pool_max_size
             && self.pool_timeout_ms == other.pool_timeout_ms
+            && self.policy == other.policy
     }
 }
 
@@ -1124,6 +1231,7 @@ pub struct SqliteAdapter {
     pub url: Option<String>,
     pub transport: AxDataTransport,
     pub api_url: Option<String>,
+    pub policy: AxDatabasePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -1135,25 +1243,31 @@ impl AxDatabaseAdapter for PostgresAdapter {
     }
 
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value> {
-        dispatch_load(
-            self.driver(),
-            self.transport,
-            &self.url,
-            &self.api_url,
-            self.direct_pool(&request.collection)?,
-            request,
-        )
+        retry_database_read(self.policy, || {
+            dispatch_load(
+                self.driver(),
+                self.transport,
+                &self.url,
+                &self.api_url,
+                self.direct_pool(&request.collection)?,
+                request,
+                DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
+            )
+        })
     }
 
     fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value> {
-        dispatch_raw_query(
-            self.driver(),
-            self.transport,
-            &self.url,
-            &self.api_url,
-            self.direct_pool("raw_sql")?,
-            request,
-        )
+        retry_database_read(self.policy, || {
+            dispatch_raw_query(
+                self.driver(),
+                self.transport,
+                &self.url,
+                &self.api_url,
+                self.direct_pool("raw_sql")?,
+                request,
+                DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
+            )
+        })
     }
 
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value> {
@@ -1164,6 +1278,7 @@ impl AxDatabaseAdapter for PostgresAdapter {
             &self.api_url,
             self.direct_pool(&request.collection)?,
             request,
+            DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
         )
     }
 
@@ -1175,6 +1290,7 @@ impl AxDatabaseAdapter for PostgresAdapter {
             &self.api_url,
             self.direct_pool(&request.collection)?,
             request,
+            DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
         )
     }
 
@@ -1186,6 +1302,7 @@ impl AxDatabaseAdapter for PostgresAdapter {
             &self.api_url,
             self.direct_pool(&request.collection)?,
             request,
+            DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
         )
     }
 
@@ -1197,6 +1314,7 @@ impl AxDatabaseAdapter for PostgresAdapter {
             &self.url,
             self.direct_pool(resource)?,
             request,
+            DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
         )
     }
 
@@ -1249,6 +1367,7 @@ impl AxDatabaseAdapter for MySqlAdapter {
             &self.api_url,
             None,
             request,
+            DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
         )
     }
 
@@ -1260,6 +1379,7 @@ impl AxDatabaseAdapter for MySqlAdapter {
             &self.api_url,
             None,
             request,
+            DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
         )
     }
 
@@ -1271,6 +1391,7 @@ impl AxDatabaseAdapter for MySqlAdapter {
             &self.api_url,
             None,
             request,
+            DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
         )
     }
 
@@ -1282,6 +1403,7 @@ impl AxDatabaseAdapter for MySqlAdapter {
             &self.api_url,
             None,
             request,
+            DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
         )
     }
 
@@ -1293,6 +1415,7 @@ impl AxDatabaseAdapter for MySqlAdapter {
             &self.api_url,
             None,
             request,
+            DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS,
         )
     }
 }
@@ -1303,25 +1426,31 @@ impl AxDatabaseAdapter for SqliteAdapter {
     }
 
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value> {
-        dispatch_load(
-            self.driver(),
-            self.transport,
-            &self.url,
-            &self.api_url,
-            None,
-            request,
-        )
+        retry_database_read(self.policy, || {
+            dispatch_load(
+                self.driver(),
+                self.transport,
+                &self.url,
+                &self.api_url,
+                None,
+                request,
+                self.policy.sqlite_busy_timeout_ms,
+            )
+        })
     }
 
     fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value> {
-        dispatch_raw_query(
-            self.driver(),
-            self.transport,
-            &self.url,
-            &self.api_url,
-            None,
-            request,
-        )
+        retry_database_read(self.policy, || {
+            dispatch_raw_query(
+                self.driver(),
+                self.transport,
+                &self.url,
+                &self.api_url,
+                None,
+                request,
+                self.policy.sqlite_busy_timeout_ms,
+            )
+        })
     }
 
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value> {
@@ -1332,6 +1461,7 @@ impl AxDatabaseAdapter for SqliteAdapter {
             &self.api_url,
             None,
             request,
+            self.policy.sqlite_busy_timeout_ms,
         )
     }
 
@@ -1343,6 +1473,7 @@ impl AxDatabaseAdapter for SqliteAdapter {
             &self.api_url,
             None,
             request,
+            self.policy.sqlite_busy_timeout_ms,
         )
     }
 
@@ -1354,11 +1485,19 @@ impl AxDatabaseAdapter for SqliteAdapter {
             &self.api_url,
             None,
             request,
+            self.policy.sqlite_busy_timeout_ms,
         )
     }
 
     fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
-        dispatch_transaction(self.driver(), self.transport, &self.url, None, request)
+        dispatch_transaction(
+            self.driver(),
+            self.transport,
+            &self.url,
+            None,
+            request,
+            self.policy.sqlite_busy_timeout_ms,
+        )
     }
 
     fn migration_history(&self) -> AxRuntimeResult<Vec<AxAppliedMigration>> {
@@ -1459,6 +1598,7 @@ pub fn adapter_from_config(config: &AxDatabaseConfig) -> Box<dyn AxDatabaseAdapt
             config.api_url.clone(),
             config.pool_max_size,
             config.pool_timeout_ms,
+            config.policy,
         )),
         AxDatabaseDriver::MySql => Box::new(MySqlAdapter {
             url: config.url.clone(),
@@ -1469,6 +1609,7 @@ pub fn adapter_from_config(config: &AxDatabaseConfig) -> Box<dyn AxDatabaseAdapt
             url: config.url.clone(),
             transport: config.transport,
             api_url: config.api_url.clone(),
+            policy: config.policy,
         }),
         AxDatabaseDriver::Memory => Box::new(MemoryAdapter),
     }
@@ -1533,6 +1674,40 @@ fn mutation_payload(
     })
 }
 
+fn retry_database_read<T>(
+    policy: AxDatabasePolicy,
+    mut operation: impl FnMut() -> AxRuntimeResult<T>,
+) -> AxRuntimeResult<T> {
+    let mut attempt = 0_u32;
+    loop {
+        match operation() {
+            Ok(value) => return Ok(value),
+            Err(error)
+                if attempt < policy.read_retry_attempts
+                    && is_retryable_database_read_error(&error) =>
+            {
+                attempt += 1;
+                let delay_ms = policy
+                    .read_retry_backoff_ms
+                    .saturating_mul(u64::from(attempt));
+                std::thread::sleep(Duration::from_millis(delay_ms));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn is_retryable_database_read_error(error: &AxRuntimeError) -> bool {
+    matches!(
+        error,
+        AxRuntimeError::Database { error }
+            if matches!(
+                error.code.as_str(),
+                "db.timeout" | "db.connection_failed"
+            )
+    )
+}
+
 fn dispatch_load(
     driver: AxDatabaseDriver,
     transport: AxDataTransport,
@@ -1540,9 +1715,12 @@ fn dispatch_load(
     api_url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxQueryRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
     match transport {
-        AxDataTransport::Direct => direct_load_plan(driver, url, postgres_pool, request),
+        AxDataTransport::Direct => {
+            direct_load_plan(driver, url, postgres_pool, request, sqlite_busy_timeout_ms)
+        }
         AxDataTransport::Api => api_load_plan(driver, api_url, request),
     }
 }
@@ -1554,9 +1732,12 @@ fn dispatch_raw_query(
     api_url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxRawSqlRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
     match transport {
-        AxDataTransport::Direct => direct_raw_query_plan(driver, url, postgres_pool, request),
+        AxDataTransport::Direct => {
+            direct_raw_query_plan(driver, url, postgres_pool, request, sqlite_busy_timeout_ms)
+        }
         AxDataTransport::Api => api_raw_query_plan(driver, api_url, request),
     }
 }
@@ -1568,9 +1749,12 @@ fn dispatch_insert(
     api_url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxInsertRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
     match transport {
-        AxDataTransport::Direct => direct_insert_plan(driver, url, postgres_pool, request),
+        AxDataTransport::Direct => {
+            direct_insert_plan(driver, url, postgres_pool, request, sqlite_busy_timeout_ms)
+        }
         AxDataTransport::Api => api_mutation_plan(
             driver,
             api_url,
@@ -1589,9 +1773,12 @@ fn dispatch_update(
     api_url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxUpdateRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
     match transport {
-        AxDataTransport::Direct => direct_update_plan(driver, url, postgres_pool, request),
+        AxDataTransport::Direct => {
+            direct_update_plan(driver, url, postgres_pool, request, sqlite_busy_timeout_ms)
+        }
         AxDataTransport::Api => api_mutation_plan(
             driver,
             api_url,
@@ -1610,9 +1797,12 @@ fn dispatch_delete(
     api_url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxDeleteRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
     match transport {
-        AxDataTransport::Direct => direct_delete_plan(driver, url, postgres_pool, request),
+        AxDataTransport::Direct => {
+            direct_delete_plan(driver, url, postgres_pool, request, sqlite_busy_timeout_ms)
+        }
         AxDataTransport::Api => api_delete_plan(driver, api_url, request),
     }
 }
@@ -1623,6 +1813,7 @@ fn dispatch_transaction(
     url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxTransactionRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Vec<Value>> {
     let resource = transaction_resource(request)?;
     if transport != AxDataTransport::Direct {
@@ -1631,7 +1822,9 @@ fn dispatch_transaction(
 
     let operations = prepare_transaction_operations(driver.clone(), request)?;
     match driver {
-        AxDatabaseDriver::Sqlite => sqlite_execute_transaction(url, &operations),
+        AxDatabaseDriver::Sqlite => {
+            sqlite_execute_transaction(url, &operations, sqlite_busy_timeout_ms)
+        }
         AxDatabaseDriver::Postgres => {
             postgres_execute_transaction(postgres_pool, url, resource, &operations)
         }
@@ -1669,6 +1862,7 @@ fn direct_load_plan(
     url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxQueryRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
     let Some(dialect) = driver.sql_dialect() else {
         return Ok(apply_query_mode(
@@ -1711,6 +1905,7 @@ fn direct_load_plan(
                 &request.collection,
                 &execution.sql,
                 &execution.params,
+                sqlite_busy_timeout_ms,
             )
             .map(|value| apply_query_mode(request.mode, value));
         }
@@ -1742,6 +1937,7 @@ fn direct_raw_query_plan(
     url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxRawSqlRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
     validate_raw_select_sql(&driver, &request.sql)?;
 
@@ -1764,7 +1960,13 @@ fn direct_raw_query_plan(
 
     match driver {
         AxDatabaseDriver::Sqlite => {
-            return sqlite_execute_query(url, "raw_sql", &execution.sql, &execution.params);
+            return sqlite_execute_query(
+                url,
+                "raw_sql",
+                &execution.sql,
+                &execution.params,
+                sqlite_busy_timeout_ms,
+            );
         }
         AxDatabaseDriver::Postgres => {
             return postgres_execute_query(
@@ -1801,6 +2003,7 @@ fn direct_insert_plan(
     url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxInsertRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
     let Some(dialect) = driver.sql_dialect() else {
         return Ok(mutation_payload(
@@ -1838,6 +2041,7 @@ fn direct_insert_plan(
                 &request.collection,
                 &execution.sql,
                 &execution.params,
+                sqlite_busy_timeout_ms,
             );
         }
         AxDatabaseDriver::Postgres => {
@@ -1866,6 +2070,7 @@ fn direct_update_plan(
     url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxUpdateRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
     let Some(dialect) = driver.sql_dialect() else {
         return Ok(mutation_payload(
@@ -1904,6 +2109,7 @@ fn direct_update_plan(
                 &request.collection,
                 &execution.sql,
                 &execution.params,
+                sqlite_busy_timeout_ms,
             );
         }
         AxDatabaseDriver::Postgres => {
@@ -1932,6 +2138,7 @@ fn direct_delete_plan(
     url: &Option<String>,
     postgres_pool: Option<&AxPostgresPool>,
     request: &AxDeleteRequest,
+    sqlite_busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
     let Some(dialect) = driver.sql_dialect() else {
         return Ok(json!({
@@ -1967,6 +2174,7 @@ fn direct_delete_plan(
                 &request.collection,
                 &execution.sql,
                 &execution.params,
+                sqlite_busy_timeout_ms,
             );
         }
         AxDatabaseDriver::Postgres => {
@@ -2086,8 +2294,9 @@ fn sqlite_execute_query(
     resource: &str,
     sql: &str,
     params: &[Value],
+    busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
-    let connection = sqlite_open_connection(url, resource)?;
+    let connection = sqlite_open_connection_with_timeout(url, resource, busy_timeout_ms)?;
     let sqlite_params = json_params_to_sqlite(params)?;
     let mut statement = connection
         .prepare(sql)
@@ -2117,8 +2326,9 @@ fn sqlite_execute_mutation(
     resource: &str,
     sql: &str,
     params: &[Value],
+    busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Value> {
-    let connection = sqlite_open_connection(url, resource)?;
+    let connection = sqlite_open_connection_with_timeout(url, resource, busy_timeout_ms)?;
     let sqlite_params = json_params_to_sqlite(params)?;
     let changes = connection
         .execute(sql, rusqlite::params_from_iter(sqlite_params))
@@ -2137,12 +2347,13 @@ fn sqlite_execute_mutation(
 fn sqlite_execute_transaction(
     url: &Option<String>,
     operations: &[AxPreparedTransactionOperation],
+    busy_timeout_ms: u64,
 ) -> AxRuntimeResult<Vec<Value>> {
     let resource = operations
         .first()
         .map(|operation| operation.resource.as_str())
         .unwrap_or("transaction");
-    let mut connection = sqlite_open_connection(url, resource)?;
+    let mut connection = sqlite_open_connection_with_timeout(url, resource, busy_timeout_ms)?;
     let transaction = connection
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| sqlite_runtime_error(resource, error))?;
@@ -2613,6 +2824,14 @@ fn sqlite_open_connection(
     url: &Option<String>,
     resource: &str,
 ) -> AxRuntimeResult<rusqlite::Connection> {
+    sqlite_open_connection_with_timeout(url, resource, DEFAULT_DB_SQLITE_BUSY_TIMEOUT_MS)
+}
+
+fn sqlite_open_connection_with_timeout(
+    url: &Option<String>,
+    resource: &str,
+    busy_timeout_ms: u64,
+) -> AxRuntimeResult<rusqlite::Connection> {
     let Some(url) = url else {
         return Err(AxRuntimeError::database(
             AxDbError::new(AxDbErrorCode::ConnectionFailed)
@@ -2622,8 +2841,12 @@ fn sqlite_open_connection(
         ));
     };
 
-    rusqlite::Connection::open(sqlite_database_path(url))
-        .map_err(|error| sqlite_runtime_error(resource, error))
+    let connection = rusqlite::Connection::open(sqlite_database_path(url))
+        .map_err(|error| sqlite_runtime_error(resource, error))?;
+    connection
+        .busy_timeout(Duration::from_millis(busy_timeout_ms))
+        .map_err(|error| sqlite_runtime_error(resource, error))?;
+    Ok(connection)
 }
 
 fn sqlite_database_path(url: &str) -> String {
@@ -3146,6 +3369,7 @@ fn postgres_create_pool(
     resource: &str,
     max_size: u32,
     timeout_ms: u64,
+    query_timeout_ms: u64,
 ) -> AxRuntimeResult<AxPostgresPool> {
     let (connection_url, connector) = postgres_connection_parts(url, resource)?;
     let config = connection_url
@@ -3159,6 +3383,9 @@ fn postgres_create_pool(
         .max_size(max_size)
         .min_idle(Some(0))
         .connection_timeout(Duration::from_millis(timeout_ms))
+        .connection_customizer(Box::new(AxPostgresConnectionCustomizer {
+            query_timeout_ms,
+        }))
         .build_unchecked(manager))
 }
 
@@ -3802,6 +4029,7 @@ pub mod prelude {
     pub use super::AxDatabaseAdapter;
     pub use super::AxDatabaseConfig;
     pub use super::AxDatabaseDriver;
+    pub use super::AxDatabasePolicy;
     pub use super::AxDatabaseRuntime;
     pub use super::AxDbError;
     pub use super::AxDbErrorCode;
@@ -4143,6 +4371,7 @@ mod tests {
                 api_key: None,
                 pool_max_size: DEFAULT_DB_POOL_MAX_SIZE,
                 pool_timeout_ms: DEFAULT_DB_POOL_TIMEOUT_MS,
+                policy: AxDatabasePolicy::default(),
             }
         );
     }
@@ -4165,6 +4394,7 @@ mod tests {
                 api_key: None,
                 pool_max_size: DEFAULT_DB_POOL_MAX_SIZE,
                 pool_timeout_ms: DEFAULT_DB_POOL_TIMEOUT_MS,
+                policy: AxDatabasePolicy::default(),
             }
         );
     }
@@ -4184,6 +4414,98 @@ mod tests {
             .expect("configured database pool should resolve");
         assert_eq!(configured.pool_max_size, 24);
         assert_eq!(configured.pool_timeout_ms, 1_250);
+    }
+
+    #[test]
+    fn env_resolves_database_policy_defaults_and_overrides() {
+        let defaults = AxEnv::new()
+            .database_policy()
+            .expect("default database policy should resolve");
+        assert_eq!(defaults, AxDatabasePolicy::default());
+
+        let configured = AxEnv::new()
+            .with_secret("db_query_timeout_ms", "2400")
+            .with_secret("db_read_retry_attempts", "3")
+            .with_secret("db_read_retry_backoff_ms", "25")
+            .with_secret("db_sqlite_busy_timeout_ms", "900")
+            .database_policy()
+            .expect("configured database policy should resolve");
+        assert_eq!(
+            configured,
+            AxDatabasePolicy {
+                query_timeout_ms: 2_400,
+                read_retry_attempts: 3,
+                read_retry_backoff_ms: 25,
+                sqlite_busy_timeout_ms: 900,
+            }
+        );
+    }
+
+    #[test]
+    fn env_rejects_invalid_database_policy_values() {
+        for (key, value, name) in [
+            ("db_query_timeout_ms", "0", "DB_QUERY_TIMEOUT_MS"),
+            ("db_read_retry_attempts", "later", "DB_READ_RETRY_ATTEMPTS"),
+            ("db_read_retry_backoff_ms", "0", "DB_READ_RETRY_BACKOFF_MS"),
+            (
+                "db_sqlite_busy_timeout_ms",
+                "never",
+                "DB_SQLITE_BUSY_TIMEOUT_MS",
+            ),
+            ("db_read_retry_attempts", "6", "DB_READ_RETRY_ATTEMPTS"),
+        ] {
+            let error = AxEnv::new()
+                .with_secret(key, value)
+                .database_policy()
+                .expect_err("invalid database policy should fail");
+            assert!(error.to_string().contains(name));
+        }
+    }
+
+    #[test]
+    fn read_retry_only_repeats_transient_database_errors() {
+        let policy = AxDatabasePolicy {
+            read_retry_attempts: 2,
+            read_retry_backoff_ms: 1,
+            ..AxDatabasePolicy::default()
+        };
+        let mut attempts = 0;
+        let value = retry_database_read(policy, || {
+            attempts += 1;
+            if attempts < 3 {
+                return Err(AxRuntimeError::database(
+                    AxDbError::new(AxDbErrorCode::Timeout)
+                        .with_driver(AxDatabaseDriver::Postgres)
+                        .with_resource("posts"),
+                ));
+            }
+            Ok("ready")
+        })
+        .expect("transient read should retry");
+        assert_eq!(value, "ready");
+        assert_eq!(attempts, 3);
+
+        let mut invalid_attempts = 0;
+        let error = retry_database_read(policy, || -> AxRuntimeResult<()> {
+            invalid_attempts += 1;
+            Err(AxRuntimeError::database(AxDbError::new(
+                AxDbErrorCode::InvalidQuery,
+            )))
+        })
+        .expect_err("invalid query should not retry");
+        assert!(matches!(error, AxRuntimeError::Database { .. }));
+        assert_eq!(invalid_attempts, 1);
+    }
+
+    #[test]
+    fn sqlite_connection_applies_busy_timeout_policy() {
+        let connection =
+            sqlite_open_connection_with_timeout(&Some(":memory:".to_string()), "posts", 321)
+                .expect("sqlite connection should open");
+        let timeout = connection
+            .query_row("pragma busy_timeout", [], |row| row.get::<_, u64>(0))
+            .expect("sqlite busy timeout should read");
+        assert_eq!(timeout, 321);
     }
 
     #[test]
@@ -4208,6 +4530,7 @@ mod tests {
             None,
             3,
             75,
+            AxDatabasePolicy::default(),
         );
 
         assert!(adapter.pool.get().is_none());
@@ -5456,6 +5779,7 @@ mod tests {
             api_key: None,
             pool_max_size: DEFAULT_DB_POOL_MAX_SIZE,
             pool_timeout_ms: DEFAULT_DB_POOL_TIMEOUT_MS,
+            policy: AxDatabasePolicy::default(),
         };
 
         let error = config
@@ -5477,6 +5801,7 @@ mod tests {
             api_key: None,
             pool_max_size: DEFAULT_DB_POOL_MAX_SIZE,
             pool_timeout_ms: DEFAULT_DB_POOL_TIMEOUT_MS,
+            policy: AxDatabasePolicy::default(),
         };
 
         let error = config
