@@ -4061,6 +4061,7 @@ pub mod prelude {
     pub use super::MySqlAdapter;
     pub use super::PostgresAdapter;
     pub use super::SqliteAdapter;
+    pub use super::MAX_DB_READ_RETRY_ATTEMPTS;
 }
 
 #[cfg(test)]
