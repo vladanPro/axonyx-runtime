@@ -1408,6 +1408,7 @@ impl AxDatabaseAdapter for PostgresAdapter {
         connection
             .simple_query("select 1")
             .map_err(|error| postgres_runtime_error("_axonyx_health", error))?;
+        drop(connection);
         let state = pool.state();
 
         Ok(AxDatabaseHealthReport::ready(
