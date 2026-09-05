@@ -1959,21 +1959,54 @@ fn eval_preview_query_with_functions(
         AxQuerySourcePlan::ContentCollection { collection } => collection,
         AxQuerySourcePlan::RawSql { .. } => return Ok(AxValue::List(Vec::new())),
     };
-    let mut items = store.collection_items(collection);
+    let items = store.collection_items(collection);
+    let mut rows = items
+        .into_iter()
+        .map(|item| (item, BTreeMap::<String, AxValue>::new()))
+        .collect::<Vec<_>>();
+
+    for join in &query.joins {
+        let targets = store.collection_items(&join.collection);
+        rows = rows
+            .into_iter()
+            .filter_map(|(item, mut joined)| {
+                let target = targets.iter().find(|target| {
+                    join.columns.iter().all(|column| {
+                        let source = preview_record_field(&item, &column.source);
+                        let target = preview_record_field(target, &column.target);
+                        matches!((source, target), (Some(source), Some(target)) if !matches!(source, AxValue::Null) && !matches!(target, AxValue::Null) && source == target)
+                    })
+                })?;
+                joined.insert(join.collection.clone(), target.clone());
+                Some((item, joined))
+            })
+            .collect();
+    }
 
     for filter in &query.filters {
         let expected = eval_preview_expr_with_functions(&filter.value, scope, env, functions)?;
-        items.retain(|item| preview_record_matches(item, &filter.field, filter.op, &expected));
+        rows.retain(|(item, joined)| {
+            preview_query_record_matches(
+                collection,
+                item,
+                joined,
+                &filter.field,
+                filter.op,
+                &expected,
+            )
+        });
     }
 
     for order in query.orders.iter().rev() {
-        items.sort_by(|left, right| {
-            let left_value = preview_record_field(left, &order.field)
-                .map(AxValue::as_string)
-                .unwrap_or_default();
-            let right_value = preview_record_field(right, &order.field)
-                .map(AxValue::as_string)
-                .unwrap_or_default();
+        rows.sort_by(|(left, left_joined), (right, right_joined)| {
+            let left_value =
+                preview_query_record_field(collection, left, left_joined, &order.field)
+                    .map(AxValue::as_string)
+                    .unwrap_or_default();
+            let right_value =
+                preview_query_record_field(collection, right, right_joined, &order.field)
+                    .map(AxValue::as_string)
+                    .unwrap_or_default();
 
             match order.direction {
                 AxQueryOrderDirectionPlan::Asc => left_value.cmp(&right_value),
@@ -1983,14 +2016,58 @@ fn eval_preview_query_with_functions(
     }
 
     if let Some(offset) = query.offset {
-        items = items.into_iter().skip(offset as usize).collect();
+        rows = rows.into_iter().skip(offset as usize).collect();
     }
 
     if let Some(limit) = query.limit {
-        items.truncate(limit as usize);
+        rows.truncate(limit as usize);
     }
 
+    let items = rows.into_iter().map(|(item, _)| item).collect();
     Ok(apply_preview_query_mode(query.mode, items))
+}
+
+fn preview_query_record_matches(
+    source: &str,
+    item: &AxValue,
+    joined: &BTreeMap<String, AxValue>,
+    field: &str,
+    op: AxQueryFilterOpPlan,
+    expected: &AxValue,
+) -> bool {
+    let value = preview_query_record_field(source, item, joined, field);
+    match op {
+        AxQueryFilterOpPlan::IsNull => matches!(value, None | Some(AxValue::Null)),
+        AxQueryFilterOpPlan::IsNotNull => !matches!(value, None | Some(AxValue::Null)),
+        AxQueryFilterOpPlan::Eq => value.is_some_and(|value| value == expected),
+        AxQueryFilterOpPlan::Ne => value.is_some_and(|value| value != expected),
+        AxQueryFilterOpPlan::In => match (value, expected) {
+            (Some(value), AxValue::List(items)) => items.iter().any(|item| item == value),
+            _ => false,
+        },
+        AxQueryFilterOpPlan::NotIn => match (value, expected) {
+            (Some(value), AxValue::List(items)) => !items.iter().any(|item| item == value),
+            _ => false,
+        },
+    }
+}
+
+fn preview_query_record_field<'a>(
+    source: &str,
+    item: &'a AxValue,
+    joined: &'a BTreeMap<String, AxValue>,
+    field: &str,
+) -> Option<&'a AxValue> {
+    let Some((qualifier, field)) = field.split_once('.') else {
+        return preview_record_field(item, field);
+    };
+    if qualifier == source {
+        preview_record_field(item, field)
+    } else {
+        joined
+            .get(qualifier)
+            .and_then(|record| preview_record_field(record, field))
+    }
 }
 
 fn apply_preview_query_mode(mode: AxQueryModePlan, items: Vec<AxValue>) -> AxValue {
@@ -2009,6 +2086,21 @@ fn preview_query_to_runtime_request(
 ) -> Result<backend::AxQueryRequest, PreviewError> {
     Ok(backend::AxQueryRequest {
         collection: collection.to_string(),
+        joins: query
+            .joins
+            .iter()
+            .map(|join| backend::AxQueryJoinRequest {
+                collection: join.collection.clone(),
+                columns: join
+                    .columns
+                    .iter()
+                    .map(|column| backend::AxQueryJoinColumnRequest {
+                        source: column.source.clone(),
+                        target: column.target.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
         filters: query
             .filters
             .iter()
@@ -7193,6 +7285,54 @@ page Posts
         assert!(html.contains("Hello Axonyx"));
         assert!(html.contains("Docs Without Bloat"));
         assert!(!html.contains("Draft Preview"));
+    }
+
+    #[test]
+    fn previews_typed_join_with_qualified_filter() {
+        let store = AxPreviewStore::default()
+            .with_collection(
+                "posts",
+                vec![
+                    AxValue::record([
+                        ("id", AxValue::Number(10)),
+                        ("title", AxValue::from("Compiler")),
+                        ("author_id", AxValue::Number(1)),
+                    ]),
+                    AxValue::record([
+                        ("id", AxValue::Number(11)),
+                        ("title", AxValue::from("Runtime")),
+                        ("author_id", AxValue::Number(2)),
+                    ]),
+                ],
+            )
+            .with_collection(
+                "authors",
+                vec![
+                    AxValue::record([("id", AxValue::Number(1)), ("name", AxValue::from("Ada"))]),
+                    AxValue::record([("id", AxValue::Number(2)), ("name", AxValue::from("Grace"))]),
+                ],
+            );
+        let html = preview_ax_route_with_backend(
+            &[],
+            &[r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.join(db.authors, { author_id: id }).where({ "authors.name": "Ada" }).all()
+  return posts
+"#],
+            &[],
+            r#"
+page Posts
+  data posts = loadPosts()
+  each post in posts
+    Copy -> post.title
+"#,
+            "/posts",
+            &store,
+        )
+        .expect("typed join preview should render");
+
+        assert!(html.contains("Compiler"));
+        assert!(!html.contains("Runtime"));
     }
 
     #[test]

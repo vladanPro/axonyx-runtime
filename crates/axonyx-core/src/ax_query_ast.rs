@@ -5,6 +5,7 @@ use crate::ax_ast::prelude::AxExpr;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxQuerySpec {
     pub source: AxQuerySource,
+    pub joins: Vec<AxQueryJoin>,
     pub filters: Vec<AxQueryFilter>,
     pub orders: Vec<AxQueryOrder>,
     pub limit: Option<u32>,
@@ -16,12 +17,18 @@ impl AxQuerySpec {
     pub fn new(source: AxQuerySource) -> Self {
         Self {
             source,
+            joins: Vec::new(),
             filters: Vec::new(),
             orders: Vec::new(),
             limit: None,
             offset: None,
             mode: AxQueryMode::Many,
         }
+    }
+
+    pub fn join(mut self, join: AxQueryJoin) -> Self {
+        self.joins.push(join);
+        self
     }
 
     pub fn filter(mut self, filter: AxQueryFilter) -> Self {
@@ -48,6 +55,39 @@ impl AxQuerySpec {
         self.mode = AxQueryMode::First;
         self.limit.get_or_insert(1);
         self
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxQueryJoin {
+    pub collection: String,
+    pub columns: Vec<AxQueryJoinColumn>,
+}
+
+impl AxQueryJoin {
+    pub fn new(
+        collection: impl Into<String>,
+        columns: impl IntoIterator<Item = AxQueryJoinColumn>,
+    ) -> Self {
+        Self {
+            collection: collection.into(),
+            columns: columns.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxQueryJoinColumn {
+    pub source: String,
+    pub target: String,
+}
+
+impl AxQueryJoinColumn {
+    pub fn new(source: impl Into<String>, target: impl Into<String>) -> Self {
+        Self {
+            source: source.into(),
+            target: target.into(),
+        }
     }
 }
 
@@ -115,6 +155,8 @@ pub enum AxQueryOrderDirection {
 pub mod prelude {
     pub use super::AxQueryFilter;
     pub use super::AxQueryFilterOp;
+    pub use super::AxQueryJoin;
+    pub use super::AxQueryJoinColumn;
     pub use super::AxQueryMode;
     pub use super::AxQueryOrder;
     pub use super::AxQueryOrderDirection;
@@ -146,6 +188,7 @@ mod tests {
                 source: AxQuerySource::Stream {
                     collection: "posts".to_string(),
                 },
+                joins: vec![],
                 filters: vec![AxQueryFilter {
                     field: "status".to_string(),
                     op: AxQueryFilterOp::Eq,

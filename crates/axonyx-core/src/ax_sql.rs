@@ -59,6 +59,12 @@ pub enum AxSqlCompileError {
     RawSqlRuntimeOnly,
     #[error("identifier `{ident}` contains unsupported characters")]
     InvalidIdentifier { ident: String },
+    #[error("join target `{collection}` is duplicated or aliases the source collection")]
+    AmbiguousJoinCollection { collection: String },
+    #[error("join target `{collection}` must map at least one column")]
+    EmptyJoinColumns { collection: String },
+    #[error("query field `{field}` uses unknown collection qualifier `{qualifier}`")]
+    UnknownQueryQualifier { field: String, qualifier: String },
     #[error("unsupported query filter operator")]
     UnsupportedFilterOperator,
     #[error("mutation must contain at least one field")]
@@ -86,15 +92,70 @@ pub fn compile_query_plan_to_sql(
     };
     validate_ident(collection)?;
 
-    let mut sql = format!("select * from {}", dialect.quote_ident(collection));
+    let mut qualifiers = std::collections::BTreeSet::from([collection.as_str()]);
+    for join in &query.joins {
+        validate_ident(&join.collection)?;
+        if !qualifiers.insert(join.collection.as_str()) {
+            return Err(AxSqlCompileError::AmbiguousJoinCollection {
+                collection: join.collection.clone(),
+            });
+        }
+        if join.columns.is_empty() {
+            return Err(AxSqlCompileError::EmptyJoinColumns {
+                collection: join.collection.clone(),
+            });
+        }
+        for column in &join.columns {
+            validate_ident(&column.source)?;
+            validate_ident(&column.target)?;
+        }
+    }
+
+    let mut sql = if query.joins.is_empty() {
+        format!("select * from {}", dialect.quote_ident(collection))
+    } else {
+        format!(
+            "select {}.* from {}",
+            dialect.quote_ident(collection),
+            dialect.quote_ident(collection)
+        )
+    };
+    for join in &query.joins {
+        let clauses = join
+            .columns
+            .iter()
+            .map(|column| {
+                format!(
+                    "{}.{} = {}.{}",
+                    dialect.quote_ident(collection),
+                    dialect.quote_ident(&column.source),
+                    dialect.quote_ident(&join.collection),
+                    dialect.quote_ident(&column.target)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" and ");
+        sql.push_str(&format!(
+            " inner join {} on {clauses}",
+            dialect.quote_ident(&join.collection)
+        ));
+    }
     let mut params = Vec::new();
 
     if !query.filters.is_empty() {
         let mut clauses = Vec::with_capacity(query.filters.len());
 
         for filter in &query.filters {
-            clauses.push(compile_filter_clause(
+            let field = compile_query_field(
+                &filter.field,
+                collection,
+                &qualifiers,
+                !query.joins.is_empty(),
+                dialect,
+            )?;
+            clauses.push(compile_filter_clause_with_field(
                 filter,
+                field,
                 dialect,
                 &mut params,
                 AxSqlFilterContext::Query,
@@ -109,10 +170,15 @@ pub fn compile_query_plan_to_sql(
         let mut clauses = Vec::with_capacity(query.orders.len());
 
         for order in &query.orders {
-            validate_ident(&order.field)?;
             clauses.push(format!(
                 "{} {}",
-                dialect.quote_ident(&order.field),
+                compile_query_field(
+                    &order.field,
+                    collection,
+                    &qualifiers,
+                    !query.joins.is_empty(),
+                    dialect,
+                )?,
                 order_direction_name(order.direction)
             ));
         }
@@ -263,6 +329,16 @@ fn compile_filter_clause(
     validate_ident(&filter.field)?;
     let field = dialect.quote_ident(&filter.field);
 
+    compile_filter_clause_with_field(filter, field, dialect, params, context)
+}
+
+fn compile_filter_clause_with_field(
+    filter: &AxQueryFilterPlan,
+    field: String,
+    dialect: AxSqlDialect,
+    params: &mut Vec<AxSqlParam>,
+    context: AxSqlFilterContext,
+) -> Result<String, AxSqlCompileError> {
     match filter.op {
         AxQueryFilterOpPlan::Eq | AxQueryFilterOpPlan::Ne => {
             let placeholder = push_sql_param(params, filter.value.clone(), dialect);
@@ -301,6 +377,41 @@ fn compile_filter_clause(
         }
         AxQueryFilterOpPlan::IsNull => Ok(format!("{field} is null")),
         AxQueryFilterOpPlan::IsNotNull => Ok(format!("{field} is not null")),
+    }
+}
+
+fn compile_query_field(
+    field: &str,
+    source: &str,
+    qualifiers: &std::collections::BTreeSet<&str>,
+    qualify_source: bool,
+    dialect: AxSqlDialect,
+) -> Result<String, AxSqlCompileError> {
+    if let Some((qualifier, column)) = field.split_once('.') {
+        validate_ident(qualifier)?;
+        validate_ident(column)?;
+        if !qualifiers.contains(qualifier) {
+            return Err(AxSqlCompileError::UnknownQueryQualifier {
+                field: field.to_string(),
+                qualifier: qualifier.to_string(),
+            });
+        }
+        return Ok(format!(
+            "{}.{}",
+            dialect.quote_ident(qualifier),
+            dialect.quote_ident(column)
+        ));
+    }
+
+    validate_ident(field)?;
+    if qualify_source {
+        Ok(format!(
+            "{}.{}",
+            dialect.quote_ident(source),
+            dialect.quote_ident(field)
+        ))
+    } else {
+        Ok(dialect.quote_ident(field))
     }
 }
 
@@ -428,6 +539,7 @@ mod tests {
             source: AxQuerySourcePlan::Stream {
                 collection: "posts".to_string(),
             },
+            joins: Vec::new(),
             filters: vec![AxQueryFilterPlan {
                 field: "status".to_string(),
                 op: AxQueryFilterOpPlan::Eq,
@@ -459,11 +571,62 @@ mod tests {
     }
 
     #[test]
+    fn compiles_typed_join_and_qualified_fields_into_sql() {
+        let query = AxQueryPlan {
+            source: AxQuerySourcePlan::Stream {
+                collection: "posts".to_string(),
+            },
+            joins: vec![AxQueryJoinPlan {
+                collection: "authors".to_string(),
+                columns: vec![
+                    AxQueryJoinColumnPlan {
+                        source: "tenant_id".to_string(),
+                        target: "tenant_id".to_string(),
+                    },
+                    AxQueryJoinColumnPlan {
+                        source: "author_id".to_string(),
+                        target: "id".to_string(),
+                    },
+                ],
+            }],
+            filters: vec![
+                AxQueryFilterPlan {
+                    field: "status".to_string(),
+                    op: AxQueryFilterOpPlan::Eq,
+                    value: AxRustExpr::new(r#""published".to_string()"#),
+                },
+                AxQueryFilterPlan {
+                    field: "authors.active".to_string(),
+                    op: AxQueryFilterOpPlan::Eq,
+                    value: AxRustExpr::new("true"),
+                },
+            ],
+            orders: vec![AxQueryOrderPlan {
+                field: "authors.name".to_string(),
+                direction: AxQueryOrderDirectionPlan::Asc,
+            }],
+            limit: None,
+            offset: None,
+            mode: AxQueryModePlan::Many,
+        };
+
+        let sql = compile_query_plan_to_sql(&query, AxSqlDialect::Postgres)
+            .expect("join query should compile");
+
+        assert_eq!(
+            sql.sql,
+            r#"select "posts".* from "posts" inner join "authors" on "posts"."tenant_id" = "authors"."tenant_id" and "posts"."author_id" = "authors"."id" where "posts"."status" = $1 and "authors"."active" = $2 order by "authors"."name" asc"#
+        );
+        assert_eq!(sql.params.len(), 2);
+    }
+
+    #[test]
     fn compiles_mysql_query_plan_into_sql() {
         let query = AxQueryPlan {
             source: AxQuerySourcePlan::Stream {
                 collection: "posts".to_string(),
             },
+            joins: Vec::new(),
             filters: vec![
                 AxQueryFilterPlan {
                     field: "status".to_string(),
@@ -503,6 +666,7 @@ mod tests {
             source: AxQuerySourcePlan::Stream {
                 collection: "posts".to_string(),
             },
+            joins: Vec::new(),
             filters: vec![
                 AxQueryFilterPlan {
                     field: "archived".to_string(),
@@ -578,6 +742,7 @@ mod tests {
             source: AxQuerySourcePlan::Stream {
                 collection: "posts".to_string(),
             },
+            joins: Vec::new(),
             filters: vec![AxQueryFilterPlan {
                 field: "status".to_string(),
                 op: AxQueryFilterOpPlan::In,
@@ -601,6 +766,7 @@ mod tests {
             source: AxQuerySourcePlan::Stream {
                 collection: "posts".to_string(),
             },
+            joins: Vec::new(),
             filters: vec![AxQueryFilterPlan {
                 field: "slug".to_string(),
                 op: AxQueryFilterOpPlan::In,
@@ -637,6 +803,7 @@ mod tests {
             source: AxQuerySourcePlan::Stream {
                 collection: "posts".to_string(),
             },
+            joins: Vec::new(),
             filters: vec![AxQueryFilterPlan {
                 field: "status".to_string(),
                 op: AxQueryFilterOpPlan::NotIn,
@@ -671,6 +838,7 @@ mod tests {
             source: AxQuerySourcePlan::Stream {
                 collection: "posts".to_string(),
             },
+            joins: Vec::new(),
             filters: Vec::new(),
             orders: vec![AxQueryOrderPlan {
                 field: "created_at".to_string(),
@@ -697,6 +865,7 @@ mod tests {
             source: AxQuerySourcePlan::Stream {
                 collection: "blog-posts".to_string(),
             },
+            joins: Vec::new(),
             filters: Vec::new(),
             orders: Vec::new(),
             limit: None,

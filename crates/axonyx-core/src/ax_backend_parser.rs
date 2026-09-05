@@ -1247,6 +1247,7 @@ fn is_query_clause(text: &str) -> bool {
         || text.starts_with("whereNotIn(")
         || text.starts_with("whereNull(")
         || text.starts_with("whereNotNull(")
+        || text.starts_with("join(")
         || text.starts_with("order(")
         || text.starts_with("limit(")
         || text.starts_with("offset(")
@@ -1328,6 +1329,9 @@ fn parse_fluent_query_spec(
         };
 
         match method {
+            "join" => {
+                query = query.join(parse_query_join(args, line)?);
+            }
             "where" | "whereNot" | "whereIn" | "whereNotIn" => {
                 let op = match method {
                     "where" => AxQueryFilterOp::Eq,
@@ -1336,7 +1340,7 @@ fn parse_fluent_query_spec(
                     "whereNotIn" => AxQueryFilterOp::NotIn,
                     _ => unreachable!("method matched above"),
                 };
-                for (field, value) in parse_object_fields(args, line)? {
+                for (field, value) in parse_query_object_fields(args, line)? {
                     query = query.filter(AxQueryFilter::new(field, op, parse_expr(value, line)?));
                 }
             }
@@ -1347,13 +1351,13 @@ fn parse_fluent_query_spec(
                     _ => unreachable!("method matched above"),
                 };
                 query = query.filter(AxQueryFilter::new(
-                    parse_string_arg(args, line)?,
+                    parse_query_field_arg(args, line)?,
                     op,
                     AxExpr::bool(true),
                 ));
             }
             "order" => {
-                for (field, value) in parse_object_fields(args, line)? {
+                for (field, value) in parse_query_object_fields(args, line)? {
                     let direction = match parse_expr(value, line)? {
                         AxExpr::String(value) if value.eq_ignore_ascii_case("desc") => {
                             AxQueryOrderDirection::Desc
@@ -1399,6 +1403,7 @@ fn apply_method_query_clause(
     line: usize,
 ) -> Result<AxQuerySpec, AxBackendParseError> {
     match method {
+        "join" => Ok(query.join(parse_query_join(args, line)?)),
         "where" | "whereNot" | "whereIn" | "whereNotIn" => {
             let op = match method {
                 "where" => AxQueryFilterOp::Eq,
@@ -1407,7 +1412,7 @@ fn apply_method_query_clause(
                 "whereNotIn" => AxQueryFilterOp::NotIn,
                 _ => unreachable!("method matched above"),
             };
-            for (field, value) in parse_object_fields(args, line)? {
+            for (field, value) in parse_query_object_fields(args, line)? {
                 query = query.filter(AxQueryFilter::new(field, op, parse_expr(value, line)?));
             }
             Ok(query)
@@ -1419,13 +1424,13 @@ fn apply_method_query_clause(
                 _ => unreachable!("method matched above"),
             };
             Ok(query.filter(AxQueryFilter::new(
-                parse_string_arg(args, line)?,
+                parse_query_field_arg(args, line)?,
                 op,
                 AxExpr::bool(true),
             )))
         }
         "order" => {
-            for (field, value) in parse_object_fields(args, line)? {
+            for (field, value) in parse_query_object_fields(args, line)? {
                 let direction = match parse_expr(value, line)? {
                     AxExpr::String(value) if value.eq_ignore_ascii_case("desc") => {
                         AxQueryOrderDirection::Desc
@@ -1452,6 +1457,7 @@ fn is_method_query_clause(text: &str) -> bool {
     matches!(
         text[..open_index].trim(),
         "where"
+            | "join"
             | "whereNot"
             | "whereIn"
             | "whereNotIn"
@@ -1461,6 +1467,30 @@ fn is_method_query_clause(text: &str) -> bool {
             | "limit"
             | "offset"
     )
+}
+
+fn parse_query_join(input: &str, line: usize) -> Result<AxQueryJoin, AxBackendParseError> {
+    let args = split_top_level(input, ',');
+    let [target, columns] = args.as_slice() else {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    };
+    let target = target.trim();
+    let Some(collection) = target.strip_prefix("db.") else {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    };
+    if !is_valid_object_key(collection) {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    }
+
+    let columns = parse_object_fields(columns, line)?
+        .into_iter()
+        .map(|(source, target)| {
+            parse_object_key(target.trim(), line)
+                .map(|target| AxQueryJoinColumn::new(source, target))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(AxQueryJoin::new(collection, columns))
 }
 
 fn parse_fluent_mutation_stmt(
@@ -1686,6 +1716,70 @@ fn parse_object_fields(
     }
 
     Ok(fields)
+}
+
+fn parse_query_object_fields(
+    input: &str,
+    line: usize,
+) -> Result<Vec<(String, &str)>, AxBackendParseError> {
+    let input = input.trim();
+    let Some(inner) = input
+        .strip_prefix('{')
+        .and_then(|value| value.strip_suffix('}'))
+    else {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    };
+
+    let mut fields = Vec::new();
+    for part in split_top_level(inner, ',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let Some((field, value)) = split_top_level_once(part, ":") else {
+            if part.contains('.') || part.contains(' ') || is_quoted_object_key(part) {
+                return Err(AxBackendParseError::InvalidQueryClause { line });
+            }
+            fields.push((parse_query_field_key(part, line)?, part));
+            continue;
+        };
+        let field = parse_query_field_key(field.trim(), line)?;
+        let value = value.trim();
+        if value.is_empty() {
+            return Err(AxBackendParseError::InvalidQueryClause { line });
+        }
+        fields.push((field, value));
+    }
+
+    if fields.is_empty() {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    }
+    Ok(fields)
+}
+
+fn parse_query_field_arg(input: &str, line: usize) -> Result<String, AxBackendParseError> {
+    let parts = split_top_level(input, ',');
+    if parts.len() != 1 {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    }
+    match parse_expr(parts[0].trim(), line)? {
+        AxExpr::String(value) => parse_query_field_key(&value, line),
+        _ => Err(AxBackendParseError::InvalidQueryClause { line }),
+    }
+}
+
+fn parse_query_field_key(input: &str, line: usize) -> Result<String, AxBackendParseError> {
+    let input = parse_quoted_object_key(input).unwrap_or(input);
+    let mut parts = input.split('.');
+    let first = parts.next().unwrap_or_default();
+    let second = parts.next();
+    if !is_valid_object_key(first)
+        || second.is_some_and(|part| !is_valid_object_key(part))
+        || parts.next().is_some()
+    {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    }
+    Ok(input.to_string())
 }
 
 fn parse_object_assignments(
@@ -3100,6 +3194,48 @@ query loadPosts() -> Post[]
                     AxExpr::string("published"),
                 ))
                 .order(AxQueryOrder::new("created_at", AxQueryOrderDirection::Desc))
+            )
+        );
+    }
+
+    #[test]
+    fn parses_typed_join_with_composite_columns_and_qualified_filter() {
+        let input = r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.join(db.authors, { tenant_id, author_id: id }).where({ "authors.active": true }).order({ "authors.name": "asc" }).all()
+  return posts
+"#;
+
+        let document = parse_backend_ax(input).expect("document should parse");
+        let AxBackendBlock::Loader(loader) = &document.blocks[0] else {
+            panic!("expected query function to lower as loader block");
+        };
+        let AxBackendStmt::Data(posts) = &loader.body[0] else {
+            panic!("expected data statement");
+        };
+
+        assert_eq!(
+            posts.value,
+            AxBackendValue::Query(
+                AxQuerySpec::new(AxQuerySource::Stream {
+                    collection: "posts".to_string(),
+                })
+                .join(AxQueryJoin::new(
+                    "authors",
+                    [
+                        AxQueryJoinColumn::new("tenant_id", "tenant_id"),
+                        AxQueryJoinColumn::new("author_id", "id"),
+                    ],
+                ))
+                .filter(AxQueryFilter::new(
+                    "authors.active",
+                    AxQueryFilterOp::Eq,
+                    AxExpr::bool(true),
+                ))
+                .order(AxQueryOrder::new(
+                    "authors.name",
+                    AxQueryOrderDirection::Asc,
+                ))
             )
         );
     }

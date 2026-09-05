@@ -1157,6 +1157,33 @@ fn render_value_plan(value: &AxValuePlan) -> String {
 }
 
 fn render_query_plan(query: &AxQueryPlan) -> String {
+    let joins = if query.joins.is_empty() {
+        "vec![]".to_string()
+    } else {
+        let entries = query
+            .joins
+            .iter()
+            .map(|join| {
+                let columns = join
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        format!(
+                            "AxQueryJoinColumnRequest {{ source: {:?}.to_string(), target: {:?}.to_string() }}",
+                            column.source, column.target
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "AxQueryJoinRequest {{ collection: {:?}.to_string(), columns: vec![{columns}] }}",
+                    join.collection
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("vec![{entries}]")
+    };
     let filters = if query.filters.is_empty() {
         "vec![]".to_string()
     } else {
@@ -1205,7 +1232,7 @@ fn render_query_plan(query: &AxQueryPlan) -> String {
     };
 
     format!(
-        "AxQueryRequest {{ collection: {source}, filters: {filters}, orders: {orders}, limit: {}, offset: {}, mode: {} }}",
+        "AxQueryRequest {{ collection: {source}, joins: {joins}, filters: {filters}, orders: {orders}, limit: {}, offset: {}, mode: {} }}",
         render_option_u32(query.limit),
         render_option_u32(query.offset),
         render_query_mode(query.mode)
@@ -2202,6 +2229,24 @@ route GET "/api/posts/:slug"
         .expect("source should compile");
 
         assert!(module.contains("AxHttpResponse::text(404, \"not found\")"));
+    }
+
+    #[test]
+    fn compiles_typed_join_into_runtime_request() {
+        let module = compile_backend_ax_to_module(
+            r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.join(db.authors, { author_id: id }).where({ "authors.active": true }).all()
+  return posts
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("joins: vec![AxQueryJoinRequest"));
+        assert!(module.contains("collection: \"authors\".to_string()"));
+        assert!(module.contains("source: \"author_id\".to_string()"));
+        assert!(module.contains("target: \"id\".to_string()"));
+        assert!(module.contains("field: \"authors.active\".to_string()"));
     }
 
     #[test]

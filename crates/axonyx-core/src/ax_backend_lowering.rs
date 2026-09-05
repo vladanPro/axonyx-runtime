@@ -231,11 +231,24 @@ pub enum AxReturnPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxQueryPlan {
     pub source: AxQuerySourcePlan,
+    pub joins: Vec<AxQueryJoinPlan>,
     pub filters: Vec<AxQueryFilterPlan>,
     pub orders: Vec<AxQueryOrderPlan>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
     pub mode: AxQueryModePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxQueryJoinPlan {
+    pub collection: String,
+    pub columns: Vec<AxQueryJoinColumnPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxQueryJoinColumnPlan {
+    pub source: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -761,6 +774,21 @@ fn lower_query(query: &AxQuerySpec) -> AxQueryPlan {
                 params: params.iter().map(lower_expr).collect(),
             },
         },
+        joins: query
+            .joins
+            .iter()
+            .map(|join| AxQueryJoinPlan {
+                collection: join.collection.clone(),
+                columns: join
+                    .columns
+                    .iter()
+                    .map(|column| AxQueryJoinColumnPlan {
+                        source: column.source.clone(),
+                        target: column.target.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
         filters: query
             .filters
             .iter()
@@ -1041,6 +1069,8 @@ pub mod prelude {
     pub use super::AxLiteralUnionPlan;
     pub use super::AxQueryFilterOpPlan;
     pub use super::AxQueryFilterPlan;
+    pub use super::AxQueryJoinColumnPlan;
+    pub use super::AxQueryJoinPlan;
     pub use super::AxQueryModePlan;
     pub use super::AxQueryOrderDirectionPlan;
     pub use super::AxQueryOrderPlan;
@@ -1128,6 +1158,7 @@ loader PostsList
                 source: AxQuerySourcePlan::Stream {
                     collection: "posts".to_string(),
                 },
+                joins: Vec::new(),
                 filters: vec![AxQueryFilterPlan {
                     field: "status".to_string(),
                     op: AxQueryFilterOpPlan::Eq,
@@ -1172,6 +1203,7 @@ loader PostsList
                 source: AxQuerySourcePlan::Stream {
                     collection: "posts".to_string(),
                 },
+                joins: Vec::new(),
                 filters: Vec::new(),
                 orders: Vec::new(),
                 limit: None,
