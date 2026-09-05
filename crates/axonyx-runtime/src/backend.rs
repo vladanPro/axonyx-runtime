@@ -5126,6 +5126,8 @@ mod tests {
             return;
         };
         let table = format!("axonyx_runtime_test_{}", std::process::id());
+        let migration_table = format!("axonyx_migration_test_{}", std::process::id());
+        let migration_version = format!("99999999_{}", std::process::id());
         let mut admin = postgres_open_connection(&Some(url.clone()), &table)
             .expect("postgres test connection should open");
         admin
@@ -5142,6 +5144,13 @@ mod tests {
         .expect("postgres runtime should initialize");
 
         let result = (|| -> AxRuntimeResult<()> {
+            let health = runtime.database_health()?;
+            assert!(health.ok);
+            assert_eq!(health.driver, "postgres");
+            assert_eq!(health.transport, "direct");
+            assert_eq!(health.probe, "select-1");
+            assert!(health.pool.is_some());
+
             let value = runtime.query(&AxRawSqlRequest {
                 sql: "select $1::integer as value".to_string(),
                 params: vec![json!(7)],
@@ -5257,12 +5266,39 @@ mod tests {
                 mode: AxQueryMode::Many,
             })?;
             assert_eq!(rolled_back, json!([]));
+
+            let migration = test_migration(
+                &migration_version,
+                "postgres_ci_probe",
+                'c',
+                &format!("create table \"{migration_table}\" (id bigint primary key);"),
+                &format!("drop table \"{migration_table}\";"),
+            );
+            runtime.apply_migration(&migration)?;
+            assert!(runtime
+                .migration_history()?
+                .iter()
+                .any(|applied| applied.version == migration_version));
+            runtime.rollback_migration(&migration)?;
+            let migration_table_exists = runtime.query(&AxRawSqlRequest {
+                sql: "select to_regclass($1)::text as name".to_string(),
+                params: vec![json!(migration_table)],
+            })?;
+            assert_eq!(migration_table_exists, json!([{ "name": null }]));
             Ok(())
         })();
 
         admin
-            .batch_execute(&format!("drop table if exists \"{table}\""))
-            .expect("postgres test table should clean up");
+            .execute(
+                "delete from _axonyx_migrations where version = $1",
+                &[&migration_version],
+            )
+            .ok();
+        admin
+            .batch_execute(&format!(
+                "drop table if exists \"{migration_table}\"; drop table if exists \"{table}\""
+            ))
+            .expect("postgres test tables should clean up");
         result.expect("live postgres CRUD should execute");
     }
 
