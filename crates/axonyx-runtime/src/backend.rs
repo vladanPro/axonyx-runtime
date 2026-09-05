@@ -13,7 +13,7 @@ use axonyx_core::ax_sql_prelude::{
 };
 use bytes::BytesMut;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
-use postgres::types::{to_sql_checked, IsNull, ToSql, Type};
+use postgres::types::{to_sql_checked, IsNull, Kind, ToSql, Type};
 use postgres::Client;
 use r2d2::{Pool, PooledConnection};
 use r2d2_postgres::PostgresConnectionManager;
@@ -3858,6 +3858,10 @@ impl ToSql for AxPostgresParam {
         ty: &Type,
         out: &mut BytesMut,
     ) -> Result<IsNull, Box<dyn StdError + Sync + Send>> {
+        if let Kind::Domain(inner) = ty.kind() {
+            return self.to_sql(inner, out);
+        }
+
         match &self.0 {
             Value::Null => Ok(IsNull::Yes),
             Value::Bool(value) => value.to_sql(ty, out),
@@ -3875,6 +3879,12 @@ impl ToSql for AxPostgresParam {
                         .ok_or_else(|| postgres_param_error("bytea arrays require values 0..255"))
                 })
                 .collect::<Result<Vec<_>, _>>()?
+                .to_sql(ty, out),
+            Value::Array(values) if matches!(ty.kind(), Kind::Array(_)) => values
+                .iter()
+                .cloned()
+                .map(AxPostgresParam)
+                .collect::<Vec<_>>()
                 .to_sql(ty, out),
             Value::Array(_) | Value::Object(_) => Err(postgres_param_error(&format!(
                 "Axonyx JSON value cannot be encoded as postgres type {ty}"
@@ -3907,6 +3917,7 @@ fn postgres_number_to_sql(
             .to_sql(ty, out),
         Type::FLOAT4 => (number_f64(value)? as f32).to_sql(ty, out),
         Type::FLOAT8 => number_f64(value)?.to_sql(ty, out),
+        Type::NUMERIC => postgres_decimal_to_sql(&value.to_string(), out),
         _ => Err(postgres_param_error(&format!(
             "Axonyx number cannot be encoded as postgres type {ty}"
         ))),
@@ -3929,10 +3940,111 @@ fn postgres_string_to_sql(
         Type::TIMESTAMPTZ => DateTime::parse_from_rfc3339(value)?.to_sql(ty, out),
         Type::JSON | Type::JSONB => serde_json::from_str::<Value>(value)?.to_sql(ty, out),
         Type::BYTEA => value.as_bytes().to_sql(ty, out),
+        Type::NUMERIC => postgres_decimal_to_sql(value, out),
+        _ if matches!(ty.kind(), Kind::Enum(_)) => {
+            out.extend_from_slice(value.as_bytes());
+            Ok(IsNull::No)
+        }
         _ => Err(postgres_param_error(&format!(
             "Axonyx string cannot be encoded as postgres type {ty}"
         ))),
     }
+}
+
+fn postgres_decimal_to_sql(
+    value: &str,
+    out: &mut BytesMut,
+) -> Result<IsNull, Box<dyn StdError + Sync + Send>> {
+    let (negative, digits, decimal_position) = parse_decimal_parts(value)?;
+    let decimal_position = usize::try_from(decimal_position).map_err(postgres_box_error)?;
+    let dscale = digits.len().saturating_sub(decimal_position);
+    let dscale = u16::try_from(dscale)
+        .map_err(|_| postgres_param_error("postgres numeric scale exceeds u16 range"))?;
+
+    let integer_groups = decimal_position.div_ceil(4);
+    let left_padding = integer_groups * 4 - decimal_position;
+    let right_padding = (4 - dscale as usize % 4) % 4;
+    let mut grouped = String::with_capacity(left_padding + digits.len() + right_padding);
+    grouped.extend(std::iter::repeat_n('0', left_padding));
+    grouped.push_str(&digits);
+    grouped.extend(std::iter::repeat_n('0', right_padding));
+
+    let mut groups = grouped
+        .as_bytes()
+        .chunks_exact(4)
+        .map(|chunk| {
+            std::str::from_utf8(chunk)
+                .map_err(postgres_box_error)?
+                .parse::<u16>()
+                .map_err(postgres_box_error)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut weight = i32::try_from(integer_groups).map_err(postgres_box_error)? - 1;
+    while groups.first() == Some(&0) {
+        groups.remove(0);
+        weight -= 1;
+    }
+    while groups.last() == Some(&0) {
+        groups.pop();
+    }
+    if groups.is_empty() {
+        weight = 0;
+    }
+
+    let ndigits = i16::try_from(groups.len())
+        .map_err(|_| postgres_param_error("postgres numeric has too many base-10000 digits"))?;
+    let weight = i16::try_from(weight)
+        .map_err(|_| postgres_param_error("postgres numeric weight exceeds i16 range"))?;
+    let sign = if negative { 0x4000_u16 } else { 0_u16 };
+    out.extend_from_slice(&ndigits.to_be_bytes());
+    out.extend_from_slice(&weight.to_be_bytes());
+    out.extend_from_slice(&sign.to_be_bytes());
+    out.extend_from_slice(&dscale.to_be_bytes());
+    for group in groups {
+        out.extend_from_slice(&group.to_be_bytes());
+    }
+    Ok(IsNull::No)
+}
+
+fn parse_decimal_parts(
+    value: &str,
+) -> Result<(bool, String, i64), Box<dyn StdError + Sync + Send>> {
+    let (negative, unsigned) = value
+        .strip_prefix('-')
+        .map_or((false, value), |value| (true, value));
+    let (mantissa, exponent) =
+        unsigned
+            .split_once(['e', 'E'])
+            .map_or(Ok((unsigned, 0_i64)), |(mantissa, exponent)| {
+                exponent
+                    .parse::<i64>()
+                    .map(|exponent| (mantissa, exponent))
+                    .map_err(postgres_box_error)
+            })?;
+    let mut parts = mantissa.split('.');
+    let integer = parts.next().unwrap_or_default();
+    let fraction = parts.next().unwrap_or_default();
+    if integer.is_empty()
+        || parts.next().is_some()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return Err(postgres_param_error("invalid postgres numeric parameter"));
+    }
+
+    let mut digits = format!("{integer}{fraction}");
+    let mut decimal_position = i64::try_from(integer.len()).map_err(postgres_box_error)? + exponent;
+    if decimal_position < 0 {
+        let padding = usize::try_from(-decimal_position).map_err(postgres_box_error)?;
+        digits.insert_str(0, &"0".repeat(padding));
+        decimal_position = 0;
+    }
+    let digit_len = i64::try_from(digits.len()).map_err(postgres_box_error)?;
+    if decimal_position > digit_len {
+        let padding = usize::try_from(decimal_position - digit_len).map_err(postgres_box_error)?;
+        digits.extend(std::iter::repeat_n('0', padding));
+    }
+    Ok((negative, digits, decimal_position))
 }
 
 fn parse_postgres_timestamp(value: &str) -> Result<NaiveDateTime, Box<dyn StdError + Sync + Send>> {
@@ -4313,6 +4425,7 @@ pub mod prelude {
     pub use super::PostgresAdapter;
     pub use super::SqliteAdapter;
     pub use super::MAX_DB_READ_RETRY_ATTEMPTS;
+    pub use axonyx_core::ax_types::AxDecimal;
 }
 
 #[cfg(test)]
@@ -5047,6 +5160,56 @@ mod tests {
     }
 
     #[test]
+    fn postgres_numeric_parameters_use_exact_binary_encoding() {
+        for (source, expected) in [
+            ("12.34", vec![0, 2, 0, 0, 0, 0, 0, 2, 0, 12, 13, 72]),
+            ("-0.0012", vec![0, 1, 255, 255, 64, 0, 0, 4, 0, 12]),
+        ] {
+            let mut output = BytesMut::new();
+            AxPostgresParam(json!(source))
+                .to_sql(&Type::NUMERIC, &mut output)
+                .expect("decimal string should encode as postgres numeric");
+            assert_eq!(output.as_ref(), expected, "{source}");
+        }
+
+        let exact_number: Value = serde_json::from_str("12345678901234567890.12345678901234567890")
+            .expect("arbitrary precision JSON number should parse");
+        let mut output = BytesMut::new();
+        AxPostgresParam(exact_number)
+            .to_sql(&Type::NUMERIC, &mut output)
+            .expect("arbitrary precision JSON number should encode");
+        assert!(!output.is_empty());
+    }
+
+    #[test]
+    fn postgres_custom_scalar_and_array_parameters_encode() {
+        let status = Type::new(
+            "post_status".to_string(),
+            40_000,
+            Kind::Enum(vec!["draft".to_string(), "published".to_string()]),
+            "public".to_string(),
+        );
+        let price = Type::new(
+            "price".to_string(),
+            40_001,
+            Kind::Domain(Type::NUMERIC),
+            "public".to_string(),
+        );
+
+        for (value, ty) in [
+            (json!("published"), status),
+            (json!("123.4500"), price),
+            (json!(["rust", "axonyx"]), Type::TEXT_ARRAY),
+        ] {
+            let mut output = BytesMut::new();
+            AxPostgresParam(value)
+                .to_sql(&ty, &mut output)
+                .expect("custom postgres scalar should encode");
+            assert!(!output.is_empty());
+        }
+    }
+
+    #[test]
     fn postgres_connection_failures_use_public_database_error() {
         let error = match postgres_open_connection(
             &Some("postgres://127.0.0.1:1/axonyx?connect_timeout=1".to_string()),
@@ -5126,13 +5289,31 @@ mod tests {
             return;
         };
         let table = format!("axonyx_runtime_test_{}", std::process::id());
+        let status_type = format!("axonyx_status_test_{}", std::process::id());
+        let price_domain = format!("axonyx_price_test_{}", std::process::id());
         let migration_table = format!("axonyx_migration_test_{}", std::process::id());
         let migration_version = format!("99999999_{}", std::process::id());
         let mut admin = postgres_open_connection(&Some(url.clone()), &table)
             .expect("postgres test connection should open");
         admin
             .batch_execute(&format!(
-                "drop table if exists \"{table}\"; create table \"{table}\" (id serial primary key, title text not null unique, published boolean not null default false)"
+                "drop table if exists \"{table}\";
+                 drop domain if exists \"{price_domain}\";
+                 drop type if exists \"{status_type}\";
+                 create type \"{status_type}\" as enum ('draft', 'published');
+                 create domain \"{price_domain}\" as numeric(38, 12) check (value >= 0);
+                 create table \"{table}\" (
+                   id serial primary key,
+                   title text not null unique,
+                   published boolean not null default false,
+                   amount numeric(38, 12),
+                   price \"{price_domain}\",
+                   status \"{status_type}\",
+                   external_id uuid,
+                   published_at timestamptz,
+                   metadata jsonb,
+                   tags text[]
+                 )"
             ))
             .expect("postgres test table should create");
         let runtime = runtime_from_env(
@@ -5172,6 +5353,22 @@ mod tests {
                 fields: BTreeMap::from([
                     ("title".to_string(), json!("Foundry")),
                     ("published".to_string(), json!(false)),
+                    (
+                        "amount".to_string(),
+                        json!("12345678901234567890.123456789012"),
+                    ),
+                    ("price".to_string(), json!("19.990000000000")),
+                    ("status".to_string(), json!("published")),
+                    (
+                        "external_id".to_string(),
+                        json!("550e8400-e29b-41d4-a716-446655440000"),
+                    ),
+                    (
+                        "published_at".to_string(),
+                        json!("2026-09-05T10:15:30+00:00"),
+                    ),
+                    ("metadata".to_string(), json!({ "source": "scalar-v1" })),
+                    ("tags".to_string(), json!(["rust", "axonyx"])),
                 ]),
             })?;
             assert_eq!(inserted["changes"], 1);
@@ -5189,6 +5386,21 @@ mod tests {
                 mode: AxQueryMode::Many,
             })?;
             assert_eq!(rows[0]["published"], false);
+            assert_eq!(
+                rows[0]["amount"].to_string(),
+                "12345678901234567890.123456789012"
+            );
+            assert_eq!(rows[0]["price"].to_string(), "19.990000000000");
+            assert_eq!(rows[0]["status"], "published");
+            assert_eq!(
+                rows[0]["external_id"],
+                "550e8400-e29b-41d4-a716-446655440000"
+            );
+            assert_eq!(rows[0]["metadata"], json!({ "source": "scalar-v1" }));
+            assert_eq!(rows[0]["tags"], json!(["rust", "axonyx"]));
+            assert!(rows[0]["published_at"]
+                .as_str()
+                .is_some_and(|value| value.starts_with("2026-09-05T10:15:30")));
 
             let updated = runtime.update(&AxUpdateRequest {
                 collection: table.clone(),
@@ -5296,7 +5508,10 @@ mod tests {
             .ok();
         admin
             .batch_execute(&format!(
-                "drop table if exists \"{migration_table}\"; drop table if exists \"{table}\""
+                "drop table if exists \"{migration_table}\";
+                 drop table if exists \"{table}\";
+                 drop domain if exists \"{price_domain}\";
+                 drop type if exists \"{status_type}\""
             ))
             .expect("postgres test tables should clean up");
         result.expect("live postgres CRUD should execute");
