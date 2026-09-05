@@ -1489,6 +1489,14 @@ fn parse_query_join(input: &str, line: usize) -> Result<AxQueryJoin, AxBackendPa
                 .map(|target| AxQueryJoinColumn::new(source, target))
         })
         .collect::<Result<Vec<_>, _>>()?;
+    let mut source_columns = std::collections::BTreeSet::new();
+    let mut target_columns = std::collections::BTreeSet::new();
+    if columns.iter().any(|column| {
+        !source_columns.insert(column.source.as_str())
+            || !target_columns.insert(column.target.as_str())
+    }) {
+        return Err(AxBackendParseError::InvalidQueryClause { line });
+    }
 
     Ok(AxQueryJoin::new(collection, columns))
 }
@@ -3238,6 +3246,18 @@ query loadPosts() -> Post[]
                 ))
             )
         );
+    }
+
+    #[test]
+    fn rejects_typed_join_with_duplicate_columns() {
+        let input = r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.join(db.authors, { author_id: id, author_id: id }).all()
+  return posts
+"#;
+
+        let error = parse_backend_ax(input).expect_err("duplicate join columns must fail");
+        assert_eq!(error, AxBackendParseError::InvalidQueryClause { line: 3 });
     }
 
     #[test]

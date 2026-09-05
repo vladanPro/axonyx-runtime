@@ -63,6 +63,8 @@ pub enum AxSqlCompileError {
     AmbiguousJoinCollection { collection: String },
     #[error("join target `{collection}` must map at least one column")]
     EmptyJoinColumns { collection: String },
+    #[error("join target `{collection}` maps duplicate source or target columns")]
+    DuplicateJoinColumns { collection: String },
     #[error("query field `{field}` uses unknown collection qualifier `{qualifier}`")]
     UnknownQueryQualifier { field: String, qualifier: String },
     #[error("unsupported query filter operator")]
@@ -105,9 +107,18 @@ pub fn compile_query_plan_to_sql(
                 collection: join.collection.clone(),
             });
         }
+        let mut source_columns = std::collections::BTreeSet::new();
+        let mut target_columns = std::collections::BTreeSet::new();
         for column in &join.columns {
             validate_ident(&column.source)?;
             validate_ident(&column.target)?;
+            if !source_columns.insert(column.source.as_str())
+                || !target_columns.insert(column.target.as_str())
+            {
+                return Err(AxSqlCompileError::DuplicateJoinColumns {
+                    collection: join.collection.clone(),
+                });
+            }
         }
     }
 
@@ -618,6 +629,40 @@ mod tests {
             r#"select "posts".* from "posts" inner join "authors" on "posts"."tenant_id" = "authors"."tenant_id" and "posts"."author_id" = "authors"."id" where "posts"."status" = $1 and "authors"."active" = $2 order by "authors"."name" asc"#
         );
         assert_eq!(sql.params.len(), 2);
+    }
+
+    #[test]
+    fn rejects_programmatic_join_with_duplicate_columns() {
+        let query = AxQueryPlan {
+            source: AxQuerySourcePlan::Stream {
+                collection: "posts".to_string(),
+            },
+            joins: vec![AxQueryJoinPlan {
+                collection: "authors".to_string(),
+                columns: vec![
+                    AxQueryJoinColumnPlan {
+                        source: "author_id".to_string(),
+                        target: "id".to_string(),
+                    },
+                    AxQueryJoinColumnPlan {
+                        source: "author_id".to_string(),
+                        target: "tenant_id".to_string(),
+                    },
+                ],
+            }],
+            filters: Vec::new(),
+            orders: Vec::new(),
+            limit: None,
+            offset: None,
+            mode: AxQueryModePlan::Many,
+        };
+
+        assert_eq!(
+            compile_query_plan_to_sql(&query, AxSqlDialect::Postgres),
+            Err(AxSqlCompileError::DuplicateJoinColumns {
+                collection: "authors".to_string(),
+            })
+        );
     }
 
     #[test]
