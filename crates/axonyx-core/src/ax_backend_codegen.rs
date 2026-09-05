@@ -299,7 +299,7 @@ fn rust_function_return_type(ty: &AxType, function: &str) -> Result<String, AxBa
             rust_function_return_type(inner, function)?
         }
         AxType::Record(name) => name.clone(),
-        AxType::Never | AxType::Signal(_) | AxType::Resource(_, _) => {
+        AxType::Decimal | AxType::Never | AxType::Signal(_) | AxType::Resource(_, _) => {
             return Err(AxBackendCodegenError::UnsupportedFunctionReturnType {
                 function: function.to_string(),
                 ty: ty.display_name(),
@@ -546,6 +546,7 @@ fn rust_contract_type(
             "String".to_string()
         }
         AxType::Number | AxType::Float => "f64".to_string(),
+        AxType::Decimal => "AxDecimal".to_string(),
         AxType::Int => "i64".to_string(),
         AxType::Bool => "bool".to_string(),
         AxType::Bytes => "Vec<u8>".to_string(),
@@ -596,6 +597,7 @@ fn validate_ordered_type(
         ty,
         AxType::String
             | AxType::Int
+            | AxType::Decimal
             | AxType::Bool
             | AxType::DateTime
             | AxType::Date
@@ -1607,6 +1609,7 @@ export type Post {
   summary?: String
   author: Author
   score: Number
+  amount: Decimal
   views: Int
   ratio: Float
   published: Bool
@@ -1641,6 +1644,7 @@ loader PostsList() -> Post[] {
             "pub summary: Option<String>,",
             "pub author: Author,",
             "pub score: f64,",
+            "pub amount: AxDecimal,",
             "pub views: i64,",
             "pub image: Vec<u8>,",
             "pub metadata: Value,",
