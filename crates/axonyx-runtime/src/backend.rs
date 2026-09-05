@@ -5148,7 +5148,7 @@ mod tests {
             assert!(health.ok);
             assert_eq!(health.driver, "postgres");
             assert_eq!(health.transport, "direct");
-            assert_eq!(health.probe, "select-1");
+            assert_eq!(health.probe, "query");
             assert!(health.pool.is_some());
 
             let value = runtime.query(&AxRawSqlRequest {
