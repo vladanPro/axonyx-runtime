@@ -22,6 +22,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::io::BufReader;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use thiserror::Error;
@@ -590,6 +591,124 @@ impl Default for AxDatabasePolicy {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxDatabasePoolHealth {
+    pub max_size: u32,
+    pub connections: u32,
+    pub idle_connections: u32,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxDatabaseMetricsSnapshot {
+    pub reads: u64,
+    pub writes: u64,
+    pub failures: u64,
+    pub timeouts: u64,
+    pub connection_failures: u64,
+    pub total_duration_us: u64,
+    pub last_duration_us: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxDatabaseHealthReport {
+    pub ok: bool,
+    pub driver: String,
+    pub transport: String,
+    pub probe: String,
+    pub latency_ms: u64,
+    pub pool: Option<AxDatabasePoolHealth>,
+    pub metrics: AxDatabaseMetricsSnapshot,
+}
+
+impl AxDatabaseHealthReport {
+    fn ready(
+        driver: AxDatabaseDriver,
+        transport: AxDataTransport,
+        probe: impl Into<String>,
+        started: Instant,
+        pool: Option<AxDatabasePoolHealth>,
+    ) -> Self {
+        Self {
+            ok: true,
+            driver: driver.as_str().to_string(),
+            transport: transport.as_str().to_string(),
+            probe: probe.into(),
+            latency_ms: duration_millis(started.elapsed()),
+            pool,
+            metrics: AxDatabaseMetricsSnapshot::default(),
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct AxDatabaseMetrics {
+    reads: AtomicU64,
+    writes: AtomicU64,
+    failures: AtomicU64,
+    timeouts: AtomicU64,
+    connection_failures: AtomicU64,
+    total_duration_us: AtomicU64,
+    last_duration_us: AtomicU64,
+}
+
+impl AxDatabaseMetrics {
+    fn observe<T>(
+        &self,
+        write: bool,
+        operation: impl FnOnce() -> AxRuntimeResult<T>,
+    ) -> AxRuntimeResult<T> {
+        let started = Instant::now();
+        let result = operation();
+        let elapsed_us = duration_micros(started.elapsed());
+
+        if write {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+        } else {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+        }
+        self.total_duration_us
+            .fetch_add(elapsed_us, Ordering::Relaxed);
+        self.last_duration_us.store(elapsed_us, Ordering::Relaxed);
+
+        if let Err(error) = &result {
+            self.failures.fetch_add(1, Ordering::Relaxed);
+            if let AxRuntimeError::Database { error } = error {
+                match error.code.as_str() {
+                    "db.timeout" => {
+                        self.timeouts.fetch_add(1, Ordering::Relaxed);
+                    }
+                    "db.connection_failed" => {
+                        self.connection_failures.fetch_add(1, Ordering::Relaxed);
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        result
+    }
+
+    fn snapshot(&self) -> AxDatabaseMetricsSnapshot {
+        AxDatabaseMetricsSnapshot {
+            reads: self.reads.load(Ordering::Relaxed),
+            writes: self.writes.load(Ordering::Relaxed),
+            failures: self.failures.load(Ordering::Relaxed),
+            timeouts: self.timeouts.load(Ordering::Relaxed),
+            connection_failures: self.connection_failures.load(Ordering::Relaxed),
+            total_duration_us: self.total_duration_us.load(Ordering::Relaxed),
+            last_duration_us: self.last_duration_us.load(Ordering::Relaxed),
+        }
+    }
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    u64::try_from(duration.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn duration_micros(duration: Duration) -> u64 {
+    u64::try_from(duration.as_micros()).unwrap_or(u64::MAX)
+}
+
 impl AxDatabaseConfig {
     pub fn sql_dialect(&self) -> Option<AxSqlDialect> {
         self.driver.sql_dialect()
@@ -885,6 +1004,7 @@ pub trait AxRuntimeEnvAccess {
 
 pub trait AxDatabaseAdapter: Send + Sync {
     fn driver(&self) -> AxDatabaseDriver;
+    fn health(&self) -> AxRuntimeResult<AxDatabaseHealthReport>;
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value>;
     fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value>;
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value>;
@@ -926,6 +1046,10 @@ where
 {
     fn driver(&self) -> AxDatabaseDriver {
         (**self).driver()
+    }
+
+    fn health(&self) -> AxRuntimeResult<AxDatabaseHealthReport> {
+        (**self).health()
     }
 
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value> {
@@ -975,6 +1099,11 @@ where
 pub trait AxQueryExecutor {
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value>;
     fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value>;
+    fn database_health(&self) -> AxRuntimeResult<AxDatabaseHealthReport> {
+        Err(AxRuntimeError::message(
+            "database health is unavailable for this backend runtime",
+        ))
+    }
 }
 
 pub trait AxMutationExecutor {
@@ -1031,11 +1160,16 @@ impl<T> AxBackendRuntime for T where
 pub struct AxDatabaseRuntime<A> {
     env: AxEnv,
     adapter: A,
+    metrics: AxDatabaseMetrics,
 }
 
 impl<A> AxDatabaseRuntime<A> {
     pub fn new(env: AxEnv, adapter: A) -> Self {
-        Self { env, adapter }
+        Self {
+            env,
+            adapter,
+            metrics: AxDatabaseMetrics::default(),
+        }
     }
 }
 
@@ -1050,11 +1184,18 @@ where
     A: AxDatabaseAdapter,
 {
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value> {
-        self.adapter.load(request)
+        self.metrics.observe(false, || self.adapter.load(request))
     }
 
     fn query(&self, request: &AxRawSqlRequest) -> AxRuntimeResult<Value> {
-        self.adapter.query(request)
+        self.metrics.observe(false, || self.adapter.query(request))
+    }
+
+    fn database_health(&self) -> AxRuntimeResult<AxDatabaseHealthReport> {
+        self.env.database_config()?.validate()?;
+        let mut report = self.adapter.health()?;
+        report.metrics = self.metrics.snapshot();
+        Ok(report)
     }
 }
 
@@ -1063,19 +1204,20 @@ where
     A: AxDatabaseAdapter,
 {
     fn insert(&self, request: &AxInsertRequest) -> AxRuntimeResult<Value> {
-        self.adapter.insert(request)
+        self.metrics.observe(true, || self.adapter.insert(request))
     }
 
     fn update(&self, request: &AxUpdateRequest) -> AxRuntimeResult<Value> {
-        self.adapter.update(request)
+        self.metrics.observe(true, || self.adapter.update(request))
     }
 
     fn delete(&self, request: &AxDeleteRequest) -> AxRuntimeResult<Value> {
-        self.adapter.delete(request)
+        self.metrics.observe(true, || self.adapter.delete(request))
     }
 
     fn transaction(&self, request: &AxTransactionRequest) -> AxRuntimeResult<Vec<Value>> {
-        self.adapter.transaction(request)
+        self.metrics
+            .observe(true, || self.adapter.transaction(request))
     }
 }
 
@@ -1242,6 +1384,45 @@ impl AxDatabaseAdapter for PostgresAdapter {
         AxDatabaseDriver::Postgres
     }
 
+    fn health(&self) -> AxRuntimeResult<AxDatabaseHealthReport> {
+        let started = Instant::now();
+        if self.transport == AxDataTransport::Api {
+            return Ok(AxDatabaseHealthReport::ready(
+                self.driver(),
+                self.transport,
+                "configuration",
+                started,
+                None,
+            ));
+        }
+
+        let pool = self
+            .direct_pool("_axonyx_health")?
+            .ok_or_else(|| database_health_error(self.driver(), "database pool is unavailable"))?;
+        let mut connection = pool.get().map_err(|error| {
+            database_health_error(
+                self.driver(),
+                format!("database pool checkout failed: {error}"),
+            )
+        })?;
+        connection
+            .simple_query("select 1")
+            .map_err(|error| postgres_runtime_error("_axonyx_health", error))?;
+        let state = pool.state();
+
+        Ok(AxDatabaseHealthReport::ready(
+            self.driver(),
+            self.transport,
+            "query",
+            started,
+            Some(AxDatabasePoolHealth {
+                max_size: pool.max_size(),
+                connections: state.connections,
+                idle_connections: state.idle_connections,
+            }),
+        ))
+    }
+
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value> {
         retry_database_read(self.policy, || {
             dispatch_load(
@@ -1359,6 +1540,24 @@ impl AxDatabaseAdapter for MySqlAdapter {
         AxDatabaseDriver::MySql
     }
 
+    fn health(&self) -> AxRuntimeResult<AxDatabaseHealthReport> {
+        let started = Instant::now();
+        if self.transport == AxDataTransport::Api {
+            return Ok(AxDatabaseHealthReport::ready(
+                self.driver(),
+                self.transport,
+                "configuration",
+                started,
+                None,
+            ));
+        }
+
+        Err(database_health_error(
+            self.driver(),
+            "direct MySQL health probes are not implemented",
+        ))
+    }
+
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value> {
         dispatch_load(
             self.driver(),
@@ -1423,6 +1622,36 @@ impl AxDatabaseAdapter for MySqlAdapter {
 impl AxDatabaseAdapter for SqliteAdapter {
     fn driver(&self) -> AxDatabaseDriver {
         AxDatabaseDriver::Sqlite
+    }
+
+    fn health(&self) -> AxRuntimeResult<AxDatabaseHealthReport> {
+        let started = Instant::now();
+        if self.transport == AxDataTransport::Api {
+            return Ok(AxDatabaseHealthReport::ready(
+                self.driver(),
+                self.transport,
+                "configuration",
+                started,
+                None,
+            ));
+        }
+
+        let connection = sqlite_open_connection_with_timeout(
+            &self.url,
+            "_axonyx_health",
+            self.policy.sqlite_busy_timeout_ms,
+        )?;
+        connection
+            .query_row("select 1", [], |_| Ok(()))
+            .map_err(|error| sqlite_runtime_error("_axonyx_health", error))?;
+
+        Ok(AxDatabaseHealthReport::ready(
+            self.driver(),
+            self.transport,
+            "query",
+            started,
+            None,
+        ))
     }
 
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value> {
@@ -1527,6 +1756,16 @@ impl AxDatabaseAdapter for SqliteAdapter {
 impl AxDatabaseAdapter for MemoryAdapter {
     fn driver(&self) -> AxDatabaseDriver {
         AxDatabaseDriver::Memory
+    }
+
+    fn health(&self) -> AxRuntimeResult<AxDatabaseHealthReport> {
+        Ok(AxDatabaseHealthReport::ready(
+            self.driver(),
+            AxDataTransport::Direct,
+            "memory",
+            Instant::now(),
+            None,
+        ))
     }
 
     fn load(&self, request: &AxQueryRequest) -> AxRuntimeResult<Value> {
@@ -3601,6 +3840,14 @@ fn postgres_runtime_error(resource: &str, error: postgres::Error) -> AxRuntimeEr
     ))
 }
 
+fn database_health_error(driver: AxDatabaseDriver, detail: impl Into<String>) -> AxRuntimeError {
+    AxRuntimeError::database(AxDbError::from_driver_detail(
+        driver,
+        "_axonyx_health",
+        detail,
+    ))
+}
+
 #[derive(Debug)]
 struct AxPostgresParam(Value);
 
@@ -4029,7 +4276,10 @@ pub mod prelude {
     pub use super::AxDatabaseAdapter;
     pub use super::AxDatabaseConfig;
     pub use super::AxDatabaseDriver;
+    pub use super::AxDatabaseHealthReport;
+    pub use super::AxDatabaseMetricsSnapshot;
     pub use super::AxDatabasePolicy;
+    pub use super::AxDatabasePoolHealth;
     pub use super::AxDatabaseRuntime;
     pub use super::AxDbError;
     pub use super::AxDbErrorCode;
@@ -4507,6 +4757,61 @@ mod tests {
             .query_row("pragma busy_timeout", [], |row| row.get::<_, u64>(0))
             .expect("sqlite busy timeout should read");
         assert_eq!(timeout, 321);
+    }
+
+    #[test]
+    fn sqlite_health_probes_the_database_without_exposing_connection_details() {
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_driver", "sqlite")
+                .with_secret("db_url", ":memory:"),
+        )
+        .expect("sqlite runtime should initialize");
+
+        let report = runtime
+            .database_health()
+            .expect("sqlite health probe should pass");
+
+        assert!(report.ok);
+        assert_eq!(report.driver, "sqlite");
+        assert_eq!(report.transport, "direct");
+        assert_eq!(report.probe, "query");
+        assert_eq!(report.pool, None);
+        assert_eq!(report.metrics, AxDatabaseMetricsSnapshot::default());
+        let payload = serde_json::to_string(&report).expect("health report should serialize");
+        assert!(!payload.contains(":memory:"));
+        assert!(!payload.contains("db_url"));
+    }
+
+    #[test]
+    fn database_health_reports_process_local_operation_metrics() {
+        let runtime = runtime_from_env(AxEnv::new().with_secret("db_driver", "memory"))
+            .expect("memory runtime should initialize");
+
+        runtime
+            .load(&AxQueryRequest {
+                collection: "posts".to_string(),
+                filters: Vec::new(),
+                orders: Vec::new(),
+                limit: Some(1),
+                offset: None,
+                mode: AxQueryMode::Many,
+            })
+            .expect("memory read should pass");
+        runtime
+            .insert(&AxInsertRequest {
+                collection: "posts".to_string(),
+                fields: BTreeMap::new(),
+            })
+            .expect("memory write should pass");
+
+        let report = runtime
+            .database_health()
+            .expect("memory health probe should pass");
+        assert_eq!(report.probe, "memory");
+        assert_eq!(report.metrics.reads, 1);
+        assert_eq!(report.metrics.writes, 1);
+        assert_eq!(report.metrics.failures, 0);
     }
 
     #[test]
