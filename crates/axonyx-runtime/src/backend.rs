@@ -4,8 +4,9 @@ use std::fs;
 use std::path::Path;
 
 use axonyx_core::ax_backend_lowering_prelude::{
-    AxAssignmentPlan, AxQueryFilterOpPlan, AxQueryFilterPlan, AxQueryModePlan,
-    AxQueryOrderDirectionPlan, AxQueryOrderPlan, AxQueryPlan, AxQuerySourcePlan, AxRustExpr,
+    AxAssignmentPlan, AxQueryFilterOpPlan, AxQueryFilterPlan, AxQueryJoinColumnPlan,
+    AxQueryJoinPlan, AxQueryModePlan, AxQueryOrderDirectionPlan, AxQueryOrderPlan, AxQueryPlan,
+    AxQuerySourcePlan, AxRustExpr,
 };
 use axonyx_core::ax_sql_prelude::{
     compile_delete_plan_to_sql, compile_insert_plan_to_sql, compile_query_plan_to_sql,
@@ -328,11 +329,25 @@ fn extract_driver_error_field(detail: &str) -> Option<String> {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AxQueryRequest {
     pub collection: String,
+    #[serde(default)]
+    pub joins: Vec<AxQueryJoinRequest>,
     pub filters: Vec<AxQueryFilterRequest>,
     pub orders: Vec<AxQueryOrderRequest>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
     pub mode: AxQueryMode,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxQueryJoinRequest {
+    pub collection: String,
+    pub columns: Vec<AxQueryJoinColumnRequest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxQueryJoinColumnRequest {
+    pub source: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -2114,6 +2129,7 @@ fn direct_load_plan(
                 &None,
                 request.collection.clone(),
                 json!({
+                    "joins": request.joins,
                     "filters": request.filters,
                     "orders": request.orders,
                     "limit": request.limit,
@@ -4213,6 +4229,7 @@ fn api_load_plan(
         action: "load".to_string(),
         resource: request.collection.clone(),
         payload: json!({
+            "joins": request.joins,
             "filters": request.filters,
             "orders": request.orders,
             "limit": request.limit,
@@ -4317,6 +4334,21 @@ fn query_request_to_plan(request: &AxQueryRequest) -> AxQueryPlan {
         source: AxQuerySourcePlan::Stream {
             collection: request.collection.clone(),
         },
+        joins: request
+            .joins
+            .iter()
+            .map(|join| AxQueryJoinPlan {
+                collection: join.collection.clone(),
+                columns: join
+                    .columns
+                    .iter()
+                    .map(|column| AxQueryJoinColumnPlan {
+                        source: column.source.clone(),
+                        target: column.target.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
         filters: query_filters_to_plan(&request.filters),
         orders: request
             .orders
@@ -4407,6 +4439,8 @@ pub mod prelude {
     pub use super::AxQueryExecutor;
     pub use super::AxQueryFilterOp;
     pub use super::AxQueryFilterRequest;
+    pub use super::AxQueryJoinColumnRequest;
+    pub use super::AxQueryJoinRequest;
     pub use super::AxQueryMode;
     pub use super::AxQueryOrderDirection;
     pub use super::AxQueryOrderRequest;
@@ -4506,6 +4540,7 @@ mod tests {
         let result = runtime
             .load(&AxQueryRequest {
                 collection: "posts".to_string(),
+                joins: Vec::new(),
                 filters: vec![AxQueryFilterRequest {
                     field: "status".to_string(),
                     op: AxQueryFilterOp::Eq,
@@ -4905,6 +4940,7 @@ mod tests {
         runtime
             .load(&AxQueryRequest {
                 collection: "posts".to_string(),
+                joins: Vec::new(),
                 filters: Vec::new(),
                 orders: Vec::new(),
                 limit: Some(1),
@@ -4974,6 +5010,7 @@ mod tests {
         let value = runtime
             .load(&AxQueryRequest {
                 collection: "posts".to_string(),
+                joins: Vec::new(),
                 filters: Vec::new(),
                 orders: Vec::new(),
                 limit: Some(10),
@@ -4995,6 +5032,7 @@ mod tests {
     fn direct_transport_emits_sql_execution_plan() {
         let request = AxQueryRequest {
             collection: "posts".to_string(),
+            joins: Vec::new(),
             filters: vec![AxQueryFilterRequest {
                 field: "status".to_string(),
                 op: AxQueryFilterOp::Eq,
@@ -5023,6 +5061,7 @@ mod tests {
     fn direct_transport_emits_extended_filter_sql_plan() {
         let request = AxQueryRequest {
             collection: "posts".to_string(),
+            joins: Vec::new(),
             filters: vec![
                 AxQueryFilterRequest {
                     field: "archived".to_string(),
@@ -5375,6 +5414,7 @@ mod tests {
 
             let rows = runtime.load(&AxQueryRequest {
                 collection: table.clone(),
+                joins: Vec::new(),
                 filters: vec![AxQueryFilterRequest {
                     field: "title".to_string(),
                     op: AxQueryFilterOp::Eq,
@@ -5467,6 +5507,7 @@ mod tests {
             ));
             let rolled_back = runtime.load(&AxQueryRequest {
                 collection: table.clone(),
+                joins: Vec::new(),
                 filters: vec![AxQueryFilterRequest {
                     field: "title".to_string(),
                     op: AxQueryFilterOp::Eq,
@@ -5518,6 +5559,77 @@ mod tests {
     }
 
     #[test]
+    fn postgres_live_typed_join_runs_when_test_url_is_configured() {
+        let Ok(url) = std::env::var("AXONYX_TEST_POSTGRES_URL") else {
+            return;
+        };
+        let suffix = std::process::id();
+        let authors = format!("axonyx_join_authors_{suffix}");
+        let posts = format!("axonyx_join_posts_{suffix}");
+        let mut admin = postgres_open_connection(&Some(url.clone()), &posts)
+            .expect("postgres test connection should open");
+        admin
+            .batch_execute(&format!(
+                "drop table if exists \"{posts}\";
+                 drop table if exists \"{authors}\";
+                 create table \"{authors}\" (id bigint primary key, name text not null);
+                 create table \"{posts}\" (
+                   id bigint primary key,
+                   title text not null,
+                   author_id bigint references \"{authors}\"(id)
+                 );
+                 insert into \"{authors}\" (id, name) values (1, 'Ada'), (2, 'Grace');
+                 insert into \"{posts}\" (id, title, author_id) values
+                   (10, 'Compiler', 1),
+                   (11, 'Runtime', 2),
+                   (12, 'Orphan', null);"
+            ))
+            .expect("postgres join fixture should create");
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "postgres")
+                .with_secret("db_url", &url)
+                .with_secret("db_pool_max_size", "1"),
+        )
+        .expect("postgres runtime should initialize");
+
+        let result = runtime.load(&AxQueryRequest {
+            collection: posts.clone(),
+            joins: vec![AxQueryJoinRequest {
+                collection: authors.clone(),
+                columns: vec![AxQueryJoinColumnRequest {
+                    source: "author_id".to_string(),
+                    target: "id".to_string(),
+                }],
+            }],
+            filters: vec![AxQueryFilterRequest {
+                field: format!("{authors}.name"),
+                op: AxQueryFilterOp::Eq,
+                value: json!("Ada"),
+            }],
+            orders: Vec::new(),
+            limit: None,
+            offset: None,
+            mode: AxQueryMode::Many,
+        });
+
+        admin
+            .batch_execute(&format!(
+                "drop table if exists \"{posts}\";
+                 drop table if exists \"{authors}\";"
+            ))
+            .expect("postgres join fixture should clean up");
+        assert_eq!(
+            result.expect("postgres join query should execute"),
+            json!([{
+                "id": 10,
+                "title": "Compiler",
+                "author_id": 1
+            }])
+        );
+    }
+
+    #[test]
     fn sqlite_direct_load_reads_rows_from_database() {
         let (_path, url) = temp_sqlite_database("load");
         seed_sqlite_posts(&url);
@@ -5531,6 +5643,7 @@ mod tests {
         let value = runtime
             .load(&AxQueryRequest {
                 collection: "posts".to_string(),
+                joins: Vec::new(),
                 filters: vec![AxQueryFilterRequest {
                     field: "status".to_string(),
                     op: AxQueryFilterOp::Eq,
@@ -5560,6 +5673,67 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_direct_load_executes_typed_join_and_returns_base_rows() {
+        let (_path, url) = temp_sqlite_database("join_load");
+        let connection =
+            rusqlite::Connection::open(sqlite_database_path(&url)).expect("sqlite should open");
+        connection
+            .execute_batch(
+                "create table authors (id integer primary key, name text not null);
+                 create table posts (
+                   id integer primary key,
+                   title text not null,
+                   author_id integer,
+                   foreign key (author_id) references authors(id)
+                 );
+                 insert into authors (id, name) values (1, 'Ada'), (2, 'Grace');
+                 insert into posts (id, title, author_id) values
+                   (10, 'Compiler', 1),
+                   (11, 'Runtime', 2),
+                   (12, 'Orphan', null);",
+            )
+            .expect("join fixture should create");
+        drop(connection);
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", &url),
+        )
+        .expect("runtime should initialize");
+
+        let value = runtime
+            .load(&AxQueryRequest {
+                collection: "posts".to_string(),
+                joins: vec![AxQueryJoinRequest {
+                    collection: "authors".to_string(),
+                    columns: vec![AxQueryJoinColumnRequest {
+                        source: "author_id".to_string(),
+                        target: "id".to_string(),
+                    }],
+                }],
+                filters: vec![AxQueryFilterRequest {
+                    field: "authors.name".to_string(),
+                    op: AxQueryFilterOp::Eq,
+                    value: json!("Ada"),
+                }],
+                orders: Vec::new(),
+                limit: None,
+                offset: None,
+                mode: AxQueryMode::Many,
+            })
+            .expect("sqlite join query should execute");
+
+        assert_eq!(
+            value,
+            json!([{
+                "id": 10,
+                "title": "Compiler",
+                "author_id": 1
+            }])
+        );
+    }
+
+    #[test]
     fn sqlite_direct_first_load_reads_single_row_from_database() {
         let (_path, url) = temp_sqlite_database("first_load");
         seed_sqlite_posts(&url);
@@ -5573,6 +5747,7 @@ mod tests {
         let value = runtime
             .load(&AxQueryRequest {
                 collection: "posts".to_string(),
+                joins: Vec::new(),
                 filters: vec![AxQueryFilterRequest {
                     field: "status".to_string(),
                     op: AxQueryFilterOp::Eq,
