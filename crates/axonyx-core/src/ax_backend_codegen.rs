@@ -299,7 +299,7 @@ fn rust_function_return_type(ty: &AxType, function: &str) -> Result<String, AxBa
             rust_function_return_type(inner, function)?
         }
         AxType::Record(name) => name.clone(),
-        AxType::Never | AxType::Signal(_) | AxType::Resource(_, _) => {
+        AxType::Decimal | AxType::Never | AxType::Signal(_) | AxType::Resource(_, _) => {
             return Err(AxBackendCodegenError::UnsupportedFunctionReturnType {
                 function: function.to_string(),
                 ty: ty.display_name(),
@@ -546,6 +546,7 @@ fn rust_contract_type(
             "String".to_string()
         }
         AxType::Number | AxType::Float => "f64".to_string(),
+        AxType::Decimal => "AxDecimal".to_string(),
         AxType::Int => "i64".to_string(),
         AxType::Bool => "bool".to_string(),
         AxType::Bytes => "Vec<u8>".to_string(),
@@ -596,6 +597,7 @@ fn validate_ordered_type(
         ty,
         AxType::String
             | AxType::Int
+            | AxType::Decimal
             | AxType::Bool
             | AxType::DateTime
             | AxType::Date
@@ -937,6 +939,25 @@ fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -
         AxStepPlan::Let { binding, value } => {
             format!("    let {binding} = {};\n", render_value_plan(value))
         }
+        AxStepPlan::Transaction { operations } => {
+            let rendered = operations
+                .iter()
+                .map(render_transaction_operation)
+                .collect::<Vec<_>>()
+                .join(",\n");
+            let mut output = format!(
+                "    runtime.transaction(&AxTransactionRequest {{\n        operations: vec![\n{rendered}\n        ],\n    }})?;\n"
+            );
+            if action_response {
+                for resource in operations.iter().map(transaction_operation_resource) {
+                    output.push_str(&format!(
+                        "    __ax_push_invalidation(&mut __ax_invalidations, {:?}.to_string(), false);\n",
+                        resource
+                    ));
+                }
+            }
+            output
+        }
         AxStepPlan::Insert { collection, fields } => {
             let invalidation = if action_response {
                 format!(
@@ -1063,6 +1084,42 @@ fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -
     }
 }
 
+fn render_transaction_operation(operation: &AxTransactionOperationPlan) -> String {
+    match operation {
+        AxTransactionOperationPlan::Insert { collection, fields } => format!(
+            "            AxTransactionOperation::Insert(AxInsertRequest {{ collection: {:?}.to_string(), fields: {} }})",
+            collection,
+            render_fields_map(fields)
+        ),
+        AxTransactionOperationPlan::Update {
+            collection,
+            fields,
+            filters,
+        } => format!(
+            "            AxTransactionOperation::Update(AxUpdateRequest {{ collection: {:?}.to_string(), fields: {}, filters: {} }})",
+            collection,
+            render_fields_map(fields),
+            render_query_filters(filters)
+        ),
+        AxTransactionOperationPlan::Delete {
+            collection,
+            filters,
+        } => format!(
+            "            AxTransactionOperation::Delete(AxDeleteRequest {{ collection: {:?}.to_string(), filters: {} }})",
+            collection,
+            render_query_filters(filters)
+        ),
+    }
+}
+
+fn transaction_operation_resource(operation: &AxTransactionOperationPlan) -> &str {
+    match operation {
+        AxTransactionOperationPlan::Insert { collection, .. }
+        | AxTransactionOperationPlan::Update { collection, .. }
+        | AxTransactionOperationPlan::Delete { collection, .. } => collection,
+    }
+}
+
 fn render_route_hook_step(phase: AxHookPhasePlan, value: &AxRustExpr) -> String {
     match value.code.as_str() {
         "Security.headers" => {
@@ -1100,6 +1157,33 @@ fn render_value_plan(value: &AxValuePlan) -> String {
 }
 
 fn render_query_plan(query: &AxQueryPlan) -> String {
+    let joins = if query.joins.is_empty() {
+        "vec![]".to_string()
+    } else {
+        let entries = query
+            .joins
+            .iter()
+            .map(|join| {
+                let columns = join
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        format!(
+                            "AxQueryJoinColumnRequest {{ source: {:?}.to_string(), target: {:?}.to_string() }}",
+                            column.source, column.target
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "AxQueryJoinRequest {{ collection: {:?}.to_string(), columns: vec![{columns}] }}",
+                    join.collection
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!("vec![{entries}]")
+    };
     let filters = if query.filters.is_empty() {
         "vec![]".to_string()
     } else {
@@ -1148,7 +1232,7 @@ fn render_query_plan(query: &AxQueryPlan) -> String {
     };
 
     format!(
-        "AxQueryRequest {{ collection: {source}, filters: {filters}, orders: {orders}, limit: {}, offset: {}, mode: {} }}",
+        "AxQueryRequest {{ collection: {source}, joins: {joins}, filters: {filters}, orders: {orders}, limit: {}, offset: {}, mode: {} }}",
         render_option_u32(query.limit),
         render_option_u32(query.offset),
         render_query_mode(query.mode)
@@ -1552,6 +1636,7 @@ export type Post {
   summary?: String
   author: Author
   score: Number
+  amount: Decimal
   views: Int
   ratio: Float
   published: Bool
@@ -1586,6 +1671,7 @@ loader PostsList() -> Post[] {
             "pub summary: Option<String>,",
             "pub author: Author,",
             "pub score: f64,",
+            "pub amount: AxDecimal,",
             "pub views: i64,",
             "pub image: Vec<u8>,",
             "pub metadata: Value,",
@@ -1667,6 +1753,31 @@ export type Settings {
         assert!(error
             .to_string()
             .contains("duplicate backend type declaration `Post`"));
+    }
+
+    #[test]
+    fn compiles_transaction_block_into_one_runtime_request() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action publishPost(id: String, title: String) {
+  transaction {
+    db.posts.where({ id: input.id }).update({ title: input.title, status: "published" })
+    db.audit.insert({ post_id: input.id, event: "published" })
+    db.drafts.where({ post_id: input.id }).delete()
+  }
+  return ok()
+}
+"#,
+        )
+        .expect("transaction action should compile");
+
+        assert!(module.contains("runtime.transaction(&AxTransactionRequest"));
+        assert!(module.contains("AxTransactionOperation::Update(AxUpdateRequest"));
+        assert!(module.contains("AxTransactionOperation::Insert(AxInsertRequest"));
+        assert!(module.contains("AxTransactionOperation::Delete(AxDeleteRequest"));
+        assert!(module.contains("\"posts\".to_string(), false"));
+        assert!(module.contains("\"audit\".to_string(), false"));
+        assert!(module.contains("\"drafts\".to_string(), false"));
     }
 
     #[test]
@@ -2118,6 +2229,24 @@ route GET "/api/posts/:slug"
         .expect("source should compile");
 
         assert!(module.contains("AxHttpResponse::text(404, \"not found\")"));
+    }
+
+    #[test]
+    fn compiles_typed_join_into_runtime_request() {
+        let module = compile_backend_ax_to_module(
+            r#"
+query loadPosts() -> Post[]
+  data posts = db.posts.join(db.authors, { author_id: id }).where({ "authors.active": true }).all()
+  return posts
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("joins: vec![AxQueryJoinRequest"));
+        assert!(module.contains("collection: \"authors\".to_string()"));
+        assert!(module.contains("source: \"author_id\".to_string()"));
+        assert!(module.contains("target: \"id\".to_string()"));
+        assert!(module.contains("field: \"authors.active\".to_string()"));
     }
 
     #[test]

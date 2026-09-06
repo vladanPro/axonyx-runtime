@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
+use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 
 use crate::ax_ast::prelude::{
@@ -8,12 +10,85 @@ use crate::ax_ast::prelude::{
 };
 use crate::ax_ast_v2::prelude::AxFileV2;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AxDecimal(String);
+
+impl AxDecimal {
+    pub fn new(value: impl Into<String>) -> Result<Self, AxDecimalError> {
+        let value = value.into();
+        if is_valid_decimal(&value) {
+            Ok(Self(value))
+        } else {
+            Err(AxDecimalError::Invalid { value })
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Default for AxDecimal {
+    fn default() -> Self {
+        Self("0".to_string())
+    }
+}
+
+impl fmt::Display for AxDecimal {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl FromStr for AxDecimal {
+    type Err = AxDecimalError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+impl Serialize for AxDecimal {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.0)
+    }
+}
+
+impl<'de> Deserialize<'de> for AxDecimal {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        let value = match value {
+            serde_json::Value::String(value) => value,
+            serde_json::Value::Number(value) => value.to_string(),
+            _ => {
+                return Err(D::Error::custom(
+                    "decimal value must be a JSON string or number",
+                ))
+            }
+        };
+        Self::new(value).map_err(D::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum AxDecimalError {
+    #[error("invalid decimal value `{value}`")]
+    Invalid { value: String },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum AxType {
     String,
     Number,
     Int,
     Float,
+    Decimal,
     Bool,
     DateTime,
     Date,
@@ -58,6 +133,7 @@ impl AxType {
             Self::Number => "Number".to_string(),
             Self::Int => "Int".to_string(),
             Self::Float => "Float".to_string(),
+            Self::Decimal => "Decimal".to_string(),
             Self::Bool => "Bool".to_string(),
             Self::DateTime => "DateTime".to_string(),
             Self::Date => "Date".to_string(),
@@ -104,9 +180,12 @@ impl AxType {
 
     pub fn supports_client_state(&self) -> bool {
         match self {
-            Self::Never | Self::Void | Self::Secret(_) | Self::Signal(_) | Self::Resource(_, _) => {
-                false
-            }
+            Self::Decimal
+            | Self::Never
+            | Self::Void
+            | Self::Secret(_)
+            | Self::Signal(_)
+            | Self::Resource(_, _) => false,
             Self::List(item) | Self::Set(item) | Self::Optional(item) | Self::Public(item) => {
                 item.supports_client_state()
             }
@@ -126,6 +205,11 @@ impl AxType {
             Self::Number => matches!(value, AxExpr::Number(_) | AxExpr::Float(_)),
             Self::Int => matches!(value, AxExpr::Number(_)),
             Self::Float => matches!(value, AxExpr::Number(_) | AxExpr::Float(_)),
+            Self::Decimal => match value {
+                AxExpr::String(value) => is_valid_decimal(value),
+                AxExpr::Number(_) | AxExpr::Float(_) => true,
+                _ => false,
+            },
             Self::Bool => matches!(value, AxExpr::Bool(_)),
             Self::Bytes => matches!(value, AxExpr::List(items) if items.iter().all(|item| {
                 matches!(item, AxExpr::Number(number) if (0..=255).contains(number))
@@ -171,6 +255,7 @@ impl AxType {
                 self.accepts_string_literal(value)
             }
             Self::Int => value.parse::<i64>().is_ok(),
+            Self::Decimal => is_valid_decimal(value),
             Self::Bool => matches!(value, "true" | "false"),
             Self::Public(inner) => inner.accepts_map_key(value),
             _ => false,
@@ -184,6 +269,7 @@ impl AxType {
             Self::Time => is_valid_time(value),
             Self::DateTime => is_valid_datetime(value),
             Self::Uuid => is_valid_uuid(value),
+            Self::Decimal => is_valid_decimal(value),
             Self::Public(inner) => inner.accepts_string_literal(value),
             _ => false,
         }
@@ -218,6 +304,27 @@ fn is_valid_date(value: &str) -> bool {
         _ => 31,
     };
     (1..=max_day).contains(&day)
+}
+
+fn is_valid_decimal(value: &str) -> bool {
+    let value = value.strip_prefix('-').unwrap_or(value);
+    if value.is_empty() {
+        return false;
+    }
+    let mut parts = value.split('.');
+    let Some(integer) = parts.next() else {
+        return false;
+    };
+    let fraction = parts.next();
+    if parts.next().is_some()
+        || integer.is_empty()
+        || !integer.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return false;
+    }
+    fraction.is_none_or(|fraction| {
+        !fraction.is_empty() && fraction.bytes().all(|byte| byte.is_ascii_digit())
+    })
 }
 
 fn is_valid_time(value: &str) -> bool {
@@ -759,6 +866,7 @@ fn parse_type_annotation(input: &str) -> Result<AxType, AxTypeParseError> {
         "Number" => AxType::Number,
         "Int" => AxType::Int,
         "Float" => AxType::Float,
+        "Decimal" => AxType::Decimal,
         "Bool" => AxType::Bool,
         "DateTime" => AxType::DateTime,
         "Date" => AxType::Date,
@@ -1287,6 +1395,8 @@ fn format_binary_op(op: AxBinaryOp) -> &'static str {
 pub mod prelude {
     pub use super::check_document_types;
     pub use super::AxDataContext;
+    pub use super::AxDecimal;
+    pub use super::AxDecimalError;
     pub use super::AxRecordType;
     pub use super::AxType;
     pub use super::AxTypeCheckError;
@@ -1317,6 +1427,7 @@ mod tests {
         let cases = [
             ("Int", AxType::Int),
             ("Float", AxType::Float),
+            ("Decimal", AxType::Decimal),
             ("Date", AxType::Date),
             ("Time", AxType::Time),
             ("Uuid", AxType::Uuid),
@@ -1349,6 +1460,31 @@ mod tests {
         for (source, expected) in cases {
             assert_eq!(AxType::parse_annotation(source), Ok(expected), "{source}");
         }
+    }
+
+    #[test]
+    fn decimal_contract_preserves_exact_json_digits() {
+        let source = "12345678901234567890.12345678901234567890";
+        let decimal: AxDecimal = serde_json::from_str(source)
+            .expect("an arbitrary-precision JSON number should deserialize");
+
+        assert_eq!(decimal.as_str(), source);
+        assert_eq!(
+            serde_json::to_string(&decimal).expect("decimal should serialize"),
+            format!("\"{source}\"")
+        );
+        assert!("12.30".parse::<AxDecimal>().is_ok());
+        assert!("-0.0012".parse::<AxDecimal>().is_ok());
+        assert!("1e3".parse::<AxDecimal>().is_err());
+        assert!(".5".parse::<AxDecimal>().is_err());
+    }
+
+    #[test]
+    fn validates_decimal_state_literals_without_float_coercion() {
+        assert!(AxType::Decimal.accepts_state_initializer(&AxExpr::string("12.30")));
+        assert!(AxType::Decimal.accepts_state_initializer(&AxExpr::number(12)));
+        assert!(!AxType::Decimal.accepts_state_initializer(&AxExpr::string("1e3")));
+        assert!(!AxType::Decimal.accepts_state_initializer(&AxExpr::string("12.")));
     }
 
     #[test]

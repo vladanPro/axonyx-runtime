@@ -130,6 +130,9 @@ pub enum AxStepPlan {
         binding: String,
         value: AxValuePlan,
     },
+    Transaction {
+        operations: Vec<AxTransactionOperationPlan>,
+    },
     Insert {
         collection: String,
         fields: Vec<AxAssignmentPlan>,
@@ -177,6 +180,23 @@ pub enum AxStepPlan {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AxTransactionOperationPlan {
+    Insert {
+        collection: String,
+        fields: Vec<AxAssignmentPlan>,
+    },
+    Update {
+        collection: String,
+        fields: Vec<AxAssignmentPlan>,
+        filters: Vec<AxQueryFilterPlan>,
+    },
+    Delete {
+        collection: String,
+        filters: Vec<AxQueryFilterPlan>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AxHookPhasePlan {
     Before,
@@ -211,11 +231,24 @@ pub enum AxReturnPlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxQueryPlan {
     pub source: AxQuerySourcePlan,
+    pub joins: Vec<AxQueryJoinPlan>,
     pub filters: Vec<AxQueryFilterPlan>,
     pub orders: Vec<AxQueryOrderPlan>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
     pub mode: AxQueryModePlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxQueryJoinPlan {
+    pub collection: String,
+    pub columns: Vec<AxQueryJoinColumnPlan>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxQueryJoinColumnPlan {
+    pub source: String,
+    pub target: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -562,6 +595,13 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
             value: lower_backend_value(&data.value),
         },
         AxBackendStmt::Env(_) => unreachable!("env declarations are lowered at document level"),
+        AxBackendStmt::Transaction(transaction) => AxStepPlan::Transaction {
+            operations: transaction
+                .operations
+                .iter()
+                .map(lower_transaction_operation)
+                .collect(),
+        },
         AxBackendStmt::Insert(mutation) => AxStepPlan::Insert {
             collection: mutation.collection.clone(),
             fields: lower_assignments(&mutation.fields),
@@ -625,6 +665,40 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
         AxBackendStmt::Send(send) => AxStepPlan::Send {
             target: send.target.clone(),
             payload: lower_expr(&send.payload),
+        },
+    }
+}
+
+fn lower_transaction_operation(operation: &AxTransactionOperation) -> AxTransactionOperationPlan {
+    match operation {
+        AxTransactionOperation::Insert(mutation) => AxTransactionOperationPlan::Insert {
+            collection: mutation.collection.clone(),
+            fields: lower_assignments(&mutation.fields),
+        },
+        AxTransactionOperation::Update(mutation) => AxTransactionOperationPlan::Update {
+            collection: mutation.collection.clone(),
+            fields: lower_assignments(&mutation.fields),
+            filters: mutation
+                .filters
+                .iter()
+                .map(|filter| AxQueryFilterPlan {
+                    field: filter.field.clone(),
+                    op: lower_query_filter_op(filter.op),
+                    value: lower_expr(&filter.value),
+                })
+                .collect(),
+        },
+        AxTransactionOperation::Delete(mutation) => AxTransactionOperationPlan::Delete {
+            collection: mutation.collection.clone(),
+            filters: mutation
+                .filters
+                .iter()
+                .map(|filter| AxQueryFilterPlan {
+                    field: filter.field.clone(),
+                    op: lower_query_filter_op(filter.op),
+                    value: lower_expr(&filter.value),
+                })
+                .collect(),
         },
     }
 }
@@ -700,6 +774,21 @@ fn lower_query(query: &AxQuerySpec) -> AxQueryPlan {
                 params: params.iter().map(lower_expr).collect(),
             },
         },
+        joins: query
+            .joins
+            .iter()
+            .map(|join| AxQueryJoinPlan {
+                collection: join.collection.clone(),
+                columns: join
+                    .columns
+                    .iter()
+                    .map(|column| AxQueryJoinColumnPlan {
+                        source: column.source.clone(),
+                        target: column.target.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
         filters: query
             .filters
             .iter()
@@ -980,6 +1069,8 @@ pub mod prelude {
     pub use super::AxLiteralUnionPlan;
     pub use super::AxQueryFilterOpPlan;
     pub use super::AxQueryFilterPlan;
+    pub use super::AxQueryJoinColumnPlan;
+    pub use super::AxQueryJoinPlan;
     pub use super::AxQueryModePlan;
     pub use super::AxQueryOrderDirectionPlan;
     pub use super::AxQueryOrderPlan;
@@ -990,6 +1081,7 @@ pub mod prelude {
     pub use super::AxReturnPlan;
     pub use super::AxRustExpr;
     pub use super::AxStepPlan;
+    pub use super::AxTransactionOperationPlan;
     pub use super::AxValuePlan;
 }
 
@@ -1066,6 +1158,7 @@ loader PostsList
                 source: AxQuerySourcePlan::Stream {
                     collection: "posts".to_string(),
                 },
+                joins: Vec::new(),
                 filters: vec![AxQueryFilterPlan {
                     field: "status".to_string(),
                     op: AxQueryFilterOpPlan::Eq,
@@ -1110,6 +1203,7 @@ loader PostsList
                 source: AxQuerySourcePlan::Stream {
                     collection: "posts".to_string(),
                 },
+                joins: Vec::new(),
                 filters: Vec::new(),
                 orders: Vec::new(),
                 limit: None,

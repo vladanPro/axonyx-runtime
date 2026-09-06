@@ -74,6 +74,27 @@ AX_SECRET_DB_DIALECT=postgres
 AX_SECRET_DB_TRANSPORT=direct
 ```
 
+Direct database execution has a bounded runtime policy:
+
+```env
+AX_SECRET_DB_POOL_MAX_SIZE=10
+AX_SECRET_DB_POOL_TIMEOUT_MS=5000
+AX_SECRET_DB_QUERY_TIMEOUT_MS=5000
+AX_SECRET_DB_READ_RETRY_ATTEMPTS=1
+AX_SECRET_DB_READ_RETRY_BACKOFF_MS=50
+AX_SECRET_DB_SQLITE_BUSY_TIMEOUT_MS=5000
+```
+
+Postgres applies `DB_QUERY_TIMEOUT_MS` as a server-side statement timeout. SQLite uses its
+dedicated busy timeout to bound lock contention; this is not a general SQLite query cancellation
+deadline. Only failed reads are retried, and only after timeout or connection failures. Mutations
+and transactions are never retried automatically because their commit result can be ambiguous.
+
+Postgres connections are encrypted and certificate-verified by default. For a provider with a
+private CA, use `sslmode=verify-full&sslrootcert=/path/to/provider-ca.crt`. The explicit
+`sslmode=require` compatibility mode still encrypts traffic, but does not verify the server
+certificate or hostname. `prefer` and `allow` are rejected because they can fall back to plaintext.
+
 ## Data Transport Direction
 
 The runtime keeps data access contracts transport-aware:

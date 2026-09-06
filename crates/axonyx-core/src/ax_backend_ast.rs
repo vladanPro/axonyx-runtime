@@ -420,6 +420,7 @@ impl AxScopeRender {
 pub enum AxBackendStmt {
     Data(AxBackendData),
     Env(AxBackendEnv),
+    Transaction(AxTransaction),
     Insert(AxMutation),
     Update(AxMutation),
     Delete(AxMutation),
@@ -452,6 +453,10 @@ impl AxBackendStmt {
         fields: impl IntoIterator<Item = AxAssignment>,
     ) -> Self {
         Self::Insert(AxMutation::new(collection, fields))
+    }
+
+    pub fn transaction(operations: impl IntoIterator<Item = AxTransactionOperation>) -> Self {
+        Self::Transaction(AxTransaction::new(operations))
     }
 
     pub fn update(
@@ -512,6 +517,26 @@ impl AxBackendStmt {
     pub fn send(target: impl Into<String>, payload: impl Into<AxExpr>) -> Self {
         Self::Send(AxSend::new(target, payload))
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxTransaction {
+    pub operations: Vec<AxTransactionOperation>,
+}
+
+impl AxTransaction {
+    pub fn new(operations: impl IntoIterator<Item = AxTransactionOperation>) -> Self {
+        Self {
+            operations: operations.into_iter().collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum AxTransactionOperation {
+    Insert(AxMutation),
+    Update(AxMutation),
+    Delete(AxMutation),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -853,6 +878,8 @@ pub mod prelude {
     pub use super::AxScopeState;
     pub use super::AxScopeStmt;
     pub use super::AxSend;
+    pub use super::AxTransaction;
+    pub use super::AxTransactionOperation;
 }
 
 #[cfg(test)]

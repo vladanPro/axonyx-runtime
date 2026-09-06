@@ -14,12 +14,12 @@ repository = "https://github.com/vladanPro/axonyx-runtime"
 homepage = "https://github.com/vladanPro/axonyx-runtime"
 documentation = "https://github.com/vladanPro/axonyx-runtime"
 rust-version = "1.82"
-version = "0.2.1"
+version = "0.3.0"
 
 [workspace.dependencies]
 thiserror = "2.0.12"
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.145"
+serde_json = { version = "1.0.145", features = ["arbitrary_precision"] }
 hmac = "0.12.1"
 sha2 = "0.10.9"
 axum = "0.8.9"
@@ -27,6 +27,22 @@ bytes = "1.11.1"
 futures-util = "0.3.32"
 tokio = "1.52.3"
 rusqlite = { version = "0.37.0", features = ["bundled"] }
+postgres = { version = "=0.19.10", features = ["with-chrono-0_4", "with-serde_json-1", "with-uuid-1"] }
+r2d2 = "=0.8.10"
+r2d2_postgres = "=0.18.2"
+postgres-protocol = "=0.6.8"
+postgres-types = "=0.2.9"
+tokio-postgres = "=0.7.13"
+tokio-postgres-rustls = "=0.12.0"
+rustls = { version = "=0.23.35", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "=2.2.0"
+webpki-roots = "=0.26.8"
+# Keep the TLS stack on Axonyx's Rust 1.82 MSRV.
+base64ct = "=1.7.3"
+zeroize = "=1.8.1"
+zeroize_derive = "=1.4.2"
+chrono = "=0.4.42"
+uuid = "=1.18.1"
 proc-macro2 = "1.0.106"
 quote = "1.0.45"
 syn = { version = "2.0.117", features = ["full"] }
