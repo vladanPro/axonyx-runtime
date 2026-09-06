@@ -59,6 +59,67 @@ pub fn parse_ax_v2(input: &str) -> Result<AxFileV2, AxParseV2Error> {
     parser.parse_file()
 }
 
+/// Parses a component-only module by giving declarations a synthetic page owner.
+///
+/// Returns `Ok(None)` when the source does not declare a component. This keeps
+/// regular page parsing explicit while giving build, check, and editor tooling
+/// one canonical path for standalone component files.
+pub fn parse_ax_component_module_v2(input: &str) -> Result<Option<AxFileV2>, AxParseV2Error> {
+    let component_names = component_names_from_source(input);
+    if component_names.is_empty() {
+        return Ok(None);
+    }
+
+    if let Ok(file) = parse_ax_v2(input) {
+        if !file.components.is_empty() {
+            return Ok(Some(file));
+        }
+    }
+
+    let mut prefix = Vec::new();
+    let mut body = Vec::new();
+    let mut in_prefix = true;
+    for line in input.lines() {
+        let trimmed = line.trim_start();
+        if in_prefix
+            && (trimmed.is_empty() || trimmed.starts_with("use ") || trimmed.starts_with("import "))
+        {
+            prefix.push(line);
+        } else {
+            in_prefix = false;
+            body.push(line);
+        }
+    }
+
+    let mut synthetic = String::new();
+    if !prefix.is_empty() {
+        synthetic.push_str(&prefix.join("\n"));
+        synthetic.push_str("\n\n");
+    }
+    synthetic.push_str("page ComponentModule\n\n");
+    synthetic.push_str(&body.join("\n"));
+    synthetic.push_str("\n\n");
+    for component_name in component_names {
+        synthetic.push_str(&format!("<{component_name} />\n"));
+    }
+
+    parse_ax_v2(&synthetic).map(Some)
+}
+
+fn component_names_from_source(source: &str) -> Vec<String> {
+    source
+        .lines()
+        .filter_map(|line| {
+            let rest = line.trim_start().strip_prefix("component ")?;
+            let name = rest
+                .split(|char: char| !(char.is_ascii_alphanumeric() || char == '_'))
+                .next()
+                .unwrap_or_default();
+            (!name.is_empty()).then(|| name.to_string())
+        })
+        .collect()
+}
+
 fn parse_literal_union_members(source: &str) -> Option<Vec<String>> {
     let mut seen = std::collections::BTreeSet::new();
     let literals = source
@@ -1868,13 +1929,34 @@ fn is_ax_identifier(input: &str) -> bool {
 }
 
 pub mod prelude {
-    pub use super::parse_ax_v2;
     pub use super::AxParseV2Error;
+    pub use super::{parse_ax_component_module_v2, parse_ax_v2};
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_component_only_module_through_canonical_adapter() {
+        let file = parse_ax_component_module_v2(
+            r#"
+import { Copy } from "@axonyx/ui"
+
+component Greeting {
+  render ASX {
+    <Copy>Hello</Copy>
+  }
+}
+"#,
+        )
+        .expect("component module should parse")
+        .expect("component declaration should be detected");
+
+        assert_eq!(file.page.name, "ComponentModule");
+        assert_eq!(file.components.len(), 1);
+        assert_eq!(file.components[0].name, "Greeting");
+    }
 
     #[test]
     fn parses_v2_imports_page_and_nested_elements() {
