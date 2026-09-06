@@ -136,7 +136,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
         out.push('\n');
     }
 
-    out.push_str(&render_compiled_dispatchers(&plan.handlers));
+    out.push_str(&render_compiled_dispatchers(plan));
 
     Ok(out)
 }
@@ -718,7 +718,7 @@ fn render_handler_fn(
     Ok(out)
 }
 
-fn render_compiled_dispatchers(handlers: &[AxHandlerPlan]) -> String {
+fn render_compiled_dispatchers(plan: &AxBackendPlan) -> String {
     let mut out = String::from(
         r#"fn __ax_request_path(target: &str) -> &str {
     target.split_once('?').map_or(target, |(path, _)| path)
@@ -756,20 +756,32 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
 "#,
     );
 
-    out.push_str("pub fn dispatch_api_route(runtime: &impl AxBackendRuntime, request: &AxHttpRequest) -> AxRuntimeResult<Option<AxHttpResponse>> {\n");
-    for handler in handlers {
-        let AxHandlerKind::Route { method, path, .. } = &handler.kind else {
+    out.push_str(&render_api_contract_context(plan));
+    out.push_str("pub fn dispatch_api_route(runtime: &impl AxBackendRuntime, request: &AxHttpRequest, validate_responses: bool) -> AxRuntimeResult<Option<AxHttpResponse>> {\n");
+    for handler in &plan.handlers {
+        let AxHandlerKind::Route {
+            method,
+            path,
+            returns,
+            ..
+        } = &handler.kind
+        else {
             continue;
         };
+        let validation = returns.as_ref().map_or_else(String::new, |contract| {
+            format!(
+                " if validate_responses {{ let body = response.body.chunks_iter().flat_map(|chunk| chunk.iter().copied()).collect::<Vec<_>>(); validate_api_response_bytes(response.status, &response.content_type, &body, {contract:?}, __ax_api_contract_context()).map_err(|error| AxRuntimeError::message(format!(\"API response validation failed for {method} {path}: {{error}}\")))?; }}"
+            )
+        });
         out.push_str(&format!(
-            "    if request.method.eq_ignore_ascii_case({method:?}) && __ax_route_params({path:?}, &request.target).is_some() {{ return {}(runtime, request).map(Some); }}\n",
+            "    if request.method.eq_ignore_ascii_case({method:?}) && __ax_route_params({path:?}, &request.target).is_some() {{ let response = {}(runtime, request)?;{validation} return Ok(Some(response)); }}\n",
             handler.rust_fn
         ));
     }
     out.push_str("    Ok(None)\n}\n\n");
 
     out.push_str("pub fn dispatch_action(runtime: &impl AxBackendRuntime, name: &str, request: &AxHttpRequest) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
-    for handler in handlers {
+    for handler in &plan.handlers {
         let AxHandlerKind::Action { input, .. } = &handler.kind else {
             continue;
         };
@@ -802,7 +814,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
     out.push_str("        _ => Ok(None),\n    }\n}\n");
 
     out.push_str("\npub fn dispatch_loader(runtime: &impl AxBackendRuntime, name: &str, pattern: &str, request: &AxHttpRequest, args: &[Value]) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
-    for handler in handlers {
+    for handler in &plan.handlers {
         let AxHandlerKind::Loader { input, .. } = &handler.kind else {
             continue;
         };
@@ -840,6 +852,84 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
     }
     out.push_str("        _ => Ok(None),\n    }\n}\n");
     out
+}
+
+fn render_api_contract_context(plan: &AxBackendPlan) -> String {
+    let mut expression = "AxDataContext::new()".to_string();
+    for literal_union in &plan.literal_unions {
+        let literals = literal_union
+            .literals
+            .iter()
+            .map(|literal| format!("{literal:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        expression.push_str(&format!(
+            ".with_literal_union({:?}, [{literals}])",
+            literal_union.name
+        ));
+    }
+    for record in &plan.types {
+        let mut record_expression = format!("AxRecordType::new({:?})", record.name);
+        for field in &record.fields {
+            record_expression.push_str(&format!(
+                ".field({:?}, {})",
+                field.name,
+                render_ax_type_expr(&field.ty)
+            ));
+        }
+        expression.push_str(&format!(".with_record({record_expression})"));
+    }
+    format!(
+        "fn __ax_api_contract_context() -> &'static AxDataContext {{\n    static CONTEXT: std::sync::OnceLock<AxDataContext> = std::sync::OnceLock::new();\n    CONTEXT.get_or_init(|| {expression})\n}}\n\n"
+    )
+}
+
+fn render_ax_type_expr(ty: &AxType) -> String {
+    match ty {
+        AxType::String => "AxType::String".to_string(),
+        AxType::Number => "AxType::Number".to_string(),
+        AxType::Int => "AxType::Int".to_string(),
+        AxType::Float => "AxType::Float".to_string(),
+        AxType::Decimal => "AxType::Decimal".to_string(),
+        AxType::Bool => "AxType::Bool".to_string(),
+        AxType::DateTime => "AxType::DateTime".to_string(),
+        AxType::Date => "AxType::Date".to_string(),
+        AxType::Time => "AxType::Time".to_string(),
+        AxType::Uuid => "AxType::Uuid".to_string(),
+        AxType::Bytes => "AxType::Bytes".to_string(),
+        AxType::Json => "AxType::Json".to_string(),
+        AxType::Never => "AxType::Never".to_string(),
+        AxType::Void => "AxType::Void".to_string(),
+        AxType::List(item) => format!("AxType::list({})", render_ax_type_expr(item)),
+        AxType::Map(key, value) => format!(
+            "AxType::Map(Box::new({}), Box::new({}))",
+            render_ax_type_expr(key),
+            render_ax_type_expr(value)
+        ),
+        AxType::Set(item) => format!("AxType::Set(Box::new({}))", render_ax_type_expr(item)),
+        AxType::Optional(item) => format!("AxType::optional({})", render_ax_type_expr(item)),
+        AxType::Result(ok, error) => format!(
+            "AxType::Result(Box::new({}), Box::new({}))",
+            render_ax_type_expr(ok),
+            render_ax_type_expr(error)
+        ),
+        AxType::Secret(item) => {
+            format!("AxType::Secret(Box::new({}))", render_ax_type_expr(item))
+        }
+        AxType::Public(item) => {
+            format!("AxType::Public(Box::new({}))", render_ax_type_expr(item))
+        }
+        AxType::Signal(item) => {
+            format!("AxType::Signal(Box::new({}))", render_ax_type_expr(item))
+        }
+        AxType::Resource(value, error) => format!(
+            "AxType::Resource(Box::new({}), Box::new({}))",
+            render_ax_type_expr(value),
+            render_ax_type_expr(error)
+        ),
+        AxType::Record(name) => format!("AxType::record({name:?})"),
+        AxType::Unknown => "AxType::Unknown".to_string(),
+    }
 }
 
 fn handler_input_fields(handler: &AxHandlerPlan) -> Option<&[AxFieldPlan]> {
@@ -2341,7 +2431,7 @@ action RemovePost
     fn generates_compiled_api_and_action_dispatchers() {
         let module = compile_backend_ax_to_module(
             r#"
-route GET "/api/posts/:slug"
+route GET "/api/posts/:slug" -> String
   data slug = params.slug
   return json(slug)
 
@@ -2360,6 +2450,9 @@ action Refresh {
         .expect("source should compile");
 
         assert!(module.contains("pub fn dispatch_api_route"));
+        assert!(module.contains("validate_responses: bool"));
+        assert!(module.contains("validate_api_response_bytes"));
+        assert!(module.contains("__ax_api_contract_context()"));
         assert!(module.contains("__ax_route_params(\"/api/posts/:slug\""));
         assert!(
             module.contains("let context = __ax_loader_context(\"/api/posts/:slug\", request)?")

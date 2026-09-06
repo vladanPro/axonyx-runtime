@@ -23,6 +23,7 @@ use axonyx_core::ax_lowering_prelude::{
 };
 use axonyx_core::ax_parser_auto::AxAutoParseError;
 use axonyx_core::ax_parser_auto_prelude::parse_ax_auto;
+use axonyx_core::ax_types::prelude::{AxDataContext, AxJsonValidationError, AxRecordType, AxType};
 use axonyx_core::prelude::{Attribute, AxNode};
 use axonyx_core::{AxonyxIr, SourceKind, TransformKind, ViewKind};
 use serde::{Deserialize, Serialize};
@@ -34,6 +35,143 @@ pub use serde;
 pub use server::prelude as server_prelude;
 
 pub const AX_STATE_WASM_PATH: &str = "/_ax/runtime/axonyx-state-v2.wasm";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AxApiResponseValidationMode {
+    Off,
+    #[default]
+    Development,
+    Always,
+}
+
+impl AxApiResponseValidationMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "development" => Some(Self::Development),
+            "always" => Some(Self::Always),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Development => "development",
+            Self::Always => "always",
+        }
+    }
+
+    pub fn enabled(self, development: bool) -> bool {
+        matches!(self, Self::Always) || (development && matches!(self, Self::Development))
+    }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum AxApiResponseValidationError {
+    #[error("invalid API return contract `{contract}`: {message}")]
+    InvalidContract { contract: String, message: String },
+    #[error("successful API response for `{contract}` must use a JSON content type, found `{content_type}`")]
+    NonJsonResponse {
+        contract: String,
+        content_type: String,
+    },
+    #[error("successful API response for `{contract}` contains invalid JSON: {message}")]
+    InvalidJson { contract: String, message: String },
+    #[error("API response does not satisfy `{contract}`: {source}")]
+    ContractMismatch {
+        contract: String,
+        #[source]
+        source: AxJsonValidationError,
+    },
+}
+
+pub fn validate_api_response_bytes(
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    contract: &str,
+    context: &AxDataContext,
+) -> Result<(), AxApiResponseValidationError> {
+    if !(200..300).contains(&status) || status == 204 {
+        return Ok(());
+    }
+    if !is_json_content_type(content_type) {
+        return Err(AxApiResponseValidationError::NonJsonResponse {
+            contract: contract.to_string(),
+            content_type: content_type.to_string(),
+        });
+    }
+    let expected = parse_api_return_contract(contract)?;
+    let value = serde_json::from_slice(body).map_err(|error| {
+        AxApiResponseValidationError::InvalidJson {
+            contract: contract.to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    context.validate_json(&expected, &value).map_err(|source| {
+        AxApiResponseValidationError::ContractMismatch {
+            contract: contract.to_string(),
+            source,
+        }
+    })
+}
+
+fn is_json_content_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    media_type.eq_ignore_ascii_case("application/json")
+        || media_type.to_ascii_lowercase().ends_with("+json")
+}
+
+fn parse_api_return_contract(contract: &str) -> Result<AxType, AxApiResponseValidationError> {
+    let contract = contract.trim();
+    if let Some(inner) = contract.strip_suffix("[]") {
+        return Ok(AxType::list(parse_api_return_contract(inner)?));
+    }
+    for (wrapper, wrap) in [
+        ("List", AxType::list as fn(AxType) -> AxType),
+        ("Optional", AxType::optional as fn(AxType) -> AxType),
+    ] {
+        if let Some(inner) = contract
+            .strip_prefix(&format!("{wrapper}<"))
+            .and_then(|value| value.strip_suffix('>'))
+        {
+            return Ok(wrap(parse_api_return_contract(inner)?));
+        }
+    }
+
+    let parsed = match contract {
+        "String" | "string" => AxType::String,
+        "Bool" | "Boolean" | "bool" | "boolean" => AxType::Bool,
+        "Number" | "number" | "f64" | "float" => AxType::Number,
+        "i64" | "u64" | "int" | "integer" => AxType::Int,
+        "Json" => AxType::Json,
+        "Null" => AxType::Void,
+        name if is_api_type_identifier(name) => AxType::record(name),
+        _ => {
+            return Err(AxApiResponseValidationError::InvalidContract {
+                contract: contract.to_string(),
+                message: "expected a built-in type, named type, List<T>, Optional<T>, or T[]"
+                    .to_string(),
+            });
+        }
+    };
+    Ok(parsed)
+}
+
+fn is_api_type_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|char| char.is_ascii_alphanumeric() || char == '_')
+}
 
 pub fn ax_state_wasm_bytes() -> &'static [u8] {
     include_bytes!("../assets/axonyx-state-v2.wasm")
@@ -469,6 +607,7 @@ struct PreviewHandlers {
     loaders: BTreeMap<String, AxHandlerPlan>,
     actions: BTreeMap<String, AxHandlerPlan>,
     functions: BTreeMap<String, AxFunctionPlan>,
+    type_context: AxDataContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,6 +621,16 @@ struct PreviewFilter {
 struct PreviewRouteMatch<'a> {
     handler: &'a AxHandlerPlan,
     params: BTreeMap<String, AxValue>,
+}
+
+struct PreviewBackendContext<'a> {
+    env: &'a backend::AxEnv,
+    runtime: Option<&'a dyn backend::AxBackendRuntime>,
+}
+
+struct PreviewResponseValidation<'a> {
+    enabled: bool,
+    type_context: &'a AxDataContext,
 }
 
 pub fn preview_ax_route_with_backend(
@@ -824,6 +973,15 @@ pub fn execute_preview_route_request_sources(
     request: &server::AxHttpRequest,
     store: &mut AxPreviewStore,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    execute_preview_route_request_sources_validated(route_sources, request, false, store)
+}
+
+pub fn execute_preview_route_request_sources_validated(
+    route_sources: &[&str],
+    request: &server::AxHttpRequest,
+    validate_response: bool,
+    store: &mut AxPreviewStore,
+) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
     let handlers = collect_preview_handlers(&[], &[], route_sources)?;
     let env = backend::AxEnv::from_env();
     let request_path = normalize_preview_request_path(&request.target)?;
@@ -833,8 +991,14 @@ pub fn execute_preview_route_request_sources(
         request,
         &request_path,
         &query,
-        &env,
-        None,
+        PreviewBackendContext {
+            env: &env,
+            runtime: None,
+        },
+        PreviewResponseValidation {
+            enabled: validate_response,
+            type_context: &handlers.type_context,
+        },
         store,
     )
 }
@@ -843,6 +1007,22 @@ pub fn execute_preview_route_request_sources_with_runtime(
     route_sources: &[&str],
     request: &server::AxHttpRequest,
     runtime: &dyn backend::AxBackendRuntime,
+    store: &mut AxPreviewStore,
+) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    execute_preview_route_request_sources_with_runtime_validated(
+        route_sources,
+        request,
+        runtime,
+        false,
+        store,
+    )
+}
+
+pub fn execute_preview_route_request_sources_with_runtime_validated(
+    route_sources: &[&str],
+    request: &server::AxHttpRequest,
+    runtime: &dyn backend::AxBackendRuntime,
+    validate_response: bool,
     store: &mut AxPreviewStore,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
     let handlers = collect_preview_handlers(&[], &[], route_sources)?;
@@ -854,8 +1034,14 @@ pub fn execute_preview_route_request_sources_with_runtime(
         request,
         &request_path,
         &query,
-        env,
-        Some(runtime),
+        PreviewBackendContext {
+            env,
+            runtime: Some(runtime),
+        },
+        PreviewResponseValidation {
+            enabled: validate_response,
+            type_context: &handlers.type_context,
+        },
         store,
     )
 }
@@ -878,10 +1064,12 @@ fn collect_preview_handlers(
     let mut actions = BTreeMap::new();
     let mut functions = BTreeMap::new();
     let mut globals = Vec::new();
+    let mut type_context = AxDataContext::new();
 
     for source in route_sources {
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
+        collect_preview_types(&plan, &mut type_context);
         globals.extend(plan.globals);
         collect_preview_functions(plan.functions, &mut functions);
 
@@ -897,6 +1085,7 @@ fn collect_preview_handlers(
     for source in loader_sources {
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
+        collect_preview_types(&plan, &mut type_context);
         globals.extend(plan.globals);
         collect_preview_functions(plan.functions, &mut functions);
 
@@ -910,6 +1099,7 @@ fn collect_preview_handlers(
     for source in action_sources {
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
+        collect_preview_types(&plan, &mut type_context);
         globals.extend(plan.globals);
         collect_preview_functions(plan.functions, &mut functions);
 
@@ -938,7 +1128,30 @@ fn collect_preview_handlers(
         loaders,
         actions,
         functions,
+        type_context,
     })
+}
+
+fn collect_preview_types(
+    plan: &axonyx_core::ax_backend_lowering_prelude::AxBackendPlan,
+    context: &mut AxDataContext,
+) {
+    for literal_union in &plan.literal_unions {
+        context
+            .literal_unions
+            .insert(literal_union.name.clone(), literal_union.literals.clone());
+    }
+    for record in &plan.types {
+        context.records.insert(
+            record.name.clone(),
+            record
+                .fields
+                .iter()
+                .fold(AxRecordType::new(&record.name), |record, field| {
+                    record.field(&field.name, field.ty.clone())
+                }),
+        );
+    }
 }
 
 fn collect_preview_functions(
@@ -1479,10 +1692,14 @@ fn execute_preview_route(
     request: &server::AxHttpRequest,
     request_path: &str,
     query: &BTreeMap<String, String>,
-    env: &backend::AxEnv,
-    runtime: Option<&dyn backend::AxBackendRuntime>,
+    backend: PreviewBackendContext<'_>,
+    validation: PreviewResponseValidation<'_>,
     store: &mut AxPreviewStore,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    let env = backend.env;
+    let runtime = backend.runtime;
+    let validate_response = validation.enabled;
+    let type_context = validation.type_context;
     let Some(route_match) = match_preview_route(routes, &request.method, request_path) else {
         return Ok(None);
     };
@@ -1593,10 +1810,13 @@ fn execute_preview_route(
                         apply_preview_route_hook(value, &scope, env, &mut headers)?
                     {
                         apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
-                        return Ok(Some(apply_preview_response_metadata(
+                        let response =
+                            apply_preview_response_metadata(response, headers, set_cookies);
+                        return Ok(Some(validate_preview_api_response(
+                            route_match.handler,
                             response,
-                            headers,
-                            set_cookies,
+                            validate_response,
+                            type_context,
                         )));
                     }
                 }
@@ -1630,27 +1850,83 @@ fn execute_preview_route(
                 if !preview_require_passes(&eval_preview_require_expr(value, &scope, env)?) {
                     let response = render_preview_require_fallback(fallback.as_ref(), &scope, env)?;
                     apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
-                    return Ok(Some(apply_preview_response_metadata(
+                    let response = apply_preview_response_metadata(response, headers, set_cookies);
+                    return Ok(Some(validate_preview_api_response(
+                        route_match.handler,
                         response,
-                        headers,
-                        set_cookies,
+                        validate_response,
+                        type_context,
                     )));
                 }
             }
             AxStepPlan::Return(result) => {
                 apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
-                return render_preview_route_return(result, &scope, env, headers, set_cookies);
+                return render_preview_route_return(result, &scope, env, headers, set_cookies).map(
+                    |response| {
+                        response.map(|response| {
+                            validate_preview_api_response(
+                                route_match.handler,
+                                response,
+                                validate_response,
+                                type_context,
+                            )
+                        })
+                    },
+                );
             }
             AxStepPlan::Revalidate { .. } | AxStepPlan::Patch { .. } | AxStepPlan::Send { .. } => {}
         }
     }
 
     apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
-    Ok(Some(apply_preview_response_metadata(
+    let response = apply_preview_response_metadata(
         render_preview_json_response(&AxValue::Null)?,
         headers,
         set_cookies,
+    );
+    Ok(Some(validate_preview_api_response(
+        route_match.handler,
+        response,
+        validate_response,
+        type_context,
     )))
+}
+
+fn validate_preview_api_response(
+    handler: &AxHandlerPlan,
+    response: AxPreviewHttpResponse,
+    enabled: bool,
+    context: &AxDataContext,
+) -> AxPreviewHttpResponse {
+    let AxHandlerKind::Route {
+        returns: Some(contract),
+        method,
+        path,
+        ..
+    } = &handler.kind
+    else {
+        return response;
+    };
+    if !enabled {
+        return response;
+    }
+    if let Err(error) = validate_api_response_bytes(
+        response.status,
+        &response.content_type,
+        &response.body,
+        contract,
+        context,
+    ) {
+        eprintln!("Axonyx API response validation failed for {method} {path}: {error}");
+        return AxPreviewHttpResponse {
+            status: 500,
+            content_type: "application/json; charset=utf-8".to_string(),
+            headers: BTreeMap::from([("Cache-Control".to_string(), "no-store".to_string())]),
+            set_cookies: Vec::new(),
+            body: br#"{"error":"internal_server_error","message":"API response did not satisfy its declared contract."}"#.to_vec(),
+        };
+    }
+    response
 }
 
 fn render_preview_require_fallback(
@@ -8954,5 +9230,76 @@ page Home
         assert!(html.contains("<title>Page Title</title>"));
         assert!(html.contains("<meta name=\"description\" content=\"Layout description.\">"));
         assert!(html.contains("<link rel=\"icon\" href=\"/favicon.svg\">"));
+    }
+
+    #[test]
+    fn api_response_validation_modes_have_safe_defaults() {
+        assert_eq!(
+            AxApiResponseValidationMode::default(),
+            AxApiResponseValidationMode::Development
+        );
+        assert!(AxApiResponseValidationMode::Development.enabled(true));
+        assert!(!AxApiResponseValidationMode::Development.enabled(false));
+        assert!(AxApiResponseValidationMode::Always.enabled(false));
+        assert!(!AxApiResponseValidationMode::Off.enabled(true));
+    }
+
+    #[test]
+    fn validates_declared_api_response_bytes() {
+        let context = AxDataContext::new().with_record(
+            AxRecordType::new("Post")
+                .field("title", AxType::String)
+                .field("published", AxType::Bool),
+        );
+
+        validate_api_response_bytes(
+            200,
+            "application/json; charset=utf-8",
+            br#"[{"title":"Axonyx","published":true}]"#,
+            "Post[]",
+            &context,
+        )
+        .expect("matching response should pass");
+
+        let error = validate_api_response_bytes(
+            200,
+            "application/json",
+            br#"[{"title":"Axonyx","published":"yes"}]"#,
+            "Post[]",
+            &context,
+        )
+        .expect_err("mismatched response should fail");
+        assert!(error.to_string().contains("$[0].published"));
+
+        assert!(
+            validate_api_response_bytes(404, "text/plain", b"not found", "Post[]", &context,)
+                .is_ok()
+        );
+        assert!(validate_api_response_bytes(204, "text/plain", b"", "Post[]", &context).is_ok());
+    }
+
+    #[test]
+    fn preview_api_response_validation_returns_a_safe_500() {
+        let mut store = AxPreviewStore::default();
+        let request = server::AxHttpRequest::new("GET", "/api/posts");
+        let response = execute_preview_route_request_sources_validated(
+            &[r#"
+route GET "/api/posts" -> String {
+  return json(7)
+}
+"#],
+            &request,
+            true,
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 500);
+        assert_eq!(response.content_type, "application/json; charset=utf-8");
+        assert_eq!(
+            response.body,
+            br#"{"error":"internal_server_error","message":"API response did not satisfy its declared contract."}"#
+        );
     }
 }
