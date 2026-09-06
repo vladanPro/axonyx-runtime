@@ -3,6 +3,7 @@ use std::fmt;
 use std::str::FromStr;
 
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+use serde_json::Value;
 use thiserror::Error;
 
 use crate::ax_ast::prelude::{
@@ -471,6 +472,186 @@ impl AxDataContext {
         self.bindings.get(name)
     }
 
+    pub fn validate_json(
+        &self,
+        expected: &AxType,
+        value: &Value,
+    ) -> Result<(), AxJsonValidationError> {
+        self.validate_json_at(expected, value, "$", 0)
+    }
+
+    fn validate_json_at(
+        &self,
+        expected: &AxType,
+        value: &Value,
+        path: &str,
+        depth: usize,
+    ) -> Result<(), AxJsonValidationError> {
+        if depth > 64 {
+            return Err(AxJsonValidationError::new(
+                path,
+                expected.display_name(),
+                json_kind(value),
+                "contract nesting exceeds 64 levels",
+            ));
+        }
+
+        let mismatch = |reason: &'static str| {
+            AxJsonValidationError::new(path, expected.display_name(), json_kind(value), reason)
+        };
+
+        match expected {
+            AxType::String => value
+                .is_string()
+                .then_some(())
+                .ok_or_else(|| mismatch("expected a JSON string")),
+            AxType::Number | AxType::Float => value
+                .is_number()
+                .then_some(())
+                .ok_or_else(|| mismatch("expected a JSON number")),
+            AxType::Int => value
+                .as_i64()
+                .is_some()
+                .then_some(())
+                .or_else(|| value.as_u64().is_some().then_some(()))
+                .ok_or_else(|| mismatch("expected a JSON integer")),
+            AxType::Decimal => match value {
+                Value::Number(_) => Ok(()),
+                Value::String(value) if is_valid_decimal(value) => Ok(()),
+                _ => Err(mismatch("expected a decimal JSON string or number")),
+            },
+            AxType::Bool => value
+                .is_boolean()
+                .then_some(())
+                .ok_or_else(|| mismatch("expected a JSON boolean")),
+            AxType::DateTime | AxType::Date | AxType::Time | AxType::Uuid => match value {
+                Value::String(value) if expected.accepts_string_literal(value) => Ok(()),
+                _ => Err(mismatch("expected a valid canonical string value")),
+            },
+            AxType::Bytes => match value {
+                Value::Array(items)
+                    if items
+                        .iter()
+                        .all(|item| item.as_u64().is_some_and(|byte| byte <= 255)) =>
+                {
+                    Ok(())
+                }
+                _ => Err(mismatch("expected an array of byte integers (0..255)")),
+            },
+            AxType::Json | AxType::Unknown => Ok(()),
+            AxType::Never => Err(mismatch("Never cannot have a response value")),
+            AxType::Void => value
+                .is_null()
+                .then_some(())
+                .ok_or_else(|| mismatch("expected null")),
+            AxType::List(item) | AxType::Set(item) => {
+                let Value::Array(items) = value else {
+                    return Err(mismatch("expected a JSON array"));
+                };
+                for (index, value) in items.iter().enumerate() {
+                    self.validate_json_at(item, value, &format!("{path}[{index}]"), depth + 1)?;
+                }
+                Ok(())
+            }
+            AxType::Map(key, item) => {
+                let Value::Object(fields) = value else {
+                    return Err(mismatch("expected a JSON object"));
+                };
+                for (name, value) in fields {
+                    if !key.accepts_map_key(name) {
+                        return Err(AxJsonValidationError::new(
+                            format!("{path}.{name}"),
+                            key.display_name(),
+                            "object key",
+                            "map key does not satisfy its declared type",
+                        ));
+                    }
+                    self.validate_json_at(item, value, &format!("{path}.{name}"), depth + 1)?;
+                }
+                Ok(())
+            }
+            AxType::Optional(item) => {
+                if value.is_null() {
+                    Ok(())
+                } else {
+                    self.validate_json_at(item, value, path, depth + 1)
+                }
+            }
+            AxType::Result(ok, error) => {
+                let Value::Object(fields) = value else {
+                    return Err(mismatch(
+                        "expected an object with exactly one Ok or Err field",
+                    ));
+                };
+                if fields.len() != 1 {
+                    return Err(mismatch(
+                        "expected an object with exactly one Ok or Err field",
+                    ));
+                }
+                if let Some(value) = fields.get("Ok") {
+                    self.validate_json_at(ok, value, &format!("{path}.Ok"), depth + 1)
+                } else if let Some(value) = fields.get("Err") {
+                    self.validate_json_at(error, value, &format!("{path}.Err"), depth + 1)
+                } else {
+                    Err(mismatch(
+                        "expected an object with exactly one Ok or Err field",
+                    ))
+                }
+            }
+            AxType::Public(item) | AxType::Signal(item) => {
+                self.validate_json_at(item, value, path, depth + 1)
+            }
+            AxType::Secret(_) => Err(mismatch("Secret values cannot cross an API boundary")),
+            AxType::Resource(_, _) => Err(mismatch(
+                "Resource is a runtime state container, not an API response contract",
+            )),
+            AxType::Record(name) => {
+                if let Some(literals) = self.literal_union(name) {
+                    return match value {
+                        Value::String(value) if literals.iter().any(|literal| literal == value) => {
+                            Ok(())
+                        }
+                        _ => Err(mismatch(
+                            "value is not a member of the declared literal union",
+                        )),
+                    };
+                }
+
+                let Some(record) = self.record(name) else {
+                    return Err(AxJsonValidationError::new(
+                        path,
+                        name,
+                        json_kind(value),
+                        "unknown record contract",
+                    ));
+                };
+                let Value::Object(fields) = value else {
+                    return Err(mismatch("expected a JSON object"));
+                };
+                for (field, field_type) in &record.fields {
+                    let Some(field_value) = fields.get(field) else {
+                        if matches!(field_type, AxType::Optional(_)) {
+                            continue;
+                        }
+                        return Err(AxJsonValidationError::new(
+                            format!("{path}.{field}"),
+                            field_type.display_name(),
+                            "missing",
+                            "required field is missing",
+                        ));
+                    };
+                    self.validate_json_at(
+                        field_type,
+                        field_value,
+                        &format!("{path}.{field}"),
+                        depth + 1,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn accepts_state_initializer(&self, ty: &AxType, value: &AxExpr) -> bool {
         self.accepts_state_initializer_at_depth(ty, value, 0)
     }
@@ -772,6 +953,43 @@ impl AxDataContext {
         }
 
         Ok(AxType::list(first_type))
+    }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[error("{path}: expected {expected}, found {actual} ({reason})")]
+pub struct AxJsonValidationError {
+    pub path: String,
+    pub expected: String,
+    pub actual: String,
+    pub reason: String,
+}
+
+impl AxJsonValidationError {
+    fn new(
+        path: impl Into<String>,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+        reason: impl Into<String>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            expected: expected.into(),
+            actual: actual.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(value) if value.is_i64() || value.is_u64() => "integer",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
     }
 }
 
@@ -1397,6 +1615,7 @@ pub mod prelude {
     pub use super::AxDataContext;
     pub use super::AxDecimal;
     pub use super::AxDecimalError;
+    pub use super::AxJsonValidationError;
     pub use super::AxRecordType;
     pub use super::AxType;
     pub use super::AxTypeCheckError;
@@ -1420,6 +1639,67 @@ mod tests {
                     .field("excerpt", AxType::String),
             )
             .with_binding("posts", AxType::list(AxType::record("Post")))
+    }
+
+    #[test]
+    fn validates_nested_json_records_and_optional_fields() {
+        let context = AxDataContext::new()
+            .with_literal_union("PostStatus", ["draft", "published"])
+            .with_record(
+                AxRecordType::new("Author")
+                    .field("name", AxType::String)
+                    .field("email", AxType::optional(AxType::String)),
+            )
+            .with_record(
+                AxRecordType::new("Post")
+                    .field("title", AxType::String)
+                    .field("status", AxType::record("PostStatus"))
+                    .field("author", AxType::record("Author")),
+            );
+        let value = serde_json::json!([{
+            "title": "Typed boundaries",
+            "status": "published",
+            "author": { "name": "Axonyx" },
+            "extra": true
+        }]);
+
+        assert!(context
+            .validate_json(&AxType::list(AxType::record("Post")), &value)
+            .is_ok());
+    }
+
+    #[test]
+    fn reports_the_precise_json_contract_path() {
+        let context = AxDataContext::new().with_record(
+            AxRecordType::new("Post")
+                .field("title", AxType::String)
+                .field("published", AxType::Bool),
+        );
+        let value = serde_json::json!([{
+            "title": "Broken contract",
+            "published": "yes"
+        }]);
+
+        let error = context
+            .validate_json(&AxType::list(AxType::record("Post")), &value)
+            .expect_err("string boolean should fail");
+
+        assert_eq!(error.path, "$[0].published");
+        assert_eq!(error.expected, "Bool");
+        assert_eq!(error.actual, "string");
+    }
+
+    #[test]
+    fn rejects_missing_required_json_fields() {
+        let context = AxDataContext::new()
+            .with_record(AxRecordType::new("Post").field("title", AxType::String));
+
+        let error = context
+            .validate_json(&AxType::record("Post"), &serde_json::json!({}))
+            .expect_err("required title should fail");
+
+        assert_eq!(error.path, "$.title");
+        assert_eq!(error.actual, "missing");
     }
 
     #[test]
