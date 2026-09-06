@@ -35,7 +35,7 @@ zeroize_derive.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 bytes.workspace = true
-axonyx-core = { version = "0.2.1", path = "../axonyx-core" }
+axonyx-core = { version = "0.3.0", path = "../axonyx-core" }
 axum = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["net", "rt-multi-thread"] }
