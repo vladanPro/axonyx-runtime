@@ -25,6 +25,34 @@ pub struct AxLanguageDiagnostic {
 pub struct AxLanguageImport {
     pub source: String,
     pub line: usize,
+    pub bindings: Vec<AxLanguageImportBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxLanguageImportBinding {
+    pub imported: String,
+    pub local: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AxLanguageSymbolKind {
+    Page,
+    Layout,
+    Component,
+    Function,
+    Type,
+    Query,
+    Action,
+    Scope,
+    Job,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxLanguageSymbol {
+    pub name: String,
+    pub line: usize,
+    pub column: usize,
+    pub kind: AxLanguageSymbolKind,
 }
 
 impl AxLanguageDiagnostic {
@@ -100,24 +128,45 @@ pub fn diagnose_ax_source(path: &str, source: &str) -> Vec<AxLanguageDiagnostic>
 }
 
 pub fn ax_source_imports(path: &str, source: &str) -> Vec<AxLanguageImport> {
-    let sources = match classify_ax_source(path, source) {
-        AxSourceKind::Backend => parse_backend_ax(source).ok().map(|document| {
-            document
-                .imports
-                .into_iter()
-                .map(|import| import.source)
-                .collect::<Vec<_>>()
-        }),
-        AxSourceKind::Page => page_import_sources(source),
+    match classify_ax_source(path, source) {
+        AxSourceKind::Backend => parse_backend_ax(source)
+            .ok()
+            .map(|document| {
+                document
+                    .imports
+                    .into_iter()
+                    .map(|import| AxLanguageImport {
+                        line: import_source_line(source, &import.source),
+                        source: import.source,
+                        bindings: import
+                            .bindings
+                            .into_iter()
+                            .map(|binding| AxLanguageImportBinding {
+                                imported: binding.imported,
+                                local: binding.local,
+                            })
+                            .collect(),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        AxSourceKind::Page => page_language_imports(source).unwrap_or_default(),
     }
-    .unwrap_or_default();
+}
 
-    sources
-        .into_iter()
-        .map(|import_source| AxLanguageImport {
-            line: import_source_line(source, &import_source),
-            source: import_source,
-        })
+pub fn ax_source_symbols(path: &str, source: &str) -> Vec<AxLanguageSymbol> {
+    let parsed = match classify_ax_source(path, source) {
+        AxSourceKind::Backend => parse_backend_ax(source).is_ok(),
+        AxSourceKind::Page => page_import_sources(source).is_some(),
+    };
+    if !parsed {
+        return Vec::new();
+    }
+
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| parse_language_symbol(line, index + 1))
         .collect()
 }
 
@@ -191,11 +240,27 @@ pub fn resolve_ax_import_path(
 }
 
 fn page_import_sources(source: &str) -> Option<Vec<String>> {
+    page_language_imports(source)
+        .map(|imports| imports.into_iter().map(|import| import.source).collect())
+}
+
+fn page_language_imports(source: &str) -> Option<Vec<AxLanguageImport>> {
     if let Ok(Some(file)) = parse_ax_component_module_v2(source) {
         return Some(
             file.imports
                 .into_iter()
-                .map(|import| import.source)
+                .map(|import| AxLanguageImport {
+                    line: import_source_line(source, &import.source),
+                    source: import.source,
+                    bindings: import
+                        .bindings
+                        .into_iter()
+                        .map(|binding| AxLanguageImportBinding {
+                            imported: binding.imported,
+                            local: binding.local,
+                        })
+                        .collect(),
+                })
                 .collect(),
         );
     }
@@ -204,9 +269,63 @@ fn page_import_sources(source: &str) -> Option<Vec<String>> {
         document
             .imports
             .into_iter()
-            .map(|import| import.source)
+            .map(|import| AxLanguageImport {
+                line: import_source_line(source, &import.source),
+                source: import.source,
+                bindings: import
+                    .bindings
+                    .into_iter()
+                    .map(|binding| AxLanguageImportBinding {
+                        imported: binding.imported,
+                        local: binding.local,
+                    })
+                    .collect(),
+            })
             .collect()
     })
+}
+
+fn parse_language_symbol(line: &str, line_number: usize) -> Option<AxLanguageSymbol> {
+    let trimmed = line.trim_start();
+    let declaration = trimmed.strip_prefix("export ").unwrap_or(trimmed);
+    let declarations = [
+        ("page", AxLanguageSymbolKind::Page),
+        ("layout", AxLanguageSymbolKind::Layout),
+        ("component", AxLanguageSymbolKind::Component),
+        ("fn", AxLanguageSymbolKind::Function),
+        ("type", AxLanguageSymbolKind::Type),
+        ("query", AxLanguageSymbolKind::Query),
+        ("loader", AxLanguageSymbolKind::Query),
+        ("action", AxLanguageSymbolKind::Action),
+        ("scope", AxLanguageSymbolKind::Scope),
+        ("job", AxLanguageSymbolKind::Job),
+    ];
+
+    for (keyword, kind) in declarations {
+        let Some(rest) = declaration.strip_prefix(keyword) else {
+            continue;
+        };
+        if !rest.chars().next().is_some_and(char::is_whitespace) {
+            continue;
+        }
+        let rest = rest.trim_start();
+        let name = rest
+            .chars()
+            .take_while(|character| character.is_ascii_alphanumeric() || *character == '_')
+            .collect::<String>();
+        if name.is_empty() {
+            return None;
+        }
+        let name_offset = line.find(&name)?;
+        return Some(AxLanguageSymbol {
+            name,
+            line: line_number,
+            column: line[..name_offset].encode_utf16().count() + 1,
+            kind,
+        });
+    }
+
+    None
 }
 
 fn import_source_line(source: &str, import_source: &str) -> usize {
@@ -404,8 +523,10 @@ fn line_from_backend_parse_error(error: &AxBackendParseError) -> usize {
 
 pub mod prelude {
     pub use super::{
-        ax_source_imports, classify_ax_source, diagnose_ax_source, diagnose_ax_workspace_imports,
-        resolve_ax_import_path, AxLanguageDiagnostic, AxLanguageImport, AxSourceKind,
+        ax_source_imports, ax_source_symbols, classify_ax_source, diagnose_ax_source,
+        diagnose_ax_workspace_imports, resolve_ax_import_path, AxLanguageDiagnostic,
+        AxLanguageImport, AxLanguageImportBinding, AxLanguageSymbol, AxLanguageSymbolKind,
+        AxSourceKind,
     };
 }
 
@@ -545,6 +666,51 @@ mod tests {
         assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics[0].message.contains("use an `@/` app alias"));
         fs::remove_dir_all(root).expect("workspace should be removed");
+    }
+
+    #[test]
+    fn exposes_named_alias_and_namespace_import_bindings() {
+        let frontend = ax_source_imports(
+            "app/page.asx",
+            "import { Card as Panel } from \"@/components/Card\"\nimport * as Domain from \"@/domain\"\n\npage Home() { return ASX { <Panel /> } }",
+        );
+
+        assert_eq!(frontend.len(), 2);
+        assert_eq!(frontend[0].bindings[0].imported, "Card");
+        assert_eq!(frontend[0].bindings[0].local, "Panel");
+        assert_eq!(frontend[1].bindings[0].imported, "*");
+        assert_eq!(frontend[1].bindings[0].local, "Domain");
+
+        let backend = ax_source_imports(
+            "app/posts/loader.ax",
+            "import { visible as isVisible } from \"./domain.ax\"\n\nquery loadPosts() -> Post[] {\n  return []\n}",
+        );
+        assert_eq!(backend[0].bindings[0].imported, "visible");
+        assert_eq!(backend[0].bindings[0].local, "isVisible");
+    }
+
+    #[test]
+    fn indexes_frontend_and_backend_declaration_locations() {
+        let frontend = ax_source_symbols(
+            "app/components/Card.asx",
+            "component Card(title = \"\") {\n  render ASX {\n    <article>{title}</article>\n  }\n}",
+        );
+        assert_eq!(frontend.len(), 1);
+        assert_eq!(frontend[0].name, "Card");
+        assert_eq!(frontend[0].line, 1);
+        assert_eq!(frontend[0].column, 11);
+        assert_eq!(frontend[0].kind, AxLanguageSymbolKind::Component);
+
+        let backend = ax_source_symbols(
+            "app/posts/domain.ax",
+            "export type Post {\n  title: String\n}\n\nexport fn visible(post: Post) -> Bool {\n  return true\n}",
+        );
+        assert_eq!(backend.len(), 2);
+        assert_eq!(backend[0].name, "Post");
+        assert_eq!(backend[0].kind, AxLanguageSymbolKind::Type);
+        assert_eq!(backend[1].name, "visible");
+        assert_eq!(backend[1].line, 5);
+        assert_eq!(backend[1].kind, AxLanguageSymbolKind::Function);
     }
 
     #[test]
