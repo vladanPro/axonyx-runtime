@@ -6,15 +6,29 @@ The format is intentionally simple while the project is still early-stage.
 
 ## Unreleased
 
+## 0.3.0 - 2026-09-06
+
 ### Added
 
-- production Postgres TLS through Rustls
-- verified TLS by default with optional `sslrootcert` provider CA support
-- explicit `sslmode=require` compatibility for encrypted pooler connections
+- direct PostgreSQL execution with Rustls TLS, connection pooling, bounded
+  checkout timeouts, statement timeouts, and safe transient read retries
+- atomic generated transactions and serialized migration batches for SQLite and
+  PostgreSQL
+- typed database resources, mutations, scalar contracts, foreign-key relation
+  contracts, and explicit typed inner joins
+- database health/readiness observability with redacted public failures and
+  internal pool/operation reports
+- mandatory PostgreSQL CI coverage for health, CRUD, transactions, and
+  migration apply/rollback
 
 ### Changed
 
-- reject Postgres `sslmode=prefer` and `sslmode=allow` because they can fall back to plaintext
+- compiled database handlers run on Tokio's blocking pool instead of occupying
+  asynchronous network workers
+- PostgreSQL scalar transport preserves exact numeric, enum, domain, array,
+  UUID, temporal, JSON, and byte contracts
+- PostgreSQL `sslmode=prefer` and `sslmode=allow` are rejected because they can
+  fall back to plaintext
 
 ## 0.1.12 - 2026-05-30
 
