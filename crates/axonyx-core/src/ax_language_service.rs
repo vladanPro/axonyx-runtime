@@ -145,7 +145,7 @@ pub fn diagnose_ax_source(path: &str, source: &str) -> Vec<AxLanguageDiagnostic>
 }
 
 pub fn ax_source_imports(path: &str, source: &str) -> Vec<AxLanguageImport> {
-    match classify_ax_source(path, source) {
+    let parsed = match classify_ax_source(path, source) {
         AxSourceKind::Backend => parse_backend_ax(source)
             .ok()
             .map(|document| {
@@ -168,23 +168,94 @@ pub fn ax_source_imports(path: &str, source: &str) -> Vec<AxLanguageImport> {
             })
             .unwrap_or_default(),
         AxSourceKind::Page => page_language_imports(source).unwrap_or_default(),
+    };
+
+    if parsed.is_empty() {
+        tolerant_language_imports(source)
+    } else {
+        parsed
     }
 }
 
-pub fn ax_source_symbols(path: &str, source: &str) -> Vec<AxLanguageSymbol> {
-    let parsed = match classify_ax_source(path, source) {
-        AxSourceKind::Backend => parse_backend_ax(source).is_ok(),
-        AxSourceKind::Page => page_import_sources(source).is_some(),
-    };
-    if !parsed {
-        return Vec::new();
-    }
-
+pub fn ax_source_symbols(_path: &str, source: &str) -> Vec<AxLanguageSymbol> {
     source
         .lines()
         .enumerate()
         .filter_map(|(index, line)| parse_language_symbol(line, index + 1))
         .collect()
+}
+
+fn tolerant_language_imports(source: &str) -> Vec<AxLanguageImport> {
+    source
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| tolerant_language_import(line, index + 1))
+        .collect()
+}
+
+fn tolerant_language_import(line: &str, line_number: usize) -> Option<AxLanguageImport> {
+    let declaration = line.trim().strip_prefix("import ")?;
+    let (bindings_source, source_literal) = declaration.rsplit_once(" from ")?;
+    let source = source_literal
+        .trim()
+        .strip_suffix(';')
+        .unwrap_or(source_literal.trim())
+        .trim();
+    let quote = source.chars().next()?;
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
+    let source = source.strip_prefix(quote)?.strip_suffix(quote)?;
+    if source.is_empty() {
+        return None;
+    }
+
+    let bindings_source = bindings_source.trim();
+    let bindings = if let Some(local) = bindings_source.strip_prefix("* as ") {
+        let local = local.trim();
+        valid_language_identifier(local).then(|| {
+            vec![AxLanguageImportBinding {
+                imported: "*".to_string(),
+                local: local.to_string(),
+            }]
+        })?
+    } else {
+        let named = bindings_source.strip_prefix('{')?.strip_suffix('}')?;
+        let bindings = named
+            .split(',')
+            .filter_map(|binding| {
+                let binding = binding.trim();
+                if binding.is_empty() {
+                    return None;
+                }
+                let (imported, local) = binding
+                    .split_once(" as ")
+                    .map(|(imported, local)| (imported.trim(), local.trim()))
+                    .unwrap_or((binding, binding));
+                (valid_language_identifier(imported) && valid_language_identifier(local)).then(
+                    || AxLanguageImportBinding {
+                        imported: imported.to_string(),
+                        local: local.to_string(),
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        (!bindings.is_empty()).then_some(bindings)?
+    };
+
+    Some(AxLanguageImport {
+        source: source.to_string(),
+        line: line_number,
+        bindings,
+    })
+}
+
+fn valid_language_identifier(value: &str) -> bool {
+    let mut characters = value.chars();
+    characters
+        .next()
+        .is_some_and(|character| character.is_ascii_alphabetic() || character == '_')
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '_')
 }
 
 pub fn diagnose_ax_workspace_imports(
@@ -254,11 +325,6 @@ pub fn resolve_ax_import_path(
     let candidate = resolve_ax_import_extension(base.join(relative), kind);
     let candidate = normalize_ax_path(&candidate);
     candidate.starts_with(boundary).then_some(candidate)
-}
-
-fn page_import_sources(source: &str) -> Option<Vec<String>> {
-    page_language_imports(source)
-        .map(|imports| imports.into_iter().map(|import| import.source).collect())
 }
 
 fn page_language_imports(source: &str) -> Option<Vec<AxLanguageImport>> {
@@ -739,6 +805,22 @@ mod tests {
         );
         assert_eq!(backend[0].bindings[0].imported, "visible");
         assert_eq!(backend[0].bindings[0].local, "isVisible");
+    }
+
+    #[test]
+    fn indexes_complete_imports_and_declarations_while_the_body_is_incomplete() {
+        let source = "import { Card as Panel } from \"@/components/Card\"\n\ncomponent Preview() {\n  render ASX {\n    <Pan";
+
+        let imports = ax_source_imports("app/components/Preview.asx", source);
+        let symbols = ax_source_symbols("app/components/Preview.asx", source);
+
+        assert_eq!(imports.len(), 1);
+        assert_eq!(imports[0].source, "@/components/Card");
+        assert_eq!(imports[0].bindings[0].imported, "Card");
+        assert_eq!(imports[0].bindings[0].local, "Panel");
+        assert_eq!(symbols.len(), 1);
+        assert_eq!(symbols[0].name, "Preview");
+        assert_eq!(symbols[0].kind, AxLanguageSymbolKind::Component);
     }
 
     #[test]
