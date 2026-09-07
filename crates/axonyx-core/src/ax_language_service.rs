@@ -47,12 +47,29 @@ pub enum AxLanguageSymbolKind {
     Job,
 }
 
+impl AxLanguageSymbolKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Page => "page",
+            Self::Layout => "layout",
+            Self::Component => "component",
+            Self::Function => "function",
+            Self::Type => "type",
+            Self::Query => "query",
+            Self::Action => "action",
+            Self::Scope => "scope",
+            Self::Job => "job",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxLanguageSymbol {
     pub name: String,
     pub line: usize,
     pub column: usize,
     pub kind: AxLanguageSymbolKind,
+    pub signature: String,
 }
 
 impl AxLanguageDiagnostic {
@@ -322,10 +339,45 @@ fn parse_language_symbol(line: &str, line_number: usize) -> Option<AxLanguageSym
             line: line_number,
             column: line[..name_offset].encode_utf16().count() + 1,
             kind,
+            signature: declaration_signature(declaration),
         });
     }
 
     None
+}
+
+fn declaration_signature(declaration: &str) -> String {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+
+    for (index, character) in declaration.char_indices() {
+        if let Some(active_quote) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == active_quote {
+                quote = None;
+            }
+            continue;
+        }
+
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' if paren_depth == 0 && bracket_depth == 0 => {
+                return declaration[..index].trim_end().to_string();
+            }
+            _ => {}
+        }
+    }
+
+    declaration.trim_end_matches([' ', ';']).to_string()
 }
 
 fn import_source_line(source: &str, import_source: &str) -> usize {
@@ -700,6 +752,8 @@ mod tests {
         assert_eq!(frontend[0].line, 1);
         assert_eq!(frontend[0].column, 11);
         assert_eq!(frontend[0].kind, AxLanguageSymbolKind::Component);
+        assert_eq!(frontend[0].kind.label(), "component");
+        assert_eq!(frontend[0].signature, "component Card(title = \"\")");
 
         let backend = ax_source_symbols(
             "app/posts/domain.ax",
@@ -711,6 +765,19 @@ mod tests {
         assert_eq!(backend[1].name, "visible");
         assert_eq!(backend[1].line, 5);
         assert_eq!(backend[1].kind, AxLanguageSymbolKind::Function);
+        assert_eq!(backend[1].signature, "fn visible(post: Post) -> Bool");
+    }
+
+    #[test]
+    fn symbol_signature_preserves_nested_default_values() {
+        assert_eq!(
+            declaration_signature("fn build(options: Config = { mode: \"safe\" }) -> Result {"),
+            "fn build(options: Config = { mode: \"safe\" }) -> Result"
+        );
+        assert_eq!(
+            declaration_signature("type Theme = \"silver\" | \"gold\";"),
+            "type Theme = \"silver\" | \"gold\""
+        );
     }
 
     #[test]
