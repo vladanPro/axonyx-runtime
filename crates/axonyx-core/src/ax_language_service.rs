@@ -73,6 +73,14 @@ pub struct AxLanguageSymbol {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxLanguageIdentifierOccurrence {
+    pub name: String,
+    pub line: usize,
+    pub column: usize,
+    pub end_column: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxLanguageComponentContract {
     pub name: String,
     pub props: Vec<AxLanguageComponentProp>,
@@ -198,6 +206,97 @@ pub fn ax_source_symbols(_path: &str, source: &str) -> Vec<AxLanguageSymbol> {
         .enumerate()
         .filter_map(|(index, line)| parse_language_symbol(line, index + 1))
         .collect()
+}
+
+pub fn ax_source_identifier_occurrences(source: &str) -> Vec<AxLanguageIdentifierOccurrence> {
+    let mut occurrences = Vec::new();
+    let mut block_comment = false;
+
+    for (line_index, line) in source.lines().enumerate() {
+        let mut index = 0usize;
+        let mut quote = None;
+        let mut escaped = false;
+
+        while index < line.len() {
+            let rest = &line[index..];
+            if block_comment {
+                if rest.starts_with("*/") {
+                    block_comment = false;
+                    index += 2;
+                } else {
+                    index += rest
+                        .chars()
+                        .next()
+                        .expect("non-empty source remainder")
+                        .len_utf8();
+                }
+                continue;
+            }
+
+            if let Some(delimiter) = quote {
+                let character = rest.chars().next().expect("non-empty source remainder");
+                index += character.len_utf8();
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == delimiter {
+                    quote = None;
+                }
+                continue;
+            }
+
+            if rest.starts_with("//") {
+                break;
+            }
+            if rest.starts_with("/*") {
+                block_comment = true;
+                index += 2;
+                continue;
+            }
+
+            let character = rest.chars().next().expect("non-empty source remainder");
+            if matches!(character, '\'' | '"' | '`') {
+                quote = Some(character);
+                index += character.len_utf8();
+                continue;
+            }
+            if !is_language_identifier_start(character) {
+                index += character.len_utf8();
+                continue;
+            }
+
+            let start = index;
+            index += character.len_utf8();
+            while index < line.len() {
+                let next = line[index..]
+                    .chars()
+                    .next()
+                    .expect("non-empty source remainder");
+                if !is_language_identifier_continue(next) {
+                    break;
+                }
+                index += next.len_utf8();
+            }
+
+            occurrences.push(AxLanguageIdentifierOccurrence {
+                name: line[start..index].to_string(),
+                line: line_index + 1,
+                column: line[..start].encode_utf16().count() + 1,
+                end_column: line[..index].encode_utf16().count() + 1,
+            });
+        }
+    }
+
+    occurrences
+}
+
+fn is_language_identifier_start(character: char) -> bool {
+    character.is_ascii_alphabetic() || character == '_'
+}
+
+fn is_language_identifier_continue(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
 }
 
 pub fn ax_source_component_contracts(source: &str) -> Vec<AxLanguageComponentContract> {
@@ -936,11 +1035,11 @@ fn line_from_backend_parse_error(error: &AxBackendParseError) -> usize {
 
 pub mod prelude {
     pub use super::{
-        ax_source_component_contracts, ax_source_imports, ax_source_symbols, classify_ax_source,
-        diagnose_ax_source, diagnose_ax_workspace_imports, resolve_ax_import_path,
-        AxLanguageComponentContract, AxLanguageComponentProp, AxLanguageDiagnostic,
-        AxLanguageImport, AxLanguageImportBinding, AxLanguageSymbol, AxLanguageSymbolKind,
-        AxSourceKind,
+        ax_source_component_contracts, ax_source_identifier_occurrences, ax_source_imports,
+        ax_source_symbols, classify_ax_source, diagnose_ax_source, diagnose_ax_workspace_imports,
+        resolve_ax_import_path, AxLanguageComponentContract, AxLanguageComponentProp,
+        AxLanguageDiagnostic, AxLanguageIdentifierOccurrence, AxLanguageImport,
+        AxLanguageImportBinding, AxLanguageSymbol, AxLanguageSymbolKind, AxSourceKind,
     };
 }
 
@@ -1156,6 +1255,29 @@ mod tests {
             declaration_signature("type Theme = \"silver\" | \"gold\";"),
             "type Theme = \"silver\" | \"gold\""
         );
+    }
+
+    #[test]
+    fn identifier_index_uses_utf16_columns_and_skips_strings_and_comments() {
+        let source = concat!(
+            "component Card() {\n",
+            "  return ASX { <Card title=\"Card\">Čelik {Card()}</Card> }\n",
+            "  // Card()\n",
+            "  /* Card() */ Card()\n",
+            "}\n",
+        );
+
+        let cards = ax_source_identifier_occurrences(source)
+            .into_iter()
+            .filter(|occurrence| occurrence.name == "Card")
+            .collect::<Vec<_>>();
+
+        assert_eq!(cards.len(), 5);
+        assert_eq!((cards[0].line, cards[0].column), (1, 11));
+        assert_eq!((cards[1].line, cards[1].column), (2, 17));
+        assert_eq!((cards[2].line, cards[2].column), (2, 42));
+        assert_eq!((cards[3].line, cards[3].column), (2, 51));
+        assert_eq!((cards[4].line, cards[4].column), (4, 16));
     }
 
     #[test]
