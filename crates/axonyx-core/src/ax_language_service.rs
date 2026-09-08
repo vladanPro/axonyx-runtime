@@ -72,6 +72,21 @@ pub struct AxLanguageSymbol {
     pub signature: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxLanguageComponentContract {
+    pub name: String,
+    pub props: Vec<AxLanguageComponentProp>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxLanguageComponentProp {
+    pub name: String,
+    pub ty: Option<String>,
+    pub default: Option<String>,
+    pub required: bool,
+    pub allowed_values: Vec<String>,
+}
+
 impl AxLanguageDiagnostic {
     fn error(line: usize, code: &'static str, message: impl Into<String>) -> Self {
         Self {
@@ -183,6 +198,67 @@ pub fn ax_source_symbols(_path: &str, source: &str) -> Vec<AxLanguageSymbol> {
         .enumerate()
         .filter_map(|(index, line)| parse_language_symbol(line, index + 1))
         .collect()
+}
+
+pub fn ax_source_component_contracts(source: &str) -> Vec<AxLanguageComponentContract> {
+    parse_ax_component_module_v2(source)
+        .ok()
+        .flatten()
+        .map(|file| {
+            file.components
+                .into_iter()
+                .map(|component| AxLanguageComponentContract {
+                    name: component.name,
+                    props: component
+                        .params
+                        .into_iter()
+                        .map(|prop| {
+                            let allowed_values = prop
+                                .ty
+                                .as_deref()
+                                .map(language_literal_union_values)
+                                .unwrap_or_default();
+                            AxLanguageComponentProp {
+                                name: prop.name,
+                                required: prop.default.is_none()
+                                    && !prop.ty.as_deref().is_some_and(language_type_is_optional),
+                                ty: prop.ty,
+                                default: prop.default,
+                                allowed_values,
+                            }
+                        })
+                        .collect(),
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn language_type_is_optional(ty: &str) -> bool {
+    let ty = ty.trim();
+    ty.ends_with('?') || (ty.starts_with("Optional<") && ty.ends_with('>'))
+}
+
+fn language_literal_union_values(ty: &str) -> Vec<String> {
+    let mut ty = ty.trim();
+    if let Some(inner) = ty.strip_suffix('?') {
+        ty = inner.trim();
+    }
+    if let Some(inner) = ty
+        .strip_prefix("Optional<")
+        .and_then(|inner| inner.strip_suffix('>'))
+    {
+        ty = inner.trim();
+    }
+
+    let values = ty
+        .split('|')
+        .map(str::trim)
+        .map(|value| serde_json::from_str::<String>(value).ok())
+        .collect::<Option<Vec<_>>>();
+    values
+        .filter(|values| !values.is_empty())
+        .unwrap_or_default()
 }
 
 fn tolerant_language_imports(source: &str) -> Vec<AxLanguageImport> {
@@ -641,8 +717,9 @@ fn line_from_backend_parse_error(error: &AxBackendParseError) -> usize {
 
 pub mod prelude {
     pub use super::{
-        ax_source_imports, ax_source_symbols, classify_ax_source, diagnose_ax_source,
-        diagnose_ax_workspace_imports, resolve_ax_import_path, AxLanguageDiagnostic,
+        ax_source_component_contracts, ax_source_imports, ax_source_symbols, classify_ax_source,
+        diagnose_ax_source, diagnose_ax_workspace_imports, resolve_ax_import_path,
+        AxLanguageComponentContract, AxLanguageComponentProp, AxLanguageDiagnostic,
         AxLanguageImport, AxLanguageImportBinding, AxLanguageSymbol, AxLanguageSymbolKind,
         AxSourceKind,
     };
@@ -860,6 +937,32 @@ mod tests {
             declaration_signature("type Theme = \"silver\" | \"gold\";"),
             "type Theme = \"silver\" | \"gold\""
         );
+    }
+
+    #[test]
+    fn exposes_typed_component_prop_contracts_and_literal_values() {
+        let contracts = ax_source_component_contracts(
+            r#"
+component Button(label: String, variant: "primary" | "ghost" = "primary", size: Optional<"sm" | "md" | "lg">, disabled: Bool = false) {
+  render ASX {
+    <button>{label}</button>
+  }
+}
+"#,
+        );
+
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].name, "Button");
+        assert_eq!(contracts[0].props.len(), 4);
+        assert!(contracts[0].props[0].required);
+        assert_eq!(
+            contracts[0].props[1].allowed_values,
+            vec!["primary", "ghost"]
+        );
+        assert!(!contracts[0].props[1].required);
+        assert_eq!(contracts[0].props[2].allowed_values, vec!["sm", "md", "lg"]);
+        assert!(!contracts[0].props[2].required);
+        assert_eq!(contracts[0].props[3].default.as_deref(), Some("false"));
     }
 
     #[test]
