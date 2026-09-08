@@ -245,10 +245,27 @@ fn language_component_prop(
 }
 
 fn tolerant_language_component_contracts(source: &str) -> Vec<AxLanguageComponentContract> {
-    source
-        .lines()
-        .filter_map(tolerant_language_component_contract)
-        .collect()
+    let mut contracts = Vec::new();
+    let mut offset = 0usize;
+
+    for line in source.split_inclusive('\n') {
+        let content = line.strip_suffix('\n').unwrap_or(line);
+        let leading = content.len() - content.trim_start().len();
+        let declaration = &source[offset + leading..];
+        if content
+            .trim_start()
+            .strip_prefix("export ")
+            .unwrap_or(content.trim_start())
+            .starts_with("component ")
+        {
+            if let Some(contract) = tolerant_language_component_contract(declaration) {
+                contracts.push(contract);
+            }
+        }
+        offset += line.len();
+    }
+
+    contracts
 }
 
 fn tolerant_language_component_contract(line: &str) -> Option<AxLanguageComponentContract> {
@@ -1181,6 +1198,30 @@ component Button(label: String, variant: "primary" | "ghost" = "primary") {
         assert_eq!(contracts[0].name, "Button");
         assert_eq!(contracts[0].props.len(), 2);
         assert!(contracts[0].props[0].required);
+        assert_eq!(
+            contracts[0].props[1].allowed_values,
+            vec!["primary", "ghost"]
+        );
+    }
+
+    #[test]
+    fn retains_multiline_component_contract_when_the_page_is_incomplete() {
+        let contracts = ax_source_component_contracts(
+            r#"
+component Button(
+  label: String,
+  variant: "primary" | "ghost" = "primary",
+) {
+  render ASX { <button>{label}</button> }
+}
+
+page Home() { return ASX { <Button va
+"#,
+        );
+
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].props.len(), 2);
+        assert_eq!(contracts[0].props[0].name, "label");
         assert_eq!(
             contracts[0].props[1].allowed_values,
             vec!["primary", "ghost"]
