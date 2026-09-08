@@ -310,6 +310,17 @@ mod tests {
     }
 
     #[test]
+    fn formats_multiline_component_signatures_and_remains_parseable() {
+        let source = "page Home() {\ncomponent Button(\nlabel: String,\nvariant: \"primary\" | \"ghost\" = \"primary\",\ndisabled: Bool = false,\n) {\nrender ASX { <button>{label}</button> }\n}\nreturn ASX { <Button label=\"Ship\" /> }\n}\n";
+        let expected = "page Home() {\n  component Button(\n    label: String,\n    variant: \"primary\" | \"ghost\" = \"primary\",\n    disabled: Bool = false,\n  ) {\n    render ASX { <button>{label}</button> }\n  }\n  return ASX { <Button label=\"Ship\" /> }\n}\n";
+
+        let formatted = format_ax_source(source);
+        assert_eq!(formatted, expected);
+        assert_eq!(format_ax_source(&formatted), expected);
+        parse_ax_v2(&formatted).expect("formatted multiline signature should parse");
+    }
+
+    #[test]
     fn keeps_else_blocks_at_the_parent_depth() {
         let source =
             "fn label(value: Bool) {\nif value {\nreturn \"on\"\n} else {\nreturn \"off\"\n}\n}\n";

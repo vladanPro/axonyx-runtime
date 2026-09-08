@@ -718,7 +718,7 @@ impl<'a> Parser<'a> {
             return Err(AxParseV2Error::InvalidFunction { line });
         }
         let params = self.parse_param_list(line, AxParseV2Error::InvalidFunction { line })?;
-        self.skip_spaces();
+        self.skip_layout_whitespace();
 
         if self.peek_char() != Some('=') {
             return Err(AxParseV2Error::InvalidFunction { line });
@@ -908,13 +908,14 @@ impl<'a> Parser<'a> {
         let mut params = Vec::new();
         self.bump_char();
         loop {
-            self.skip_spaces();
+            self.skip_layout_whitespace();
             if self.peek_char() == Some(')') {
                 self.bump_char();
                 break;
             }
 
             params.push(self.parse_component_param(line)?);
+            self.skip_layout_whitespace();
 
             match self.peek_char() {
                 Some(',') => {
@@ -1545,6 +1546,7 @@ impl<'a> Parser<'a> {
                     self.bump_char();
                 }
                 ',' if paren_depth == 0 => break,
+                '\n' | '\r' if paren_depth == 0 => break,
                 _ => {
                     self.bump_char();
                 }
@@ -2138,6 +2140,39 @@ component ThemeSwitcher(label: String = "Theme", storageKey: String, post: Optio
     }
 
     #[test]
+    fn parses_multiline_page_and_component_params() {
+        let input = r#"
+page Home(
+  title: String = "Axonyx",
+  theme: "silver" | "bronze" | "gold" = "silver",
+) {
+  component ThemeSwitcher(
+    label: String = "Theme",
+    disabled: Bool = false,
+  ) {
+    render ASX { <Copy>{label}</Copy> }
+  }
+
+  return ASX {
+    <ThemeSwitcher label={title} />
+  }
+}
+"#;
+
+        let file = parse_ax_v2(input).expect("multiline params should parse");
+
+        assert_eq!(file.page.params.len(), 2);
+        assert_eq!(file.components.len(), 1);
+        assert_eq!(
+            file.components[0].params,
+            vec![
+                AxComponentParamDeclV2::with_type_and_default("label", "String", "\"Theme\""),
+                AxComponentParamDeclV2::with_type_and_default("disabled", "Bool", "false")
+            ]
+        );
+    }
+
+    #[test]
     fn parses_layered_component_with_client_style_and_render_asx() {
         let input = r#"
 page Home
@@ -2649,6 +2684,26 @@ fn heroTitle(title = "Hello") = title
         );
         assert_eq!(file.functions[0].body, "title");
         assert_eq!(file.body.len(), 1);
+    }
+
+    #[test]
+    fn parses_multiline_pure_function_params() {
+        let input = r#"
+page Home
+
+fn displayLabel(
+  label: String,
+  fallback: String = "Ready",
+) = label ?? fallback
+
+<Copy>{displayLabel("", "Ready")}</Copy>
+"#;
+
+        let file = parse_ax_v2(input).expect("multiline function params should parse");
+
+        assert_eq!(file.functions.len(), 1);
+        assert_eq!(file.functions[0].params.len(), 2);
+        assert_eq!(file.functions[0].body, "label ?? fallback");
     }
 
     #[test]
