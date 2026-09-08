@@ -201,7 +201,7 @@ pub fn ax_source_symbols(_path: &str, source: &str) -> Vec<AxLanguageSymbol> {
 }
 
 pub fn ax_source_component_contracts(source: &str) -> Vec<AxLanguageComponentContract> {
-    parse_ax_component_module_v2(source)
+    let parsed: Vec<AxLanguageComponentContract> = parse_ax_component_module_v2(source)
         .ok()
         .flatten()
         .map(|file| {
@@ -212,26 +212,228 @@ pub fn ax_source_component_contracts(source: &str) -> Vec<AxLanguageComponentCon
                     props: component
                         .params
                         .into_iter()
-                        .map(|prop| {
-                            let allowed_values = prop
-                                .ty
-                                .as_deref()
-                                .map(language_literal_union_values)
-                                .unwrap_or_default();
-                            AxLanguageComponentProp {
-                                name: prop.name,
-                                required: prop.default.is_none()
-                                    && !prop.ty.as_deref().is_some_and(language_type_is_optional),
-                                ty: prop.ty,
-                                default: prop.default,
-                                allowed_values,
-                            }
-                        })
+                        .map(|prop| language_component_prop(prop.name, prop.ty, prop.default))
                         .collect(),
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    if parsed.is_empty() {
+        tolerant_language_component_contracts(source)
+    } else {
+        parsed
+    }
+}
+
+fn language_component_prop(
+    name: String,
+    ty: Option<String>,
+    default: Option<String>,
+) -> AxLanguageComponentProp {
+    let allowed_values = ty
+        .as_deref()
+        .map(language_literal_union_values)
+        .unwrap_or_default();
+    AxLanguageComponentProp {
+        name,
+        required: default.is_none() && !ty.as_deref().is_some_and(language_type_is_optional),
+        ty,
+        default,
+        allowed_values,
+    }
+}
+
+fn tolerant_language_component_contracts(source: &str) -> Vec<AxLanguageComponentContract> {
+    source
+        .lines()
+        .filter_map(tolerant_language_component_contract)
+        .collect()
+}
+
+fn tolerant_language_component_contract(line: &str) -> Option<AxLanguageComponentContract> {
+    let declaration = line.trim_start();
+    let declaration = declaration.strip_prefix("export ").unwrap_or(declaration);
+    let declaration = declaration.strip_prefix("component ")?;
+    let name_end = declaration
+        .char_indices()
+        .find(|(_, character)| !character.is_ascii_alphanumeric() && *character != '_')
+        .map(|(index, _)| index)
+        .unwrap_or(declaration.len());
+    let name = declaration.get(..name_end)?;
+    if !valid_language_identifier(name) {
+        return None;
+    }
+
+    let remainder = declaration.get(name_end..)?.trim_start();
+    let Some(params_source) = remainder.strip_prefix('(') else {
+        return Some(AxLanguageComponentContract {
+            name: name.to_string(),
+            props: Vec::new(),
+        });
+    };
+    let (params_source, complete) = tolerant_component_param_source(params_source);
+    let mut params = split_tolerant_component_params(params_source);
+    if !complete && !params_source.trim_end().ends_with(',') {
+        params.pop();
+    }
+
+    Some(AxLanguageComponentContract {
+        name: name.to_string(),
+        props: params
+            .into_iter()
+            .filter_map(parse_tolerant_component_prop)
+            .collect(),
+    })
+}
+
+fn tolerant_component_param_source(source: &str) -> (&str, bool) {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+
+    for (index, character) in source.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => paren_depth += 1,
+            ')' if paren_depth == 0 => return (&source[..index], true),
+            ')' => paren_depth -= 1,
+            _ => {}
+        }
+    }
+
+    (source, false)
+}
+
+fn split_tolerant_component_params(source: &str) -> Vec<&str> {
+    let mut params = Vec::new();
+    let mut start = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut angle_depth = 0usize;
+
+    for (index, character) in source.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            ',' if paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && angle_depth == 0 =>
+            {
+                params.push(source[start..index].trim());
+                start = index + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    if start < source.len() {
+        params.push(source[start..].trim());
+    }
+    params
+}
+
+fn parse_tolerant_component_prop(source: &str) -> Option<AxLanguageComponentProp> {
+    let source = source.trim();
+    if source.is_empty() {
+        return None;
+    }
+    let equals = top_level_component_param_separator(source, '=');
+    let declaration = equals.map(|index| &source[..index]).unwrap_or(source);
+    let colon = top_level_component_param_separator(declaration, ':');
+    let name = colon
+        .map(|index| &declaration[..index])
+        .unwrap_or(declaration)
+        .trim();
+    if !valid_language_identifier(name) {
+        return None;
+    }
+
+    let ty = colon
+        .map(|index| declaration[index + 1..].trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let default = equals
+        .map(|index| source[index + 1..].trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Some(language_component_prop(name.to_string(), ty, default))
+}
+
+fn top_level_component_param_separator(source: &str, separator: char) -> Option<usize> {
+    let mut quote = None;
+    let mut escaped = false;
+    let mut paren_depth = 0usize;
+    let mut bracket_depth = 0usize;
+    let mut brace_depth = 0usize;
+    let mut angle_depth = 0usize;
+
+    for (index, character) in source.char_indices() {
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if character == '\\' {
+                escaped = true;
+            } else if character == delimiter {
+                quote = None;
+            }
+            continue;
+        }
+
+        match character {
+            '\'' | '"' => quote = Some(character),
+            '(' => paren_depth += 1,
+            ')' => paren_depth = paren_depth.saturating_sub(1),
+            '[' => bracket_depth += 1,
+            ']' => bracket_depth = bracket_depth.saturating_sub(1),
+            '{' => brace_depth += 1,
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            '<' => angle_depth += 1,
+            '>' => angle_depth = angle_depth.saturating_sub(1),
+            _ if character == separator
+                && paren_depth == 0
+                && bracket_depth == 0
+                && brace_depth == 0
+                && angle_depth == 0 =>
+            {
+                return Some(index);
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn language_type_is_optional(ty: &str) -> bool {
@@ -963,6 +1165,40 @@ component Button(label: String, variant: "primary" | "ghost" = "primary", size: 
         assert_eq!(contracts[0].props[2].allowed_values, vec!["sm", "md", "lg"]);
         assert!(!contracts[0].props[2].required);
         assert_eq!(contracts[0].props[3].default.as_deref(), Some("false"));
+    }
+
+    #[test]
+    fn retains_component_contract_when_the_surrounding_body_is_incomplete() {
+        let contracts = ax_source_component_contracts(
+            r#"
+component Button(label: String, variant: "primary" | "ghost" = "primary") {
+  render ASX {
+    <button>{label}
+"#,
+        );
+
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].name, "Button");
+        assert_eq!(contracts[0].props.len(), 2);
+        assert!(contracts[0].props[0].required);
+        assert_eq!(
+            contracts[0].props[1].allowed_values,
+            vec!["primary", "ghost"]
+        );
+    }
+
+    #[test]
+    fn tolerant_component_contract_keeps_only_completed_partial_params() {
+        let contracts = ax_source_component_contracts(
+            r#"
+component Button(label: String, variant: "primary" | "ghost" = "primary", disa
+"#,
+        );
+
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0].props.len(), 2);
+        assert_eq!(contracts[0].props[0].name, "label");
+        assert_eq!(contracts[0].props[1].name, "variant");
     }
 
     #[test]
