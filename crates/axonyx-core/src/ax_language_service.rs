@@ -1041,6 +1041,9 @@ pub mod prelude {
         AxLanguageDiagnostic, AxLanguageIdentifierOccurrence, AxLanguageImport,
         AxLanguageImportBinding, AxLanguageSymbol, AxLanguageSymbolKind, AxSourceKind,
     };
+    pub use crate::ax_local_symbols::{
+        ax_source_local_symbols, AxLanguageLocalSymbol, AxLanguageLocalSymbolKind,
+    };
 }
 
 #[cfg(test)]
