@@ -3,8 +3,12 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::ax_backend_parser::{parse_backend_ax, AxBackendParseError};
 use crate::ax_parser::AxParseError;
-use crate::ax_parser_auto::{convert_ax_v2_file, parse_ax_auto, AxAutoParseError};
-use crate::ax_parser_v2::{parse_ax_component_module_v2, AxParseV2Error};
+use crate::ax_parser_auto::{
+    convert_ax_v2_file, looks_like_ax_v2, parse_ax_auto, AxAutoParseError,
+};
+use crate::ax_parser_v2::{
+    parse_ax_component_module_v2, parse_ax_v2_with_span, AxParseV2Error, AxSourceSpanV2,
+};
 use crate::ax_semantics_v2::validate_ax_v2_semantics;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,6 +21,8 @@ pub enum AxSourceKind {
 pub struct AxLanguageDiagnostic {
     pub line: usize,
     pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
     pub code: &'static str,
     pub message: String,
 }
@@ -97,9 +103,23 @@ pub struct AxLanguageComponentProp {
 
 impl AxLanguageDiagnostic {
     fn error(line: usize, code: &'static str, message: impl Into<String>) -> Self {
+        let line = line.max(1);
         Self {
-            line: line.max(1),
+            line,
             column: 1,
+            end_line: line,
+            end_column: 2,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn error_at(span: AxSourceSpanV2, code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            line: span.line.max(1),
+            column: span.column.max(1),
+            end_line: span.end_line.max(span.line).max(1),
+            end_column: span.end_column.max(span.column + 1),
             code,
             message: message.into(),
         }
@@ -928,6 +948,34 @@ fn diagnose_page_source(source: &str) -> Option<AxLanguageDiagnostic> {
         }
     }
 
+    if looks_like_ax_v2(source) {
+        let file = match parse_ax_v2_with_span(source) {
+            Ok(file) => file,
+            Err(failure) => {
+                return Some(AxLanguageDiagnostic::error_at(
+                    failure.span,
+                    "axonyx-parse",
+                    failure.error.to_string(),
+                ));
+            }
+        };
+        if let Err(error) = validate_ax_v2_semantics(&file) {
+            return Some(AxLanguageDiagnostic::error(
+                1,
+                "axonyx-semantic",
+                error.to_string(),
+            ));
+        }
+        if let Err(error) = convert_ax_v2_file(&file) {
+            return Some(AxLanguageDiagnostic::error(
+                1,
+                "axonyx-parse",
+                error.to_string(),
+            ));
+        }
+        return None;
+    }
+
     parse_ax_auto(source).err().map(|error| {
         AxLanguageDiagnostic::error(
             line_from_auto_parse_error(&error),
@@ -973,29 +1021,7 @@ fn line_from_ax_parse_error(error: &AxParseError) -> usize {
 }
 
 fn line_from_ax_parse_v2_error(error: &AxParseV2Error) -> usize {
-    match error {
-        AxParseV2Error::EmptyDocument | AxParseV2Error::MissingPage => 1,
-        AxParseV2Error::InvalidImport { line }
-        | AxParseV2Error::InvalidUse { line }
-        | AxParseV2Error::MissingImportFrom { line }
-        | AxParseV2Error::EmptyImportList { line }
-        | AxParseV2Error::InvalidPage { line }
-        | AxParseV2Error::InvalidLet { line }
-        | AxParseV2Error::InvalidState { line }
-        | AxParseV2Error::InvalidStatePersistence { line, .. }
-        | AxParseV2Error::InvalidType { line }
-        | AxParseV2Error::InvalidFunction { line }
-        | AxParseV2Error::InvalidComponent { line }
-        | AxParseV2Error::InvalidReturnAsx { line }
-        | AxParseV2Error::DuplicatePage { line }
-        | AxParseV2Error::InvalidTag { line }
-        | AxParseV2Error::UnterminatedTag { line }
-        | AxParseV2Error::UnterminatedString { line }
-        | AxParseV2Error::UnterminatedExpression { line }
-        | AxParseV2Error::UnexpectedClosingTag { line, .. }
-        | AxParseV2Error::MismatchedClosingTag { line, .. }
-        | AxParseV2Error::MissingAttributeValue { line, .. } => *line,
-    }
+    error.line()
 }
 
 fn line_from_backend_parse_error(error: &AxBackendParseError) -> usize {
@@ -1086,7 +1112,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_page_parser_line() {
+    fn reports_precise_page_parser_span() {
         let diagnostics = diagnose_ax_source(
             "app/page.asx",
             "page Home() {\n  return ASX {\n    <Card>\n    </Grid>\n  }\n}\n",
@@ -1094,8 +1120,24 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].line, 4);
-        assert_eq!(diagnostics[0].column, 1);
+        assert_eq!(diagnostics[0].column, 7);
+        assert_eq!(diagnostics[0].end_line, 4);
+        assert_eq!(diagnostics[0].end_column, 11);
         assert_eq!(diagnostics[0].code, "axonyx-parse");
+    }
+
+    #[test]
+    fn reports_page_parser_columns_as_utf16() {
+        let source = "page Home() {\n  return ASX {\n    <Copy>🔥</Copy><Card title= />\n  }\n}";
+        let diagnostics = diagnose_ax_source("app/page.asx", source);
+        let error_line = source.lines().nth(2).expect("error line should exist");
+        let title_offset = error_line.find("title").expect("title should exist");
+        let expected_column = error_line[..title_offset].encode_utf16().count() + 1;
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 3);
+        assert_eq!(diagnostics[0].column, expected_column);
+        assert_eq!(diagnostics[0].end_column, expected_column + "title".len());
     }
 
     #[test]
@@ -1107,6 +1149,9 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].line, 2);
+        assert_eq!(diagnostics[0].column, 1);
+        assert_eq!(diagnostics[0].end_line, 2);
+        assert_eq!(diagnostics[0].end_column, 2);
         assert_eq!(diagnostics[0].code, "axonyx-backend-parse");
     }
 

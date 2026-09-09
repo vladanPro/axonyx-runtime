@@ -54,9 +54,60 @@ pub enum AxParseV2Error {
     MissingAttributeValue { line: usize, name: String },
 }
 
+impl AxParseV2Error {
+    pub fn line(&self) -> usize {
+        match self {
+            Self::EmptyDocument | Self::MissingPage => 1,
+            Self::InvalidImport { line }
+            | Self::InvalidUse { line }
+            | Self::MissingImportFrom { line }
+            | Self::EmptyImportList { line }
+            | Self::InvalidPage { line }
+            | Self::InvalidLet { line }
+            | Self::InvalidState { line }
+            | Self::InvalidStatePersistence { line, .. }
+            | Self::InvalidType { line }
+            | Self::InvalidFunction { line }
+            | Self::InvalidComponent { line }
+            | Self::InvalidReturnAsx { line }
+            | Self::DuplicatePage { line }
+            | Self::InvalidTag { line }
+            | Self::UnterminatedTag { line }
+            | Self::UnterminatedString { line }
+            | Self::UnterminatedExpression { line }
+            | Self::UnexpectedClosingTag { line, .. }
+            | Self::MismatchedClosingTag { line, .. }
+            | Self::MissingAttributeValue { line, .. } => *line,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AxSourceSpanV2 {
+    pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[error("{error}")]
+pub struct AxParseV2Failure {
+    pub error: AxParseV2Error,
+    pub span: AxSourceSpanV2,
+}
+
 pub fn parse_ax_v2(input: &str) -> Result<AxFileV2, AxParseV2Error> {
     let mut parser = Parser::new(input);
     parser.parse_file()
+}
+
+pub fn parse_ax_v2_with_span(input: &str) -> Result<AxFileV2, AxParseV2Failure> {
+    let mut parser = Parser::new(input);
+    parser.parse_file().map_err(|error| AxParseV2Failure {
+        span: parser.failure_span(&error),
+        error,
+    })
 }
 
 /// Parses a component-only module by giving declarations a synthetic page owner.
@@ -148,6 +199,35 @@ impl<'a> Parser<'a> {
             line: 1,
             page_seen: false,
         }
+    }
+
+    fn failure_span(&self, error: &AxParseV2Error) -> AxSourceSpanV2 {
+        let line = error.line().max(1);
+        let (line_start, line_end) = source_line_bounds(self.input, line);
+        let line_source = &self.input[line_start..line_end];
+        let anchor = match error {
+            AxParseV2Error::MissingAttributeValue { name, .. } => line_source.rfind(name),
+            AxParseV2Error::UnexpectedClosingTag { name, .. }
+            | AxParseV2Error::MismatchedClosingTag { found: name, .. } => line_source.rfind(name),
+            AxParseV2Error::UnterminatedTag { .. } | AxParseV2Error::InvalidTag { .. } => {
+                line_source.rfind('<')
+            }
+            AxParseV2Error::UnterminatedExpression { .. } => line_source.rfind('{'),
+            AxParseV2Error::UnterminatedString { .. } => line_source
+                .char_indices()
+                .rev()
+                .find(|(_, ch)| matches!(ch, '\'' | '"'))
+                .map(|(index, _)| index),
+            _ => None,
+        };
+        let cursor = anchor.map(|offset| line_start + offset).unwrap_or_else(|| {
+            if self.line == line {
+                self.pos.clamp(line_start, line_end)
+            } else {
+                line_start
+            }
+        });
+        source_token_span(self.input, line, line_start, line_end, cursor)
     }
 
     fn parse_file(&mut self) -> Result<AxFileV2, AxParseV2Error> {
@@ -1930,9 +2010,122 @@ fn is_ax_identifier(input: &str) -> bool {
         && chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+fn source_line_bounds(source: &str, target_line: usize) -> (usize, usize) {
+    let mut line = 1;
+    let mut start = 0;
+
+    for (index, byte) in source.bytes().enumerate() {
+        if line == target_line && byte == b'\n' {
+            let end = if index > start && source.as_bytes()[index - 1] == b'\r' {
+                index - 1
+            } else {
+                index
+            };
+            return (start, end);
+        }
+        if byte == b'\n' {
+            line += 1;
+            start = index + 1;
+        }
+    }
+
+    if line == target_line {
+        let end = source
+            .as_bytes()
+            .last()
+            .filter(|byte| **byte == b'\r')
+            .map_or(source.len(), |_| source.len() - 1);
+        (start, end)
+    } else {
+        (source.len(), source.len())
+    }
+}
+
+fn source_token_span(
+    source: &str,
+    line: usize,
+    line_start: usize,
+    line_end: usize,
+    cursor: usize,
+) -> AxSourceSpanV2 {
+    let mut start = cursor.clamp(line_start, line_end);
+    while start < line_end {
+        let ch = source[start..line_end]
+            .chars()
+            .next()
+            .expect("non-empty source slice should have a character");
+        if !ch.is_whitespace() {
+            break;
+        }
+        start += ch.len_utf8();
+    }
+
+    if start == line_end && start > line_start {
+        while start > line_start {
+            let ch = source[line_start..start]
+                .chars()
+                .next_back()
+                .expect("non-empty source slice should have a character");
+            start -= ch.len_utf8();
+            if !ch.is_whitespace() {
+                break;
+            }
+        }
+    }
+
+    if start < line_end {
+        let current = source[start..line_end]
+            .chars()
+            .next()
+            .expect("non-empty source slice should have a character");
+        if is_span_identifier_char(current) {
+            while start > line_start {
+                let previous = source[line_start..start]
+                    .chars()
+                    .next_back()
+                    .expect("non-empty source slice should have a character");
+                if !is_span_identifier_char(previous) {
+                    break;
+                }
+                start -= previous.len_utf8();
+            }
+        }
+    }
+
+    let mut end = start;
+    if start < line_end {
+        let first = source[start..line_end]
+            .chars()
+            .next()
+            .expect("non-empty source slice should have a character");
+        if is_span_identifier_char(first) {
+            end += source[start..line_end]
+                .chars()
+                .take_while(|ch| is_span_identifier_char(*ch))
+                .map(char::len_utf8)
+                .sum::<usize>();
+        } else {
+            end += first.len_utf8();
+        }
+    }
+
+    let column = source[line_start..start].encode_utf16().count() + 1;
+    let end_column = source[line_start..end].encode_utf16().count() + 1;
+    AxSourceSpanV2 {
+        line,
+        column,
+        end_line: line,
+        end_column: end_column.max(column + 1),
+    }
+}
+
+fn is_span_identifier_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | ':')
+}
+
 pub mod prelude {
-    pub use super::AxParseV2Error;
-    pub use super::{parse_ax_component_module_v2, parse_ax_v2};
+    pub use super::{parse_ax_component_module_v2, parse_ax_v2, parse_ax_v2_with_span};
+    pub use super::{AxParseV2Error, AxParseV2Failure, AxSourceSpanV2};
 }
 
 #[cfg(test)]
@@ -2788,6 +2981,44 @@ page Home
 
         let error = parse_ax_v2(input).expect_err("parse should fail");
         assert!(matches!(error, AxParseV2Error::MismatchedClosingTag { .. }));
+    }
+
+    #[test]
+    fn reports_precise_span_for_mismatched_closing_tag() {
+        let input = "page Home\n\n<Card><Copy>Hello</Grid></Card>";
+
+        let failure = parse_ax_v2_with_span(input).expect_err("parse should fail");
+
+        assert!(matches!(
+            failure.error,
+            AxParseV2Error::MismatchedClosingTag { ref found, .. } if found == "Grid"
+        ));
+        assert_eq!(failure.span.line, 3);
+        assert_eq!(failure.span.column, 20);
+        assert_eq!(failure.span.end_column, 24);
+    }
+
+    #[test]
+    fn reports_utf16_span_for_missing_attribute_value() {
+        let input = "page Home\n\n<Copy>🔥</Copy><Card title= />";
+        let title_offset = input.rfind("title").expect("title should exist");
+        let line_start = input[..title_offset]
+            .rfind('\n')
+            .map_or(0, |index| index + 1);
+        let expected_column = input[line_start..title_offset].encode_utf16().count() + 1;
+
+        let failure = parse_ax_v2_with_span(input).expect_err("parse should fail");
+
+        assert_eq!(
+            failure.error,
+            AxParseV2Error::MissingAttributeValue {
+                line: 3,
+                name: "title".to_string(),
+            }
+        );
+        assert_eq!(failure.span.line, 3);
+        assert_eq!(failure.span.column, expected_column);
+        assert_eq!(failure.span.end_column, expected_column + "title".len());
     }
 
     #[test]
