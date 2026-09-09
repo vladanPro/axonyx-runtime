@@ -6,6 +6,7 @@ pub mod ax_backend_lowering;
 pub mod ax_backend_parser;
 pub mod ax_formatter;
 pub mod ax_language_service;
+pub mod ax_local_symbols;
 pub mod ax_lowering;
 pub mod ax_parser;
 pub mod ax_parser_auto;
