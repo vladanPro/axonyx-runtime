@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 
-use crate::ax_backend_parser::{parse_backend_ax, AxBackendParseError};
+use crate::ax_backend_parser::{parse_backend_ax, parse_backend_ax_with_span, AxBackendSourceSpan};
 use crate::ax_parser::AxParseError;
 use crate::ax_parser_auto::{
     convert_ax_v2_file, looks_like_ax_v2, parse_ax_auto, AxAutoParseError,
@@ -115,11 +115,44 @@ impl AxLanguageDiagnostic {
     }
 
     fn error_at(span: AxSourceSpanV2, code: &'static str, message: impl Into<String>) -> Self {
+        Self::error_range(
+            span.line,
+            span.column,
+            span.end_line,
+            span.end_column,
+            code,
+            message,
+        )
+    }
+
+    fn backend_error_at(
+        span: AxBackendSourceSpan,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::error_range(
+            span.line,
+            span.column,
+            span.end_line,
+            span.end_column,
+            code,
+            message,
+        )
+    }
+
+    fn error_range(
+        line: usize,
+        column: usize,
+        end_line: usize,
+        end_column: usize,
+        code: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
         Self {
-            line: span.line.max(1),
-            column: span.column.max(1),
-            end_line: span.end_line.max(span.line).max(1),
-            end_column: span.end_column.max(span.column + 1),
+            line: line.max(1),
+            column: column.max(1),
+            end_line: end_line.max(line).max(1),
+            end_column: end_column.max(column + 1),
             code,
             message: message.into(),
         }
@@ -175,11 +208,11 @@ pub fn classify_ax_source(path: &str, source: &str) -> AxSourceKind {
 pub fn diagnose_ax_source(path: &str, source: &str) -> Vec<AxLanguageDiagnostic> {
     let diagnostic = match classify_ax_source(path, source) {
         AxSourceKind::Page => diagnose_page_source(source),
-        AxSourceKind::Backend => parse_backend_ax(source).err().map(|error| {
-            AxLanguageDiagnostic::error(
-                line_from_backend_parse_error(&error),
+        AxSourceKind::Backend => parse_backend_ax_with_span(source).err().map(|failure| {
+            AxLanguageDiagnostic::backend_error_at(
+                failure.span,
                 "axonyx-backend-parse",
-                error.to_string(),
+                failure.error.to_string(),
             )
         }),
     };
@@ -1024,41 +1057,6 @@ fn line_from_ax_parse_v2_error(error: &AxParseV2Error) -> usize {
     error.line()
 }
 
-fn line_from_backend_parse_error(error: &AxBackendParseError) -> usize {
-    match error {
-        AxBackendParseError::EmptyDocument => 1,
-        AxBackendParseError::InvalidImport { line }
-        | AxBackendParseError::MissingImportFrom { line }
-        | AxBackendParseError::EmptyImportList { line }
-        | AxBackendParseError::TabsNotSupported { line }
-        | AxBackendParseError::InvalidIndentation { line }
-        | AxBackendParseError::UnexpectedIndentation { line }
-        | AxBackendParseError::InvalidBlock { line }
-        | AxBackendParseError::InvalidDataBinding { line }
-        | AxBackendParseError::InvalidEnvDeclaration { line }
-        | AxBackendParseError::InvalidInputSection { line }
-        | AxBackendParseError::InvalidField { line }
-        | AxBackendParseError::InvalidTypeDeclaration { line }
-        | AxBackendParseError::InvalidMutation { line }
-        | AxBackendParseError::InvalidTransaction { line }
-        | AxBackendParseError::InvalidAssignment { line }
-        | AxBackendParseError::InvalidHeader { line }
-        | AxBackendParseError::InvalidCookie { line }
-        | AxBackendParseError::InvalidHook { line }
-        | AxBackendParseError::InvalidRequirement { line }
-        | AxBackendParseError::InvalidReturn { line }
-        | AxBackendParseError::InvalidSend { line }
-        | AxBackendParseError::InvalidScope { line }
-        | AxBackendParseError::InvalidScopeMember { line }
-        | AxBackendParseError::InvalidScopeState { line }
-        | AxBackendParseError::InvalidScopeRender { line }
-        | AxBackendParseError::InvalidQuerySource { line }
-        | AxBackendParseError::InvalidQueryClause { line }
-        | AxBackendParseError::InvalidQueryNumber { line }
-        | AxBackendParseError::InvalidExpression { line, .. } => *line,
-    }
-}
-
 pub mod prelude {
     pub use super::{
         ax_source_component_contracts, ax_source_identifier_occurrences, ax_source_imports,
@@ -1149,9 +1147,24 @@ mod tests {
 
         assert_eq!(diagnostics.len(), 1);
         assert_eq!(diagnostics[0].line, 2);
-        assert_eq!(diagnostics[0].column, 1);
+        assert_eq!(diagnostics[0].column, 3);
         assert_eq!(diagnostics[0].end_line, 2);
-        assert_eq!(diagnostics[0].end_column, 2);
+        assert_eq!(diagnostics[0].end_column, 7);
+        assert_eq!(diagnostics[0].code, "axonyx-backend-parse");
+    }
+
+    #[test]
+    fn reports_backend_parser_columns_as_utf16() {
+        let diagnostics = diagnose_ax_source(
+            "app/posts/loader.ax",
+            "query loadPosts() -> Post[] {\n  🔥 nope\n}\n",
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 2);
+        assert_eq!(diagnostics[0].column, 3);
+        assert_eq!(diagnostics[0].end_line, 2);
+        assert_eq!(diagnostics[0].end_column, 5);
         assert_eq!(diagnostics[0].code, "axonyx-backend-parse");
     }
 
