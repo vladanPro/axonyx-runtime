@@ -2,7 +2,7 @@ use thiserror::Error;
 
 use crate::ax_ast::prelude::AxExpr;
 use crate::ax_backend_ast::prelude::*;
-use crate::ax_parser::{parse_expr_with_span, AxParseError};
+use crate::ax_parser::{expression_error_span, parse_expr as parse_shared_expr, AxParseError};
 use crate::ax_query_ast::prelude::*;
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
@@ -67,15 +67,6 @@ pub enum AxBackendParseError {
     InvalidQueryNumber { line: usize },
     #[error("invalid expression at line {line}: {message}")]
     InvalidExpression { line: usize, message: String },
-    #[error("invalid expression at line {line}: {message}")]
-    #[doc(hidden)]
-    InvalidExpressionAt {
-        line: usize,
-        message: String,
-        expression: String,
-        start: usize,
-        end: usize,
-    },
 }
 
 impl AxBackendParseError {
@@ -110,17 +101,7 @@ impl AxBackendParseError {
             | Self::InvalidQuerySource { line }
             | Self::InvalidQueryClause { line }
             | Self::InvalidQueryNumber { line }
-            | Self::InvalidExpression { line, .. }
-            | Self::InvalidExpressionAt { line, .. } => *line,
-        }
-    }
-
-    fn without_internal_span(self) -> Self {
-        match self {
-            Self::InvalidExpressionAt { line, message, .. } => {
-                Self::InvalidExpression { line, message }
-            }
-            error => error,
+            | Self::InvalidExpression { line, .. } => *line,
         }
     }
 }
@@ -148,10 +129,6 @@ struct BackendLine {
 }
 
 pub fn parse_backend_ax(input: &str) -> Result<AxBackendDocument, AxBackendParseError> {
-    parse_backend_ax_internal(input).map_err(AxBackendParseError::without_internal_span)
-}
-
-fn parse_backend_ax_internal(input: &str) -> Result<AxBackendDocument, AxBackendParseError> {
     let lines = preprocess(input)?;
     if lines.is_empty() {
         return Err(AxBackendParseError::EmptyDocument);
@@ -166,12 +143,9 @@ fn parse_backend_ax_internal(input: &str) -> Result<AxBackendDocument, AxBackend
 }
 
 pub fn parse_backend_ax_with_span(input: &str) -> Result<AxBackendDocument, AxBackendParseFailure> {
-    parse_backend_ax_internal(input).map_err(|error| {
-        let span = backend_failure_span(input, &error);
-        AxBackendParseFailure {
-            error: error.without_internal_span(),
-            span,
-        }
+    parse_backend_ax(input).map_err(|error| AxBackendParseFailure {
+        span: backend_failure_span(input, &error),
+        error,
     })
 }
 
@@ -179,25 +153,13 @@ fn backend_failure_span(input: &str, error: &AxBackendParseError) -> AxBackendSo
     let line = error.line().max(1);
     let source = input.lines().nth(line - 1).unwrap_or_default();
 
-    if let AxBackendParseError::InvalidExpressionAt {
-        expression,
-        start,
-        end,
-        ..
-    } = error
-    {
-        let expression_start = source.find(expression).unwrap_or_else(|| {
-            let statement_start = backend_statement_start(source);
-            source[statement_start..]
-                .find(expression.trim())
-                .map_or(statement_start, |relative| statement_start + relative)
-        });
-        return backend_line_span(
-            source,
+    if let AxBackendParseError::InvalidExpression { message, .. } = error {
+        let expression_error = AxParseError::InvalidExpression {
             line,
-            expression_start + start,
-            expression_start + end,
-        );
+            message: message.clone(),
+        };
+        let (start, end) = expression_error_span(source, &expression_error);
+        return backend_line_span(source, line, start, end);
     }
 
     if matches!(error, AxBackendParseError::TabsNotSupported { .. }) {
@@ -2051,18 +2013,12 @@ fn parse_string_arg(input: &str, line: usize) -> Result<String, AxBackendParseEr
 }
 
 fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxBackendParseError> {
-    parse_expr_with_span(input, line).map_err(|failure| {
-        let message = match failure.error {
+    parse_shared_expr(input, line).map_err(|error| {
+        let message = match error {
             AxParseError::InvalidExpression { message, .. } => message,
             error => error.to_string(),
         };
-        AxBackendParseError::InvalidExpressionAt {
-            line,
-            message,
-            expression: input.to_string(),
-            start: failure.start,
-            end: failure.end,
-        }
+        AxBackendParseError::InvalidExpression { line, message }
     })
 }
 
