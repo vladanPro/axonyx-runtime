@@ -1169,6 +1169,21 @@ mod tests {
     }
 
     #[test]
+    fn reports_backend_expression_operator_range() {
+        let diagnostics = diagnose_ax_source(
+            "app/posts/domain.ax",
+            "fn normalize(status: String) -> String {\n  return status ??\n}\n",
+        );
+
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].line, 2);
+        assert_eq!(diagnostics[0].column, 17);
+        assert_eq!(diagnostics[0].end_line, 2);
+        assert_eq!(diagnostics[0].end_column, 19);
+        assert_eq!(diagnostics[0].code, "axonyx-backend-parse");
+    }
+
+    #[test]
     fn valid_sources_have_no_diagnostics() {
         assert!(diagnose_ax_source(
             "app/page.asx",
