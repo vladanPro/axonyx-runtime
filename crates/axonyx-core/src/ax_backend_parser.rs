@@ -4,7 +4,7 @@ use crate::ax_ast::prelude::{AxExpr, AxFloat};
 use crate::ax_backend_ast::prelude::*;
 use crate::ax_query_ast::prelude::*;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum AxBackendParseError {
     #[error("document is empty")]
     EmptyDocument,
@@ -68,6 +68,58 @@ pub enum AxBackendParseError {
     InvalidExpression { line: usize, message: String },
 }
 
+impl AxBackendParseError {
+    pub fn line(&self) -> usize {
+        match self {
+            Self::EmptyDocument => 1,
+            Self::InvalidImport { line }
+            | Self::MissingImportFrom { line }
+            | Self::EmptyImportList { line }
+            | Self::TabsNotSupported { line }
+            | Self::InvalidIndentation { line }
+            | Self::UnexpectedIndentation { line }
+            | Self::InvalidBlock { line }
+            | Self::InvalidDataBinding { line }
+            | Self::InvalidEnvDeclaration { line }
+            | Self::InvalidInputSection { line }
+            | Self::InvalidField { line }
+            | Self::InvalidTypeDeclaration { line }
+            | Self::InvalidMutation { line }
+            | Self::InvalidTransaction { line }
+            | Self::InvalidAssignment { line }
+            | Self::InvalidHeader { line }
+            | Self::InvalidCookie { line }
+            | Self::InvalidHook { line }
+            | Self::InvalidRequirement { line }
+            | Self::InvalidReturn { line }
+            | Self::InvalidSend { line }
+            | Self::InvalidScope { line }
+            | Self::InvalidScopeMember { line }
+            | Self::InvalidScopeState { line }
+            | Self::InvalidScopeRender { line }
+            | Self::InvalidQuerySource { line }
+            | Self::InvalidQueryClause { line }
+            | Self::InvalidQueryNumber { line }
+            | Self::InvalidExpression { line, .. } => *line,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AxBackendSourceSpan {
+    pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[error("{error}")]
+pub struct AxBackendParseFailure {
+    pub error: AxBackendParseError,
+    pub span: AxBackendSourceSpan,
+}
+
 #[derive(Debug, Clone)]
 struct BackendLine {
     line: usize,
@@ -87,6 +139,67 @@ pub fn parse_backend_ax(input: &str) -> Result<AxBackendDocument, AxBackendParse
         synthetic_counter: 0,
     };
     parser.parse_document()
+}
+
+pub fn parse_backend_ax_with_span(input: &str) -> Result<AxBackendDocument, AxBackendParseFailure> {
+    parse_backend_ax(input).map_err(|error| AxBackendParseFailure {
+        span: backend_failure_span(input, &error),
+        error,
+    })
+}
+
+fn backend_failure_span(input: &str, error: &AxBackendParseError) -> AxBackendSourceSpan {
+    let line = error.line().max(1);
+    let source = input.lines().nth(line - 1).unwrap_or_default();
+
+    if matches!(error, AxBackendParseError::TabsNotSupported { .. }) {
+        let start = source.find('\t').unwrap_or(0);
+        return backend_line_span(source, line, start, start + 1);
+    }
+
+    if matches!(error, AxBackendParseError::InvalidIndentation { .. }) {
+        let end = source.len() - source.trim_start_matches(' ').len();
+        return backend_line_span(source, line, 0, end.max(1).min(source.len()));
+    }
+
+    if matches!(error, AxBackendParseError::EmptyImportList { .. }) {
+        let start = source
+            .find('{')
+            .unwrap_or_else(|| backend_statement_start(source));
+        let end = source[start..]
+            .find('}')
+            .map_or(start + 1, |relative| start + relative + 1);
+        return backend_line_span(source, line, start, end.min(source.len()));
+    }
+
+    let start = backend_statement_start(source);
+    let end = source[start..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '(' | '{' | '=' | ','))
+        .map_or(source.len(), |(relative, _)| start + relative)
+        .max(start + source[start..].chars().next().map_or(0, char::len_utf8));
+    backend_line_span(source, line, start, end)
+}
+
+fn backend_statement_start(source: &str) -> usize {
+    let mut start = source.len() - source.trim_start().len();
+    if source[start..].starts_with("export ") {
+        start += "export ".len();
+    }
+    start.min(source.len())
+}
+
+fn backend_line_span(source: &str, line: usize, start: usize, end: usize) -> AxBackendSourceSpan {
+    let start = start.min(source.len());
+    let end = end.clamp(start, source.len());
+    let column = source[..start].encode_utf16().count() + 1;
+    let end_column = source[..end].encode_utf16().count() + 1;
+    AxBackendSourceSpan {
+        line,
+        column,
+        end_line: line,
+        end_column: end_column.max(column + 1),
+    }
 }
 
 struct Parser {
@@ -2351,8 +2464,8 @@ fn parse_backend_signature_param(input: &str, line: usize) -> Result<AxField, Ax
 }
 
 pub mod prelude {
-    pub use super::parse_backend_ax;
-    pub use super::AxBackendParseError;
+    pub use super::{parse_backend_ax, parse_backend_ax_with_span};
+    pub use super::{AxBackendParseError, AxBackendParseFailure, AxBackendSourceSpan};
 }
 
 #[cfg(test)]
@@ -2473,6 +2586,59 @@ query loadPosts() -> Post[] {
         let error = parse_backend_ax(input).expect_err("empty import list should fail");
 
         assert_eq!(error, AxBackendParseError::EmptyImportList { line: 2 });
+    }
+
+    #[test]
+    fn reports_precise_span_for_empty_backend_import_list() {
+        let input = "import { } from \"./domain.ax\"\n\nquery loadPosts() {\n  return []\n}";
+
+        let failure = parse_backend_ax_with_span(input).expect_err("empty import list should fail");
+
+        assert_eq!(
+            failure.error,
+            AxBackendParseError::EmptyImportList { line: 1 }
+        );
+        assert_eq!(
+            failure.span,
+            AxBackendSourceSpan {
+                line: 1,
+                column: 8,
+                end_line: 1,
+                end_column: 11,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_precise_span_for_unknown_backend_statement() {
+        let input = "query loadPosts() {\n  nope ???\n}";
+
+        let failure = parse_backend_ax_with_span(input).expect_err("unknown statement should fail");
+
+        assert_eq!(failure.error, AxBackendParseError::InvalidBlock { line: 2 });
+        assert_eq!(
+            failure.span,
+            AxBackendSourceSpan {
+                line: 2,
+                column: 3,
+                end_line: 2,
+                end_column: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_invalid_indentation_as_its_own_span() {
+        let input = "query loadPosts() {\n   return []\n}";
+
+        let failure = parse_backend_ax_with_span(input).expect_err("indentation should fail");
+
+        assert_eq!(
+            failure.error,
+            AxBackendParseError::InvalidIndentation { line: 2 }
+        );
+        assert_eq!(failure.span.column, 1);
+        assert_eq!(failure.span.end_column, 4);
     }
 
     #[test]
