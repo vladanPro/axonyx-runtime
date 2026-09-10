@@ -32,6 +32,13 @@ pub enum AxParseError {
     InvalidExpression { line: usize, message: String },
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct AxExpressionParseFailure {
+    pub error: AxParseError,
+    pub start: usize,
+    pub end: usize,
+}
+
 #[derive(Debug, Clone)]
 struct AxLine {
     line: usize,
@@ -431,6 +438,20 @@ fn split_first_token(input: &str) -> Option<(&str, &str)> {
 }
 
 pub(crate) fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
+    parse_expr_impl(input, line)
+}
+
+pub(crate) fn parse_expr_with_span(
+    input: &str,
+    line: usize,
+) -> Result<AxExpr, AxExpressionParseFailure> {
+    parse_expr_impl(input, line).map_err(|error| {
+        let (start, end) = expression_error_span(input, &error);
+        AxExpressionParseFailure { error, start, end }
+    })
+}
+
+fn parse_expr_impl(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
     let input = input.trim();
     if input.is_empty() {
         return Err(AxParseError::InvalidExpression {
@@ -478,6 +499,117 @@ pub(crate) fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseErro
     }
 
     parse_operator_expr(input, line)
+}
+
+fn expression_error_span(input: &str, error: &AxParseError) -> (usize, usize) {
+    let leading = input.len() - input.trim_start().len();
+    let trimmed = input.trim();
+    let fallback_end = leading
+        + trimmed
+            .chars()
+            .next()
+            .map_or(0, char::len_utf8)
+            .max(trimmed.len());
+    let fallback = (leading, fallback_end.max(leading + 1).min(input.len()));
+    let AxParseError::InvalidExpression { message, .. } = error else {
+        return fallback;
+    };
+
+    if message == "unterminated string escape" {
+        if let Some(start) = input.rfind('\\') {
+            return (start, start + 1);
+        }
+    }
+    if message == "unterminated string literal" {
+        if let Some(start) = input.rfind(['"', '\'']) {
+            return (start, input.len());
+        }
+    }
+
+    let Some(fragment) = backtick_fragment(message) else {
+        return fallback;
+    };
+    let search = if message.starts_with("duplicate object key") {
+        input.rfind(fragment)
+    } else {
+        input.find(fragment)
+    };
+    let Some(fragment_start) = search else {
+        return fallback;
+    };
+
+    if message.starts_with("missing operand") {
+        if let Some((start, end)) = trailing_binary_operator_span(fragment) {
+            return (fragment_start + start, fragment_start + end);
+        }
+    }
+    if message.starts_with("invalid member expression") {
+        if let Some((start, end)) = malformed_member_span(fragment) {
+            return (fragment_start + start, fragment_start + end);
+        }
+    }
+    if message.starts_with("empty item in list literal") {
+        if let Some(index) = fragment.find(",,").map(|index| index + 1).or_else(|| {
+            fragment
+                .strip_suffix(']')
+                .and_then(|inner| inner.trim_end().strip_suffix(','))
+                .map(|inner| inner.len())
+        }) {
+            return (fragment_start + index, fragment_start + index + 1);
+        }
+    }
+    if message.starts_with("invalid call path") {
+        if let Some(index) = fragment.find('(') {
+            return (fragment_start + index, fragment_start + index + 1);
+        }
+    }
+
+    let end = fragment_start + fragment.len();
+    (fragment_start, end.max(fragment_start + 1).min(input.len()))
+}
+
+fn backtick_fragment(message: &str) -> Option<&str> {
+    let start = message.find('`')? + 1;
+    let end = message[start..].find('`')? + start;
+    Some(&message[start..end])
+}
+
+fn trailing_binary_operator_span(input: &str) -> Option<(usize, usize)> {
+    let trimmed = input.trim_end();
+    for token in [
+        "??", "||", "&&", "==", "!=", ">=", "<=", "in", ">", "<", "+", "-", "*", "/", "%",
+    ] {
+        if let Some(prefix) = trimmed.strip_suffix(token) {
+            let start = prefix.len();
+            if token != "in"
+                || prefix
+                    .chars()
+                    .next_back()
+                    .is_none_or(|ch| !is_identifier_char(ch))
+            {
+                return Some((start, start + token.len()));
+            }
+        }
+    }
+    None
+}
+
+fn malformed_member_span(input: &str) -> Option<(usize, usize)> {
+    if input.starts_with("?.") {
+        return Some((0, 2));
+    }
+    if input.starts_with('.') {
+        return Some((0, 1));
+    }
+    if let Some(index) = input.find("..") {
+        return Some((index + 1, index + 2));
+    }
+    if let Some(prefix) = input.strip_suffix("?.") {
+        return Some((prefix.len(), input.len()));
+    }
+    input
+        .strip_suffix('.')
+        .map(|prefix| (prefix.len(), input.len()))
 }
 
 fn parse_numeric_literal(input: &str, line: usize) -> Option<Result<AxExpr, AxParseError>> {
@@ -1459,6 +1591,27 @@ page Home
                 AxExpr::binary(AxBinaryOp::Mul, AxExpr::number(1), AxExpr::number(2)),
             )
         );
+    }
+
+    #[test]
+    fn reports_the_missing_operand_operator_span() {
+        let failure =
+            parse_expr_with_span("status ??", 7).expect_err("missing operand should fail");
+
+        assert_eq!(failure.start, 7);
+        assert_eq!(failure.end, 9);
+        assert!(matches!(
+            failure.error,
+            AxParseError::InvalidExpression { line: 7, .. }
+        ));
+    }
+
+    #[test]
+    fn reports_an_invalid_nested_literal_span() {
+        let failure =
+            parse_expr_with_span("[🔥, 1.2.3]", 3).expect_err("invalid nested float should fail");
+
+        assert_eq!(&"[🔥, 1.2.3]"[failure.start..failure.end], "1.2.3");
     }
 
     #[test]
