@@ -32,6 +32,7 @@ pub enum AxParseError {
     InvalidExpression { line: usize, message: String },
 }
 
+#[cfg(test)]
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct AxExpressionParseFailure {
     pub error: AxParseError,
@@ -441,6 +442,7 @@ pub(crate) fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxParseErro
     parse_expr_impl(input, line)
 }
 
+#[cfg(test)]
 pub(crate) fn parse_expr_with_span(
     input: &str,
     line: usize,
@@ -501,7 +503,7 @@ fn parse_expr_impl(input: &str, line: usize) -> Result<AxExpr, AxParseError> {
     parse_operator_expr(input, line)
 }
 
-fn expression_error_span(input: &str, error: &AxParseError) -> (usize, usize) {
+pub(crate) fn expression_error_span(input: &str, error: &AxParseError) -> (usize, usize) {
     let leading = input.len() - input.trim_start().len();
     let trimmed = input.trim();
     let fallback_end = leading
