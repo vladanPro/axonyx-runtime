@@ -49,6 +49,13 @@ struct Owner {
 }
 
 #[derive(Debug, Clone)]
+struct BackendOwner {
+    start: usize,
+    end: usize,
+    params: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone)]
 struct LocalDraft {
     name: String,
     kind: AxLanguageLocalSymbolKind,
@@ -64,17 +71,18 @@ struct ByteRange {
     end: usize,
 }
 
-/// Builds a conservative local-symbol index for frontend Axonyx sources.
+/// Builds a conservative local-symbol index for Axonyx sources.
 ///
 /// Only compiler-owned expression regions participate. ASX text, strings,
-/// comments, property names, and embedded client/style blocks are excluded so
-/// editor refactors fail closed instead of rewriting unrelated text.
+/// comments, property names, database fields, and embedded client/style blocks
+/// are excluded so editor refactors fail closed instead of rewriting unrelated
+/// text.
 pub fn ax_source_local_symbols(source: &str) -> Vec<AxLanguageLocalSymbol> {
     let mask = code_mask(source);
     let line_starts = source_line_starts(source);
     let owners = collect_owners(&mask, &line_starts);
     if !owners.iter().any(|owner| owner.kind == OwnerKind::Page) {
-        return Vec::new();
+        return backend_source_local_symbols(source, &mask, &line_starts);
     }
 
     let raw_ranges = collect_raw_ranges(&mask, &line_starts);
@@ -171,6 +179,325 @@ pub fn ax_source_local_symbols(source: &str) -> Vec<AxLanguageLocalSymbol> {
             }
         })
         .collect()
+}
+
+fn backend_source_local_symbols(
+    source: &str,
+    mask: &[u8],
+    line_starts: &[usize],
+) -> Vec<AxLanguageLocalSymbol> {
+    let owners = collect_backend_owners(mask, line_starts);
+    if owners.is_empty() {
+        return Vec::new();
+    }
+
+    let mut drafts = collect_backend_parameter_drafts(mask, &owners);
+    let (declarations, initializer_ranges) =
+        collect_backend_local_declarations(mask, line_starts, &owners);
+    drafts.extend(declarations);
+
+    let mut expression_ranges = initializer_ranges;
+    expression_ranges.extend(collect_backend_parameter_default_ranges(mask, &owners));
+    expression_ranges.extend(collect_backend_expression_ranges(
+        mask,
+        line_starts,
+        &owners,
+    ));
+
+    resolve_local_drafts(source, mask, line_starts, drafts, &expression_ranges)
+}
+
+fn resolve_local_drafts(
+    source: &str,
+    mask: &[u8],
+    line_starts: &[usize],
+    drafts: Vec<LocalDraft>,
+    expression_ranges: &[ByteRange],
+) -> Vec<AxLanguageLocalSymbol> {
+    let identifiers = identifier_tokens(mask);
+    let mut resolved = vec![Vec::<(usize, usize)>::new(); drafts.len()];
+    for &(start, end) in &identifiers {
+        if let Some(index) = drafts
+            .iter()
+            .position(|draft| draft.declaration_start == start && draft.declaration_end == end)
+        {
+            resolved[index].push((start, end));
+            continue;
+        }
+        if !expression_ranges
+            .iter()
+            .any(|range| range.start <= start && end <= range.end)
+            || is_member_or_object_key(mask, start, end)
+        {
+            continue;
+        }
+
+        let name = &source[start..end];
+        let candidate = drafts
+            .iter()
+            .enumerate()
+            .filter(|(_, draft)| {
+                draft.name == name
+                    && draft.scope_start <= start
+                    && end <= draft.scope_end
+                    && draft.declaration_start <= start
+            })
+            .min_by_key(|(_, draft)| {
+                (
+                    draft.scope_end.saturating_sub(draft.scope_start),
+                    usize::MAX - draft.declaration_start,
+                )
+            })
+            .map(|(index, _)| index);
+        if let Some(index) = candidate {
+            resolved[index].push((start, end));
+        }
+    }
+
+    drafts
+        .into_iter()
+        .enumerate()
+        .map(|(index, draft)| {
+            let declaration = occurrence(
+                source,
+                line_starts,
+                draft.declaration_start,
+                draft.declaration_end,
+            );
+            let mut occurrences = resolved[index]
+                .iter()
+                .map(|&(start, end)| occurrence(source, line_starts, start, end))
+                .collect::<Vec<_>>();
+            occurrences.sort_by_key(|item| (item.line, item.column));
+            occurrences.dedup();
+            AxLanguageLocalSymbol {
+                name: draft.name,
+                kind: draft.kind,
+                declaration,
+                occurrences,
+                scope_start: draft.scope_start,
+                scope_end: draft.scope_end,
+            }
+        })
+        .collect()
+}
+
+fn collect_backend_owners(mask: &[u8], line_starts: &[usize]) -> Vec<BackendOwner> {
+    let ranges = line_ranges(mask.len(), line_starts);
+    let mut owners = Vec::new();
+    for (line_index, &(line_start, line_end)) in ranges.iter().enumerate() {
+        let mut cursor = skip_ascii_space(mask, line_start, line_end);
+        if cursor != line_start {
+            continue;
+        }
+        if keyword_at(mask, cursor, "export") {
+            cursor = skip_ascii_space(mask, cursor + "export".len(), line_end);
+        }
+
+        let callable = ["loader", "query", "action", "fn"]
+            .iter()
+            .find(|keyword| keyword_at(mask, cursor, keyword));
+        let block_only = ["route", "job"]
+            .iter()
+            .find(|keyword| keyword_at(mask, cursor, keyword));
+        let Some(keyword) = callable.or(block_only) else {
+            continue;
+        };
+        cursor = skip_ascii_space(mask, cursor + keyword.len(), line_end);
+
+        let params = if callable.is_some() {
+            identifier_at(mask, cursor).and_then(|(_, name_end)| {
+                let open = skip_ascii_space(mask, name_end, mask.len());
+                (mask.get(open) == Some(&b'('))
+                    .then(|| matching_delimiter(mask, open, b'(', b')'))
+                    .flatten()
+                    .map(|close| (open + 1, close))
+            })
+        } else {
+            None
+        };
+
+        let header_end = params.map_or(line_end, |(_, close)| {
+            line_end_for_offset(mask.len(), line_starts, close)
+        });
+        let body_search_start = params.map_or(cursor, |(_, close)| close + 1);
+        let open = find_byte(mask, body_search_start, header_end, b'{');
+        let (start, end) = if let Some(open) = open {
+            let Some(close) = matching_delimiter(mask, open, b'{', b'}') else {
+                continue;
+            };
+            (open + 1, close)
+        } else {
+            let end = ranges
+                .iter()
+                .skip(line_index + 1)
+                .find_map(|&(start, end)| {
+                    let content = skip_ascii_space(mask, start, end);
+                    (content == start && content < end).then_some(start)
+                })
+                .unwrap_or(mask.len());
+            (header_end, end)
+        };
+        owners.push(BackendOwner { start, end, params });
+    }
+    owners
+}
+
+fn collect_backend_parameter_drafts(mask: &[u8], owners: &[BackendOwner]) -> Vec<LocalDraft> {
+    let mut drafts = Vec::new();
+    for owner in owners {
+        let Some((start, end)) = owner.params else {
+            continue;
+        };
+        for range in split_top_level(mask, start, end, b',') {
+            let cursor = skip_ascii_space(mask, range.start, range.end);
+            let Some((name_start, name_end)) = identifier_at(mask, cursor) else {
+                continue;
+            };
+            drafts.push(LocalDraft {
+                name: String::from_utf8_lossy(&mask[name_start..name_end]).into_owned(),
+                kind: AxLanguageLocalSymbolKind::Parameter,
+                declaration_start: name_start,
+                declaration_end: name_end,
+                scope_start: start,
+                scope_end: owner.end,
+            });
+        }
+    }
+    drafts
+}
+
+fn collect_backend_parameter_default_ranges(
+    mask: &[u8],
+    owners: &[BackendOwner],
+) -> Vec<ByteRange> {
+    owners
+        .iter()
+        .filter_map(|owner| owner.params)
+        .flat_map(|(start, end)| split_top_level(mask, start, end, b','))
+        .filter_map(|param| {
+            find_top_level_equals(mask, param.start, param.end).map(|equals| ByteRange {
+                start: equals + 1,
+                end: param.end,
+            })
+        })
+        .collect()
+}
+
+fn collect_backend_local_declarations(
+    mask: &[u8],
+    line_starts: &[usize],
+    owners: &[BackendOwner],
+) -> (Vec<LocalDraft>, Vec<ByteRange>) {
+    let mut drafts = Vec::new();
+    let mut expressions = Vec::new();
+    for &(line_start, line_end) in &line_ranges(mask.len(), line_starts) {
+        let cursor = skip_ascii_space(mask, line_start, line_end);
+        let Some(owner) = innermost_backend_owner(owners, cursor) else {
+            continue;
+        };
+        let (kind, keyword_len) = if keyword_at(mask, cursor, "data") {
+            (AxLanguageLocalSymbolKind::Data, 4)
+        } else if keyword_at(mask, cursor, "const") {
+            (AxLanguageLocalSymbolKind::Constant, 5)
+        } else if keyword_at(mask, cursor, "let") {
+            (AxLanguageLocalSymbolKind::Variable, 3)
+        } else {
+            continue;
+        };
+        let declaration_start = skip_ascii_space(mask, cursor + keyword_len, line_end);
+        let Some((name_start, name_end)) = identifier_at(mask, declaration_start) else {
+            continue;
+        };
+        let Some(equals) = find_top_level_equals(mask, name_end, line_end) else {
+            continue;
+        };
+        drafts.push(LocalDraft {
+            name: String::from_utf8_lossy(&mask[name_start..name_end]).into_owned(),
+            kind,
+            declaration_start: name_start,
+            declaration_end: name_end,
+            scope_start: name_start,
+            scope_end: owner.end,
+        });
+        expressions.push(ByteRange {
+            start: equals + 1,
+            end: line_end,
+        });
+    }
+    (drafts, expressions)
+}
+
+fn collect_backend_expression_ranges(
+    mask: &[u8],
+    line_starts: &[usize],
+    owners: &[BackendOwner],
+) -> Vec<ByteRange> {
+    let mut ranges = Vec::new();
+    for &(line_start, line_end) in &line_ranges(mask.len(), line_starts) {
+        let cursor = skip_ascii_space(mask, line_start, line_end);
+        if innermost_backend_owner(owners, cursor).is_none()
+            || ["data", "const", "let"]
+                .iter()
+                .any(|keyword| keyword_at(mask, cursor, keyword))
+        {
+            continue;
+        }
+
+        let prefixed = [
+            "return",
+            "require",
+            "revalidate",
+            "invalidate",
+            "before",
+            "after",
+            "patch",
+            "header",
+            "cookie",
+            "clearCookie",
+        ]
+        .iter()
+        .find(|keyword| keyword_at(mask, cursor, keyword))
+        .map(|keyword| skip_ascii_space(mask, cursor + keyword.len(), line_end));
+        let start = if let Some(start) = prefixed {
+            start
+        } else if keyword_at(mask, cursor, "send") {
+            find_mask_sequence(mask, cursor + 4, line_end, b" with ")
+                .map(|index| index + " with ".len())
+                .unwrap_or(line_end)
+        } else if keyword_at(mask, cursor, "where")
+            || find_byte(mask, cursor, line_end, b'=').is_some()
+        {
+            find_byte(mask, cursor, line_end, b'=')
+                .map(|index| index + 1)
+                .unwrap_or(line_end)
+        } else if find_byte(mask, cursor, line_end, b'(').is_some() {
+            cursor
+        } else {
+            continue;
+        };
+        if start < line_end {
+            ranges.push(ByteRange {
+                start,
+                end: line_end,
+            });
+        }
+    }
+    ranges
+}
+
+fn innermost_backend_owner(owners: &[BackendOwner], offset: usize) -> Option<&BackendOwner> {
+    owners
+        .iter()
+        .filter(|owner| owner.start <= offset && offset <= owner.end)
+        .min_by_key(|owner| owner.end.saturating_sub(owner.start))
+}
+
+fn find_mask_sequence(mask: &[u8], start: usize, end: usize, target: &[u8]) -> Option<usize> {
+    mask.get(start..end)?
+        .windows(target.len())
+        .position(|window| window == target)
+        .map(|offset| start + offset)
 }
 
 fn collect_owners(mask: &[u8], line_starts: &[usize]) -> Vec<Owner> {
@@ -833,5 +1160,102 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn indexes_backend_function_params_and_local_bindings() {
+        let source = r#"export fn normalize(status: String, fallback: String = status) -> String {
+  const selected = status ?? fallback
+  let result = selected
+  return result
+}
+"#;
+
+        let symbols = ax_source_local_symbols(source);
+        let symbol = |name: &str| symbols.iter().find(|symbol| symbol.name == name).unwrap();
+
+        assert_eq!(symbol("status").kind, AxLanguageLocalSymbolKind::Parameter);
+        assert_eq!(symbol("status").occurrences.len(), 3);
+        assert_eq!(symbol("fallback").occurrences.len(), 2);
+        assert_eq!(symbol("selected").occurrences.len(), 2);
+        assert_eq!(symbol("result").occurrences.len(), 2);
+    }
+
+    #[test]
+    fn keeps_backend_local_shadowing_inside_each_callable() {
+        let source = r#"fn first(value: String) -> String {
+  const result = value
+  return result
+}
+
+fn second(value: String) -> String {
+  const result = value
+  return result
+}
+"#;
+
+        let symbols = ax_source_local_symbols(source);
+        let values = symbols
+            .iter()
+            .filter(|symbol| symbol.name == "value")
+            .collect::<Vec<_>>();
+        let results = symbols
+            .iter()
+            .filter(|symbol| symbol.name == "result")
+            .collect::<Vec<_>>();
+
+        assert_eq!(values.len(), 2);
+        assert_eq!(results.len(), 2);
+        assert!(values.iter().all(|symbol| symbol.occurrences.len() == 2));
+        assert!(results.iter().all(|symbol| symbol.occurrences.len() == 2));
+    }
+
+    #[test]
+    fn ignores_object_defaults_when_finding_a_backend_callable_body() {
+        let source = r#"fn describe(options: Map<String, String> = { label: "default" }) -> String {
+  const label = options.label
+  return label
+}
+"#;
+
+        let symbols = ax_source_local_symbols(source);
+        let options = symbols
+            .iter()
+            .find(|symbol| symbol.name == "options")
+            .unwrap();
+        let label = symbols
+            .iter()
+            .find(|symbol| symbol.name == "label")
+            .unwrap();
+
+        assert_eq!(options.occurrences.len(), 2);
+        assert_eq!(label.occurrences.len(), 2);
+    }
+
+    #[test]
+    fn backend_locals_do_not_capture_database_fields_members_or_strings() {
+        let source = r#"action updateStatus(status: String) {
+  data current = db.posts.where({ status: status }).first()
+  update posts
+    status = status
+    where status = current.id
+  return current
+  // status current
+  header "status" = "current"
+}
+"#;
+
+        let symbols = ax_source_local_symbols(source);
+        let status = symbols
+            .iter()
+            .find(|symbol| symbol.name == "status")
+            .unwrap();
+        let current = symbols
+            .iter()
+            .find(|symbol| symbol.name == "current")
+            .unwrap();
+
+        assert_eq!(status.occurrences.len(), 3);
+        assert_eq!(current.occurrences.len(), 3);
     }
 }
