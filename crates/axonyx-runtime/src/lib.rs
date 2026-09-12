@@ -3858,6 +3858,30 @@ fn ax_action_script() -> &'static str {
   };
 
   const actionStatuses = (form) => Array.from(form.querySelectorAll(".ax-action-status[data-state]"));
+  const actionSubmitControls = (form) => Array.from(form.querySelectorAll(
+    'button:not([type]), button[type="submit"], input[type="submit"], input[type="image"]'
+  ));
+
+  const setActionPending = (form, pending) => {
+    if (pending) form.setAttribute("aria-busy", "true");
+    else form.removeAttribute("aria-busy");
+    actionSubmitControls(form).forEach((control) => {
+      if (pending) {
+        if (!control.hasAttribute("data-ax-disabled-before-pending")) {
+          control.setAttribute(
+            "data-ax-disabled-before-pending",
+            control.disabled ? "true" : "false"
+          );
+        }
+        control.disabled = true;
+        return;
+      }
+      const previous = control.getAttribute("data-ax-disabled-before-pending");
+      if (previous === null) return;
+      control.disabled = previous === "true";
+      control.removeAttribute("data-ax-disabled-before-pending");
+    });
+  };
 
   const syncActionStatus = (form) => {
     const current = form.getAttribute("data-ax-action-state") || "";
@@ -3871,6 +3895,7 @@ fn ax_action_script() -> &'static str {
 
   const setActionState = (form, state) => {
     form.setAttribute("data-ax-action-state", state);
+    setActionPending(form, state === "pending");
     syncActionStatus(form);
   };
 
@@ -3986,6 +4011,7 @@ fn ax_action_script() -> &'static str {
     const form = event.target;
     if (!(form instanceof HTMLFormElement) || !isAxonyxActionForm(form)) return;
     event.preventDefault();
+    if (form.getAttribute("data-ax-action-state") === "pending") return;
 
     const formData = new FormData(form);
     if (!formData.has("__ax_patch")) formData.append("__ax_patch", "1");
@@ -3997,6 +4023,9 @@ fn ax_action_script() -> &'static str {
       "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
     };
     setActionState(form, "pending");
+    window.dispatchEvent(new CustomEvent("axonyx:action-start", {
+      detail: { form },
+    }));
 
     try {
       const response = await fetch(form.action, {
@@ -7841,6 +7870,11 @@ page Posts
         assert!(html.contains("application/x-www-form-urlencoded;charset=UTF-8"));
         assert!(html.contains("syncActionStatus"));
         assert!(html.contains("setActionState"));
+        assert!(html.contains("setActionPending"));
+        assert!(html.contains("data-ax-disabled-before-pending"));
+        assert!(html.contains("aria-busy"));
+        assert!(html.contains("axonyx:action-start"));
+        assert!(html.contains("data-ax-action-state\") === \"pending"));
         assert!(html.contains("status.hidden = !active"));
         assert!(html.contains("aria-live"));
         assert!(html.contains("refreshes"));
