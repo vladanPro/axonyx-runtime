@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -23,12 +24,36 @@ pub struct AxFileRef {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AxStorageAccess {
+    Read,
+    Write,
+    ReadWrite,
+}
+
+impl AxStorageAccess {
+    pub fn can_read(self) -> bool {
+        matches!(self, Self::Read | Self::ReadWrite)
+    }
+
+    pub fn can_write(self) -> bool {
+        matches!(self, Self::Write | Self::ReadWrite)
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum AxStorageError {
     #[error("storage capability name is invalid")]
     InvalidCapabilityName,
     #[error("storage file limit must be greater than zero")]
     InvalidFileLimit,
+    #[error("storage capability does not allow `{operation}`")]
+    AccessDenied { operation: &'static str },
+    #[error("storage capability `{name}` is already registered")]
+    DuplicateCapability { name: String },
+    #[error("storage capability `{name}` is not registered")]
+    UnknownCapability { name: String },
     #[error("storage file name is invalid")]
     InvalidFileName,
     #[error("storage content type metadata is invalid")]
@@ -54,6 +79,7 @@ pub struct AxCapabilityStorage {
     name: String,
     root: Dir,
     max_file_bytes: u64,
+    access: AxStorageAccess,
 }
 
 impl AxCapabilityStorage {
@@ -61,6 +87,15 @@ impl AxCapabilityStorage {
         name: impl Into<String>,
         root: impl AsRef<Path>,
         max_file_bytes: u64,
+    ) -> Result<Self, AxStorageError> {
+        Self::open_with_access(name, root, max_file_bytes, AxStorageAccess::ReadWrite)
+    }
+
+    pub fn open_with_access(
+        name: impl Into<String>,
+        root: impl AsRef<Path>,
+        max_file_bytes: u64,
+        access: AxStorageAccess,
     ) -> Result<Self, AxStorageError> {
         let name = name.into();
         validate_capability_name(&name)?;
@@ -83,6 +118,7 @@ impl AxCapabilityStorage {
             name,
             root,
             max_file_bytes,
+            access,
         })
     }
 
@@ -92,6 +128,10 @@ impl AxCapabilityStorage {
 
     pub fn max_file_bytes(&self) -> u64 {
         self.max_file_bytes
+    }
+
+    pub fn access(&self) -> AxStorageAccess {
+        self.access
     }
 
     pub fn store(&self, file: &AxIncomingFile) -> Result<AxFileRef, AxStorageError> {
@@ -104,6 +144,9 @@ impl AxCapabilityStorage {
         content_type: Option<&str>,
         bytes: &[u8],
     ) -> Result<AxFileRef, AxStorageError> {
+        if !self.access.can_write() {
+            return Err(AxStorageError::AccessDenied { operation: "write" });
+        }
         validate_file_name(file_name)?;
         validate_content_type(content_type)?;
         let size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
@@ -158,6 +201,9 @@ impl AxCapabilityStorage {
     }
 
     pub fn read(&self, file_ref: &AxFileRef) -> Result<Vec<u8>, AxStorageError> {
+        if !self.access.can_read() {
+            return Err(AxStorageError::AccessDenied { operation: "read" });
+        }
         self.validate_ref(file_ref)?;
         let path = object_path(&file_ref.id, &file_ref.file_name)?;
         let bytes = self.root.read(path).map_err(|source| AxStorageError::Io {
@@ -178,6 +224,46 @@ impl AxCapabilityStorage {
         validate_file_id(&file_ref.id)?;
         validate_file_name(&file_ref.file_name)?;
         validate_content_type(file_ref.content_type.as_deref())
+    }
+}
+
+#[derive(Debug, Default)]
+pub struct AxStorageRegistry {
+    capabilities: BTreeMap<String, AxCapabilityStorage>,
+}
+
+impl AxStorageRegistry {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn register(&mut self, storage: AxCapabilityStorage) -> Result<(), AxStorageError> {
+        let name = storage.name().to_string();
+        if self.capabilities.contains_key(&name) {
+            return Err(AxStorageError::DuplicateCapability { name });
+        }
+        self.capabilities.insert(name, storage);
+        Ok(())
+    }
+
+    pub fn get(&self, name: &str) -> Result<&AxCapabilityStorage, AxStorageError> {
+        self.capabilities
+            .get(name)
+            .ok_or_else(|| AxStorageError::UnknownCapability {
+                name: name.to_string(),
+            })
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.capabilities.keys().map(String::as_str)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.capabilities.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.capabilities.len()
     }
 }
 
@@ -245,7 +331,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 pub mod prelude {
-    pub use super::{AxCapabilityStorage, AxFileRef, AxStorageError};
+    pub use super::{
+        AxCapabilityStorage, AxFileRef, AxStorageAccess, AxStorageError, AxStorageRegistry,
+    };
 }
 
 #[cfg(test)]
@@ -326,5 +414,63 @@ mod tests {
         drop(second);
         std::fs::remove_dir_all(first_root).expect("first root should clean up");
         std::fs::remove_dir_all(second_root).expect("second root should clean up");
+    }
+
+    #[test]
+    fn enforces_access_and_registry_boundaries() {
+        let read_root = temp_root("read-only");
+        let write_root = temp_root("write-only");
+        let read_only = AxCapabilityStorage::open_with_access(
+            "public",
+            &read_root,
+            1024,
+            AxStorageAccess::Read,
+        )
+        .expect("read capability should open");
+        let write_only = AxCapabilityStorage::open_with_access(
+            "uploads",
+            &write_root,
+            1024,
+            AxStorageAccess::Write,
+        )
+        .expect("write capability should open");
+
+        assert!(matches!(
+            read_only.store(&incoming("cover.png", b"PNG")),
+            Err(AxStorageError::AccessDenied { operation: "write" })
+        ));
+        let file_ref = write_only
+            .store(&incoming("cover.png", b"PNG"))
+            .expect("write capability should store");
+        assert!(matches!(
+            write_only.read(&file_ref),
+            Err(AxStorageError::AccessDenied { operation: "read" })
+        ));
+
+        let mut registry = AxStorageRegistry::new();
+        registry
+            .register(read_only)
+            .expect("first capability should register");
+        assert_eq!(registry.names().collect::<Vec<_>>(), vec!["public"]);
+        let duplicate = AxCapabilityStorage::open_with_access(
+            "public",
+            &write_root,
+            1024,
+            AxStorageAccess::Read,
+        )
+        .expect("duplicate capability should open before registration");
+        assert!(matches!(
+            registry.register(duplicate),
+            Err(AxStorageError::DuplicateCapability { .. })
+        ));
+        assert!(matches!(
+            registry.get("missing"),
+            Err(AxStorageError::UnknownCapability { .. })
+        ));
+
+        drop(registry);
+        drop(write_only);
+        std::fs::remove_dir_all(read_root).expect("read root should clean up");
+        std::fs::remove_dir_all(write_root).expect("write root should clean up");
     }
 }
