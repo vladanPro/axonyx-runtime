@@ -50,9 +50,18 @@ struct Owner {
 
 #[derive(Debug, Clone)]
 struct BackendOwner {
+    kind: BackendOwnerKind,
     start: usize,
     end: usize,
     params: Option<(usize, usize)>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BackendOwnerKind {
+    Callable,
+    Route,
+    Job,
+    Scope,
 }
 
 #[derive(Debug, Clone)]
@@ -294,18 +303,23 @@ fn collect_backend_owners(mask: &[u8], line_starts: &[usize]) -> Vec<BackendOwne
             cursor = skip_ascii_space(mask, cursor + "export".len(), line_end);
         }
 
-        let callable = ["loader", "query", "action", "fn"]
-            .iter()
-            .find(|keyword| keyword_at(mask, cursor, keyword));
-        let block_only = ["route", "job"]
-            .iter()
-            .find(|keyword| keyword_at(mask, cursor, keyword));
-        let Some(keyword) = callable.or(block_only) else {
+        let declaration = [
+            ("loader", BackendOwnerKind::Callable),
+            ("query", BackendOwnerKind::Callable),
+            ("action", BackendOwnerKind::Callable),
+            ("fn", BackendOwnerKind::Callable),
+            ("route", BackendOwnerKind::Route),
+            ("job", BackendOwnerKind::Job),
+            ("scope", BackendOwnerKind::Scope),
+        ]
+        .into_iter()
+        .find(|(keyword, _)| keyword_at(mask, cursor, keyword));
+        let Some((keyword, kind)) = declaration else {
             continue;
         };
         cursor = skip_ascii_space(mask, cursor + keyword.len(), line_end);
 
-        let params = if callable.is_some() {
+        let params = if kind == BackendOwnerKind::Callable {
             identifier_at(mask, cursor).and_then(|(_, name_end)| {
                 let open = skip_ascii_space(mask, name_end, mask.len());
                 (mask.get(open) == Some(&b'('))
@@ -327,6 +341,8 @@ fn collect_backend_owners(mask: &[u8], line_starts: &[usize]) -> Vec<BackendOwne
                 continue;
             };
             (open + 1, close)
+        } else if kind == BackendOwnerKind::Scope {
+            continue;
         } else {
             let end = ranges
                 .iter()
@@ -338,7 +354,12 @@ fn collect_backend_owners(mask: &[u8], line_starts: &[usize]) -> Vec<BackendOwne
                 .unwrap_or(mask.len());
             (header_end, end)
         };
-        owners.push(BackendOwner { start, end, params });
+        owners.push(BackendOwner {
+            kind,
+            start,
+            end,
+            params,
+        });
     }
     owners
 }
@@ -396,15 +417,18 @@ fn collect_backend_local_declarations(
         let Some(owner) = innermost_backend_owner(owners, cursor) else {
             continue;
         };
-        let (kind, keyword_len) = if keyword_at(mask, cursor, "data") {
-            (AxLanguageLocalSymbolKind::Data, 4)
-        } else if keyword_at(mask, cursor, "const") {
-            (AxLanguageLocalSymbolKind::Constant, 5)
-        } else if keyword_at(mask, cursor, "let") {
-            (AxLanguageLocalSymbolKind::Variable, 3)
-        } else {
-            continue;
-        };
+        let (kind, keyword_len) =
+            if owner.kind == BackendOwnerKind::Scope && keyword_at(mask, cursor, "state") {
+                (AxLanguageLocalSymbolKind::State, 5)
+            } else if owner.kind != BackendOwnerKind::Scope && keyword_at(mask, cursor, "data") {
+                (AxLanguageLocalSymbolKind::Data, 4)
+            } else if owner.kind != BackendOwnerKind::Scope && keyword_at(mask, cursor, "const") {
+                (AxLanguageLocalSymbolKind::Constant, 5)
+            } else if owner.kind != BackendOwnerKind::Scope && keyword_at(mask, cursor, "let") {
+                (AxLanguageLocalSymbolKind::Variable, 3)
+            } else {
+                continue;
+            };
         let declaration_start = skip_ascii_space(mask, cursor + keyword_len, line_end);
         let Some((name_start, name_end)) = identifier_at(mask, declaration_start) else {
             continue;
@@ -437,7 +461,7 @@ fn collect_backend_expression_ranges(
     for &(line_start, line_end) in &line_ranges(mask.len(), line_starts) {
         let cursor = skip_ascii_space(mask, line_start, line_end);
         if innermost_backend_owner(owners, cursor).is_none()
-            || ["data", "const", "let"]
+            || ["state", "data", "const", "let"]
                 .iter()
                 .any(|keyword| keyword_at(mask, cursor, keyword))
         {
@@ -455,6 +479,7 @@ fn collect_backend_expression_ranges(
             "header",
             "cookie",
             "clearCookie",
+            "render",
         ]
         .iter()
         .find(|keyword| keyword_at(mask, cursor, keyword))
@@ -1257,5 +1282,39 @@ fn second(value: String) -> String {
 
         assert_eq!(status.occurrences.len(), 3);
         assert_eq!(current.occurrences.len(), 3);
+    }
+
+    #[test]
+    fn indexes_scope_state_and_keeps_sibling_scopes_isolated() {
+        let source = r#"scope App <RenderLayout> {
+  state theme: String = "silver"
+  state selected: String = theme
+  render RenderLayout(theme, selected)
+}
+
+scope Admin <RenderLayout> {
+  state theme: String = "bronze"
+  render RenderLayout(theme)
+}
+"#;
+
+        let symbols = ax_source_local_symbols(source);
+        let themes = symbols
+            .iter()
+            .filter(|symbol| symbol.name == "theme")
+            .collect::<Vec<_>>();
+        let selected = symbols
+            .iter()
+            .find(|symbol| symbol.name == "selected")
+            .expect("selected scope state should be indexed");
+
+        assert_eq!(themes.len(), 2);
+        assert_eq!(themes[0].kind, AxLanguageLocalSymbolKind::State);
+        assert_eq!(themes[0].occurrences.len(), 3);
+        assert_eq!(themes[1].kind, AxLanguageLocalSymbolKind::State);
+        assert_eq!(themes[1].occurrences.len(), 2);
+        assert_eq!(selected.kind, AxLanguageLocalSymbolKind::State);
+        assert_eq!(selected.occurrences.len(), 2);
+        assert!(themes[0].scope_end <= themes[1].scope_start);
     }
 }
