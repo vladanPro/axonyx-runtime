@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod server;
+#[cfg(feature = "storage")]
+pub mod storage;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -33,6 +35,8 @@ use thiserror::Error;
 pub use backend::prelude as backend_prelude;
 pub use serde;
 pub use server::prelude as server_prelude;
+#[cfg(feature = "storage")]
+pub use storage::prelude as storage_prelude;
 
 pub const AX_STATE_WASM_PATH: &str = "/_ax/runtime/axonyx-state-v2.wasm";
 

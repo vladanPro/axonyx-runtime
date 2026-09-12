@@ -40,8 +40,10 @@ axum = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 multer = { workspace = true, optional = true }
 encoding_rs.workspace = true
+cap-std = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["net", "rt-multi-thread"] }
 
 [features]
 default = []
 axum = ["dep:axum", "dep:futures-util", "dep:multer", "dep:tokio"]
+storage = ["dep:cap-std"]
