@@ -51,11 +51,47 @@ impl AxServerConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxIncomingFile {
+    pub field_name: String,
+    pub file_name: String,
+    pub content_type: Option<String>,
+    pub bytes: Vec<u8>,
+}
+
+impl AxIncomingFile {
+    pub fn size(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxMultipartForm {
+    pub fields: BTreeMap<String, String>,
+    pub files: BTreeMap<String, Vec<AxIncomingFile>>,
+}
+
+impl AxMultipartForm {
+    pub fn field(&self, name: &str) -> Option<&str> {
+        self.fields.get(name).map(String::as_str)
+    }
+
+    pub fn file(&self, name: &str) -> Option<&AxIncomingFile> {
+        self.files.get(name).and_then(|files| files.first())
+    }
+
+    pub fn files(&self, name: &str) -> &[AxIncomingFile] {
+        self.files.get(name).map(Vec::as_slice).unwrap_or_default()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AxHttpRequest {
     pub method: String,
     pub target: String,
     pub headers: BTreeMap<String, String>,
     pub body: Vec<u8>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multipart: Option<AxMultipartForm>,
 }
 
 pub struct AxAuth;
@@ -741,13 +777,33 @@ pub async fn axum_request_to_axonyx_with_limit(
     limit: usize,
 ) -> Result<AxHttpRequest, Box<dyn Error + Send + Sync>> {
     let (parts, body) = request.into_parts();
-    let body = axum::body::to_bytes(body, limit).await?;
+    let content_type = parts
+        .headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let is_multipart = content_type.as_deref().is_some_and(|value| {
+        value.split(';').next().is_some_and(|media_type| {
+            media_type
+                .trim()
+                .eq_ignore_ascii_case("multipart/form-data")
+        })
+    });
+    let (body, multipart) = if is_multipart {
+        let form =
+            parse_axum_multipart(body, content_type.as_deref().unwrap_or_default(), limit).await?;
+        (Vec::new(), Some(form))
+    } else {
+        let body = axum::body::to_bytes(body, limit).await?;
+        (body.to_vec(), None)
+    };
     let target = parts
         .uri
         .path_and_query()
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| parts.uri.path().to_string());
-    let mut request = AxHttpRequest::new(parts.method.as_str(), target).with_body(body.to_vec());
+    let mut request = AxHttpRequest::new(parts.method.as_str(), target).with_body(body);
+    request.multipart = multipart;
 
     for (name, value) in parts.headers.iter() {
         if let Ok(value) = value.to_str() {
@@ -756,6 +812,89 @@ pub async fn axum_request_to_axonyx_with_limit(
     }
 
     Ok(request)
+}
+
+#[cfg(feature = "axum")]
+async fn parse_axum_multipart(
+    body: axum::body::Body,
+    content_type: &str,
+    limit: usize,
+) -> Result<AxMultipartForm, Box<dyn Error + Send + Sync>> {
+    const MAX_PARTS: usize = 128;
+    const MAX_TEXT_FIELD_BYTES: usize = 64 * 1024;
+
+    let boundary = multer::parse_boundary(content_type)?;
+    let limit = u64::try_from(limit).unwrap_or(u64::MAX);
+    let constraints = multer::Constraints::new().size_limit(
+        multer::SizeLimit::new()
+            .whole_stream(limit)
+            .per_field(limit),
+    );
+    let mut multipart =
+        multer::Multipart::with_constraints(body.into_data_stream(), boundary, constraints);
+    let mut form = AxMultipartForm::default();
+    let mut part_count = 0usize;
+
+    while let Some(field) = multipart.next_field().await? {
+        part_count += 1;
+        if part_count > MAX_PARTS {
+            return Err(invalid_multipart("multipart form exceeded 128 parts"));
+        }
+        let field_name = field
+            .name()
+            .filter(|name| !name.is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| invalid_multipart("multipart part is missing a field name"))?;
+        let file_name = field
+            .file_name()
+            .map(sanitize_client_file_name)
+            .transpose()?;
+        let content_type = field.content_type().map(ToString::to_string);
+        let bytes = field.bytes().await?;
+
+        if let Some(file_name) = file_name {
+            form.files
+                .entry(field_name.clone())
+                .or_default()
+                .push(AxIncomingFile {
+                    field_name,
+                    file_name,
+                    content_type,
+                    bytes: bytes.to_vec(),
+                });
+        } else {
+            if bytes.len() > MAX_TEXT_FIELD_BYTES {
+                return Err(invalid_multipart("multipart text field exceeded 64 KiB"));
+            }
+            let value = String::from_utf8(bytes.to_vec())
+                .map_err(|_| invalid_multipart("multipart text field is not valid UTF-8"))?;
+            form.fields.insert(field_name, value);
+        }
+    }
+
+    Ok(form)
+}
+
+#[cfg(feature = "axum")]
+fn sanitize_client_file_name(value: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let file_name = value.rsplit(['/', '\\']).next().unwrap_or_default().trim();
+    if file_name.is_empty()
+        || file_name == "."
+        || file_name == ".."
+        || file_name.len() > 255
+        || file_name.chars().any(char::is_control)
+    {
+        return Err(invalid_multipart("multipart file name is invalid"));
+    }
+    Ok(file_name.to_string())
+}
+
+#[cfg(feature = "axum")]
+fn invalid_multipart(message: &str) -> Box<dyn Error + Send + Sync> {
+    Box::new(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.to_string(),
+    ))
 }
 
 #[cfg(feature = "axum")]
@@ -863,6 +1002,7 @@ impl AxHttpRequest {
             target: target.into(),
             headers: BTreeMap::new(),
             body: Vec::new(),
+            multipart: None,
         }
     }
 
@@ -897,7 +1037,22 @@ impl AxHttpRequest {
     }
 
     pub fn form_value(&self, name: &str) -> Option<String> {
-        parse_urlencoded_fields(&self.body_text_lossy()).remove(name)
+        self.multipart
+            .as_ref()
+            .and_then(|form| form.field(name))
+            .map(str::to_owned)
+            .or_else(|| parse_urlencoded_fields(&self.body_text_lossy()).remove(name))
+    }
+
+    pub fn incoming_file(&self, name: &str) -> Option<&AxIncomingFile> {
+        self.multipart.as_ref().and_then(|form| form.file(name))
+    }
+
+    pub fn incoming_files(&self, name: &str) -> &[AxIncomingFile] {
+        self.multipart
+            .as_ref()
+            .map(|form| form.files(name))
+            .unwrap_or_default()
     }
 
     pub fn json_field_value(&self, name: &str) -> Option<serde_json::Value> {
@@ -1413,11 +1568,11 @@ pub mod prelude {
         html_stream_response, no_store_middleware, require_bearer_middleware,
         require_session_middleware, require_signed_session_middleware, security_headers_middleware,
         status_reason, AxAfterMiddleware, AxAuth, AxBeforeMiddleware, AxBody, AxBodyChunks,
-        AxCookie, AxHtmlStream, AxHttpRequest, AxHttpResponse, AxMemoryServerAdapter,
-        AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult, AxRequestContext,
-        AxResponseContext, AxRouteBuildError, AxRouteDefinition, AxRouteHandler, AxRouteHook,
-        AxRouteTable, AxRouteTarget, AxServer, AxServerAdapter, AxServerConfig, AxServerMode,
-        AxSseEvent, AxUnknownMiddlewareHook,
+        AxCookie, AxHtmlStream, AxHttpRequest, AxHttpResponse, AxIncomingFile,
+        AxMemoryServerAdapter, AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult,
+        AxMultipartForm, AxRequestContext, AxResponseContext, AxRouteBuildError, AxRouteDefinition,
+        AxRouteHandler, AxRouteHook, AxRouteTable, AxRouteTarget, AxServer, AxServerAdapter,
+        AxServerConfig, AxServerMode, AxSseEvent, AxUnknownMiddlewareHook,
     };
 
     #[cfg(feature = "axum")]
@@ -1958,6 +2113,82 @@ mod tests {
             assert_eq!(request.target, "/api/posts?draft=true");
             assert_eq!(request.header_value("authorization"), Some("Bearer token"));
             assert_eq!(request.body_text_lossy(), "title=Hello");
+        });
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn axum_request_conversion_parses_bounded_multipart_fields_and_files() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime should build for multipart tests");
+
+        runtime.block_on(async {
+            let boundary = "AXONYX-BOUNDARY";
+            let body = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\nHello Axonyx\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"../cover.png\"\r\nContent-Type: image/png\r\n\r\nPNG-A\r\n\
+                 --{boundary}\r\nContent-Disposition: form-data; name=\"image\"; filename=\"cover-2.png\"\r\nContent-Type: image/png\r\n\r\nPNG-B\r\n\
+                 --{boundary}--\r\n"
+            );
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/__axonyx/action")
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(axum::body::Body::from(body))
+                .expect("multipart request should build");
+
+            let request = axum_request_to_axonyx_with_limit(request, 1024)
+                .await
+                .expect("multipart request should convert");
+
+            assert!(request.body.is_empty());
+            assert_eq!(request.form_value("title").as_deref(), Some("Hello Axonyx"));
+            let files = request.incoming_files("image");
+            assert_eq!(files.len(), 2);
+            assert_eq!(files[0].file_name, "cover.png");
+            assert_eq!(files[0].content_type.as_deref(), Some("image/png"));
+            assert_eq!(files[0].bytes, b"PNG-A");
+            assert_eq!(files[0].size(), 5);
+            assert_eq!(
+                request.incoming_file("image").map(|file| file.file_name.as_str()),
+                Some("cover.png")
+            );
+        });
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn axum_request_conversion_rejects_oversized_multipart_body() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .expect("Tokio runtime should build for multipart tests");
+
+        runtime.block_on(async {
+            let boundary = "AXONYX-LIMIT";
+            let body = format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"title\"\r\n\r\n{}\r\n--{boundary}--\r\n",
+                "x".repeat(256)
+            );
+            let request = axum::http::Request::builder()
+                .method("POST")
+                .uri("/__axonyx/action")
+                .header(
+                    axum::http::header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(axum::body::Body::from(body))
+                .expect("multipart request should build");
+
+            let error = axum_request_to_axonyx_with_limit(request, 128)
+                .await
+                .expect_err("multipart body above the configured limit should fail");
+            assert!(error.to_string().to_ascii_lowercase().contains("stream"));
         });
     }
 
