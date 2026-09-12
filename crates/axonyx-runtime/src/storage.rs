@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 
@@ -235,10 +236,12 @@ fn object_path(id: &str, file_name: &str) -> Result<PathBuf, AxStorageError> {
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
+    let digest = Sha256::digest(bytes);
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut output, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    output
 }
 
 pub mod prelude {
