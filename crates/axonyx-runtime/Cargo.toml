@@ -38,8 +38,10 @@ bytes.workspace = true
 axonyx-core = { version = "0.3.0", path = "../axonyx-core" }
 axum = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+multer = { workspace = true, optional = true }
+encoding_rs.workspace = true
 tokio = { workspace = true, optional = true, features = ["net", "rt-multi-thread"] }
 
 [features]
 default = []
-axum = ["dep:axum", "dep:futures-util", "dep:tokio"]
+axum = ["dep:axum", "dep:futures-util", "dep:multer", "dep:tokio"]
