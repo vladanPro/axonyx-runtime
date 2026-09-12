@@ -76,6 +76,7 @@ pub struct AxLanguageSymbol {
     pub column: usize,
     pub kind: AxLanguageSymbolKind,
     pub signature: String,
+    pub documentation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -254,11 +255,35 @@ pub fn ax_source_imports(path: &str, source: &str) -> Vec<AxLanguageImport> {
 }
 
 pub fn ax_source_symbols(_path: &str, source: &str) -> Vec<AxLanguageSymbol> {
-    source
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| parse_language_symbol(line, index + 1))
-        .collect()
+    let mut symbols = Vec::new();
+    let mut documentation = Vec::new();
+
+    for (index, line) in source.lines().enumerate() {
+        if let Some(line) = language_documentation_line(line) {
+            documentation.push(line.to_string());
+            continue;
+        }
+
+        if let Some(mut symbol) = parse_language_symbol(line, index + 1) {
+            let value = documentation.join("\n");
+            if !value.trim().is_empty() {
+                symbol.documentation = Some(value);
+            }
+            symbols.push(symbol);
+        }
+        documentation.clear();
+    }
+
+    symbols
+}
+
+fn language_documentation_line(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with("////") {
+        return None;
+    }
+    let content = trimmed.strip_prefix("///")?;
+    Some(content.strip_prefix(' ').unwrap_or(content))
 }
 
 pub fn ax_source_identifier_occurrences(source: &str) -> Vec<AxLanguageIdentifierOccurrence> {
@@ -853,6 +878,7 @@ fn parse_language_symbol(line: &str, line_number: usize) -> Option<AxLanguageSym
             column: line[..name_offset].encode_utf16().count() + 1,
             kind,
             signature: declaration_signature(declaration),
+            documentation: None,
         });
     }
 
@@ -1319,6 +1345,51 @@ mod tests {
         assert_eq!(backend[1].line, 5);
         assert_eq!(backend[1].kind, AxLanguageSymbolKind::Function);
         assert_eq!(backend[1].signature, "fn visible(post: Post) -> Bool");
+    }
+
+    #[test]
+    fn attaches_contiguous_documentation_comments_to_language_symbols() {
+        let symbols = ax_source_symbols(
+            "app/components/Card.asx",
+            concat!(
+                "/// Renders a forged content surface.\n",
+                "///\n",
+                "/// Use `tone` to communicate emphasis.\n",
+                "component Card(tone: String = \"default\") {\n",
+                "  render ASX { <article /> }\n",
+                "}\n",
+                "\n",
+                "  /// Returns whether a post is visible.\n",
+                "  export fn visible() -> Bool { return true }\n",
+            ),
+        );
+
+        assert_eq!(
+            symbols[0].documentation.as_deref(),
+            Some("Renders a forged content surface.\n\nUse `tone` to communicate emphasis.")
+        );
+        assert_eq!(
+            symbols[1].documentation.as_deref(),
+            Some("Returns whether a post is visible.")
+        );
+    }
+
+    #[test]
+    fn does_not_attach_non_doc_or_detached_comments() {
+        let symbols = ax_source_symbols(
+            "app/domain.ax",
+            concat!(
+                "/// Detached documentation.\n",
+                "\n",
+                "export fn first() -> Bool { return true }\n",
+                "// Ordinary comment.\n",
+                "export fn second() -> Bool { return true }\n",
+                "//// Four slashes remain an ordinary comment.\n",
+                "export fn third() -> Bool { return true }\n",
+            ),
+        );
+
+        assert!(symbols.iter().all(|symbol| symbol.documentation.is_none()));
     }
 
     #[test]
