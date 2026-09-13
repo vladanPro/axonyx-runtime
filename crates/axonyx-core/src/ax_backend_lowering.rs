@@ -321,6 +321,12 @@ pub enum AxBackendLowerError {
     EmptyRouteMethod,
     #[error("input field type cannot be empty for `{field}`")]
     EmptyInputType { field: String },
+    #[error("File input `{field}` is only supported by server actions")]
+    FileInputOutsideAction { field: String },
+    #[error("File input `{field}` must be required and cannot have a default value yet")]
+    OptionalFileInput { field: String },
+    #[error("FileRef input `{field}` must be required and cannot have a default value yet")]
+    OptionalFileRefInput { field: String },
     #[error("invalid runtime env path `{path}`")]
     InvalidRuntimeEnvPath { path: String },
     #[error("duplicate backend type declaration `{name}`")]
@@ -451,7 +457,7 @@ fn lower_function(function: &AxBackendFunction) -> Result<AxFunctionPlan, AxBack
     let input = function
         .input
         .iter()
-        .map(lower_input_field)
+        .map(lower_non_action_input_field)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AxFunctionPlan {
@@ -482,7 +488,7 @@ fn lower_route(route: &AxRoute) -> Result<AxHandlerPlan, AxBackendLowerError> {
     let input = route
         .input
         .iter()
-        .map(lower_input_field)
+        .map(lower_non_action_input_field)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AxHandlerPlan {
@@ -507,7 +513,7 @@ fn lower_loader(loader: &AxLoader) -> Result<AxHandlerPlan, AxBackendLowerError>
     let input = loader
         .input
         .iter()
-        .map(lower_input_field)
+        .map(lower_non_action_input_field)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AxHandlerPlan {
@@ -530,7 +536,7 @@ fn lower_action(action: &AxAction) -> Result<AxHandlerPlan, AxBackendLowerError>
     let input = action
         .input
         .iter()
-        .map(lower_input_field)
+        .map(lower_action_input_field)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AxHandlerPlan {
@@ -571,6 +577,29 @@ fn lower_input_field(field: &AxField) -> Result<AxFieldPlan, AxBackendLowerError
         optional: field.optional,
         default: field.default.as_ref().map(lower_expr),
     })
+}
+
+fn lower_non_action_input_field(field: &AxField) -> Result<AxFieldPlan, AxBackendLowerError> {
+    if field.ty.trim() == "File" {
+        return Err(AxBackendLowerError::FileInputOutsideAction {
+            field: field.name.clone(),
+        });
+    }
+    if field.ty.trim() == "FileRef" && (field.optional || field.default.is_some()) {
+        return Err(AxBackendLowerError::OptionalFileRefInput {
+            field: field.name.clone(),
+        });
+    }
+    lower_input_field(field)
+}
+
+fn lower_action_input_field(field: &AxField) -> Result<AxFieldPlan, AxBackendLowerError> {
+    if field.ty.trim() == "File" && (field.optional || field.default.is_some()) {
+        return Err(AxBackendLowerError::OptionalFileInput {
+            field: field.name.clone(),
+        });
+    }
+    lower_input_field(field)
 }
 
 fn lower_env(env: &AxBackendEnv) -> AxEnvPlan {
@@ -1009,6 +1038,8 @@ fn map_input_type(ty: &str) -> String {
         "i64" | "int" | "integer" => "i64".to_string(),
         "u64" => "u64".to_string(),
         "f64" | "float" | "number" => "f64".to_string(),
+        "File" => "AxIncomingFile".to_string(),
+        "FileRef" => "AxFileRef".to_string(),
         other => other.to_string(),
     }
 }
@@ -1856,6 +1887,54 @@ loader SiteConfig
                     r#"runtime.env().value("PUBLIC_SITE_URL")?"#
                 )),
             }
+        );
+    }
+
+    #[test]
+    fn lowers_required_action_file_into_incoming_file() {
+        let document = parse_backend_ax(
+            r#"
+action UploadImage(image: File) -> FileRef {
+  return json(input.image)
+}
+"#,
+        )
+        .expect("file action should parse");
+
+        let plan = lower_backend_document(&document).expect("file action should lower");
+        let AxHandlerKind::Action { input, returns } = &plan.handlers[0].kind else {
+            panic!("expected action plan");
+        };
+        assert_eq!(returns.as_deref(), Some("FileRef"));
+        assert_eq!(input[0].rust_ty, "AxIncomingFile");
+    }
+
+    #[test]
+    fn rejects_file_inputs_outside_actions_and_optional_files() {
+        let loader = parse_backend_ax(
+            r#"loader Avatar(file: File) -> String {
+  return "avatar"
+}"#,
+        )
+        .expect("loader should parse");
+        assert_eq!(
+            lower_backend_document(&loader),
+            Err(AxBackendLowerError::FileInputOutsideAction {
+                field: "file".to_string(),
+            })
+        );
+
+        let action = parse_backend_ax(
+            r#"action Upload(file?: File) {
+  return ok
+}"#,
+        )
+        .expect("action should parse");
+        assert_eq!(
+            lower_backend_document(&action),
+            Err(AxBackendLowerError::OptionalFileInput {
+                field: "file".to_string(),
+            })
         );
     }
 }

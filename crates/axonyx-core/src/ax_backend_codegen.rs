@@ -76,6 +76,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("use std::collections::BTreeMap;\n\n");
     out.push_str("use axonyx_runtime::backend_prelude::*;\n");
     out.push_str("use axonyx_runtime::server_prelude::*;\n");
+    out.push_str("use axonyx_runtime::storage_prelude::*;\n");
     out.push_str("use serde_json::{json, Value};\n\n");
 
     validate_type_contracts(&plan.types, &plan.literal_unions)?;
@@ -275,6 +276,7 @@ fn rust_function_return_type(ty: &AxType, function: &str) -> Result<String, AxBa
         AxType::Int => "i64".to_string(),
         AxType::Bool => "bool".to_string(),
         AxType::Bytes => "Vec<u8>".to_string(),
+        AxType::FileRef => "AxFileRef".to_string(),
         AxType::Json | AxType::Unknown => "Value".to_string(),
         AxType::Void => "()".to_string(),
         AxType::List(inner) => format!("Vec<{}>", rust_function_return_type(inner, function)?),
@@ -299,7 +301,11 @@ fn rust_function_return_type(ty: &AxType, function: &str) -> Result<String, AxBa
             rust_function_return_type(inner, function)?
         }
         AxType::Record(name) => name.clone(),
-        AxType::Decimal | AxType::Never | AxType::Signal(_) | AxType::Resource(_, _) => {
+        AxType::Decimal
+        | AxType::File
+        | AxType::Never
+        | AxType::Signal(_)
+        | AxType::Resource(_, _) => {
             return Err(AxBackendCodegenError::UnsupportedFunctionReturnType {
                 function: function.to_string(),
                 ty: ty.display_name(),
@@ -550,6 +556,7 @@ fn rust_contract_type(
         AxType::Int => "i64".to_string(),
         AxType::Bool => "bool".to_string(),
         AxType::Bytes => "Vec<u8>".to_string(),
+        AxType::FileRef => "AxFileRef".to_string(),
         AxType::Json | AxType::Unknown => "Value".to_string(),
         AxType::List(inner) => format!("Vec<{}>", rust_contract_type(inner, record, field)?),
         AxType::Optional(inner) => {
@@ -577,7 +584,11 @@ fn rust_contract_type(
         ),
         AxType::Secret(inner) | AxType::Public(inner) => rust_contract_type(inner, record, field)?,
         AxType::Record(name) => name.clone(),
-        AxType::Never | AxType::Void | AxType::Signal(_) | AxType::Resource(_, _) => {
+        AxType::File
+        | AxType::Never
+        | AxType::Void
+        | AxType::Signal(_)
+        | AxType::Resource(_, _) => {
             return Err(AxBackendCodegenError::UnsupportedContractType {
                 record: record.name.clone(),
                 field: field.name.clone(),
@@ -897,6 +908,8 @@ fn render_ax_type_expr(ty: &AxType) -> String {
         AxType::Time => "AxType::Time".to_string(),
         AxType::Uuid => "AxType::Uuid".to_string(),
         AxType::Bytes => "AxType::Bytes".to_string(),
+        AxType::File => "AxType::File".to_string(),
+        AxType::FileRef => "AxType::FileRef".to_string(),
         AxType::Json => "AxType::Json".to_string(),
         AxType::Never => "AxType::Never".to_string(),
         AxType::Void => "AxType::Void".to_string(),
@@ -964,6 +977,13 @@ fn render_route_input_binding(handler: &AxHandlerPlan, input: &[AxFieldPlan]) ->
 }
 
 fn render_route_input_field(field: &AxFieldPlan) -> String {
+    if field.rust_ty == "AxIncomingFile" {
+        let missing_error = format!("missing required file input `{}`", field.name);
+        return format!(
+            "request.incoming_file({:?}).cloned().ok_or_else(|| AxRuntimeError::message({missing_error:?}))?",
+            field.name
+        );
+    }
     let raw = format!("__ax_request_input_field(request, {:?})", field.name);
     render_input_field(field, &raw)
 }
@@ -986,6 +1006,10 @@ fn render_input_field(field: &AxFieldPlan, raw: &str) -> String {
                 "{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?.trim().parse::<{}>().map_err(|_| AxRuntimeError::message({:?}))?",
                 field.rust_ty,
                 format!("input `{}` expected {}", field.name, field.rust_ty)
+            ),
+            "AxFileRef" => format!(
+                "serde_json::from_str::<AxFileRef>(&{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?).map_err(|_| AxRuntimeError::message({:?}))?",
+                format!("input `{}` expected FileRef", field.name)
             ),
             _ => format!("{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?"),
         };
@@ -2462,5 +2486,22 @@ action Refresh {
         assert!(module.contains("let input = ActionPublishPostInput"));
         assert!(module.contains("\"Refresh\" =>"));
         assert!(module.contains("action_refresh(runtime).map(Some)"));
+    }
+
+    #[test]
+    fn compiles_action_file_input_from_multipart_request() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action UploadImage(image: File) -> FileRef {
+  return json(input.image)
+}
+"#,
+        )
+        .expect("file action should compile");
+
+        assert!(module.contains("pub image: AxIncomingFile"));
+        assert!(module.contains("request.incoming_file(\"image\").cloned()"));
+        assert!(module.contains("missing required file input `image`"));
+        assert!(module.contains("use axonyx_runtime::storage_prelude::*;"));
     }
 }
