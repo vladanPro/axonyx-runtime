@@ -4077,8 +4077,8 @@ fn ax_action_script() -> &'static str {
     xhr.open(form.method || "POST", form.action, true);
     Object.entries(headers).forEach(([name, value]) => xhr.setRequestHeader(name, value));
     xhr.upload.addEventListener("loadstart", () => {
-      updateUploadProgress(form, "uploading", 0, 0);
       window.dispatchEvent(new CustomEvent("axonyx:upload-start", { detail: { form } }));
+      updateUploadProgress(form, "uploading", 0, 0);
     });
     xhr.upload.addEventListener("progress", (event) => {
       updateUploadProgress(form, "uploading", event.loaded, event.lengthComputable ? event.total : 0);
