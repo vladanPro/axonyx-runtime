@@ -96,6 +96,8 @@ pub enum AxType {
     Time,
     Uuid,
     Bytes,
+    File,
+    FileRef,
     Json,
     Never,
     Void,
@@ -141,6 +143,8 @@ impl AxType {
             Self::Time => "Time".to_string(),
             Self::Uuid => "Uuid".to_string(),
             Self::Bytes => "Bytes".to_string(),
+            Self::File => "File".to_string(),
+            Self::FileRef => "FileRef".to_string(),
             Self::Json => "Json".to_string(),
             Self::Never => "Never".to_string(),
             Self::Void => "Void".to_string(),
@@ -182,6 +186,7 @@ impl AxType {
     pub fn supports_client_state(&self) -> bool {
         match self {
             Self::Decimal
+            | Self::File
             | Self::Never
             | Self::Void
             | Self::Secret(_)
@@ -215,6 +220,7 @@ impl AxType {
             Self::Bytes => matches!(value, AxExpr::List(items) if items.iter().all(|item| {
                 matches!(item, AxExpr::Number(number) if (0..=255).contains(number))
             })),
+            Self::File | Self::FileRef => false,
             Self::Json | Self::Unknown => matches!(
                 value,
                 AxExpr::String(_)
@@ -538,6 +544,44 @@ impl AxDataContext {
                 }
                 _ => Err(mismatch("expected an array of byte integers (0..255)")),
             },
+            AxType::File => Err(mismatch(
+                "File is a server-only multipart input and cannot cross a JSON boundary",
+            )),
+            AxType::FileRef => {
+                let Value::Object(fields) = value else {
+                    return Err(mismatch("expected a FileRef JSON object"));
+                };
+                for field in ["id", "storage", "file_name"] {
+                    if !fields.get(field).is_some_and(Value::is_string) {
+                        return Err(AxJsonValidationError::new(
+                            format!("{path}.{field}"),
+                            "String",
+                            fields.get(field).map_or("missing", json_kind),
+                            "required FileRef string field is missing or invalid",
+                        ));
+                    }
+                }
+                if !matches!(fields.get("size"), Some(value) if value.as_u64().is_some()) {
+                    return Err(AxJsonValidationError::new(
+                        format!("{path}.size"),
+                        "Int",
+                        fields.get("size").map_or("missing", json_kind),
+                        "required FileRef size is missing or invalid",
+                    ));
+                }
+                if fields
+                    .get("content_type")
+                    .is_some_and(|value| !value.is_null() && !value.is_string())
+                {
+                    return Err(AxJsonValidationError::new(
+                        format!("{path}.content_type"),
+                        "Optional<String>",
+                        fields.get("content_type").map_or("missing", json_kind),
+                        "FileRef content_type must be a string or null",
+                    ));
+                }
+                Ok(())
+            }
             AxType::Json | AxType::Unknown => Ok(()),
             AxType::Never => Err(mismatch("Never cannot have a response value")),
             AxType::Void => value
@@ -900,6 +944,15 @@ impl AxDataContext {
         property: &str,
     ) -> Result<AxType, AxTypeError> {
         match object_type {
+            AxType::FileRef => match property {
+                "id" | "storage" | "file_name" => Ok(AxType::String),
+                "content_type" => Ok(AxType::optional(AxType::String)),
+                "size" => Ok(AxType::Int),
+                field => Err(AxTypeError::UnknownField {
+                    record: "FileRef".to_string(),
+                    field: field.to_string(),
+                }),
+            },
             AxType::Record(record_name) => {
                 let record =
                     self.records
@@ -1091,6 +1144,8 @@ fn parse_type_annotation(input: &str) -> Result<AxType, AxTypeParseError> {
         "Time" => AxType::Time,
         "Uuid" => AxType::Uuid,
         "Bytes" => AxType::Bytes,
+        "File" => AxType::File,
+        "FileRef" => AxType::FileRef,
         "Json" => AxType::Json,
         "Never" => AxType::Never,
         "Void" => AxType::Void,
@@ -2333,5 +2388,38 @@ return ASX {
                 message: "unknown binding `post`".to_string(),
             }]
         );
+    }
+
+    #[test]
+    fn parses_file_contract_types_as_builtins() {
+        assert_eq!(AxType::parse_annotation("File"), Ok(AxType::File));
+        assert_eq!(AxType::parse_annotation("FileRef"), Ok(AxType::FileRef));
+        assert!(!AxType::File.supports_client_state());
+        assert!(AxType::FileRef.supports_client_state());
+    }
+
+    #[test]
+    fn validates_public_file_ref_shape_but_rejects_file_json() {
+        let context = AxDataContext::new();
+        let file_ref = serde_json::json!({
+            "id": "a".repeat(64),
+            "storage": "media",
+            "file_name": "photo.png",
+            "content_type": "image/png",
+            "size": 128
+        });
+
+        assert!(context.validate_json(&AxType::FileRef, &file_ref).is_ok());
+        assert!(context
+            .validate_json(&AxType::File, &file_ref)
+            .expect_err("File must not cross JSON")
+            .reason
+            .contains("server-only"));
+        assert!(context
+            .validate_json(
+                &AxType::FileRef,
+                &serde_json::json!({"storage": "media", "size": "large"}),
+            )
+            .is_err());
     }
 }
