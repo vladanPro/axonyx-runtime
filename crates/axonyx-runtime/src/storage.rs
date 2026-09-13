@@ -9,20 +9,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::server::AxIncomingFile;
+use crate::server::{AxFileRef, AxIncomingFile};
 
 const MAX_CAPABILITY_NAME_BYTES: usize = 64;
 const MAX_FILE_NAME_BYTES: usize = 255;
 const MAX_CONTENT_TYPE_BYTES: usize = 255;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct AxFileRef {
-    pub id: String,
-    pub storage: String,
-    pub file_name: String,
-    pub content_type: Option<String>,
-    pub size: u64,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -331,9 +322,9 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 pub mod prelude {
-    pub use super::{
-        AxCapabilityStorage, AxFileRef, AxStorageAccess, AxStorageError, AxStorageRegistry,
-    };
+    pub use crate::server::AxFileRef;
+
+    pub use super::{AxCapabilityStorage, AxStorageAccess, AxStorageError, AxStorageRegistry};
 }
 
 #[cfg(test)]
