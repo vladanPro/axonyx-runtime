@@ -76,7 +76,6 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("use std::collections::BTreeMap;\n\n");
     out.push_str("use axonyx_runtime::backend_prelude::*;\n");
     out.push_str("use axonyx_runtime::server_prelude::*;\n");
-    out.push_str("use axonyx_runtime::storage_prelude::*;\n");
     out.push_str("use serde_json::{json, Value};\n\n");
 
     validate_type_contracts(&plan.types, &plan.literal_unions)?;
@@ -2502,6 +2501,6 @@ action UploadImage(image: File) -> FileRef {
         assert!(module.contains("pub image: AxIncomingFile"));
         assert!(module.contains("request.incoming_file(\"image\").cloned()"));
         assert!(module.contains("missing required file input `image`"));
-        assert!(module.contains("use axonyx_runtime::storage_prelude::*;"));
+        assert!(!module.contains("storage_prelude"));
     }
 }

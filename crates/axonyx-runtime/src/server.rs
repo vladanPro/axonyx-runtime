@@ -64,6 +64,15 @@ impl AxIncomingFile {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AxFileRef {
+    pub id: String,
+    pub storage: String,
+    pub file_name: String,
+    pub content_type: Option<String>,
+    pub size: u64,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AxMultipartForm {
     pub fields: BTreeMap<String, String>,
@@ -1568,7 +1577,7 @@ pub mod prelude {
         html_stream_response, no_store_middleware, require_bearer_middleware,
         require_session_middleware, require_signed_session_middleware, security_headers_middleware,
         status_reason, AxAfterMiddleware, AxAuth, AxBeforeMiddleware, AxBody, AxBodyChunks,
-        AxCookie, AxHtmlStream, AxHttpRequest, AxHttpResponse, AxIncomingFile,
+        AxCookie, AxFileRef, AxHtmlStream, AxHttpRequest, AxHttpResponse, AxIncomingFile,
         AxMemoryServerAdapter, AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult,
         AxMultipartForm, AxRequestContext, AxResponseContext, AxRouteBuildError, AxRouteDefinition,
         AxRouteHandler, AxRouteHook, AxRouteTable, AxRouteTarget, AxServer, AxServerAdapter,
