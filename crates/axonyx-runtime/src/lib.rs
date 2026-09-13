@@ -632,6 +632,13 @@ struct PreviewBackendContext<'a> {
     runtime: Option<&'a dyn backend::AxBackendRuntime>,
 }
 
+struct PreviewActionContext<'a> {
+    env: &'a backend::AxEnv,
+    runtime: Option<&'a dyn backend::AxBackendRuntime>,
+    request: Option<&'a server::AxHttpRequest>,
+    storage: Option<&'a dyn server::AxFileStorage>,
+}
+
 struct PreviewResponseValidation<'a> {
     enabled: bool,
     type_context: &'a AxDataContext,
@@ -937,8 +944,12 @@ pub fn execute_preview_action_sources(
         &handlers.functions,
         action_name,
         input_fields,
-        &env,
-        None,
+        PreviewActionContext {
+            env: &env,
+            runtime: None,
+            request: None,
+            storage: None,
+        },
         store,
     )
 }
@@ -956,8 +967,60 @@ pub fn execute_preview_action_sources_with_runtime(
         &handlers.functions,
         action_name,
         input_fields,
-        runtime.env(),
-        Some(runtime),
+        PreviewActionContext {
+            env: runtime.env(),
+            runtime: Some(runtime),
+            request: None,
+            storage: None,
+        },
+        store,
+    )
+}
+
+pub fn execute_preview_action_request_sources_with_storage(
+    action_sources: &[&str],
+    action_name: &str,
+    request: &server::AxHttpRequest,
+    storage: &dyn server::AxFileStorage,
+    store: &mut AxPreviewStore,
+) -> Result<AxPreviewActionResult, PreviewError> {
+    let handlers = collect_preview_handlers(&[], action_sources, &[])?;
+    let env = backend::AxEnv::from_env();
+    execute_preview_action(
+        &handlers.actions,
+        &handlers.functions,
+        action_name,
+        &BTreeMap::new(),
+        PreviewActionContext {
+            env: &env,
+            runtime: None,
+            request: Some(request),
+            storage: Some(storage),
+        },
+        store,
+    )
+}
+
+pub fn execute_preview_action_request_sources_with_runtime_and_storage(
+    action_sources: &[&str],
+    action_name: &str,
+    request: &server::AxHttpRequest,
+    runtime: &dyn backend::AxBackendRuntime,
+    storage: &dyn server::AxFileStorage,
+    store: &mut AxPreviewStore,
+) -> Result<AxPreviewActionResult, PreviewError> {
+    let handlers = collect_preview_handlers(&[], action_sources, &[])?;
+    execute_preview_action(
+        &handlers.actions,
+        &handlers.functions,
+        action_name,
+        &BTreeMap::new(),
+        PreviewActionContext {
+            env: runtime.env(),
+            runtime: Some(runtime),
+            request: Some(request),
+            storage: Some(storage),
+        },
         store,
     )
 }
@@ -1430,6 +1493,11 @@ fn execute_preview_function(
                         ),
                     });
                 }
+                AxValuePlan::StorageSave { .. } => {
+                    return Err(PreviewError::Runtime {
+                        message: format!("function `{}` cannot call Storage.save", function.name),
+                    });
+                }
             },
             AxStepPlan::Return(value) => {
                 return eval_preview_return_with_functions(value, &scope, env, functions)
@@ -1494,10 +1562,15 @@ fn execute_preview_action(
     functions: &BTreeMap<String, AxFunctionPlan>,
     action_name: &str,
     input_fields: &BTreeMap<String, String>,
-    env: &backend::AxEnv,
-    runtime: Option<&dyn backend::AxBackendRuntime>,
+    context: PreviewActionContext<'_>,
     store: &mut AxPreviewStore,
 ) -> Result<AxPreviewActionResult, PreviewError> {
+    let PreviewActionContext {
+        env,
+        runtime,
+        request,
+        storage,
+    } = context;
     let action = actions
         .get(action_name)
         .ok_or_else(|| PreviewError::Runtime {
@@ -1513,7 +1586,7 @@ fn execute_preview_action(
     let mut scope = BTreeMap::new();
     scope.insert(
         "input".to_string(),
-        build_preview_input_record(input, input_fields)?,
+        build_preview_input_record(input, input_fields, request)?,
     );
 
     let mut redirect_to = None;
@@ -1527,9 +1600,33 @@ fn execute_preview_action(
                 binding,
                 value: plan,
             } => {
-                let evaluated = eval_preview_value_with_functions(
-                    plan, &scope, env, runtime, store, functions,
-                )?;
+                let evaluated = match plan {
+                    AxValuePlan::StorageSave { capability, input } => {
+                        let request = request.ok_or_else(|| PreviewError::Runtime {
+                            message: "Storage.save requires an HTTP action request".to_string(),
+                        })?;
+                        let storage = storage.ok_or_else(|| PreviewError::Runtime {
+                            message: "Storage.save requires a configured storage runtime"
+                                .to_string(),
+                        })?;
+                        let file =
+                            request
+                                .incoming_file(input)
+                                .ok_or_else(|| PreviewError::Runtime {
+                                    message: format!("missing required file input `{input}`"),
+                                })?;
+                        let file_ref = storage.save_file(capability, file)?;
+                        let value = serde_json::to_value(file_ref).map_err(|error| {
+                            PreviewError::Runtime {
+                                message: format!("failed to serialize FileRef: {error}"),
+                            }
+                        })?;
+                        preview_json_to_value(value)
+                    }
+                    _ => eval_preview_value_with_functions(
+                        plan, &scope, env, runtime, store, functions,
+                    )?,
+                };
                 scope.insert(binding.clone(), evaluated);
             }
             AxStepPlan::Insert { collection, fields } => {
@@ -2120,6 +2217,9 @@ fn eval_preview_value_with_functions(
         AxValuePlan::Query(query) => {
             eval_preview_query_with_functions(query, scope, env, runtime, store, functions)
         }
+        AxValuePlan::StorageSave { .. } => Err(PreviewError::Runtime {
+            message: "Storage.save is only evaluated by an HTTP action runtime".to_string(),
+        }),
     }
 }
 
@@ -2986,10 +3086,26 @@ fn eval_preview_filters_with_functions(
 fn build_preview_input_record(
     fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
     input_fields: &BTreeMap<String, String>,
+    request: Option<&server::AxHttpRequest>,
 ) -> Result<AxValue, PreviewError> {
     let mut record = BTreeMap::new();
     for field in fields {
-        let Some(value) = input_fields.get(&field.name).cloned() else {
+        if field.rust_ty == "AxIncomingFile" {
+            if request
+                .and_then(|request| request.incoming_file(&field.name))
+                .is_none()
+            {
+                return Err(PreviewError::Runtime {
+                    message: format!("missing required file input `{}`", field.name),
+                });
+            }
+            continue;
+        }
+        let value = input_fields
+            .get(&field.name)
+            .cloned()
+            .or_else(|| request.and_then(|request| request.form_value(&field.name)));
+        let Some(value) = value else {
             if let Some(default) = &field.default {
                 record.insert(
                     field.name.clone(),
@@ -3065,7 +3181,7 @@ fn build_preview_route_input_record(
         })
         .collect::<BTreeMap<_, _>>();
 
-    build_preview_input_record(fields, &input_fields)
+    build_preview_input_record(fields, &input_fields, Some(request))
 }
 
 fn coerce_preview_loader_input_value(
@@ -8007,6 +8123,58 @@ page Posts
         .expect("page should render with mutated store");
 
         assert!(html.contains("Axonyx Forms"));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn preview_action_saves_multipart_file_through_named_capability() {
+        let root = std::env::temp_dir().join(format!(
+            "axonyx-preview-storage-action-{}",
+            std::process::id()
+        ));
+        let storage =
+            storage::AxCapabilityStorage::open("media", &root, 1024).expect("storage should open");
+        let mut registry = storage::AxStorageRegistry::new();
+        registry.register(storage).expect("storage should register");
+
+        let mut request = server::AxHttpRequest::new("POST", "/__axonyx/action");
+        request.multipart = Some(server::AxMultipartForm {
+            fields: BTreeMap::new(),
+            files: BTreeMap::from([(
+                "image".to_string(),
+                vec![server::AxIncomingFile {
+                    field_name: "image".to_string(),
+                    file_name: "photo.png".to_string(),
+                    content_type: Some("image/png".to_string()),
+                    bytes: b"axonyx-image".to_vec(),
+                }],
+            )]),
+        });
+
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_request_sources_with_storage(
+            &[r#"
+action UploadImage(image: File) -> FileRef {
+  data saved = Storage.save("media", input.image)
+  return json(saved)
+}
+"#],
+            "UploadImage",
+            &request,
+            &registry,
+            &mut store,
+        )
+        .expect("storage action should execute");
+        let value = preview_value_to_json(&result.value);
+
+        assert_eq!(value["storage"], "media");
+        assert_eq!(value["file_name"], "photo.png");
+        assert_eq!(value["content_type"], "image/png");
+        assert_eq!(value["size"], 12);
+        assert_eq!(value["id"].as_str().map(str::len), Some(64));
+
+        drop(registry);
+        std::fs::remove_dir_all(root).expect("storage should clean up");
     }
 
     #[test]

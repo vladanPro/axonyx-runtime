@@ -9,7 +9,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-use crate::server::{AxFileRef, AxIncomingFile};
+use crate::backend::{AxRuntimeError, AxRuntimeResult};
+use crate::server::{AxFileRef, AxFileStorage, AxIncomingFile};
 
 const MAX_CAPABILITY_NAME_BYTES: usize = 64;
 const MAX_FILE_NAME_BYTES: usize = 255;
@@ -255,6 +256,14 @@ impl AxStorageRegistry {
 
     pub fn len(&self) -> usize {
         self.capabilities.len()
+    }
+}
+
+impl AxFileStorage for AxStorageRegistry {
+    fn save_file(&self, capability: &str, file: &AxIncomingFile) -> AxRuntimeResult<AxFileRef> {
+        self.get(capability)
+            .and_then(|storage| storage.store(file))
+            .map_err(|error| AxRuntimeError::message(error.to_string()))
     }
 }
 
