@@ -73,6 +73,29 @@ pub struct AxFileRef {
     pub size: u64,
 }
 
+pub trait AxFileStorage: Send + Sync {
+    fn save_file(
+        &self,
+        capability: &str,
+        file: &AxIncomingFile,
+    ) -> crate::backend::AxRuntimeResult<AxFileRef>;
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct AxUnavailableFileStorage;
+
+impl AxFileStorage for AxUnavailableFileStorage {
+    fn save_file(
+        &self,
+        capability: &str,
+        _file: &AxIncomingFile,
+    ) -> crate::backend::AxRuntimeResult<AxFileRef> {
+        Err(crate::backend::AxRuntimeError::message(format!(
+            "storage capability `{capability}` is not available"
+        )))
+    }
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AxMultipartForm {
     pub fields: BTreeMap<String, String>,
@@ -1577,11 +1600,12 @@ pub mod prelude {
         html_stream_response, no_store_middleware, require_bearer_middleware,
         require_session_middleware, require_signed_session_middleware, security_headers_middleware,
         status_reason, AxAfterMiddleware, AxAuth, AxBeforeMiddleware, AxBody, AxBodyChunks,
-        AxCookie, AxFileRef, AxHtmlStream, AxHttpRequest, AxHttpResponse, AxIncomingFile,
-        AxMemoryServerAdapter, AxMiddlewareChain, AxMiddlewarePhase, AxMiddlewareResult,
-        AxMultipartForm, AxRequestContext, AxResponseContext, AxRouteBuildError, AxRouteDefinition,
-        AxRouteHandler, AxRouteHook, AxRouteTable, AxRouteTarget, AxServer, AxServerAdapter,
-        AxServerConfig, AxServerMode, AxSseEvent, AxUnknownMiddlewareHook,
+        AxCookie, AxFileRef, AxFileStorage, AxHtmlStream, AxHttpRequest, AxHttpResponse,
+        AxIncomingFile, AxMemoryServerAdapter, AxMiddlewareChain, AxMiddlewarePhase,
+        AxMiddlewareResult, AxMultipartForm, AxRequestContext, AxResponseContext,
+        AxRouteBuildError, AxRouteDefinition, AxRouteHandler, AxRouteHook, AxRouteTable,
+        AxRouteTarget, AxServer, AxServerAdapter, AxServerConfig, AxServerMode, AxSseEvent,
+        AxUnavailableFileStorage, AxUnknownMiddlewareHook,
     };
 
     #[cfg(feature = "axum")]

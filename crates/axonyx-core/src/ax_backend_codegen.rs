@@ -201,10 +201,12 @@ fn render_function_value_plan(
 ) -> Result<String, AxBackendCodegenError> {
     match value {
         AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
-        AxValuePlan::Query(_) => Err(AxBackendCodegenError::UnsupportedFunctionQueryBinding {
-            function: function.to_string(),
-            binding: binding.to_string(),
-        }),
+        AxValuePlan::Query(_) | AxValuePlan::StorageSave { .. } => {
+            Err(AxBackendCodegenError::UnsupportedFunctionQueryBinding {
+                function: function.to_string(),
+                binding: binding.to_string(),
+            })
+        }
     }
 }
 
@@ -645,11 +647,11 @@ fn render_handler_fn(
 ) -> Result<String, AxBackendCodegenError> {
     let signature = match &handler.kind {
         AxHandlerKind::Action { input, .. } if input.is_empty() => format!(
-            "pub fn {}(runtime: &impl AxBackendRuntime) -> AxRuntimeResult<Value>",
+            "pub fn {}(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage) -> AxRuntimeResult<Value>",
             handler.rust_fn
         ),
         AxHandlerKind::Action { .. } => format!(
-            "pub fn {}(runtime: &impl AxBackendRuntime, input: &{}) -> AxRuntimeResult<Value>",
+            "pub fn {}(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, input: &{}) -> AxRuntimeResult<Value>",
             handler.rust_fn,
             input_struct_name(&handler.rust_fn)
         ),
@@ -790,7 +792,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
     }
     out.push_str("    Ok(None)\n}\n\n");
 
-    out.push_str("pub fn dispatch_action(runtime: &impl AxBackendRuntime, name: &str, request: &AxHttpRequest) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
+    out.push_str("pub fn dispatch_action(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, name: &str, request: &AxHttpRequest) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
     for handler in &plan.handlers {
         let AxHandlerKind::Action { input, .. } = &handler.kind else {
             continue;
@@ -798,7 +800,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
         out.push_str(&format!("        {:?} => {{\n", handler.name));
         if input.is_empty() {
             out.push_str(&format!(
-                "            {}(runtime).map(Some)\n",
+                "            {}(runtime, storage).map(Some)\n",
                 handler.rust_fn
             ));
         } else {
@@ -815,7 +817,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
             }
             out.push_str("            };\n");
             out.push_str(&format!(
-                "            {}(runtime, &input).map(Some)\n",
+                "            {}(runtime, storage, &input).map(Some)\n",
                 handler.rust_fn
             ));
         }
@@ -1260,6 +1262,9 @@ fn render_route_hook_step(phase: AxHookPhasePlan, value: &AxRustExpr) -> String 
 fn render_value_plan(value: &AxValuePlan) -> String {
     match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
+        AxValuePlan::StorageSave { capability, input } => {
+            format!("json!(storage.save_file({capability:?}, &input.{input})?)")
+        }
         AxValuePlan::Query(query) => match &query.source {
             AxQuerySourcePlan::RawSql { .. } => {
                 format!("runtime.query(&{})?", render_raw_sql_query_plan(query))
@@ -1947,7 +1952,7 @@ action publishPost(id: String, title: String) {
         assert!(module.contains("loader_posts_list(runtime, &context).map(Some)"));
         assert!(module.contains("runtime.load(&AxQueryRequest"));
         assert!(module.contains("pub struct ActionCreatePostInput"));
-        assert!(module.contains("pub fn action_create_post(runtime: &impl AxBackendRuntime, input: &ActionCreatePostInput)"));
+        assert!(module.contains("pub fn action_create_post(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, input: &ActionCreatePostInput)"));
         assert!(module.contains("runtime.insert(&AxInsertRequest"));
         assert!(module.contains(
             "__ax_push_invalidation(&mut __ax_invalidations, \"posts\".to_string(), false)"
@@ -2484,7 +2489,7 @@ action Refresh {
         assert!(module.contains("\"PublishPost\" =>"));
         assert!(module.contains("let input = ActionPublishPostInput"));
         assert!(module.contains("\"Refresh\" =>"));
-        assert!(module.contains("action_refresh(runtime).map(Some)"));
+        assert!(module.contains("action_refresh(runtime, storage).map(Some)"));
     }
 
     #[test]
@@ -2492,7 +2497,8 @@ action Refresh {
         let module = compile_backend_ax_to_module(
             r#"
 action UploadImage(image: File) -> FileRef {
-  return json(input.image)
+  data saved = Storage.save("media", input.image)
+  return json(saved)
 }
 "#,
         )
@@ -2501,6 +2507,10 @@ action UploadImage(image: File) -> FileRef {
         assert!(module.contains("pub image: AxIncomingFile"));
         assert!(module.contains("request.incoming_file(\"image\").cloned()"));
         assert!(module.contains("missing required file input `image`"));
+        assert!(module.contains("storage.save_file(\"media\", &input.image)?"));
+        assert!(module.contains(
+            "pub fn dispatch_action(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage"
+        ));
         assert!(!module.contains("storage_prelude"));
     }
 }
