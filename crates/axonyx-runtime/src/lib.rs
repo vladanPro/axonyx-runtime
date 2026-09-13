@@ -3978,6 +3978,7 @@ fn ax_action_script() -> &'static str {
   };
 
   const actionStatuses = (form) => Array.from(form.querySelectorAll(".ax-action-status[data-state]"));
+  const actionProgress = (form) => Array.from(form.querySelectorAll("[data-ax-action-progress]"));
   const actionSubmitControls = (form) => Array.from(form.querySelectorAll(
     'button:not([type]), button[type="submit"], input[type="submit"], input[type="image"]'
   ));
@@ -4013,17 +4014,93 @@ fn ax_action_script() -> &'static str {
     });
   };
 
+  const resetUploadProgress = (form) => {
+    form.removeAttribute("data-ax-upload-state");
+    form.removeAttribute("data-ax-upload-loaded");
+    form.removeAttribute("data-ax-upload-total");
+    form.removeAttribute("data-ax-upload-percent");
+    actionProgress(form).forEach((progress) => {
+      progress.value = 0;
+      progress.hidden = true;
+      progress.setAttribute("aria-hidden", "true");
+      progress.setAttribute("aria-valuenow", "0");
+    });
+  };
+
+  const updateUploadProgress = (form, state, loaded, total) => {
+    const boundedLoaded = Math.max(0, Number(loaded) || 0);
+    const boundedTotal = Math.max(0, Number(total) || 0);
+    const percent = boundedTotal > 0
+      ? Math.min(100, Math.round((boundedLoaded / boundedTotal) * 100))
+      : 0;
+    form.setAttribute("data-ax-upload-state", state);
+    form.setAttribute("data-ax-upload-loaded", String(boundedLoaded));
+    form.setAttribute("data-ax-upload-total", String(boundedTotal));
+    form.setAttribute("data-ax-upload-percent", String(percent));
+    actionProgress(form).forEach((progress) => {
+      progress.value = percent;
+      progress.hidden = false;
+      progress.setAttribute("aria-hidden", "false");
+      progress.setAttribute("aria-valuenow", String(percent));
+    });
+    window.dispatchEvent(new CustomEvent("axonyx:upload-progress", {
+      detail: { form, state, loaded: boundedLoaded, total: boundedTotal, percent },
+    }));
+  };
+
   const setActionState = (form, state) => {
     form.setAttribute("data-ax-action-state", state);
     setActionPending(form, state === "pending");
     syncActionStatus(form);
+    if (state !== "pending") {
+      if (form.hasAttribute("data-ax-upload-state")) {
+        form.setAttribute("data-ax-upload-state", state === "complete" ? "complete" : "error");
+      }
+      actionProgress(form).forEach((progress) => {
+        progress.hidden = true;
+        progress.setAttribute("aria-hidden", "true");
+      });
+    }
   };
 
   const initActionForms = () => {
     document.querySelectorAll("form").forEach((form) => {
-      if (isAxonyxActionForm(form)) syncActionStatus(form);
+      if (isAxonyxActionForm(form)) {
+        syncActionStatus(form);
+        resetUploadProgress(form);
+      }
     });
   };
+
+  const uploadWithProgress = (form, formData, headers) => new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(form.method || "POST", form.action, true);
+    Object.entries(headers).forEach(([name, value]) => xhr.setRequestHeader(name, value));
+    xhr.upload.addEventListener("loadstart", () => {
+      updateUploadProgress(form, "uploading", 0, 0);
+      window.dispatchEvent(new CustomEvent("axonyx:upload-start", { detail: { form } }));
+    });
+    xhr.upload.addEventListener("progress", (event) => {
+      updateUploadProgress(form, "uploading", event.loaded, event.lengthComputable ? event.total : 0);
+    });
+    xhr.upload.addEventListener("load", (event) => {
+      updateUploadProgress(form, "processing", event.loaded, event.lengthComputable ? event.total : event.loaded);
+      window.dispatchEvent(new CustomEvent("axonyx:upload-complete", {
+        detail: { form, loaded: event.loaded, total: event.lengthComputable ? event.total : event.loaded },
+      }));
+    });
+    xhr.onerror = () => reject(new Error("Axonyx upload failed"));
+    xhr.onabort = () => reject(new DOMException("Axonyx upload aborted", "AbortError"));
+    xhr.onload = () => resolve({
+      status: xhr.status,
+      ok: xhr.status >= 200 && xhr.status < 300,
+      redirected: Boolean(xhr.responseURL && xhr.responseURL !== form.action),
+      url: xhr.responseURL,
+      headers: { get: (name) => xhr.getResponseHeader(name) },
+      json: async () => JSON.parse(xhr.responseText),
+    });
+    xhr.send(formData);
+  });
 
   const actionRoutePath = (payload) => {
     const redirect = typeof payload?.redirect === "string" && payload.redirect ? payload.redirect : window.location.pathname;
@@ -4142,23 +4219,27 @@ fn ax_action_script() -> &'static str {
     const contentHeaders = hasFile ? {} : {
       "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
     };
+    resetUploadProgress(form);
     setActionState(form, "pending");
     window.dispatchEvent(new CustomEvent("axonyx:action-start", {
       detail: { form },
     }));
 
     try {
-      const response = await fetch(form.action, {
-        method: form.method || "POST",
-        headers: {
-          Accept: "application/ax-patch+json",
-          "X-Axonyx-State-Protocol": "ax-state/1",
-          "X-Axonyx-Tab": getTabId(),
-          ...contentHeaders,
-        },
-        body,
-        cache: "no-store",
-      });
+      const requestHeaders = {
+        Accept: "application/ax-patch+json",
+        "X-Axonyx-State-Protocol": "ax-state/1",
+        "X-Axonyx-Tab": getTabId(),
+        ...contentHeaders,
+      };
+      const response = hasFile && typeof XMLHttpRequest === "function"
+        ? await uploadWithProgress(form, formData, requestHeaders)
+        : await fetch(form.action, {
+            method: form.method || "POST",
+            headers: requestHeaders,
+            body,
+            cache: "no-store",
+          });
       const contentType = response.headers.get("content-type") || "";
       if (contentType.includes("application/ax-patch+json")) {
         await applyPatchResponse(await response.json(), form);
@@ -4180,6 +4261,11 @@ fn ax_action_script() -> &'static str {
       window.location.reload();
     } catch (error) {
       setActionState(form, "error");
+      if (hasFile) {
+        window.dispatchEvent(new CustomEvent("axonyx:upload-error", {
+          detail: { form, error },
+        }));
+      }
       window.dispatchEvent(new CustomEvent("axonyx:action-error", {
         detail: { form, error },
       }));
@@ -8013,6 +8099,13 @@ page Posts
         assert!(!html.contains("if (refreshes.length === 0 &&"));
         assert!(html.contains("application/ax-error+json"));
         assert!(html.contains("setActionState(form, \"error\")"));
+        assert!(html.contains("uploadWithProgress"));
+        assert!(html.contains("typeof XMLHttpRequest === \"function\""));
+        assert!(html.contains("axonyx:upload-start"));
+        assert!(html.contains("axonyx:upload-progress"));
+        assert!(html.contains("axonyx:upload-complete"));
+        assert!(html.contains("axonyx:upload-error"));
+        assert!(html.contains("data-ax-upload-percent"));
     }
 
     #[test]
@@ -8040,6 +8133,7 @@ page Home
   <ActionStatus state="pending">Saving theme...</ActionStatus>
   <ActionStatus state="complete">Theme saved.</ActionStatus>
   <ActionStatus state="error">Theme could not be saved.</ActionStatus>
+  <ActionProgress />
   <Button type="submit">Apply</Button>
 </ActionForm>
 "#,
@@ -8057,6 +8151,10 @@ page Home
         assert!(html.contains("class=\"ax-action-status\""));
         assert!(html.contains("data-state=\"pending\""));
         assert!(html.contains("Saving theme..."));
+        assert!(html.contains("class=\"ax-action-progress\""));
+        assert!(html.contains("data-ax-action-progress=\"true\""));
+        assert!(html.contains("aria-hidden=\"true\""));
+        assert!(html.contains("<progress"));
         assert!(html.contains("data-ax-runtime=\"actions\""));
     }
 
