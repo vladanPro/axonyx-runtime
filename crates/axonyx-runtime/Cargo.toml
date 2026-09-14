@@ -47,3 +47,7 @@ tokio = { workspace = true, optional = true, features = ["net", "rt-multi-thread
 default = []
 axum = ["dep:axum", "dep:futures-util", "dep:multer", "dep:tokio"]
 storage = ["dep:cap-std"]
+
+[[example]]
+name = "upload_lifecycle_fixture"
+required-features = ["axum", "storage"]
