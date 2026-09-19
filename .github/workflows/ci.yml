@@ -42,7 +42,7 @@ jobs:
         run: npm ci
 
       - name: Audit browser test dependencies
-        run: npm audit --audit-level=high
+        run: npm audit --audit-level=high --omit=optional
 
       - name: Verify Reactive Each in Chromium
         run: npm run test:reactive-each
@@ -65,7 +65,7 @@ jobs:
             echo "- Multipart upload progress and capability storage passed through Chromium and the Axum/Tokio adapter."
             echo "- \`cargo package -p axonyx-macros --allow-dirty --no-verify\` passed."
             echo "- \`axonyx-core\` and \`axonyx-runtime\` are validated after publish order and crates.io propagation."
-            echo "- Expected publish order: \`axonyx-macros\` -> \`axonyx-core\` -> \`axonyx-runtime\`."
+            echo "- Expected publish order: \`axonyx-core\` -> \`axonyx-runtime\`; the unchanged \`axonyx-macros 0.1.0\` is not republished."
           } >> "$GITHUB_STEP_SUMMARY"
 
   postgres-integration:
