@@ -647,11 +647,11 @@ fn render_handler_fn(
 ) -> Result<String, AxBackendCodegenError> {
     let signature = match &handler.kind {
         AxHandlerKind::Action { input, .. } if input.is_empty() => format!(
-            "pub fn {}(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage) -> AxRuntimeResult<Value>",
+            "pub fn {}(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, request: &AxHttpRequest) -> AxRuntimeResult<AxActionOutput>",
             handler.rust_fn
         ),
         AxHandlerKind::Action { .. } => format!(
-            "pub fn {}(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, input: &{}) -> AxRuntimeResult<Value>",
+            "pub fn {}(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, request: &AxHttpRequest, input: &{}) -> AxRuntimeResult<AxActionOutput>",
             handler.rust_fn,
             input_struct_name(&handler.rust_fn)
         ),
@@ -704,6 +704,7 @@ fn render_handler_fn(
         out.push_str("    let mut __ax_cookies: Vec<AxCookie> = Vec::new();\n");
     }
     if action_response {
+        out.push_str("    let mut __ax_cookies: Vec<AxCookie> = Vec::new();\n");
         out.push_str("    let mut __ax_patches: Vec<Value> = Vec::new();\n");
         out.push_str("    let mut __ax_invalidations: Vec<Value> = Vec::new();\n");
         out.push_str("    let mut __ax_redirect: Option<String> = None;\n");
@@ -720,7 +721,7 @@ fn render_handler_fn(
         if route_response {
             out.push_str("    Ok(__ax_finalize_response(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies))\n");
         } else if action_response {
-            out.push_str("    Ok(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect))\n");
+            out.push_str("    Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))\n");
         } else {
             out.push_str("    Ok(ok_payload())\n");
         }
@@ -792,7 +793,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
     }
     out.push_str("    Ok(None)\n}\n\n");
 
-    out.push_str("pub fn dispatch_action(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, name: &str, request: &AxHttpRequest) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
+    out.push_str("pub fn dispatch_action(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, name: &str, request: &AxHttpRequest) -> AxRuntimeResult<Option<AxActionOutput>> {\n    match name {\n");
     for handler in &plan.handlers {
         let AxHandlerKind::Action { input, .. } = &handler.kind else {
             continue;
@@ -800,7 +801,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
         out.push_str(&format!("        {:?} => {{\n", handler.name));
         if input.is_empty() {
             out.push_str(&format!(
-                "            {}(runtime, storage).map(Some)\n",
+                "            {}(runtime, storage, request).map(Some)\n",
                 handler.rust_fn
             ));
         } else {
@@ -817,7 +818,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
             }
             out.push_str("            };\n");
             out.push_str(&format!(
-                "            {}(runtime, storage, &input).map(Some)\n",
+                "            {}(runtime, storage, request, &input).map(Some)\n",
                 handler.rust_fn
             ));
         }
@@ -1536,14 +1537,14 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
     if action_response {
         return match value {
             AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => format!(
-                "    Ok(__ax_action_payload(json!({}), __ax_patches, __ax_invalidations, __ax_redirect))\n",
+                "    Ok(AxActionOutput::new(__ax_action_payload(json!({}), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))\n",
                 render_borrowed_expr(expr)
             ),
             AxReturnPlan::Ok
             | AxReturnPlan::NoContent
             | AxReturnPlan::NotFound
             | AxReturnPlan::Redirect { .. } => {
-                "    Ok(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect))\n".to_string()
+                "    Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))\n".to_string()
             }
         };
     }
@@ -1564,23 +1565,23 @@ fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
             if let Some(message) = render_error_call_message(expr) {
                 format!(
-                    "        let __ax_error_message = ({message}).to_string();\n        let __ax_error_value = json!(&__ax_error_message);\n        return Ok(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect));\n"
+                    "        let __ax_error_message = ({message}).to_string();\n        let __ax_error_value = json!(&__ax_error_message);\n        return Ok(AxActionOutput::new(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect)).with_cookies(__ax_cookies));\n"
                 )
             } else {
                 let value = format!("json!({})", render_borrowed_expr(expr));
                 format!(
-                    "        let __ax_error_value = {value};\n        let __ax_error_message = __ax_error_value.get(\"message\").or_else(|| __ax_error_value.get(\"error\")).and_then(Value::as_str).unwrap_or(\"Action requirement failed.\").to_string();\n        return Ok(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect));\n"
+                    "        let __ax_error_value = {value};\n        let __ax_error_message = __ax_error_value.get(\"message\").or_else(|| __ax_error_value.get(\"error\")).and_then(Value::as_str).unwrap_or(\"Action requirement failed.\").to_string();\n        return Ok(AxActionOutput::new(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect)).with_cookies(__ax_cookies));\n"
                 )
             }
         }
         Some(AxReturnPlan::Redirect { target, .. }) => {
             let value = render_string_expr(target);
             format!(
-                "        let __ax_error_message = {value};\n        let __ax_error_value = json!(&__ax_error_message);\n        return Ok(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect));\n"
+                "        let __ax_error_message = {value};\n        let __ax_error_value = json!(&__ax_error_message);\n        return Ok(AxActionOutput::new(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect)).with_cookies(__ax_cookies));\n"
             )
         }
-        Some(AxReturnPlan::NotFound) => "        return Ok(__ax_action_error_payload(\"not found\".to_string(), json!(\"not found\"), 422, __ax_redirect));\n".to_string(),
-        Some(AxReturnPlan::Ok) | Some(AxReturnPlan::NoContent) | None => "        return Ok(__ax_action_error_payload(\"Action requirement failed.\".to_string(), json!(\"Action requirement failed.\"), 422, __ax_redirect));\n".to_string(),
+        Some(AxReturnPlan::NotFound) => "        return Ok(AxActionOutput::new(__ax_action_error_payload(\"not found\".to_string(), json!(\"not found\"), 422, __ax_redirect)).with_cookies(__ax_cookies));\n".to_string(),
+        Some(AxReturnPlan::Ok) | Some(AxReturnPlan::NoContent) | None => "        return Ok(AxActionOutput::new(__ax_action_error_payload(\"Action requirement failed.\".to_string(), json!(\"Action requirement failed.\"), 422, __ax_redirect)).with_cookies(__ax_cookies));\n".to_string(),
     }
 }
 
@@ -1952,12 +1953,12 @@ action publishPost(id: String, title: String) {
         assert!(module.contains("loader_posts_list(runtime, &context).map(Some)"));
         assert!(module.contains("runtime.load(&AxQueryRequest"));
         assert!(module.contains("pub struct ActionCreatePostInput"));
-        assert!(module.contains("pub fn action_create_post(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, input: &ActionCreatePostInput)"));
+        assert!(module.contains("pub fn action_create_post(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, request: &AxHttpRequest, input: &ActionCreatePostInput) -> AxRuntimeResult<AxActionOutput>"));
         assert!(module.contains("runtime.insert(&AxInsertRequest"));
         assert!(module.contains(
             "__ax_push_invalidation(&mut __ax_invalidations, \"posts\".to_string(), false)"
         ));
-        assert!(module.contains("Ok(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect))"));
+        assert!(module.contains("Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))"));
     }
 
     #[test]
@@ -1993,10 +1994,11 @@ action SetTheme(theme: string) {
         .expect("source should compile");
 
         assert!(module.contains("let mut __ax_patches: Vec<Value> = Vec::new();"));
+        assert!(module.contains("let mut __ax_cookies: Vec<AxCookie> = Vec::new();"));
         assert!(module.contains("__ax_patches.push(json!({\"op\":\"set\""));
         assert!(module.contains("\"signal\":(\"ThemeSwitch.theme\".to_string()).to_string()"));
         assert!(module.contains("\"value\":&input.theme"));
-        assert!(module.contains("Ok(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect))"));
+        assert!(module.contains("Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))"));
         assert!(!module.contains("// patch"));
     }
 
@@ -2489,7 +2491,7 @@ action Refresh {
         assert!(module.contains("\"PublishPost\" =>"));
         assert!(module.contains("let input = ActionPublishPostInput"));
         assert!(module.contains("\"Refresh\" =>"));
-        assert!(module.contains("action_refresh(runtime, storage).map(Some)"));
+        assert!(module.contains("action_refresh(runtime, storage, request).map(Some)"));
     }
 
     #[test]
