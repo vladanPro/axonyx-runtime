@@ -35,11 +35,19 @@ zeroize_derive.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 bytes.workspace = true
-axonyx-core = { version = "0.3.0", path = "../axonyx-core" }
+axonyx-core = { version = "0.4.0", path = "../axonyx-core" }
 axum = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
+multer = { workspace = true, optional = true }
+encoding_rs.workspace = true
+cap-std = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["net", "rt-multi-thread"] }
 
 [features]
 default = []
-axum = ["dep:axum", "dep:futures-util", "dep:tokio"]
+axum = ["dep:axum", "dep:futures-util", "dep:multer", "dep:tokio"]
+storage = ["dep:cap-std"]
+
+[[example]]
+name = "upload_lifecycle_fixture"
+required-features = ["axum", "storage"]

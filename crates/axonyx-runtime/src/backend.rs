@@ -4459,7 +4459,8 @@ pub mod prelude {
     pub use super::PostgresAdapter;
     pub use super::SqliteAdapter;
     pub use super::MAX_DB_READ_RETRY_ATTEMPTS;
-    pub use axonyx_core::ax_types::AxDecimal;
+    pub use crate::validate_api_response_bytes;
+    pub use axonyx_core::ax_types::prelude::{AxDataContext, AxDecimal, AxRecordType, AxType};
 }
 
 #[cfg(test)]

@@ -771,6 +771,17 @@ fn lower_component_node(
             push_remaining_props(&mut attrs, props);
             element_with_attrs("p", attrs, children)
         }
+        "ActionProgress" => {
+            prepend_class_attr(&mut attrs, "ax-action-progress");
+            attrs.push(attr("data-ax-action-progress", "true"));
+            attrs.push(attr("max", "100"));
+            attrs.push(attr("value", "0"));
+            attrs.push(attr("hidden", "true"));
+            attrs.push(attr("aria-hidden", "true"));
+            push_behavior_props(&mut attrs, &mut props);
+            push_remaining_props(&mut attrs, props);
+            element_with_attrs("progress", attrs, children)
+        }
         tag if is_native_html_tag(tag) => {
             push_behavior_props(&mut attrs, &mut props);
             push_native_props(&mut attrs, props);

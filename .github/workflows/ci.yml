@@ -42,10 +42,13 @@ jobs:
         run: npm ci
 
       - name: Audit browser test dependencies
-        run: npm audit --audit-level=high
+        run: npm run audit:browser
 
       - name: Verify Reactive Each in Chromium
         run: npm run test:reactive-each
+
+      - name: Verify upload lifecycle in Chromium
+        run: npm run test:upload-lifecycle
 
       - name: Package axonyx-macros
         run: cargo package -p axonyx-macros --allow-dirty --no-verify
@@ -59,9 +62,10 @@ jobs:
             echo "- \`cargo test --workspace\` passed."
             echo "- Typed \`List<Optional<Post>>\` state crossed the browser/WASM bridge."
             echo "- Reactive \`Each\` insert/update/remove/reorder passed in Chromium without requests or VDOM replacement."
+            echo "- Multipart upload progress and capability storage passed through Chromium and the Axum/Tokio adapter."
             echo "- \`cargo package -p axonyx-macros --allow-dirty --no-verify\` passed."
             echo "- \`axonyx-core\` and \`axonyx-runtime\` are validated after publish order and crates.io propagation."
-            echo "- Expected publish order: \`axonyx-macros\` -> \`axonyx-core\` -> \`axonyx-runtime\`."
+            echo "- Expected publish order: \`axonyx-core\` -> \`axonyx-runtime\`; the unchanged \`axonyx-macros 0.1.0\` is not republished."
           } >> "$GITHUB_STEP_SUMMARY"
 
   postgres-integration:

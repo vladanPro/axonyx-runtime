@@ -136,7 +136,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
         out.push('\n');
     }
 
-    out.push_str(&render_compiled_dispatchers(&plan.handlers));
+    out.push_str(&render_compiled_dispatchers(plan));
 
     Ok(out)
 }
@@ -201,10 +201,12 @@ fn render_function_value_plan(
 ) -> Result<String, AxBackendCodegenError> {
     match value {
         AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
-        AxValuePlan::Query(_) => Err(AxBackendCodegenError::UnsupportedFunctionQueryBinding {
-            function: function.to_string(),
-            binding: binding.to_string(),
-        }),
+        AxValuePlan::Query(_) | AxValuePlan::StorageSave { .. } => {
+            Err(AxBackendCodegenError::UnsupportedFunctionQueryBinding {
+                function: function.to_string(),
+                binding: binding.to_string(),
+            })
+        }
     }
 }
 
@@ -275,6 +277,7 @@ fn rust_function_return_type(ty: &AxType, function: &str) -> Result<String, AxBa
         AxType::Int => "i64".to_string(),
         AxType::Bool => "bool".to_string(),
         AxType::Bytes => "Vec<u8>".to_string(),
+        AxType::FileRef => "AxFileRef".to_string(),
         AxType::Json | AxType::Unknown => "Value".to_string(),
         AxType::Void => "()".to_string(),
         AxType::List(inner) => format!("Vec<{}>", rust_function_return_type(inner, function)?),
@@ -299,7 +302,11 @@ fn rust_function_return_type(ty: &AxType, function: &str) -> Result<String, AxBa
             rust_function_return_type(inner, function)?
         }
         AxType::Record(name) => name.clone(),
-        AxType::Decimal | AxType::Never | AxType::Signal(_) | AxType::Resource(_, _) => {
+        AxType::Decimal
+        | AxType::File
+        | AxType::Never
+        | AxType::Signal(_)
+        | AxType::Resource(_, _) => {
             return Err(AxBackendCodegenError::UnsupportedFunctionReturnType {
                 function: function.to_string(),
                 ty: ty.display_name(),
@@ -550,6 +557,7 @@ fn rust_contract_type(
         AxType::Int => "i64".to_string(),
         AxType::Bool => "bool".to_string(),
         AxType::Bytes => "Vec<u8>".to_string(),
+        AxType::FileRef => "AxFileRef".to_string(),
         AxType::Json | AxType::Unknown => "Value".to_string(),
         AxType::List(inner) => format!("Vec<{}>", rust_contract_type(inner, record, field)?),
         AxType::Optional(inner) => {
@@ -577,7 +585,11 @@ fn rust_contract_type(
         ),
         AxType::Secret(inner) | AxType::Public(inner) => rust_contract_type(inner, record, field)?,
         AxType::Record(name) => name.clone(),
-        AxType::Never | AxType::Void | AxType::Signal(_) | AxType::Resource(_, _) => {
+        AxType::File
+        | AxType::Never
+        | AxType::Void
+        | AxType::Signal(_)
+        | AxType::Resource(_, _) => {
             return Err(AxBackendCodegenError::UnsupportedContractType {
                 record: record.name.clone(),
                 field: field.name.clone(),
@@ -635,11 +647,11 @@ fn render_handler_fn(
 ) -> Result<String, AxBackendCodegenError> {
     let signature = match &handler.kind {
         AxHandlerKind::Action { input, .. } if input.is_empty() => format!(
-            "pub fn {}(runtime: &impl AxBackendRuntime) -> AxRuntimeResult<Value>",
+            "pub fn {}(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage) -> AxRuntimeResult<Value>",
             handler.rust_fn
         ),
         AxHandlerKind::Action { .. } => format!(
-            "pub fn {}(runtime: &impl AxBackendRuntime, input: &{}) -> AxRuntimeResult<Value>",
+            "pub fn {}(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, input: &{}) -> AxRuntimeResult<Value>",
             handler.rust_fn,
             input_struct_name(&handler.rust_fn)
         ),
@@ -718,7 +730,7 @@ fn render_handler_fn(
     Ok(out)
 }
 
-fn render_compiled_dispatchers(handlers: &[AxHandlerPlan]) -> String {
+fn render_compiled_dispatchers(plan: &AxBackendPlan) -> String {
     let mut out = String::from(
         r#"fn __ax_request_path(target: &str) -> &str {
     target.split_once('?').map_or(target, |(path, _)| path)
@@ -756,27 +768,39 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
 "#,
     );
 
-    out.push_str("pub fn dispatch_api_route(runtime: &impl AxBackendRuntime, request: &AxHttpRequest) -> AxRuntimeResult<Option<AxHttpResponse>> {\n");
-    for handler in handlers {
-        let AxHandlerKind::Route { method, path, .. } = &handler.kind else {
+    out.push_str(&render_api_contract_context(plan));
+    out.push_str("pub fn dispatch_api_route(runtime: &impl AxBackendRuntime, request: &AxHttpRequest, validate_responses: bool) -> AxRuntimeResult<Option<AxHttpResponse>> {\n");
+    for handler in &plan.handlers {
+        let AxHandlerKind::Route {
+            method,
+            path,
+            returns,
+            ..
+        } = &handler.kind
+        else {
             continue;
         };
+        let validation = returns.as_ref().map_or_else(String::new, |contract| {
+            format!(
+                " if validate_responses {{ let body = response.body.chunks_iter().flat_map(|chunk| chunk.iter().copied()).collect::<Vec<_>>(); validate_api_response_bytes(response.status, &response.content_type, &body, {contract:?}, __ax_api_contract_context()).map_err(|error| AxRuntimeError::message(format!(\"API response validation failed for {method} {path}: {{error}}\")))?; }}"
+            )
+        });
         out.push_str(&format!(
-            "    if request.method.eq_ignore_ascii_case({method:?}) && __ax_route_params({path:?}, &request.target).is_some() {{ return {}(runtime, request).map(Some); }}\n",
+            "    if request.method.eq_ignore_ascii_case({method:?}) && __ax_route_params({path:?}, &request.target).is_some() {{ let response = {}(runtime, request)?;{validation} return Ok(Some(response)); }}\n",
             handler.rust_fn
         ));
     }
     out.push_str("    Ok(None)\n}\n\n");
 
-    out.push_str("pub fn dispatch_action(runtime: &impl AxBackendRuntime, name: &str, request: &AxHttpRequest) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
-    for handler in handlers {
+    out.push_str("pub fn dispatch_action(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, name: &str, request: &AxHttpRequest) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
+    for handler in &plan.handlers {
         let AxHandlerKind::Action { input, .. } = &handler.kind else {
             continue;
         };
         out.push_str(&format!("        {:?} => {{\n", handler.name));
         if input.is_empty() {
             out.push_str(&format!(
-                "            {}(runtime).map(Some)\n",
+                "            {}(runtime, storage).map(Some)\n",
                 handler.rust_fn
             ));
         } else {
@@ -793,7 +817,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
             }
             out.push_str("            };\n");
             out.push_str(&format!(
-                "            {}(runtime, &input).map(Some)\n",
+                "            {}(runtime, storage, &input).map(Some)\n",
                 handler.rust_fn
             ));
         }
@@ -802,7 +826,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
     out.push_str("        _ => Ok(None),\n    }\n}\n");
 
     out.push_str("\npub fn dispatch_loader(runtime: &impl AxBackendRuntime, name: &str, pattern: &str, request: &AxHttpRequest, args: &[Value]) -> AxRuntimeResult<Option<Value>> {\n    match name {\n");
-    for handler in handlers {
+    for handler in &plan.handlers {
         let AxHandlerKind::Loader { input, .. } = &handler.kind else {
             continue;
         };
@@ -842,6 +866,86 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
     out
 }
 
+fn render_api_contract_context(plan: &AxBackendPlan) -> String {
+    let mut expression = "AxDataContext::new()".to_string();
+    for literal_union in &plan.literal_unions {
+        let literals = literal_union
+            .literals
+            .iter()
+            .map(|literal| format!("{literal:?}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        expression.push_str(&format!(
+            ".with_literal_union({:?}, [{literals}])",
+            literal_union.name
+        ));
+    }
+    for record in &plan.types {
+        let mut record_expression = format!("AxRecordType::new({:?})", record.name);
+        for field in &record.fields {
+            record_expression.push_str(&format!(
+                ".field({:?}, {})",
+                field.name,
+                render_ax_type_expr(&field.ty)
+            ));
+        }
+        expression.push_str(&format!(".with_record({record_expression})"));
+    }
+    format!(
+        "fn __ax_api_contract_context() -> &'static AxDataContext {{\n    static CONTEXT: std::sync::OnceLock<AxDataContext> = std::sync::OnceLock::new();\n    CONTEXT.get_or_init(|| {expression})\n}}\n\n"
+    )
+}
+
+fn render_ax_type_expr(ty: &AxType) -> String {
+    match ty {
+        AxType::String => "AxType::String".to_string(),
+        AxType::Number => "AxType::Number".to_string(),
+        AxType::Int => "AxType::Int".to_string(),
+        AxType::Float => "AxType::Float".to_string(),
+        AxType::Decimal => "AxType::Decimal".to_string(),
+        AxType::Bool => "AxType::Bool".to_string(),
+        AxType::DateTime => "AxType::DateTime".to_string(),
+        AxType::Date => "AxType::Date".to_string(),
+        AxType::Time => "AxType::Time".to_string(),
+        AxType::Uuid => "AxType::Uuid".to_string(),
+        AxType::Bytes => "AxType::Bytes".to_string(),
+        AxType::File => "AxType::File".to_string(),
+        AxType::FileRef => "AxType::FileRef".to_string(),
+        AxType::Json => "AxType::Json".to_string(),
+        AxType::Never => "AxType::Never".to_string(),
+        AxType::Void => "AxType::Void".to_string(),
+        AxType::List(item) => format!("AxType::list({})", render_ax_type_expr(item)),
+        AxType::Map(key, value) => format!(
+            "AxType::Map(Box::new({}), Box::new({}))",
+            render_ax_type_expr(key),
+            render_ax_type_expr(value)
+        ),
+        AxType::Set(item) => format!("AxType::Set(Box::new({}))", render_ax_type_expr(item)),
+        AxType::Optional(item) => format!("AxType::optional({})", render_ax_type_expr(item)),
+        AxType::Result(ok, error) => format!(
+            "AxType::Result(Box::new({}), Box::new({}))",
+            render_ax_type_expr(ok),
+            render_ax_type_expr(error)
+        ),
+        AxType::Secret(item) => {
+            format!("AxType::Secret(Box::new({}))", render_ax_type_expr(item))
+        }
+        AxType::Public(item) => {
+            format!("AxType::Public(Box::new({}))", render_ax_type_expr(item))
+        }
+        AxType::Signal(item) => {
+            format!("AxType::Signal(Box::new({}))", render_ax_type_expr(item))
+        }
+        AxType::Resource(value, error) => format!(
+            "AxType::Resource(Box::new({}), Box::new({}))",
+            render_ax_type_expr(value),
+            render_ax_type_expr(error)
+        ),
+        AxType::Record(name) => format!("AxType::record({name:?})"),
+        AxType::Unknown => "AxType::Unknown".to_string(),
+    }
+}
+
 fn handler_input_fields(handler: &AxHandlerPlan) -> Option<&[AxFieldPlan]> {
     match &handler.kind {
         AxHandlerKind::Action { input, .. }
@@ -874,6 +978,13 @@ fn render_route_input_binding(handler: &AxHandlerPlan, input: &[AxFieldPlan]) ->
 }
 
 fn render_route_input_field(field: &AxFieldPlan) -> String {
+    if field.rust_ty == "AxIncomingFile" {
+        let missing_error = format!("missing required file input `{}`", field.name);
+        return format!(
+            "request.incoming_file({:?}).cloned().ok_or_else(|| AxRuntimeError::message({missing_error:?}))?",
+            field.name
+        );
+    }
     let raw = format!("__ax_request_input_field(request, {:?})", field.name);
     render_input_field(field, &raw)
 }
@@ -896,6 +1007,10 @@ fn render_input_field(field: &AxFieldPlan, raw: &str) -> String {
                 "{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?.trim().parse::<{}>().map_err(|_| AxRuntimeError::message({:?}))?",
                 field.rust_ty,
                 format!("input `{}` expected {}", field.name, field.rust_ty)
+            ),
+            "AxFileRef" => format!(
+                "serde_json::from_str::<AxFileRef>(&{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?).map_err(|_| AxRuntimeError::message({:?}))?",
+                format!("input `{}` expected FileRef", field.name)
             ),
             _ => format!("{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?"),
         };
@@ -1147,6 +1262,9 @@ fn render_route_hook_step(phase: AxHookPhasePlan, value: &AxRustExpr) -> String 
 fn render_value_plan(value: &AxValuePlan) -> String {
     match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
+        AxValuePlan::StorageSave { capability, input } => {
+            format!("json!(storage.save_file({capability:?}, &input.{input})?)")
+        }
         AxValuePlan::Query(query) => match &query.source {
             AxQuerySourcePlan::RawSql { .. } => {
                 format!("runtime.query(&{})?", render_raw_sql_query_plan(query))
@@ -1834,7 +1952,7 @@ action publishPost(id: String, title: String) {
         assert!(module.contains("loader_posts_list(runtime, &context).map(Some)"));
         assert!(module.contains("runtime.load(&AxQueryRequest"));
         assert!(module.contains("pub struct ActionCreatePostInput"));
-        assert!(module.contains("pub fn action_create_post(runtime: &impl AxBackendRuntime, input: &ActionCreatePostInput)"));
+        assert!(module.contains("pub fn action_create_post(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, input: &ActionCreatePostInput)"));
         assert!(module.contains("runtime.insert(&AxInsertRequest"));
         assert!(module.contains(
             "__ax_push_invalidation(&mut __ax_invalidations, \"posts\".to_string(), false)"
@@ -2341,7 +2459,7 @@ action RemovePost
     fn generates_compiled_api_and_action_dispatchers() {
         let module = compile_backend_ax_to_module(
             r#"
-route GET "/api/posts/:slug"
+route GET "/api/posts/:slug" -> String
   data slug = params.slug
   return json(slug)
 
@@ -2360,6 +2478,9 @@ action Refresh {
         .expect("source should compile");
 
         assert!(module.contains("pub fn dispatch_api_route"));
+        assert!(module.contains("validate_responses: bool"));
+        assert!(module.contains("validate_api_response_bytes"));
+        assert!(module.contains("__ax_api_contract_context()"));
         assert!(module.contains("__ax_route_params(\"/api/posts/:slug\""));
         assert!(
             module.contains("let context = __ax_loader_context(\"/api/posts/:slug\", request)?")
@@ -2368,6 +2489,28 @@ action Refresh {
         assert!(module.contains("\"PublishPost\" =>"));
         assert!(module.contains("let input = ActionPublishPostInput"));
         assert!(module.contains("\"Refresh\" =>"));
-        assert!(module.contains("action_refresh(runtime).map(Some)"));
+        assert!(module.contains("action_refresh(runtime, storage).map(Some)"));
+    }
+
+    #[test]
+    fn compiles_action_file_input_from_multipart_request() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action UploadImage(image: File) -> FileRef {
+  data saved = Storage.save("media", input.image)
+  return json(saved)
+}
+"#,
+        )
+        .expect("file action should compile");
+
+        assert!(module.contains("pub image: AxIncomingFile"));
+        assert!(module.contains("request.incoming_file(\"image\").cloned()"));
+        assert!(module.contains("missing required file input `image`"));
+        assert!(module.contains("storage.save_file(\"media\", &input.image)?"));
+        assert!(module.contains(
+            "pub fn dispatch_action(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage"
+        ));
+        assert!(!module.contains("storage_prelude"));
     }
 }

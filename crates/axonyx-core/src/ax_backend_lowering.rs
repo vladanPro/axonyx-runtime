@@ -207,6 +207,7 @@ pub enum AxHookPhasePlan {
 pub enum AxValuePlan {
     Expr(AxRustExpr),
     Query(AxQueryPlan),
+    StorageSave { capability: String, input: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -321,6 +322,20 @@ pub enum AxBackendLowerError {
     EmptyRouteMethod,
     #[error("input field type cannot be empty for `{field}`")]
     EmptyInputType { field: String },
+    #[error("File input `{field}` is only supported by server actions")]
+    FileInputOutsideAction { field: String },
+    #[error("File input `{field}` must be required and cannot have a default value yet")]
+    OptionalFileInput { field: String },
+    #[error("FileRef input `{field}` must be required and cannot have a default value yet")]
+    OptionalFileRefInput { field: String },
+    #[error("Storage.save is only supported inside server actions")]
+    StorageSaveOutsideAction,
+    #[error(
+        "Storage.save expects a non-empty capability literal and input.<File> as its arguments"
+    )]
+    InvalidStorageSave,
+    #[error("Storage.save input `{field}` is not declared as File on this action")]
+    InvalidStorageFileInput { field: String },
     #[error("invalid runtime env path `{path}`")]
     InvalidRuntimeEnvPath { path: String },
     #[error("duplicate backend type declaration `{name}`")]
@@ -352,7 +367,7 @@ pub fn lower_backend_document(
                 for stmt in &root.body {
                     match stmt {
                         AxBackendStmt::Env(env) => envs.push(lower_env(env)),
-                        _ => globals.push(lower_step(stmt)),
+                        _ => globals.push(lower_step(stmt, None)?),
                     }
                 }
             }
@@ -451,7 +466,7 @@ fn lower_function(function: &AxBackendFunction) -> Result<AxFunctionPlan, AxBack
     let input = function
         .input
         .iter()
-        .map(lower_input_field)
+        .map(lower_non_action_input_field)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AxFunctionPlan {
@@ -459,7 +474,7 @@ fn lower_function(function: &AxBackendFunction) -> Result<AxFunctionPlan, AxBack
         rust_fn: format!("fn_{}", normalize_ident(name)),
         returns: function.returns.clone(),
         input,
-        steps: lower_steps(&function.body),
+        steps: lower_steps(&function.body, None)?,
         exported: function.exported,
     })
 }
@@ -482,7 +497,7 @@ fn lower_route(route: &AxRoute) -> Result<AxHandlerPlan, AxBackendLowerError> {
     let input = route
         .input
         .iter()
-        .map(lower_input_field)
+        .map(lower_non_action_input_field)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AxHandlerPlan {
@@ -494,7 +509,7 @@ fn lower_route(route: &AxRoute) -> Result<AxHandlerPlan, AxBackendLowerError> {
             returns: route.returns.clone(),
             input,
         },
-        steps: lower_steps(&route.body),
+        steps: lower_steps(&route.body, None)?,
     })
 }
 
@@ -507,7 +522,7 @@ fn lower_loader(loader: &AxLoader) -> Result<AxHandlerPlan, AxBackendLowerError>
     let input = loader
         .input
         .iter()
-        .map(lower_input_field)
+        .map(lower_non_action_input_field)
         .collect::<Result<Vec<_>, _>>()?;
 
     Ok(AxHandlerPlan {
@@ -517,7 +532,7 @@ fn lower_loader(loader: &AxLoader) -> Result<AxHandlerPlan, AxBackendLowerError>
             returns: loader.returns.clone(),
             input,
         },
-        steps: lower_steps(&loader.body),
+        steps: lower_steps(&loader.body, None)?,
     })
 }
 
@@ -530,8 +545,9 @@ fn lower_action(action: &AxAction) -> Result<AxHandlerPlan, AxBackendLowerError>
     let input = action
         .input
         .iter()
-        .map(lower_input_field)
+        .map(lower_action_input_field)
         .collect::<Result<Vec<_>, _>>()?;
+    let steps = lower_steps(&action.body, Some(&input))?;
 
     Ok(AxHandlerPlan {
         name: action.name.clone(),
@@ -540,7 +556,7 @@ fn lower_action(action: &AxAction) -> Result<AxHandlerPlan, AxBackendLowerError>
             returns: action.returns.clone(),
             input,
         },
-        steps: lower_steps(&action.body),
+        steps,
     })
 }
 
@@ -554,7 +570,7 @@ fn lower_job(job: &AxJob) -> Result<AxHandlerPlan, AxBackendLowerError> {
         name: job.name.clone(),
         rust_fn: format!("job_{}", normalize_ident(name)),
         kind: AxHandlerKind::Job,
-        steps: lower_steps(&job.body),
+        steps: lower_steps(&job.body, None)?,
     })
 }
 
@@ -573,6 +589,29 @@ fn lower_input_field(field: &AxField) -> Result<AxFieldPlan, AxBackendLowerError
     })
 }
 
+fn lower_non_action_input_field(field: &AxField) -> Result<AxFieldPlan, AxBackendLowerError> {
+    if field.ty.trim() == "File" {
+        return Err(AxBackendLowerError::FileInputOutsideAction {
+            field: field.name.clone(),
+        });
+    }
+    if field.ty.trim() == "FileRef" && (field.optional || field.default.is_some()) {
+        return Err(AxBackendLowerError::OptionalFileRefInput {
+            field: field.name.clone(),
+        });
+    }
+    lower_input_field(field)
+}
+
+fn lower_action_input_field(field: &AxField) -> Result<AxFieldPlan, AxBackendLowerError> {
+    if field.ty.trim() == "File" && (field.optional || field.default.is_some()) {
+        return Err(AxBackendLowerError::OptionalFileInput {
+            field: field.name.clone(),
+        });
+    }
+    lower_input_field(field)
+}
+
 fn lower_env(env: &AxBackendEnv) -> AxEnvPlan {
     AxEnvPlan {
         name: env.name.clone(),
@@ -584,15 +623,24 @@ fn lower_env(env: &AxBackendEnv) -> AxEnvPlan {
     }
 }
 
-fn lower_steps(steps: &[AxBackendStmt]) -> Vec<AxStepPlan> {
-    steps.iter().map(lower_step).collect()
+fn lower_steps(
+    steps: &[AxBackendStmt],
+    action_input: Option<&[AxFieldPlan]>,
+) -> Result<Vec<AxStepPlan>, AxBackendLowerError> {
+    steps
+        .iter()
+        .map(|step| lower_step(step, action_input))
+        .collect()
 }
 
-fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
-    match step {
+fn lower_step(
+    step: &AxBackendStmt,
+    action_input: Option<&[AxFieldPlan]>,
+) -> Result<AxStepPlan, AxBackendLowerError> {
+    Ok(match step {
         AxBackendStmt::Data(data) => AxStepPlan::Let {
             binding: data.name.clone(),
-            value: lower_backend_value(&data.value),
+            value: lower_backend_value(&data.value, action_input)?,
         },
         AxBackendStmt::Env(_) => unreachable!("env declarations are lowered at document level"),
         AxBackendStmt::Transaction(transaction) => AxStepPlan::Transaction {
@@ -666,7 +714,7 @@ fn lower_step(step: &AxBackendStmt) -> AxStepPlan {
             target: send.target.clone(),
             payload: lower_expr(&send.payload),
         },
-    }
+    })
 }
 
 fn lower_transaction_operation(operation: &AxTransactionOperation) -> AxTransactionOperationPlan {
@@ -703,10 +751,41 @@ fn lower_transaction_operation(operation: &AxTransactionOperation) -> AxTransact
     }
 }
 
-fn lower_backend_value(value: &AxBackendValue) -> AxValuePlan {
+fn lower_backend_value(
+    value: &AxBackendValue,
+    action_input: Option<&[AxFieldPlan]>,
+) -> Result<AxValuePlan, AxBackendLowerError> {
     match value {
-        AxBackendValue::Expr(expr) => AxValuePlan::Expr(lower_expr(expr)),
-        AxBackendValue::Query(query) => AxValuePlan::Query(lower_query(query)),
+        AxBackendValue::Expr(AxExpr::Call { path, args })
+            if path.as_slice() == ["Storage", "save"] =>
+        {
+            let Some(action_input) = action_input else {
+                return Err(AxBackendLowerError::StorageSaveOutsideAction);
+            };
+            let [AxExpr::String(capability), AxExpr::Member { object, property }] = args.as_slice()
+            else {
+                return Err(AxBackendLowerError::InvalidStorageSave);
+            };
+            if capability.trim().is_empty()
+                || !matches!(object.as_ref(), AxExpr::Identifier(name) if name == "input")
+            {
+                return Err(AxBackendLowerError::InvalidStorageSave);
+            }
+            if !action_input
+                .iter()
+                .any(|field| field.name == *property && field.rust_ty == "AxIncomingFile")
+            {
+                return Err(AxBackendLowerError::InvalidStorageFileInput {
+                    field: property.clone(),
+                });
+            }
+            Ok(AxValuePlan::StorageSave {
+                capability: capability.clone(),
+                input: property.clone(),
+            })
+        }
+        AxBackendValue::Expr(expr) => Ok(AxValuePlan::Expr(lower_expr(expr))),
+        AxBackendValue::Query(query) => Ok(AxValuePlan::Query(lower_query(query))),
     }
 }
 
@@ -1009,6 +1088,8 @@ fn map_input_type(ty: &str) -> String {
         "i64" | "int" | "integer" => "i64".to_string(),
         "u64" => "u64".to_string(),
         "f64" | "float" | "number" => "f64".to_string(),
+        "File" => "AxIncomingFile".to_string(),
+        "FileRef" => "AxFileRef".to_string(),
         other => other.to_string(),
     }
 }
@@ -1856,6 +1937,117 @@ loader SiteConfig
                     r#"runtime.env().value("PUBLIC_SITE_URL")?"#
                 )),
             }
+        );
+    }
+
+    #[test]
+    fn lowers_required_action_file_into_incoming_file() {
+        let document = parse_backend_ax(
+            r#"
+action UploadImage(image: File) -> FileRef {
+  return json(input.image)
+}
+"#,
+        )
+        .expect("file action should parse");
+
+        let plan = lower_backend_document(&document).expect("file action should lower");
+        let AxHandlerKind::Action { input, returns } = &plan.handlers[0].kind else {
+            panic!("expected action plan");
+        };
+        assert_eq!(returns.as_deref(), Some("FileRef"));
+        assert_eq!(input[0].rust_ty, "AxIncomingFile");
+    }
+
+    #[test]
+    fn rejects_file_inputs_outside_actions_and_optional_files() {
+        let loader = parse_backend_ax(
+            r#"loader Avatar(file: File) -> String {
+  return "avatar"
+}"#,
+        )
+        .expect("loader should parse");
+        assert_eq!(
+            lower_backend_document(&loader),
+            Err(AxBackendLowerError::FileInputOutsideAction {
+                field: "file".to_string(),
+            })
+        );
+
+        let action = parse_backend_ax(
+            r#"action Upload(file?: File) {
+  return ok
+}"#,
+        )
+        .expect("action should parse");
+        assert_eq!(
+            lower_backend_document(&action),
+            Err(AxBackendLowerError::OptionalFileInput {
+                field: "file".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn lowers_typed_storage_save_from_action_file_input() {
+        let document = parse_backend_ax(
+            r#"
+action UploadImage(image: File) -> FileRef {
+  data saved = Storage.save("media", input.image)
+  return json(saved)
+}
+"#,
+        )
+        .expect("storage action should parse");
+
+        let plan = lower_backend_document(&document).expect("storage action should lower");
+        assert!(matches!(
+            &plan.handlers[0].steps[0],
+            AxStepPlan::Let {
+                binding,
+                value: AxValuePlan::StorageSave { capability, input },
+            } if binding == "saved" && capability == "media" && input == "image"
+        ));
+    }
+
+    #[test]
+    fn rejects_storage_save_without_a_literal_capability_or_file_input() {
+        let loader = parse_backend_ax(
+            r#"loader UploadPreview -> FileRef {
+  data saved = Storage.save("media", input.image)
+  return saved
+}"#,
+        )
+        .expect("loader should parse");
+        assert_eq!(
+            lower_backend_document(&loader),
+            Err(AxBackendLowerError::StorageSaveOutsideAction)
+        );
+
+        let dynamic = parse_backend_ax(
+            r#"action UploadImage(image: File) -> FileRef {
+  data saved = Storage.save(input.storage, input.image)
+  return saved
+}"#,
+        )
+        .expect("dynamic storage action should parse");
+        assert_eq!(
+            lower_backend_document(&dynamic),
+            Err(AxBackendLowerError::InvalidStorageSave)
+        );
+
+        let wrong_input = parse_backend_ax(
+            r#"action UploadImage(image: String) -> FileRef {
+  data saved = Storage.save("media", input.image)
+  return saved
+}"#,
+        )
+        .expect("wrong input action should parse");
+        assert_eq!(
+            lower_backend_document(&wrong_input),
+            Err(AxBackendLowerError::InvalidStorageFileInput {
+                field: "image".to_string(),
+            })
         );
     }
 }

@@ -1,10 +1,11 @@
 use thiserror::Error;
 
-use crate::ax_ast::prelude::{AxExpr, AxFloat};
+use crate::ax_ast::prelude::AxExpr;
 use crate::ax_backend_ast::prelude::*;
+use crate::ax_parser::{expression_error_span, parse_expr as parse_shared_expr, AxParseError};
 use crate::ax_query_ast::prelude::*;
 
-#[derive(Debug, Error, PartialEq, Eq)]
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum AxBackendParseError {
     #[error("document is empty")]
     EmptyDocument,
@@ -68,6 +69,58 @@ pub enum AxBackendParseError {
     InvalidExpression { line: usize, message: String },
 }
 
+impl AxBackendParseError {
+    pub fn line(&self) -> usize {
+        match self {
+            Self::EmptyDocument => 1,
+            Self::InvalidImport { line }
+            | Self::MissingImportFrom { line }
+            | Self::EmptyImportList { line }
+            | Self::TabsNotSupported { line }
+            | Self::InvalidIndentation { line }
+            | Self::UnexpectedIndentation { line }
+            | Self::InvalidBlock { line }
+            | Self::InvalidDataBinding { line }
+            | Self::InvalidEnvDeclaration { line }
+            | Self::InvalidInputSection { line }
+            | Self::InvalidField { line }
+            | Self::InvalidTypeDeclaration { line }
+            | Self::InvalidMutation { line }
+            | Self::InvalidTransaction { line }
+            | Self::InvalidAssignment { line }
+            | Self::InvalidHeader { line }
+            | Self::InvalidCookie { line }
+            | Self::InvalidHook { line }
+            | Self::InvalidRequirement { line }
+            | Self::InvalidReturn { line }
+            | Self::InvalidSend { line }
+            | Self::InvalidScope { line }
+            | Self::InvalidScopeMember { line }
+            | Self::InvalidScopeState { line }
+            | Self::InvalidScopeRender { line }
+            | Self::InvalidQuerySource { line }
+            | Self::InvalidQueryClause { line }
+            | Self::InvalidQueryNumber { line }
+            | Self::InvalidExpression { line, .. } => *line,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AxBackendSourceSpan {
+    pub line: usize,
+    pub column: usize,
+    pub end_line: usize,
+    pub end_column: usize,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[error("{error}")]
+pub struct AxBackendParseFailure {
+    pub error: AxBackendParseError,
+    pub span: AxBackendSourceSpan,
+}
+
 #[derive(Debug, Clone)]
 struct BackendLine {
     line: usize,
@@ -87,6 +140,76 @@ pub fn parse_backend_ax(input: &str) -> Result<AxBackendDocument, AxBackendParse
         synthetic_counter: 0,
     };
     parser.parse_document()
+}
+
+pub fn parse_backend_ax_with_span(input: &str) -> Result<AxBackendDocument, AxBackendParseFailure> {
+    parse_backend_ax(input).map_err(|error| AxBackendParseFailure {
+        span: backend_failure_span(input, &error),
+        error,
+    })
+}
+
+fn backend_failure_span(input: &str, error: &AxBackendParseError) -> AxBackendSourceSpan {
+    let line = error.line().max(1);
+    let source = input.lines().nth(line - 1).unwrap_or_default();
+
+    if let AxBackendParseError::InvalidExpression { message, .. } = error {
+        let expression_error = AxParseError::InvalidExpression {
+            line,
+            message: message.clone(),
+        };
+        let (start, end) = expression_error_span(source, &expression_error);
+        return backend_line_span(source, line, start, end);
+    }
+
+    if matches!(error, AxBackendParseError::TabsNotSupported { .. }) {
+        let start = source.find('\t').unwrap_or(0);
+        return backend_line_span(source, line, start, start + 1);
+    }
+
+    if matches!(error, AxBackendParseError::InvalidIndentation { .. }) {
+        let end = source.len() - source.trim_start_matches(' ').len();
+        return backend_line_span(source, line, 0, end.max(1).min(source.len()));
+    }
+
+    if matches!(error, AxBackendParseError::EmptyImportList { .. }) {
+        let start = source
+            .find('{')
+            .unwrap_or_else(|| backend_statement_start(source));
+        let end = source[start..]
+            .find('}')
+            .map_or(start + 1, |relative| start + relative + 1);
+        return backend_line_span(source, line, start, end.min(source.len()));
+    }
+
+    let start = backend_statement_start(source);
+    let end = source[start..]
+        .char_indices()
+        .find(|(_, ch)| ch.is_whitespace() || matches!(ch, '(' | '{' | '=' | ','))
+        .map_or(source.len(), |(relative, _)| start + relative)
+        .max(start + source[start..].chars().next().map_or(0, char::len_utf8));
+    backend_line_span(source, line, start, end)
+}
+
+fn backend_statement_start(source: &str) -> usize {
+    let mut start = source.len() - source.trim_start().len();
+    if source[start..].starts_with("export ") {
+        start += "export ".len();
+    }
+    start.min(source.len())
+}
+
+fn backend_line_span(source: &str, line: usize, start: usize, end: usize) -> AxBackendSourceSpan {
+    let start = start.min(source.len());
+    let end = end.clamp(start, source.len());
+    let column = source[..start].encode_utf16().count() + 1;
+    let end_column = source[..end].encode_utf16().count() + 1;
+    AxBackendSourceSpan {
+        line,
+        column,
+        end_line: line,
+        end_column: end_column.max(column + 1),
+    }
 }
 
 struct Parser {
@@ -1890,105 +2013,13 @@ fn parse_string_arg(input: &str, line: usize) -> Result<String, AxBackendParseEr
 }
 
 fn parse_expr(input: &str, line: usize) -> Result<AxExpr, AxBackendParseError> {
-    let input = input.trim();
-    if input.is_empty() {
-        return Err(AxBackendParseError::InvalidExpression {
-            line,
-            message: "expression is empty".to_string(),
-        });
-    }
-
-    if (input.starts_with('"') && input.ends_with('"'))
-        || (input.starts_with('\'') && input.ends_with('\''))
-    {
-        return Ok(AxExpr::string(input[1..input.len() - 1].to_string()));
-    }
-
-    if input == "true" {
-        return Ok(AxExpr::bool(true));
-    }
-    if input == "false" {
-        return Ok(AxExpr::bool(false));
-    }
-
-    if let Ok(value) = input.parse::<i64>() {
-        return Ok(AxExpr::number(value));
-    }
-    if input.contains('.') {
-        if let Some(value) = input.parse::<f64>().ok().and_then(AxFloat::new) {
-            return Ok(AxExpr::Float(value));
-        }
-    }
-
-    if input.starts_with('[') && input.ends_with(']') {
-        let items = &input[1..input.len() - 1];
-        let args = if items.trim().is_empty() {
-            Vec::new()
-        } else {
-            split_top_level(items, ',')
-                .into_iter()
-                .map(|part| parse_expr(part.trim(), line))
-                .collect::<Result<Vec<_>, _>>()?
+    parse_shared_expr(input, line).map_err(|error| {
+        let message = match error {
+            AxParseError::InvalidExpression { message, .. } => message,
+            error => error.to_string(),
         };
-
-        return Ok(AxExpr::call(["list"], args));
-    }
-
-    if input.ends_with(')') {
-        if let Some(open_index) = find_call_open(input) {
-            let path = input[..open_index].trim();
-            let args = &input[open_index + 1..input.len() - 1];
-            let path: Vec<String> = path
-                .split('.')
-                .map(str::trim)
-                .filter(|segment| !segment.is_empty())
-                .map(ToOwned::to_owned)
-                .collect();
-
-            if path.is_empty() {
-                return Err(AxBackendParseError::InvalidExpression {
-                    line,
-                    message: format!("invalid call path `{input}`"),
-                });
-            }
-
-            let args = if args.trim().is_empty() {
-                Vec::new()
-            } else {
-                split_top_level(args, ',')
-                    .into_iter()
-                    .map(|part| parse_expr(part.trim(), line))
-                    .collect::<Result<Vec<_>, _>>()?
-            };
-
-            return Ok(AxExpr::Call { path, args });
-        }
-    }
-
-    if input.contains('.') {
-        let mut parts = input.split('.').map(str::trim);
-        let first = parts.next().unwrap_or_default();
-        if first.is_empty() {
-            return Err(AxBackendParseError::InvalidExpression {
-                line,
-                message: format!("invalid member expression `{input}`"),
-            });
-        }
-
-        let mut expr = AxExpr::ident(first);
-        for property in parts {
-            if property.is_empty() {
-                return Err(AxBackendParseError::InvalidExpression {
-                    line,
-                    message: format!("invalid member expression `{input}`"),
-                });
-            }
-            expr = expr.member(property);
-        }
-        return Ok(expr);
-    }
-
-    Ok(AxExpr::ident(input))
+        AxBackendParseError::InvalidExpression { line, message }
+    })
 }
 
 fn parse_requirement_expr(input: &str, line: usize) -> Result<AxExpr, AxBackendParseError> {
@@ -2351,8 +2382,8 @@ fn parse_backend_signature_param(input: &str, line: usize) -> Result<AxField, Ax
 }
 
 pub mod prelude {
-    pub use super::parse_backend_ax;
-    pub use super::AxBackendParseError;
+    pub use super::{parse_backend_ax, parse_backend_ax_with_span};
+    pub use super::{AxBackendParseError, AxBackendParseFailure, AxBackendSourceSpan};
 }
 
 #[cfg(test)]
@@ -2473,6 +2504,59 @@ query loadPosts() -> Post[] {
         let error = parse_backend_ax(input).expect_err("empty import list should fail");
 
         assert_eq!(error, AxBackendParseError::EmptyImportList { line: 2 });
+    }
+
+    #[test]
+    fn reports_precise_span_for_empty_backend_import_list() {
+        let input = "import { } from \"./domain.ax\"\n\nquery loadPosts() {\n  return []\n}";
+
+        let failure = parse_backend_ax_with_span(input).expect_err("empty import list should fail");
+
+        assert_eq!(
+            failure.error,
+            AxBackendParseError::EmptyImportList { line: 1 }
+        );
+        assert_eq!(
+            failure.span,
+            AxBackendSourceSpan {
+                line: 1,
+                column: 8,
+                end_line: 1,
+                end_column: 11,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_precise_span_for_unknown_backend_statement() {
+        let input = "query loadPosts() {\n  nope ???\n}";
+
+        let failure = parse_backend_ax_with_span(input).expect_err("unknown statement should fail");
+
+        assert_eq!(failure.error, AxBackendParseError::InvalidBlock { line: 2 });
+        assert_eq!(
+            failure.span,
+            AxBackendSourceSpan {
+                line: 2,
+                column: 3,
+                end_line: 2,
+                end_column: 7,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_invalid_indentation_as_its_own_span() {
+        let input = "query loadPosts() {\n   return []\n}";
+
+        let failure = parse_backend_ax_with_span(input).expect_err("indentation should fail");
+
+        assert_eq!(
+            failure.error,
+            AxBackendParseError::InvalidIndentation { line: 2 }
+        );
+        assert_eq!(failure.span.column, 1);
+        assert_eq!(failure.span.end_column, 4);
     }
 
     #[test]
@@ -2860,6 +2944,47 @@ export fn normalizeStatus(status?: String) -> String {
         assert!(function.input[0].optional);
         assert_eq!(function.input[0].ty, "String");
         assert_eq!(function.body.len(), 1);
+        assert_eq!(
+            function.body[0],
+            AxBackendStmt::r#return(AxExpr::binary(
+                crate::ax_ast::AxBinaryOp::Fallback,
+                AxExpr::ident("status"),
+                AxExpr::string("published"),
+            ))
+        );
+    }
+
+    #[test]
+    fn reports_the_backend_expression_operator_span() {
+        let input = "fn normalize(status: String) -> String {\n  return status ??\n}";
+
+        let failure = parse_backend_ax_with_span(input).expect_err("missing operand should fail");
+
+        assert!(matches!(
+            failure.error,
+            AxBackendParseError::InvalidExpression { .. }
+        ));
+        assert_eq!(
+            failure.span,
+            AxBackendSourceSpan {
+                line: 2,
+                column: 17,
+                end_line: 2,
+                end_column: 19,
+            }
+        );
+    }
+
+    #[test]
+    fn reports_a_nested_backend_expression_span_in_utf16_columns() {
+        let input = "fn values() -> List<Float> {\n  return [🔥, 1.2.3]\n}";
+
+        let failure =
+            parse_backend_ax_with_span(input).expect_err("invalid nested float should fail");
+
+        assert_eq!(failure.span.line, 2);
+        assert_eq!(failure.span.column, 15);
+        assert_eq!(failure.span.end_column, 20);
     }
 
     #[test]
@@ -3296,10 +3421,7 @@ query loadPosts() -> Post[]
                 .filter(AxQueryFilter::new(
                     "status",
                     AxQueryFilterOp::In,
-                    AxExpr::call(
-                        ["list"],
-                        [AxExpr::string("published"), AxExpr::string("featured")],
-                    ),
+                    AxExpr::list([AxExpr::string("published"), AxExpr::string("featured")]),
                 ))
                 .filter(AxQueryFilter::new(
                     "tag",
@@ -3903,14 +4025,11 @@ action SetTheme
             AxExpr::call(
                 ["contains"],
                 [
-                    AxExpr::call(
-                        ["list"],
-                        [
-                            AxExpr::string("silver"),
-                            AxExpr::string("bronze"),
-                            AxExpr::string("gold"),
-                        ],
-                    ),
+                    AxExpr::list([
+                        AxExpr::string("silver"),
+                        AxExpr::string("bronze"),
+                        AxExpr::string("gold"),
+                    ]),
                     AxExpr::ident("input").member("theme"),
                 ],
             )

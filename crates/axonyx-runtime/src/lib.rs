@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod server;
+#[cfg(feature = "storage")]
+pub mod storage;
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -23,6 +25,7 @@ use axonyx_core::ax_lowering_prelude::{
 };
 use axonyx_core::ax_parser_auto::AxAutoParseError;
 use axonyx_core::ax_parser_auto_prelude::parse_ax_auto;
+use axonyx_core::ax_types::prelude::{AxDataContext, AxJsonValidationError, AxRecordType, AxType};
 use axonyx_core::prelude::{Attribute, AxNode};
 use axonyx_core::{AxonyxIr, SourceKind, TransformKind, ViewKind};
 use serde::{Deserialize, Serialize};
@@ -32,8 +35,147 @@ use thiserror::Error;
 pub use backend::prelude as backend_prelude;
 pub use serde;
 pub use server::prelude as server_prelude;
+#[cfg(feature = "storage")]
+pub use storage::prelude as storage_prelude;
 
 pub const AX_STATE_WASM_PATH: &str = "/_ax/runtime/axonyx-state-v2.wasm";
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AxApiResponseValidationMode {
+    Off,
+    #[default]
+    Development,
+    Always,
+}
+
+impl AxApiResponseValidationMode {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(Self::Off),
+            "development" => Some(Self::Development),
+            "always" => Some(Self::Always),
+            _ => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Development => "development",
+            Self::Always => "always",
+        }
+    }
+
+    pub fn enabled(self, development: bool) -> bool {
+        matches!(self, Self::Always) || (development && matches!(self, Self::Development))
+    }
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub enum AxApiResponseValidationError {
+    #[error("invalid API return contract `{contract}`: {message}")]
+    InvalidContract { contract: String, message: String },
+    #[error("successful API response for `{contract}` must use a JSON content type, found `{content_type}`")]
+    NonJsonResponse {
+        contract: String,
+        content_type: String,
+    },
+    #[error("successful API response for `{contract}` contains invalid JSON: {message}")]
+    InvalidJson { contract: String, message: String },
+    #[error("API response does not satisfy `{contract}`: {source}")]
+    ContractMismatch {
+        contract: String,
+        #[source]
+        source: AxJsonValidationError,
+    },
+}
+
+pub fn validate_api_response_bytes(
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    contract: &str,
+    context: &AxDataContext,
+) -> Result<(), AxApiResponseValidationError> {
+    if !(200..300).contains(&status) || status == 204 {
+        return Ok(());
+    }
+    if !is_json_content_type(content_type) {
+        return Err(AxApiResponseValidationError::NonJsonResponse {
+            contract: contract.to_string(),
+            content_type: content_type.to_string(),
+        });
+    }
+    let expected = parse_api_return_contract(contract)?;
+    let value = serde_json::from_slice(body).map_err(|error| {
+        AxApiResponseValidationError::InvalidJson {
+            contract: contract.to_string(),
+            message: error.to_string(),
+        }
+    })?;
+    context.validate_json(&expected, &value).map_err(|source| {
+        AxApiResponseValidationError::ContractMismatch {
+            contract: contract.to_string(),
+            source,
+        }
+    })
+}
+
+fn is_json_content_type(content_type: &str) -> bool {
+    let media_type = content_type
+        .split(';')
+        .next()
+        .unwrap_or(content_type)
+        .trim();
+    media_type.eq_ignore_ascii_case("application/json")
+        || media_type.to_ascii_lowercase().ends_with("+json")
+}
+
+fn parse_api_return_contract(contract: &str) -> Result<AxType, AxApiResponseValidationError> {
+    let contract = contract.trim();
+    if let Some(inner) = contract.strip_suffix("[]") {
+        return Ok(AxType::list(parse_api_return_contract(inner)?));
+    }
+    for (wrapper, wrap) in [
+        ("List", AxType::list as fn(AxType) -> AxType),
+        ("Optional", AxType::optional as fn(AxType) -> AxType),
+    ] {
+        if let Some(inner) = contract
+            .strip_prefix(&format!("{wrapper}<"))
+            .and_then(|value| value.strip_suffix('>'))
+        {
+            return Ok(wrap(parse_api_return_contract(inner)?));
+        }
+    }
+
+    let parsed = match contract {
+        "String" | "string" => AxType::String,
+        "Bool" | "Boolean" | "bool" | "boolean" => AxType::Bool,
+        "Number" | "number" | "f64" | "float" => AxType::Number,
+        "i64" | "u64" | "int" | "integer" => AxType::Int,
+        "Json" => AxType::Json,
+        "Null" => AxType::Void,
+        name if is_api_type_identifier(name) => AxType::record(name),
+        _ => {
+            return Err(AxApiResponseValidationError::InvalidContract {
+                contract: contract.to_string(),
+                message: "expected a built-in type, named type, List<T>, Optional<T>, or T[]"
+                    .to_string(),
+            });
+        }
+    };
+    Ok(parsed)
+}
+
+fn is_api_type_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || first == '_')
+        && chars.all(|char| char.is_ascii_alphanumeric() || char == '_')
+}
 
 pub fn ax_state_wasm_bytes() -> &'static [u8] {
     include_bytes!("../assets/axonyx-state-v2.wasm")
@@ -469,6 +611,7 @@ struct PreviewHandlers {
     loaders: BTreeMap<String, AxHandlerPlan>,
     actions: BTreeMap<String, AxHandlerPlan>,
     functions: BTreeMap<String, AxFunctionPlan>,
+    type_context: AxDataContext,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -482,6 +625,23 @@ struct PreviewFilter {
 struct PreviewRouteMatch<'a> {
     handler: &'a AxHandlerPlan,
     params: BTreeMap<String, AxValue>,
+}
+
+struct PreviewBackendContext<'a> {
+    env: &'a backend::AxEnv,
+    runtime: Option<&'a dyn backend::AxBackendRuntime>,
+}
+
+struct PreviewActionContext<'a> {
+    env: &'a backend::AxEnv,
+    runtime: Option<&'a dyn backend::AxBackendRuntime>,
+    request: Option<&'a server::AxHttpRequest>,
+    storage: Option<&'a dyn server::AxFileStorage>,
+}
+
+struct PreviewResponseValidation<'a> {
+    enabled: bool,
+    type_context: &'a AxDataContext,
 }
 
 pub fn preview_ax_route_with_backend(
@@ -784,8 +944,12 @@ pub fn execute_preview_action_sources(
         &handlers.functions,
         action_name,
         input_fields,
-        &env,
-        None,
+        PreviewActionContext {
+            env: &env,
+            runtime: None,
+            request: None,
+            storage: None,
+        },
         store,
     )
 }
@@ -803,8 +967,60 @@ pub fn execute_preview_action_sources_with_runtime(
         &handlers.functions,
         action_name,
         input_fields,
-        runtime.env(),
-        Some(runtime),
+        PreviewActionContext {
+            env: runtime.env(),
+            runtime: Some(runtime),
+            request: None,
+            storage: None,
+        },
+        store,
+    )
+}
+
+pub fn execute_preview_action_request_sources_with_storage(
+    action_sources: &[&str],
+    action_name: &str,
+    request: &server::AxHttpRequest,
+    storage: &dyn server::AxFileStorage,
+    store: &mut AxPreviewStore,
+) -> Result<AxPreviewActionResult, PreviewError> {
+    let handlers = collect_preview_handlers(&[], action_sources, &[])?;
+    let env = backend::AxEnv::from_env();
+    execute_preview_action(
+        &handlers.actions,
+        &handlers.functions,
+        action_name,
+        &BTreeMap::new(),
+        PreviewActionContext {
+            env: &env,
+            runtime: None,
+            request: Some(request),
+            storage: Some(storage),
+        },
+        store,
+    )
+}
+
+pub fn execute_preview_action_request_sources_with_runtime_and_storage(
+    action_sources: &[&str],
+    action_name: &str,
+    request: &server::AxHttpRequest,
+    runtime: &dyn backend::AxBackendRuntime,
+    storage: &dyn server::AxFileStorage,
+    store: &mut AxPreviewStore,
+) -> Result<AxPreviewActionResult, PreviewError> {
+    let handlers = collect_preview_handlers(&[], action_sources, &[])?;
+    execute_preview_action(
+        &handlers.actions,
+        &handlers.functions,
+        action_name,
+        &BTreeMap::new(),
+        PreviewActionContext {
+            env: runtime.env(),
+            runtime: Some(runtime),
+            request: Some(request),
+            storage: Some(storage),
+        },
         store,
     )
 }
@@ -824,6 +1040,15 @@ pub fn execute_preview_route_request_sources(
     request: &server::AxHttpRequest,
     store: &mut AxPreviewStore,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    execute_preview_route_request_sources_validated(route_sources, request, false, store)
+}
+
+pub fn execute_preview_route_request_sources_validated(
+    route_sources: &[&str],
+    request: &server::AxHttpRequest,
+    validate_response: bool,
+    store: &mut AxPreviewStore,
+) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
     let handlers = collect_preview_handlers(&[], &[], route_sources)?;
     let env = backend::AxEnv::from_env();
     let request_path = normalize_preview_request_path(&request.target)?;
@@ -833,8 +1058,14 @@ pub fn execute_preview_route_request_sources(
         request,
         &request_path,
         &query,
-        &env,
-        None,
+        PreviewBackendContext {
+            env: &env,
+            runtime: None,
+        },
+        PreviewResponseValidation {
+            enabled: validate_response,
+            type_context: &handlers.type_context,
+        },
         store,
     )
 }
@@ -843,6 +1074,22 @@ pub fn execute_preview_route_request_sources_with_runtime(
     route_sources: &[&str],
     request: &server::AxHttpRequest,
     runtime: &dyn backend::AxBackendRuntime,
+    store: &mut AxPreviewStore,
+) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    execute_preview_route_request_sources_with_runtime_validated(
+        route_sources,
+        request,
+        runtime,
+        false,
+        store,
+    )
+}
+
+pub fn execute_preview_route_request_sources_with_runtime_validated(
+    route_sources: &[&str],
+    request: &server::AxHttpRequest,
+    runtime: &dyn backend::AxBackendRuntime,
+    validate_response: bool,
     store: &mut AxPreviewStore,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
     let handlers = collect_preview_handlers(&[], &[], route_sources)?;
@@ -854,8 +1101,14 @@ pub fn execute_preview_route_request_sources_with_runtime(
         request,
         &request_path,
         &query,
-        env,
-        Some(runtime),
+        PreviewBackendContext {
+            env,
+            runtime: Some(runtime),
+        },
+        PreviewResponseValidation {
+            enabled: validate_response,
+            type_context: &handlers.type_context,
+        },
         store,
     )
 }
@@ -878,10 +1131,12 @@ fn collect_preview_handlers(
     let mut actions = BTreeMap::new();
     let mut functions = BTreeMap::new();
     let mut globals = Vec::new();
+    let mut type_context = AxDataContext::new();
 
     for source in route_sources {
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
+        collect_preview_types(&plan, &mut type_context);
         globals.extend(plan.globals);
         collect_preview_functions(plan.functions, &mut functions);
 
@@ -897,6 +1152,7 @@ fn collect_preview_handlers(
     for source in loader_sources {
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
+        collect_preview_types(&plan, &mut type_context);
         globals.extend(plan.globals);
         collect_preview_functions(plan.functions, &mut functions);
 
@@ -910,6 +1166,7 @@ fn collect_preview_handlers(
     for source in action_sources {
         let document = parse_backend_ax(source)?;
         let plan = lower_backend_document(&document)?;
+        collect_preview_types(&plan, &mut type_context);
         globals.extend(plan.globals);
         collect_preview_functions(plan.functions, &mut functions);
 
@@ -938,7 +1195,30 @@ fn collect_preview_handlers(
         loaders,
         actions,
         functions,
+        type_context,
     })
+}
+
+fn collect_preview_types(
+    plan: &axonyx_core::ax_backend_lowering_prelude::AxBackendPlan,
+    context: &mut AxDataContext,
+) {
+    for literal_union in &plan.literal_unions {
+        context
+            .literal_unions
+            .insert(literal_union.name.clone(), literal_union.literals.clone());
+    }
+    for record in &plan.types {
+        context.records.insert(
+            record.name.clone(),
+            record
+                .fields
+                .iter()
+                .fold(AxRecordType::new(&record.name), |record, field| {
+                    record.field(&field.name, field.ty.clone())
+                }),
+        );
+    }
 }
 
 fn collect_preview_functions(
@@ -1213,6 +1493,11 @@ fn execute_preview_function(
                         ),
                     });
                 }
+                AxValuePlan::StorageSave { .. } => {
+                    return Err(PreviewError::Runtime {
+                        message: format!("function `{}` cannot call Storage.save", function.name),
+                    });
+                }
             },
             AxStepPlan::Return(value) => {
                 return eval_preview_return_with_functions(value, &scope, env, functions)
@@ -1277,10 +1562,15 @@ fn execute_preview_action(
     functions: &BTreeMap<String, AxFunctionPlan>,
     action_name: &str,
     input_fields: &BTreeMap<String, String>,
-    env: &backend::AxEnv,
-    runtime: Option<&dyn backend::AxBackendRuntime>,
+    context: PreviewActionContext<'_>,
     store: &mut AxPreviewStore,
 ) -> Result<AxPreviewActionResult, PreviewError> {
+    let PreviewActionContext {
+        env,
+        runtime,
+        request,
+        storage,
+    } = context;
     let action = actions
         .get(action_name)
         .ok_or_else(|| PreviewError::Runtime {
@@ -1296,7 +1586,7 @@ fn execute_preview_action(
     let mut scope = BTreeMap::new();
     scope.insert(
         "input".to_string(),
-        build_preview_input_record(input, input_fields)?,
+        build_preview_input_record(input, input_fields, request)?,
     );
 
     let mut redirect_to = None;
@@ -1310,9 +1600,33 @@ fn execute_preview_action(
                 binding,
                 value: plan,
             } => {
-                let evaluated = eval_preview_value_with_functions(
-                    plan, &scope, env, runtime, store, functions,
-                )?;
+                let evaluated = match plan {
+                    AxValuePlan::StorageSave { capability, input } => {
+                        let request = request.ok_or_else(|| PreviewError::Runtime {
+                            message: "Storage.save requires an HTTP action request".to_string(),
+                        })?;
+                        let storage = storage.ok_or_else(|| PreviewError::Runtime {
+                            message: "Storage.save requires a configured storage runtime"
+                                .to_string(),
+                        })?;
+                        let file =
+                            request
+                                .incoming_file(input)
+                                .ok_or_else(|| PreviewError::Runtime {
+                                    message: format!("missing required file input `{input}`"),
+                                })?;
+                        let file_ref = storage.save_file(capability, file)?;
+                        let value = serde_json::to_value(file_ref).map_err(|error| {
+                            PreviewError::Runtime {
+                                message: format!("failed to serialize FileRef: {error}"),
+                            }
+                        })?;
+                        preview_json_to_value(value)
+                    }
+                    _ => eval_preview_value_with_functions(
+                        plan, &scope, env, runtime, store, functions,
+                    )?,
+                };
                 scope.insert(binding.clone(), evaluated);
             }
             AxStepPlan::Insert { collection, fields } => {
@@ -1479,10 +1793,14 @@ fn execute_preview_route(
     request: &server::AxHttpRequest,
     request_path: &str,
     query: &BTreeMap<String, String>,
-    env: &backend::AxEnv,
-    runtime: Option<&dyn backend::AxBackendRuntime>,
+    backend: PreviewBackendContext<'_>,
+    validation: PreviewResponseValidation<'_>,
     store: &mut AxPreviewStore,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
+    let env = backend.env;
+    let runtime = backend.runtime;
+    let validate_response = validation.enabled;
+    let type_context = validation.type_context;
     let Some(route_match) = match_preview_route(routes, &request.method, request_path) else {
         return Ok(None);
     };
@@ -1593,10 +1911,13 @@ fn execute_preview_route(
                         apply_preview_route_hook(value, &scope, env, &mut headers)?
                     {
                         apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
-                        return Ok(Some(apply_preview_response_metadata(
+                        let response =
+                            apply_preview_response_metadata(response, headers, set_cookies);
+                        return Ok(Some(validate_preview_api_response(
+                            route_match.handler,
                             response,
-                            headers,
-                            set_cookies,
+                            validate_response,
+                            type_context,
                         )));
                     }
                 }
@@ -1630,27 +1951,83 @@ fn execute_preview_route(
                 if !preview_require_passes(&eval_preview_require_expr(value, &scope, env)?) {
                     let response = render_preview_require_fallback(fallback.as_ref(), &scope, env)?;
                     apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
-                    return Ok(Some(apply_preview_response_metadata(
+                    let response = apply_preview_response_metadata(response, headers, set_cookies);
+                    return Ok(Some(validate_preview_api_response(
+                        route_match.handler,
                         response,
-                        headers,
-                        set_cookies,
+                        validate_response,
+                        type_context,
                     )));
                 }
             }
             AxStepPlan::Return(result) => {
                 apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
-                return render_preview_route_return(result, &scope, env, headers, set_cookies);
+                return render_preview_route_return(result, &scope, env, headers, set_cookies).map(
+                    |response| {
+                        response.map(|response| {
+                            validate_preview_api_response(
+                                route_match.handler,
+                                response,
+                                validate_response,
+                                type_context,
+                            )
+                        })
+                    },
+                );
             }
             AxStepPlan::Revalidate { .. } | AxStepPlan::Patch { .. } | AxStepPlan::Send { .. } => {}
         }
     }
 
     apply_preview_route_after_hooks(&after_hooks, &scope, env, &mut headers)?;
-    Ok(Some(apply_preview_response_metadata(
+    let response = apply_preview_response_metadata(
         render_preview_json_response(&AxValue::Null)?,
         headers,
         set_cookies,
+    );
+    Ok(Some(validate_preview_api_response(
+        route_match.handler,
+        response,
+        validate_response,
+        type_context,
     )))
+}
+
+fn validate_preview_api_response(
+    handler: &AxHandlerPlan,
+    response: AxPreviewHttpResponse,
+    enabled: bool,
+    context: &AxDataContext,
+) -> AxPreviewHttpResponse {
+    let AxHandlerKind::Route {
+        returns: Some(contract),
+        method,
+        path,
+        ..
+    } = &handler.kind
+    else {
+        return response;
+    };
+    if !enabled {
+        return response;
+    }
+    if let Err(error) = validate_api_response_bytes(
+        response.status,
+        &response.content_type,
+        &response.body,
+        contract,
+        context,
+    ) {
+        eprintln!("Axonyx API response validation failed for {method} {path}: {error}");
+        return AxPreviewHttpResponse {
+            status: 500,
+            content_type: "application/json; charset=utf-8".to_string(),
+            headers: BTreeMap::from([("Cache-Control".to_string(), "no-store".to_string())]),
+            set_cookies: Vec::new(),
+            body: br#"{"error":"internal_server_error","message":"API response did not satisfy its declared contract."}"#.to_vec(),
+        };
+    }
+    response
 }
 
 fn render_preview_require_fallback(
@@ -1840,6 +2217,9 @@ fn eval_preview_value_with_functions(
         AxValuePlan::Query(query) => {
             eval_preview_query_with_functions(query, scope, env, runtime, store, functions)
         }
+        AxValuePlan::StorageSave { .. } => Err(PreviewError::Runtime {
+            message: "Storage.save is only evaluated by an HTTP action runtime".to_string(),
+        }),
     }
 }
 
@@ -2706,10 +3086,26 @@ fn eval_preview_filters_with_functions(
 fn build_preview_input_record(
     fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
     input_fields: &BTreeMap<String, String>,
+    request: Option<&server::AxHttpRequest>,
 ) -> Result<AxValue, PreviewError> {
     let mut record = BTreeMap::new();
     for field in fields {
-        let Some(value) = input_fields.get(&field.name).cloned() else {
+        if field.rust_ty == "AxIncomingFile" {
+            if request
+                .and_then(|request| request.incoming_file(&field.name))
+                .is_none()
+            {
+                return Err(PreviewError::Runtime {
+                    message: format!("missing required file input `{}`", field.name),
+                });
+            }
+            continue;
+        }
+        let value = input_fields
+            .get(&field.name)
+            .cloned()
+            .or_else(|| request.and_then(|request| request.form_value(&field.name)));
+        let Some(value) = value else {
             if let Some(default) = &field.default {
                 record.insert(
                     field.name.clone(),
@@ -2785,7 +3181,7 @@ fn build_preview_route_input_record(
         })
         .collect::<BTreeMap<_, _>>();
 
-    build_preview_input_record(fields, &input_fields)
+    build_preview_input_record(fields, &input_fields, Some(request))
 }
 
 fn coerce_preview_loader_input_value(
@@ -3582,6 +3978,31 @@ fn ax_action_script() -> &'static str {
   };
 
   const actionStatuses = (form) => Array.from(form.querySelectorAll(".ax-action-status[data-state]"));
+  const actionProgress = (form) => Array.from(form.querySelectorAll("[data-ax-action-progress]"));
+  const actionSubmitControls = (form) => Array.from(form.querySelectorAll(
+    'button:not([type]), button[type="submit"], input[type="submit"], input[type="image"]'
+  ));
+
+  const setActionPending = (form, pending) => {
+    if (pending) form.setAttribute("aria-busy", "true");
+    else form.removeAttribute("aria-busy");
+    actionSubmitControls(form).forEach((control) => {
+      if (pending) {
+        if (!control.hasAttribute("data-ax-disabled-before-pending")) {
+          control.setAttribute(
+            "data-ax-disabled-before-pending",
+            control.disabled ? "true" : "false"
+          );
+        }
+        control.disabled = true;
+        return;
+      }
+      const previous = control.getAttribute("data-ax-disabled-before-pending");
+      if (previous === null) return;
+      control.disabled = previous === "true";
+      control.removeAttribute("data-ax-disabled-before-pending");
+    });
+  };
 
   const syncActionStatus = (form) => {
     const current = form.getAttribute("data-ax-action-state") || "";
@@ -3593,16 +4014,93 @@ fn ax_action_script() -> &'static str {
     });
   };
 
+  const resetUploadProgress = (form) => {
+    form.removeAttribute("data-ax-upload-state");
+    form.removeAttribute("data-ax-upload-loaded");
+    form.removeAttribute("data-ax-upload-total");
+    form.removeAttribute("data-ax-upload-percent");
+    actionProgress(form).forEach((progress) => {
+      progress.value = 0;
+      progress.hidden = true;
+      progress.setAttribute("aria-hidden", "true");
+      progress.setAttribute("aria-valuenow", "0");
+    });
+  };
+
+  const updateUploadProgress = (form, state, loaded, total) => {
+    const boundedLoaded = Math.max(0, Number(loaded) || 0);
+    const boundedTotal = Math.max(0, Number(total) || 0);
+    const percent = boundedTotal > 0
+      ? Math.min(100, Math.round((boundedLoaded / boundedTotal) * 100))
+      : 0;
+    form.setAttribute("data-ax-upload-state", state);
+    form.setAttribute("data-ax-upload-loaded", String(boundedLoaded));
+    form.setAttribute("data-ax-upload-total", String(boundedTotal));
+    form.setAttribute("data-ax-upload-percent", String(percent));
+    actionProgress(form).forEach((progress) => {
+      progress.value = percent;
+      progress.hidden = false;
+      progress.setAttribute("aria-hidden", "false");
+      progress.setAttribute("aria-valuenow", String(percent));
+    });
+    window.dispatchEvent(new CustomEvent("axonyx:upload-progress", {
+      detail: { form, state, loaded: boundedLoaded, total: boundedTotal, percent },
+    }));
+  };
+
   const setActionState = (form, state) => {
     form.setAttribute("data-ax-action-state", state);
+    setActionPending(form, state === "pending");
     syncActionStatus(form);
+    if (state !== "pending") {
+      if (form.hasAttribute("data-ax-upload-state")) {
+        form.setAttribute("data-ax-upload-state", state === "complete" ? "complete" : "error");
+      }
+      actionProgress(form).forEach((progress) => {
+        progress.hidden = true;
+        progress.setAttribute("aria-hidden", "true");
+      });
+    }
   };
 
   const initActionForms = () => {
     document.querySelectorAll("form").forEach((form) => {
-      if (isAxonyxActionForm(form)) syncActionStatus(form);
+      if (isAxonyxActionForm(form)) {
+        syncActionStatus(form);
+        resetUploadProgress(form);
+      }
     });
   };
+
+  const uploadWithProgress = (form, formData, headers) => new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(form.method || "POST", form.action, true);
+    Object.entries(headers).forEach(([name, value]) => xhr.setRequestHeader(name, value));
+    xhr.upload.addEventListener("loadstart", () => {
+      window.dispatchEvent(new CustomEvent("axonyx:upload-start", { detail: { form } }));
+      updateUploadProgress(form, "uploading", 0, 0);
+    });
+    xhr.upload.addEventListener("progress", (event) => {
+      updateUploadProgress(form, "uploading", event.loaded, event.lengthComputable ? event.total : 0);
+    });
+    xhr.upload.addEventListener("load", (event) => {
+      updateUploadProgress(form, "processing", event.loaded, event.lengthComputable ? event.total : event.loaded);
+      window.dispatchEvent(new CustomEvent("axonyx:upload-complete", {
+        detail: { form, loaded: event.loaded, total: event.lengthComputable ? event.total : event.loaded },
+      }));
+    });
+    xhr.onerror = () => reject(new Error("Axonyx upload failed"));
+    xhr.onabort = () => reject(new DOMException("Axonyx upload aborted", "AbortError"));
+    xhr.onload = () => resolve({
+      status: xhr.status,
+      ok: xhr.status >= 200 && xhr.status < 300,
+      redirected: Boolean(xhr.responseURL && xhr.responseURL !== form.action),
+      url: xhr.responseURL,
+      headers: { get: (name) => xhr.getResponseHeader(name) },
+      json: async () => JSON.parse(xhr.responseText),
+    });
+    xhr.send(formData);
+  });
 
   const actionRoutePath = (payload) => {
     const redirect = typeof payload?.redirect === "string" && payload.redirect ? payload.redirect : window.location.pathname;
@@ -3710,6 +4208,7 @@ fn ax_action_script() -> &'static str {
     const form = event.target;
     if (!(form instanceof HTMLFormElement) || !isAxonyxActionForm(form)) return;
     event.preventDefault();
+    if (form.getAttribute("data-ax-action-state") === "pending") return;
 
     const formData = new FormData(form);
     if (!formData.has("__ax_patch")) formData.append("__ax_patch", "1");
@@ -3720,20 +4219,27 @@ fn ax_action_script() -> &'static str {
     const contentHeaders = hasFile ? {} : {
       "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
     };
+    resetUploadProgress(form);
     setActionState(form, "pending");
+    window.dispatchEvent(new CustomEvent("axonyx:action-start", {
+      detail: { form },
+    }));
 
     try {
-      const response = await fetch(form.action, {
-        method: form.method || "POST",
-        headers: {
-          Accept: "application/ax-patch+json",
-          "X-Axonyx-State-Protocol": "ax-state/1",
-          "X-Axonyx-Tab": getTabId(),
-          ...contentHeaders,
-        },
-        body,
-        cache: "no-store",
-      });
+      const requestHeaders = {
+        Accept: "application/ax-patch+json",
+        "X-Axonyx-State-Protocol": "ax-state/1",
+        "X-Axonyx-Tab": getTabId(),
+        ...contentHeaders,
+      };
+      const response = hasFile && typeof XMLHttpRequest === "function"
+        ? await uploadWithProgress(form, formData, requestHeaders)
+        : await fetch(form.action, {
+            method: form.method || "POST",
+            headers: requestHeaders,
+            body,
+            cache: "no-store",
+          });
       const contentType = response.headers.get("content-type") || "";
       if (contentType.includes("application/ax-patch+json")) {
         await applyPatchResponse(await response.json(), form);
@@ -3755,6 +4261,11 @@ fn ax_action_script() -> &'static str {
       window.location.reload();
     } catch (error) {
       setActionState(form, "error");
+      if (hasFile) {
+        window.dispatchEvent(new CustomEvent("axonyx:upload-error", {
+          detail: { form, error },
+        }));
+      }
       window.dispatchEvent(new CustomEvent("axonyx:action-error", {
         detail: { form, error },
       }));
@@ -7565,6 +8076,11 @@ page Posts
         assert!(html.contains("application/x-www-form-urlencoded;charset=UTF-8"));
         assert!(html.contains("syncActionStatus"));
         assert!(html.contains("setActionState"));
+        assert!(html.contains("setActionPending"));
+        assert!(html.contains("data-ax-disabled-before-pending"));
+        assert!(html.contains("aria-busy"));
+        assert!(html.contains("axonyx:action-start"));
+        assert!(html.contains("data-ax-action-state\") === \"pending"));
         assert!(html.contains("status.hidden = !active"));
         assert!(html.contains("aria-live"));
         assert!(html.contains("refreshes"));
@@ -7583,6 +8099,13 @@ page Posts
         assert!(!html.contains("if (refreshes.length === 0 &&"));
         assert!(html.contains("application/ax-error+json"));
         assert!(html.contains("setActionState(form, \"error\")"));
+        assert!(html.contains("uploadWithProgress"));
+        assert!(html.contains("typeof XMLHttpRequest === \"function\""));
+        assert!(html.contains("axonyx:upload-start"));
+        assert!(html.contains("axonyx:upload-progress"));
+        assert!(html.contains("axonyx:upload-complete"));
+        assert!(html.contains("axonyx:upload-error"));
+        assert!(html.contains("data-ax-upload-percent"));
     }
 
     #[test]
@@ -7610,6 +8133,7 @@ page Home
   <ActionStatus state="pending">Saving theme...</ActionStatus>
   <ActionStatus state="complete">Theme saved.</ActionStatus>
   <ActionStatus state="error">Theme could not be saved.</ActionStatus>
+  <ActionProgress />
   <Button type="submit">Apply</Button>
 </ActionForm>
 "#,
@@ -7627,6 +8151,10 @@ page Home
         assert!(html.contains("class=\"ax-action-status\""));
         assert!(html.contains("data-state=\"pending\""));
         assert!(html.contains("Saving theme..."));
+        assert!(html.contains("class=\"ax-action-progress\""));
+        assert!(html.contains("data-ax-action-progress=\"true\""));
+        assert!(html.contains("aria-hidden=\"true\""));
+        assert!(html.contains("<progress"));
         assert!(html.contains("data-ax-runtime=\"actions\""));
     }
 
@@ -7693,6 +8221,58 @@ page Posts
         .expect("page should render with mutated store");
 
         assert!(html.contains("Axonyx Forms"));
+    }
+
+    #[cfg(feature = "storage")]
+    #[test]
+    fn preview_action_saves_multipart_file_through_named_capability() {
+        let root = std::env::temp_dir().join(format!(
+            "axonyx-preview-storage-action-{}",
+            std::process::id()
+        ));
+        let storage =
+            storage::AxCapabilityStorage::open("media", &root, 1024).expect("storage should open");
+        let mut registry = storage::AxStorageRegistry::new();
+        registry.register(storage).expect("storage should register");
+
+        let mut request = server::AxHttpRequest::new("POST", "/__axonyx/action");
+        request.multipart = Some(server::AxMultipartForm {
+            fields: BTreeMap::new(),
+            files: BTreeMap::from([(
+                "image".to_string(),
+                vec![server::AxIncomingFile {
+                    field_name: "image".to_string(),
+                    file_name: "photo.png".to_string(),
+                    content_type: Some("image/png".to_string()),
+                    bytes: b"axonyx-image".to_vec(),
+                }],
+            )]),
+        });
+
+        let mut store = AxPreviewStore::default();
+        let result = execute_preview_action_request_sources_with_storage(
+            &[r#"
+action UploadImage(image: File) -> FileRef {
+  data saved = Storage.save("media", input.image)
+  return json(saved)
+}
+"#],
+            "UploadImage",
+            &request,
+            &registry,
+            &mut store,
+        )
+        .expect("storage action should execute");
+        let value = preview_value_to_json(&result.value);
+
+        assert_eq!(value["storage"], "media");
+        assert_eq!(value["file_name"], "photo.png");
+        assert_eq!(value["content_type"], "image/png");
+        assert_eq!(value["size"], 12);
+        assert_eq!(value["id"].as_str().map(str::len), Some(64));
+
+        drop(registry);
+        std::fs::remove_dir_all(root).expect("storage should clean up");
     }
 
     #[test]
@@ -8954,5 +9534,76 @@ page Home
         assert!(html.contains("<title>Page Title</title>"));
         assert!(html.contains("<meta name=\"description\" content=\"Layout description.\">"));
         assert!(html.contains("<link rel=\"icon\" href=\"/favicon.svg\">"));
+    }
+
+    #[test]
+    fn api_response_validation_modes_have_safe_defaults() {
+        assert_eq!(
+            AxApiResponseValidationMode::default(),
+            AxApiResponseValidationMode::Development
+        );
+        assert!(AxApiResponseValidationMode::Development.enabled(true));
+        assert!(!AxApiResponseValidationMode::Development.enabled(false));
+        assert!(AxApiResponseValidationMode::Always.enabled(false));
+        assert!(!AxApiResponseValidationMode::Off.enabled(true));
+    }
+
+    #[test]
+    fn validates_declared_api_response_bytes() {
+        let context = AxDataContext::new().with_record(
+            AxRecordType::new("Post")
+                .field("title", AxType::String)
+                .field("published", AxType::Bool),
+        );
+
+        validate_api_response_bytes(
+            200,
+            "application/json; charset=utf-8",
+            br#"[{"title":"Axonyx","published":true}]"#,
+            "Post[]",
+            &context,
+        )
+        .expect("matching response should pass");
+
+        let error = validate_api_response_bytes(
+            200,
+            "application/json",
+            br#"[{"title":"Axonyx","published":"yes"}]"#,
+            "Post[]",
+            &context,
+        )
+        .expect_err("mismatched response should fail");
+        assert!(error.to_string().contains("$[0].published"));
+
+        assert!(
+            validate_api_response_bytes(404, "text/plain", b"not found", "Post[]", &context,)
+                .is_ok()
+        );
+        assert!(validate_api_response_bytes(204, "text/plain", b"", "Post[]", &context).is_ok());
+    }
+
+    #[test]
+    fn preview_api_response_validation_returns_a_safe_500() {
+        let mut store = AxPreviewStore::default();
+        let request = server::AxHttpRequest::new("GET", "/api/posts");
+        let response = execute_preview_route_request_sources_validated(
+            &[r#"
+route GET "/api/posts" -> String {
+  return json(7)
+}
+"#],
+            &request,
+            true,
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 500);
+        assert_eq!(response.content_type, "application/json; charset=utf-8");
+        assert_eq!(
+            response.body,
+            br#"{"error":"internal_server_error","message":"API response did not satisfy its declared contract."}"#
+        );
     }
 }
