@@ -46,7 +46,7 @@ base64ct = "=1.7.3"
 zeroize = "=1.8.1"
 zeroize_derive = "=1.4.2"
 chrono = "=0.4.42"
-uuid = "=1.18.1"
+uuid = { version = "=1.18.1", features = ["v4"] }
 proc-macro2 = "1.0.106"
 quote = "1.0.45"
 syn = { version = "2.0.117", features = ["full"] }
