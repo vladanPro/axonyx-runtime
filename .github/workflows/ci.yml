@@ -42,7 +42,7 @@ jobs:
         run: npm ci
 
       - name: Audit browser test dependencies
-        run: npm audit --audit-level=high --omit=optional
+        run: npm run audit:browser
 
       - name: Verify Reactive Each in Chromium
         run: npm run test:reactive-each
