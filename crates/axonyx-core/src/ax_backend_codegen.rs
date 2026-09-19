@@ -1167,7 +1167,7 @@ fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -
         AxStepPlan::Header { name, value } => {
             format!("    // header {} = {}\n", name.code, value.code)
         }
-        AxStepPlan::Cookie { name, value } if route_response => format!(
+        AxStepPlan::Cookie { name, value } if route_response || action_response => format!(
             "    __ax_cookies.push(AxCookie::new({}, {}).with_path(\"/\"));\n",
             render_string_expr(name),
             render_string_expr(value)
@@ -1175,7 +1175,7 @@ fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -
         AxStepPlan::Cookie { name, value } => {
             format!("    // cookie {} = {}\n", name.code, value.code)
         }
-        AxStepPlan::ClearCookie { name } if route_response => format!(
+        AxStepPlan::ClearCookie { name } if route_response || action_response => format!(
             "    __ax_cookies.push(AxCookie::new({}, \"\").with_path(\"/\").with_max_age(0));\n",
             render_string_expr(name)
         ),
@@ -2000,6 +2000,25 @@ action SetTheme(theme: string) {
         assert!(module.contains("\"value\":&input.theme"));
         assert!(module.contains("Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))"));
         assert!(!module.contains("// patch"));
+    }
+
+    #[test]
+    fn compiles_action_cookies_into_the_private_response_channel() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action RememberTheme(theme: string) {
+  cookie "theme" = input.theme
+  clearCookie("flash")
+  return ok()
+}
+"#,
+        )
+        .expect("source should compile");
+
+        assert!(module.contains("__ax_cookies.push(AxCookie::new"));
+        assert!(module.contains("input.theme"));
+        assert!(module.contains("with_max_age(0)"));
+        assert!(module.contains("with_cookies(__ax_cookies)"));
     }
 
     #[test]
