@@ -8,6 +8,10 @@ use uuid::Uuid;
 use crate::backend::{AxRuntimeError, AxRuntimeResult};
 use crate::server::{AxAuth, AxCookie, AxHttpRequest};
 
+mod sqlite;
+
+pub use sqlite::AxSqliteSessionStore;
+
 pub const DEFAULT_SESSION_TTL_SECONDS: i64 = 60 * 60 * 24 * 30;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -274,7 +278,7 @@ fn validate_secret(secret: &str) -> AxRuntimeResult<()> {
 pub mod prelude {
     pub use super::{
         AxMemorySessionStore, AxSameSite, AxSession, AxSessionCookiePolicy, AxSessionManager,
-        AxSessionStore, DEFAULT_SESSION_TTL_SECONDS,
+        AxSessionStore, AxSqliteSessionStore, DEFAULT_SESSION_TTL_SECONDS,
     };
 }
 

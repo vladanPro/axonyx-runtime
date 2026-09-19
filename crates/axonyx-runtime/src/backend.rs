@@ -3187,7 +3187,7 @@ fn sqlite_row_to_json(row: &rusqlite::Row<'_>, column_names: &[String]) -> rusql
     Ok(Value::Object(record))
 }
 
-fn sqlite_runtime_error(resource: &str, error: rusqlite::Error) -> AxRuntimeError {
+pub(crate) fn sqlite_runtime_error(resource: &str, error: rusqlite::Error) -> AxRuntimeError {
     AxRuntimeError::database(AxDbError::from_driver_detail(
         AxDatabaseDriver::Sqlite,
         resource,
