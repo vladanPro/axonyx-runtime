@@ -30,6 +30,33 @@ use thiserror::Error;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
+use crate::server::AxCookie;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxActionOutput {
+    pub payload: Value,
+    pub cookies: Vec<AxCookie>,
+}
+
+impl AxActionOutput {
+    pub fn new(payload: Value) -> Self {
+        Self {
+            payload,
+            cookies: Vec::new(),
+        }
+    }
+
+    pub fn with_cookie(mut self, cookie: AxCookie) -> Self {
+        self.cookies.push(cookie);
+        self
+    }
+
+    pub fn with_cookies(mut self, cookies: impl IntoIterator<Item = AxCookie>) -> Self {
+        self.cookies.extend(cookies);
+        self
+    }
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AxRuntimeError {
     #[error("runtime operation failed: {message}")]
@@ -4415,6 +4442,7 @@ pub mod prelude {
     pub use super::lazy_runtime_from_env;
     pub use super::ok_payload;
     pub use super::runtime_from_env;
+    pub use super::AxActionOutput;
     pub use super::AxAppliedMigration;
     pub use super::AxBackendRuntime;
     pub use super::AxDataTransport;
@@ -4466,6 +4494,17 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_output_keeps_response_cookies_outside_the_public_payload() {
+        let output = AxActionOutput::new(json!({ "ok": true }))
+            .with_cookie(AxCookie::new("session", "signed-id").http_only());
+
+        assert_eq!(output.payload, json!({ "ok": true }));
+        assert_eq!(output.cookies.len(), 1);
+        assert_eq!(output.cookies[0].name, "session");
+        assert!(output.payload.get("cookies").is_none());
+    }
 
     #[derive(Default)]
     struct MemoryRuntime {
