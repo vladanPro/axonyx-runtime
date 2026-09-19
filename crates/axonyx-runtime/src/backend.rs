@@ -1273,8 +1273,8 @@ impl<A> AxMessenger for AxDatabaseRuntime<A> {
 }
 
 type AxPostgresManager = PostgresConnectionManager<MakeRustlsConnect>;
-type AxPostgresPool = Pool<AxPostgresManager>;
-type AxPooledPostgresConnection = PooledConnection<AxPostgresManager>;
+pub(crate) type AxPostgresPool = Pool<AxPostgresManager>;
+pub(crate) type AxPooledPostgresConnection = PooledConnection<AxPostgresManager>;
 
 #[derive(Debug)]
 struct AxPostgresConnectionCustomizer {
@@ -3541,7 +3541,7 @@ fn postgres_with_client<T>(
     }
 }
 
-fn postgres_pool_connection(
+pub(crate) fn postgres_pool_connection(
     pool: &AxPostgresPool,
     resource: &str,
 ) -> AxRuntimeResult<AxPooledPostgresConnection> {
@@ -3620,7 +3620,7 @@ fn postgres_open_connection(url: &Option<String>, resource: &str) -> AxRuntimeRe
         .map_err(|error| postgres_runtime_error(resource, error))
 }
 
-fn postgres_create_pool(
+pub(crate) fn postgres_create_pool(
     url: &Option<String>,
     resource: &str,
     max_size: u32,
@@ -3837,7 +3837,7 @@ fn postgres_json_query(sql: &str) -> String {
     format!("select row_to_json(\"__ax_row\") from ({sql}) as \"__ax_row\"")
 }
 
-fn postgres_runtime_error(resource: &str, error: postgres::Error) -> AxRuntimeError {
+pub(crate) fn postgres_runtime_error(resource: &str, error: postgres::Error) -> AxRuntimeError {
     let detail = if let Some(db_error) = error.as_db_error() {
         format!("{}: {}", db_error.code().code(), db_error.message())
     } else {
