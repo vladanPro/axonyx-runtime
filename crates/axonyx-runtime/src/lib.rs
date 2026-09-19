@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod server;
+pub mod session;
 #[cfg(feature = "storage")]
 pub mod storage;
 
@@ -35,6 +36,7 @@ use thiserror::Error;
 pub use backend::prelude as backend_prelude;
 pub use serde;
 pub use server::prelude as server_prelude;
+pub use session::prelude as session_prelude;
 #[cfg(feature = "storage")]
 pub use storage::prelude as storage_prelude;
 
