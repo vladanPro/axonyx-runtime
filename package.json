@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "audit:browser": "node scripts/audit-browser-dependencies.mjs",
     "test:reactive-each": "node scripts/verify-reactive-each-browser.mjs",
     "test:upload-lifecycle": "node scripts/verify-upload-lifecycle-browser.mjs"
   },
