@@ -43,6 +43,8 @@ pub enum AxBackendParseError {
     InvalidHeader { line: usize },
     #[error("invalid response cookie at line {line}")]
     InvalidCookie { line: usize },
+    #[error("invalid session operation at line {line}")]
+    InvalidSession { line: usize },
     #[error("invalid hook at line {line}")]
     InvalidHook { line: usize },
     #[error("invalid requirement at line {line}")]
@@ -90,6 +92,7 @@ impl AxBackendParseError {
             | Self::InvalidAssignment { line }
             | Self::InvalidHeader { line }
             | Self::InvalidCookie { line }
+            | Self::InvalidSession { line }
             | Self::InvalidHook { line }
             | Self::InvalidRequirement { line }
             | Self::InvalidReturn { line }
@@ -792,6 +795,11 @@ impl Parser {
             return Ok(statement);
         }
 
+        if let Some(statement) = parse_session_stmt(text, line.line)? {
+            self.pos += 1;
+            return Ok(statement);
+        }
+
         if let Some(statement) = parse_function_call_stmt(text, line.line)? {
             self.pos += 1;
             return Ok(statement);
@@ -1327,6 +1335,36 @@ impl Parser {
         }
 
         Ok(query)
+    }
+}
+
+fn parse_session_stmt(
+    input: &str,
+    line: usize,
+) -> Result<Option<AxBackendStmt>, AxBackendParseError> {
+    let Some(open_index) = find_call_open(input) else {
+        return Ok(None);
+    };
+    if !input.ends_with(')') {
+        return Ok(None);
+    }
+
+    let method = input[..open_index].trim();
+    if !method.starts_with("Session.") {
+        return Ok(None);
+    }
+
+    let args = split_call_args(&input[open_index + 1..input.len() - 1], line)?;
+    match method {
+        "Session.create" if args.len() == 2 => Ok(Some(AxBackendStmt::session_create(
+            args[0].clone(),
+            args[1].clone(),
+        ))),
+        "Session.destroy" if args.is_empty() => Ok(Some(AxBackendStmt::session_destroy())),
+        "Session.create" | "Session.destroy" | "Session.refresh" => {
+            Err(AxBackendParseError::InvalidSession { line })
+        }
+        _ => Err(AxBackendParseError::InvalidSession { line }),
     }
 }
 
@@ -4315,5 +4353,45 @@ action RemovePost
         assert_eq!(mutation.collection, "posts");
         assert!(mutation.fields.is_empty());
         assert_eq!(mutation.filters.len(), 1);
+    }
+
+    #[test]
+    fn parses_session_create_and_destroy_statements() {
+        let document = parse_backend_ax(
+            r#"action Login(userId: String, role: String) {
+  Session.create(input.userId, { role: input.role })
+  return ok
+}
+
+action Logout() {
+  Session.destroy()
+  return ok
+}"#,
+        )
+        .expect("session actions should parse");
+
+        let AxBackendBlock::Action(login) = &document.blocks[0] else {
+            panic!("expected login action");
+        };
+        assert!(matches!(login.body[0], AxBackendStmt::SessionCreate(_)));
+
+        let AxBackendBlock::Action(logout) = &document.blocks[1] else {
+            panic!("expected logout action");
+        };
+        assert_eq!(logout.body[0], AxBackendStmt::SessionDestroy);
+    }
+
+    #[test]
+    fn rejects_invalid_session_operations_and_arity() {
+        for source in [
+            "action Login() {\n  Session.create(\"user\")\n}",
+            "action Logout() {\n  Session.destroy(\"unexpected\")\n}",
+            "action Refresh() {\n  Session.refresh()\n}",
+        ] {
+            assert!(matches!(
+                parse_backend_ax(source),
+                Err(AxBackendParseError::InvalidSession { .. })
+            ));
+        }
     }
 }

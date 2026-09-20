@@ -169,6 +169,11 @@ pub enum AxStepPlan {
     ClearCookie {
         name: AxRustExpr,
     },
+    SessionCreate {
+        subject: AxRustExpr,
+        data: AxRustExpr,
+    },
+    SessionDestroy,
     Require {
         value: AxRustExpr,
         fallback: Option<AxReturnPlan>,
@@ -336,6 +341,8 @@ pub enum AxBackendLowerError {
     InvalidStorageSave,
     #[error("Storage.save input `{field}` is not declared as File on this action")]
     InvalidStorageFileInput { field: String },
+    #[error("Session operations are only supported inside server actions and routes")]
+    SessionOutsideRequestHandler,
     #[error("invalid runtime env path `{path}`")]
     InvalidRuntimeEnvPath { path: String },
     #[error("duplicate backend type declaration `{name}`")]
@@ -367,7 +374,7 @@ pub fn lower_backend_document(
                 for stmt in &root.body {
                     match stmt {
                         AxBackendStmt::Env(env) => envs.push(lower_env(env)),
-                        _ => globals.push(lower_step(stmt, None)?),
+                        _ => globals.push(lower_step(stmt, None, AxStepContext::Other)?),
                     }
                 }
             }
@@ -474,7 +481,7 @@ fn lower_function(function: &AxBackendFunction) -> Result<AxFunctionPlan, AxBack
         rust_fn: format!("fn_{}", normalize_ident(name)),
         returns: function.returns.clone(),
         input,
-        steps: lower_steps(&function.body, None)?,
+        steps: lower_steps(&function.body, None, AxStepContext::Other)?,
         exported: function.exported,
     })
 }
@@ -509,7 +516,7 @@ fn lower_route(route: &AxRoute) -> Result<AxHandlerPlan, AxBackendLowerError> {
             returns: route.returns.clone(),
             input,
         },
-        steps: lower_steps(&route.body, None)?,
+        steps: lower_steps(&route.body, None, AxStepContext::Request)?,
     })
 }
 
@@ -532,7 +539,7 @@ fn lower_loader(loader: &AxLoader) -> Result<AxHandlerPlan, AxBackendLowerError>
             returns: loader.returns.clone(),
             input,
         },
-        steps: lower_steps(&loader.body, None)?,
+        steps: lower_steps(&loader.body, None, AxStepContext::Other)?,
     })
 }
 
@@ -547,7 +554,7 @@ fn lower_action(action: &AxAction) -> Result<AxHandlerPlan, AxBackendLowerError>
         .iter()
         .map(lower_action_input_field)
         .collect::<Result<Vec<_>, _>>()?;
-    let steps = lower_steps(&action.body, Some(&input))?;
+    let steps = lower_steps(&action.body, Some(&input), AxStepContext::Request)?;
 
     Ok(AxHandlerPlan {
         name: action.name.clone(),
@@ -570,7 +577,7 @@ fn lower_job(job: &AxJob) -> Result<AxHandlerPlan, AxBackendLowerError> {
         name: job.name.clone(),
         rust_fn: format!("job_{}", normalize_ident(name)),
         kind: AxHandlerKind::Job,
-        steps: lower_steps(&job.body, None)?,
+        steps: lower_steps(&job.body, None, AxStepContext::Other)?,
     })
 }
 
@@ -626,16 +633,24 @@ fn lower_env(env: &AxBackendEnv) -> AxEnvPlan {
 fn lower_steps(
     steps: &[AxBackendStmt],
     action_input: Option<&[AxFieldPlan]>,
+    context: AxStepContext,
 ) -> Result<Vec<AxStepPlan>, AxBackendLowerError> {
     steps
         .iter()
-        .map(|step| lower_step(step, action_input))
+        .map(|step| lower_step(step, action_input, context))
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AxStepContext {
+    Request,
+    Other,
 }
 
 fn lower_step(
     step: &AxBackendStmt,
     action_input: Option<&[AxFieldPlan]>,
+    context: AxStepContext,
 ) -> Result<AxStepPlan, AxBackendLowerError> {
     Ok(match step {
         AxBackendStmt::Data(data) => AxStepPlan::Let {
@@ -705,6 +720,18 @@ fn lower_step(
         AxBackendStmt::ClearCookie(name) => AxStepPlan::ClearCookie {
             name: lower_expr(name),
         },
+        AxBackendStmt::SessionCreate(session) if context == AxStepContext::Request => {
+            AxStepPlan::SessionCreate {
+                subject: lower_expr(&session.subject),
+                data: lower_expr(&session.data),
+            }
+        }
+        AxBackendStmt::SessionDestroy if context == AxStepContext::Request => {
+            AxStepPlan::SessionDestroy
+        }
+        AxBackendStmt::SessionCreate(_) | AxBackendStmt::SessionDestroy => {
+            return Err(AxBackendLowerError::SessionOutsideRequestHandler);
+        }
         AxBackendStmt::Require(requirement) => AxStepPlan::Require {
             value: lower_expr(&requirement.value),
             fallback: requirement.fallback.as_ref().map(lower_return),
@@ -2049,5 +2076,35 @@ action UploadImage(image: File) -> FileRef {
                 field: "image".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn lowers_session_operations_only_for_request_handlers() {
+        let action = parse_backend_ax(
+            r#"action Login(userId: String) {
+  Session.create(input.userId, { role: "editor" })
+  Session.destroy()
+  return ok
+}"#,
+        )
+        .expect("action should parse");
+        let plan = lower_backend_document(&action).expect("action should lower");
+        assert!(matches!(
+            plan.handlers[0].steps[0],
+            AxStepPlan::SessionCreate { .. }
+        ));
+        assert_eq!(plan.handlers[0].steps[1], AxStepPlan::SessionDestroy);
+
+        for source in [
+            "loader Current() {\n  Session.destroy()\n  return ok\n}",
+            "fn helper() {\n  Session.destroy()\n  return ok\n}",
+            "job Cleanup {\n  Session.destroy()\n}",
+        ] {
+            let document = parse_backend_ax(source).expect("source should parse before lowering");
+            assert_eq!(
+                lower_backend_document(&document),
+                Err(AxBackendLowerError::SessionOutsideRequestHandler)
+            );
+        }
     }
 }

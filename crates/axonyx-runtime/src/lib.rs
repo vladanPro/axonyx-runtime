@@ -534,6 +534,7 @@ pub struct AxPreviewActionResult {
     pub value: AxValue,
     pub patches: Vec<AxPreviewStatePatch>,
     pub invalidations: Vec<AxPreviewInvalidation>,
+    pub cookies: Vec<server::AxCookie>,
     pub error: Option<AxPreviewActionError>,
 }
 
@@ -1451,6 +1452,8 @@ fn execute_preview_loader(
             | AxStepPlan::Header { .. }
             | AxStepPlan::Cookie { .. }
             | AxStepPlan::ClearCookie { .. }
+            | AxStepPlan::SessionCreate { .. }
+            | AxStepPlan::SessionDestroy
             | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {}
         }
@@ -1514,6 +1517,8 @@ fn execute_preview_function(
             | AxStepPlan::Header { .. }
             | AxStepPlan::Cookie { .. }
             | AxStepPlan::ClearCookie { .. }
+            | AxStepPlan::SessionCreate { .. }
+            | AxStepPlan::SessionDestroy
             | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {
                 return Err(PreviewError::Runtime {
@@ -1595,6 +1600,7 @@ fn execute_preview_action(
     let mut value = AxValue::record([("ok", AxValue::Bool(true))]);
     let mut patches = Vec::new();
     let mut invalidations = Vec::new();
+    let mut cookies = Vec::new();
 
     for step in &action.steps {
         match step {
@@ -1733,6 +1739,32 @@ fn execute_preview_action(
                 let value = eval_preview_expr_with_functions(value, &scope, env, functions)?;
                 patches.push(AxPreviewStatePatch::set(signal, value));
             }
+            AxStepPlan::SessionCreate { subject, data } => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.create requires a configured backend runtime".to_string(),
+                })?;
+                let subject =
+                    eval_preview_expr_with_functions(subject, &scope, env, functions)?.as_string();
+                let data = preview_value_to_json(&eval_preview_expr_with_functions(
+                    data, &scope, env, functions,
+                )?);
+                let serde_json::Value::Object(data) = data else {
+                    return Err(PreviewError::Runtime {
+                        message: "Session.create data must be an object".to_string(),
+                    });
+                };
+                let (_, cookie) = runtime.create_session(&subject, data.into_iter().collect())?;
+                cookies.push(cookie);
+            }
+            AxStepPlan::SessionDestroy => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.destroy requires a configured backend runtime".to_string(),
+                })?;
+                let request = request.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.destroy requires an HTTP action request".to_string(),
+                })?;
+                cookies.push(runtime.destroy_session(request)?);
+            }
             AxStepPlan::Require {
                 value: requirement,
                 fallback,
@@ -1756,17 +1788,34 @@ fn execute_preview_action(
                     value,
                     patches,
                     invalidations,
+                    cookies,
                     error: Some(error),
                 });
             }
             AxStepPlan::Return(result) => {
                 value = eval_preview_return_with_functions(result, &scope, env, functions)?;
             }
-            AxStepPlan::Header { .. }
-            | AxStepPlan::Hook { .. }
-            | AxStepPlan::Cookie { .. }
-            | AxStepPlan::ClearCookie { .. }
-            | AxStepPlan::Send { .. } => {}
+            AxStepPlan::Cookie { name, value } => {
+                cookies.push(
+                    server::AxCookie::new(
+                        eval_preview_expr_with_functions(name, &scope, env, functions)?.as_string(),
+                        eval_preview_expr_with_functions(value, &scope, env, functions)?
+                            .as_string(),
+                    )
+                    .with_path("/"),
+                );
+            }
+            AxStepPlan::ClearCookie { name } => {
+                cookies.push(
+                    server::AxCookie::new(
+                        eval_preview_expr_with_functions(name, &scope, env, functions)?.as_string(),
+                        "",
+                    )
+                    .with_path("/")
+                    .with_max_age(0),
+                );
+            }
+            AxStepPlan::Header { .. } | AxStepPlan::Hook { .. } | AxStepPlan::Send { .. } => {}
         }
     }
 
@@ -1775,6 +1824,7 @@ fn execute_preview_action(
         value,
         patches,
         invalidations,
+        cookies,
         error: None,
     })
 }
@@ -1948,6 +1998,26 @@ fn execute_preview_route(
                         .with_max_age(0)
                         .render(),
                 );
+            }
+            AxStepPlan::SessionCreate { subject, data } => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.create requires a configured backend runtime".to_string(),
+                })?;
+                let subject = eval_preview_expr(subject, &scope, env)?.as_string();
+                let data = preview_value_to_json(&eval_preview_expr(data, &scope, env)?);
+                let serde_json::Value::Object(data) = data else {
+                    return Err(PreviewError::Runtime {
+                        message: "Session.create data must be an object".to_string(),
+                    });
+                };
+                let (_, cookie) = runtime.create_session(&subject, data.into_iter().collect())?;
+                set_cookies.push(cookie.render());
+            }
+            AxStepPlan::SessionDestroy => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.destroy requires a configured backend runtime".to_string(),
+                })?;
+                set_cookies.push(runtime.destroy_session(request)?.render());
             }
             AxStepPlan::Require { value, fallback } => {
                 if !preview_require_passes(&eval_preview_require_expr(value, &scope, env)?) {
@@ -2645,6 +2715,17 @@ fn eval_preview_expr_with_functions(
             })
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(AxValue::List(items));
+    }
+
+    if let Some(fields) = parse_preview_json_object(code) {
+        let fields = fields
+            .into_iter()
+            .map(|(key, value)| {
+                eval_preview_expr_with_functions(&AxRustExpr::new(value), scope, env, functions)
+                    .map(|value| (key, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        return Ok(AxValue::Record(fields));
     }
 
     if let Some(args) = parse_preview_call_args(code, "contains") {
@@ -4312,6 +4393,45 @@ fn parse_preview_vec_args(code: &str) -> Option<Vec<String>> {
     )
 }
 
+fn parse_preview_json_object(code: &str) -> Option<Vec<(String, String)>> {
+    let inner = code.strip_prefix("json!({")?.strip_suffix("})")?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+
+    split_preview_args(inner)
+        .into_iter()
+        .map(|field| {
+            let (key, value) = split_preview_object_field(field)?;
+            Some((parse_preview_string(key.trim())?, value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn split_preview_object_field(input: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if ch == quote {
+                    in_string = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => in_string = Some(ch),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ':' if depth == 0 => return Some((&input[..index], &input[index + 1..])),
+                _ => {}
+            },
+        }
+    }
+
+    None
+}
+
 fn parse_preview_named_call(code: &str) -> Option<(String, Vec<String>)> {
     let open = code.find('(')?;
     let name = code[..open].trim();
@@ -4345,8 +4465,8 @@ fn split_preview_args(input: &str) -> Vec<&str> {
             }
             None => match ch {
                 '"' | '\'' => in_string = Some(ch),
-                '(' | '[' => depth += 1,
-                ')' | ']' => depth = depth.saturating_sub(1),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
                 ',' if depth == 0 => {
                     result.push(input[start..index].trim());
                     start = index + 1;
@@ -9607,5 +9727,55 @@ route GET "/api/posts" -> String {
             response.body,
             br#"{"error":"internal_server_error","message":"API response did not satisfy its declared contract."}"#
         );
+    }
+
+    #[test]
+    fn preview_session_actions_issue_and_clear_server_cookies() {
+        let runtime = backend::runtime_from_env(
+            backend::AxEnv::new()
+                .with_secret("db_driver", "memory")
+                .with_secret("session_key", "preview-session-secret")
+                .with_secret("session_cookie_secure", "false"),
+        )
+        .expect("memory runtime should initialize");
+        let source = r#"action Login(userId: String) {
+  Session.create(input.userId, { role: "editor" })
+  return ok
+}
+
+action Logout() {
+  Session.destroy()
+  return ok
+}"#;
+        let mut store = AxPreviewStore::default();
+        let login = execute_preview_action_sources_with_runtime(
+            &[source],
+            "Login",
+            &BTreeMap::from([("userId".to_string(), "user-42".to_string())]),
+            &runtime,
+            &mut store,
+        )
+        .expect("login action should execute");
+        assert_eq!(login.cookies.len(), 1);
+        assert!(login.cookies[0].http_only);
+
+        let request = server::AxHttpRequest::new("POST", "/logout").with_header(
+            "Cookie",
+            format!("{}={}", login.cookies[0].name, login.cookies[0].value),
+        );
+        let logout = execute_preview_action_request_sources_with_runtime_and_storage(
+            &[source],
+            "Logout",
+            &request,
+            &runtime,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .expect("logout action should execute");
+        assert_eq!(logout.cookies.len(), 1);
+        assert_eq!(logout.cookies[0].max_age, Some(0));
+        assert!(backend::AxSessionExecutor::load_session(&runtime, &request)
+            .expect("session store should remain readable")
+            .is_none());
     }
 }

@@ -1180,6 +1180,14 @@ fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -
             render_string_expr(name)
         ),
         AxStepPlan::ClearCookie { name } => format!("    // clearCookie {}\n", name.code),
+        AxStepPlan::SessionCreate { subject, data } => format!(
+            "    let __ax_session_data: BTreeMap<String, Value> = serde_json::from_value(json!({})).map_err(|_| AxRuntimeError::message(\"Session.create data must be an object\"))?;\n    let (_, __ax_session_cookie) = runtime.create_session(&{}, __ax_session_data)?;\n    __ax_cookies.push(__ax_session_cookie);\n",
+            render_borrowed_expr(data),
+            render_string_expr(subject)
+        ),
+        AxStepPlan::SessionDestroy => {
+            "    __ax_cookies.push(runtime.destroy_session(request)?);\n".to_string()
+        }
         AxStepPlan::Require { value, fallback } if route_response => format!(
             "    if {}.is_empty() {{\n{}    }}\n",
             render_string_expr(value),
@@ -2533,5 +2541,27 @@ action UploadImage(image: File) -> FileRef {
             "pub fn dispatch_action(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage"
         ));
         assert!(!module.contains("storage_prelude"));
+    }
+
+    #[test]
+    fn compiles_session_actions_into_server_only_cookie_output() {
+        let module = compile_backend_ax_to_module(
+            r#"action Login(userId: String) {
+  Session.create(input.userId, { role: "editor" })
+  return ok
+}
+
+action Logout() {
+  Session.destroy()
+  return ok
+}"#,
+        )
+        .expect("session actions should compile");
+
+        assert!(module.contains("runtime.create_session"));
+        assert!(module.contains("Session.create data must be an object"));
+        assert!(module.contains("runtime.destroy_session(request)?"));
+        assert!(module.contains("__ax_cookies.push(__ax_session_cookie)"));
+        assert!(!module.contains("\"cookies\":"));
     }
 }
