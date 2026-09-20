@@ -210,9 +210,13 @@ impl AxSessionManager {
         now_unix: i64,
     ) -> AxRuntimeResult<(AxSession, AxCookie)> {
         validate_secret(secret)?;
+        let subject = subject.into();
+        if subject.trim().is_empty() {
+            return Err(AxRuntimeError::message("session subject must not be empty"));
+        }
         let session = AxSession {
             id: Uuid::new_v4().simple().to_string(),
-            subject: subject.into(),
+            subject,
             data,
             created_at_unix: now_unix,
             last_seen_at_unix: now_unix,
@@ -409,6 +413,9 @@ mod tests {
 
         assert!(manager
             .create("user-1", BTreeMap::new(), "", 1_000)
+            .is_err());
+        assert!(manager
+            .create("  ", BTreeMap::new(), "secret", 1_000)
             .is_err());
         assert!(store.is_empty().expect("store should be readable"));
     }
