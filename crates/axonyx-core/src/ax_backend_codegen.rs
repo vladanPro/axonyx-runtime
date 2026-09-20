@@ -51,6 +51,10 @@ pub enum AxBackendCodegenError {
         "Auth.subject is only supported inside server actions and routes; found in `{handler}`"
     )]
     AuthSubjectOutsideRequestHandler { handler: String },
+    #[error(
+        "query function `{query}` can only be called from a route data binding; found in `{handler}`"
+    )]
+    QueryCallOutsideRequestHandler { query: String, handler: String },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -136,7 +140,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
             out.push('\n');
         }
 
-        out.push_str(&render_handler_fn(handler, &plan.globals)?);
+        out.push_str(&render_handler_fn(handler, &plan.globals, &plan.handlers)?);
         out.push('\n');
     }
 
@@ -205,6 +209,7 @@ fn render_function_value_plan(
 ) -> Result<String, AxBackendCodegenError> {
     match value {
         AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
+        AxValuePlan::Call { path, args } => Ok(render_call_expr(path, args)),
         AxValuePlan::Query(_) | AxValuePlan::StorageSave { .. } => {
             Err(AxBackendCodegenError::UnsupportedFunctionQueryBinding {
                 function: function.to_string(),
@@ -648,6 +653,7 @@ fn render_input_struct(handler: &AxHandlerPlan, input: &[AxFieldPlan]) -> String
 fn render_handler_fn(
     handler: &AxHandlerPlan,
     globals: &[AxStepPlan],
+    handlers: &[AxHandlerPlan],
 ) -> Result<String, AxBackendCodegenError> {
     let uses_auth_subject = ax_steps_use_auth_subject(globals.iter().chain(handler.steps.iter()));
     let request_handler = matches!(
@@ -727,7 +733,13 @@ fn render_handler_fn(
         out.push_str("    let __ax_session = runtime.load_session(request)?;\n");
     }
     for step in globals.iter().chain(handler.steps.iter()) {
-        out.push_str(&render_step(step, route_response, action_response));
+        out.push_str(&render_step(
+            step,
+            handler,
+            handlers,
+            route_response,
+            action_response,
+        )?);
     }
 
     if !handler
@@ -1067,10 +1079,19 @@ fn default_value_for_rust_type(rust_ty: &str) -> String {
     }
 }
 
-fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -> String {
-    match step {
+fn render_step(
+    step: &AxStepPlan,
+    handler: &AxHandlerPlan,
+    handlers: &[AxHandlerPlan],
+    route_response: bool,
+    action_response: bool,
+) -> Result<String, AxBackendCodegenError> {
+    let output = match step {
         AxStepPlan::Let { binding, value } => {
-            format!("    let {binding} = {};\n", render_value_plan(value))
+            format!(
+                "    let {binding} = {};\n",
+                render_value_plan(value, handler, handlers)?
+            )
         }
         AxStepPlan::Transaction { operations } => {
             let rendered = operations
@@ -1222,7 +1243,8 @@ fn render_step(step: &AxStepPlan, route_response: bool, action_response: bool) -
             target,
             render_borrowed_expr(payload)
         ),
-    }
+    };
+    Ok(output)
 }
 
 fn render_transaction_operation(operation: &AxTransactionOperationPlan) -> String {
@@ -1285,9 +1307,46 @@ fn render_route_hook_step(phase: AxHookPhasePlan, value: &AxRustExpr) -> String 
     }
 }
 
-fn render_value_plan(value: &AxValuePlan) -> String {
-    match value {
+fn render_value_plan(
+    value: &AxValuePlan,
+    handler: &AxHandlerPlan,
+    handlers: &[AxHandlerPlan],
+) -> Result<String, AxBackendCodegenError> {
+    let output = match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
+        AxValuePlan::Call { path, args } => {
+            let query = path.first().filter(|_| path.len() == 1).and_then(|name| {
+                handlers.iter().find(|candidate| {
+                    candidate.name == *name
+                        && matches!(candidate.kind, AxHandlerKind::Loader { .. })
+                })
+            });
+            if let Some(query) = query {
+                let pattern = match &handler.kind {
+                    AxHandlerKind::Route { path, .. } => format!("{path:?}"),
+                    AxHandlerKind::Action { .. }
+                    | AxHandlerKind::Loader { .. }
+                    | AxHandlerKind::Job => {
+                        return Err(AxBackendCodegenError::QueryCallOutsideRequestHandler {
+                            query: query.name.clone(),
+                            handler: handler.name.clone(),
+                        });
+                    }
+                };
+                let args = args
+                    .iter()
+                    .map(|arg| format!("json!({})", render_borrowed_expr(arg)))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "dispatch_loader(runtime, {:?}, {pattern}, request, &[{args}])?.ok_or_else(|| AxRuntimeError::message({:?}))?",
+                    query.name,
+                    format!("compiled query function `{}` was not registered", query.name)
+                )
+            } else {
+                format!("json!(&{})", render_call_expr(path, args))
+            }
+        }
         AxValuePlan::StorageSave { capability, input } => {
             format!("json!(storage.save_file({capability:?}, &input.{input})?)")
         }
@@ -1297,7 +1356,26 @@ fn render_value_plan(value: &AxValuePlan) -> String {
             }
             _ => format!("runtime.load(&{})?", render_query_plan(query)),
         },
+    };
+    Ok(output)
+}
+
+fn render_call_expr(path: &[String], args: &[AxRustExpr]) -> String {
+    if path == ["list"] {
+        let args = args
+            .iter()
+            .map(render_owned_expr)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("vec![{args}]");
     }
+    let target = path.join("::");
+    let args = args
+        .iter()
+        .map(render_owned_expr)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("{target}({args})")
 }
 
 fn render_query_plan(query: &AxQueryPlan) -> String {
@@ -2399,6 +2477,58 @@ query loadAccount() {
             error,
             AxBackendCompileError::Codegen(
                 AxBackendCodegenError::AuthSubjectOutsideRequestHandler { .. }
+            )
+        ));
+    }
+
+    #[test]
+    fn compiles_route_query_function_call_through_loader_dispatch() {
+        let module = compile_backend_ax_to_module(
+            r#"
+type User {
+  id: String
+  email: String
+}
+
+query resolveUser(subject: String) -> User? {
+  return db.users.where({ id: input.subject }).first()
+}
+
+route GET "/api/me" -> User {
+  require Auth.subject else redirect("/login")
+  data user = resolveUser(Auth.subject)
+  require user else notFound()
+  return json(user)
+}
+"#,
+        )
+        .expect("route query composition should compile");
+
+        assert!(module.contains("dispatch_loader(runtime, \"resolveUser\", \"/api/me\", request"));
+        assert!(module.contains("json!(__ax_session.as_ref().map"));
+        assert_eq!(module.matches("runtime.load_session(request)?").count(), 1);
+    }
+
+    #[test]
+    fn rejects_query_function_calls_from_non_request_loaders() {
+        let error = compile_backend_ax_to_module(
+            r#"
+query findUser(subject: String) {
+  return db.users.where({ id: input.subject }).first()
+}
+
+query currentUser(subject: String) {
+  data user = findUser(input.subject)
+  return user
+}
+"#,
+        )
+        .expect_err("nested query calls need an explicit request context");
+
+        assert!(matches!(
+            error,
+            AxBackendCompileError::Codegen(
+                AxBackendCodegenError::QueryCallOutsideRequestHandler { .. }
             )
         ));
     }

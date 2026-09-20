@@ -211,8 +211,15 @@ pub enum AxHookPhasePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxValuePlan {
     Expr(AxRustExpr),
+    Call {
+        path: Vec<String>,
+        args: Vec<AxRustExpr>,
+    },
     Query(AxQueryPlan),
-    StorageSave { capability: String, input: String },
+    StorageSave {
+        capability: String,
+        input: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -811,6 +818,10 @@ fn lower_backend_value(
                 input: property.clone(),
             })
         }
+        AxBackendValue::Expr(AxExpr::Call { path, args }) => Ok(AxValuePlan::Call {
+            path: path.clone(),
+            args: args.iter().map(lower_expr).collect(),
+        }),
         AxBackendValue::Expr(expr) => Ok(AxValuePlan::Expr(lower_expr(expr))),
         AxBackendValue::Query(query) => Ok(AxValuePlan::Query(lower_query(query))),
     }
@@ -1128,6 +1139,7 @@ pub fn ax_step_uses_auth_subject(step: &AxStepPlan) -> bool {
 fn ax_value_uses_auth_subject(value: &AxValuePlan) -> bool {
     match value {
         AxValuePlan::Expr(expr) => ax_expr_uses_auth_subject(expr),
+        AxValuePlan::Call { args, .. } => args.iter().any(ax_expr_uses_auth_subject),
         AxValuePlan::Query(query) => {
             let source_uses = match &query.source {
                 AxQuerySourcePlan::RawSql { params, .. } => {

@@ -1057,7 +1057,7 @@ pub fn execute_preview_route_request_sources_validated(
     let request_path = normalize_preview_request_path(&request.target)?;
     let query = parse_preview_query_fields(&request.target);
     execute_preview_route(
-        &handlers.routes,
+        &handlers,
         request,
         &request_path,
         &query,
@@ -1100,7 +1100,7 @@ pub fn execute_preview_route_request_sources_with_runtime_validated(
     let request_path = normalize_preview_request_path(&request.target)?;
     let query = parse_preview_query_fields(&request.target);
     execute_preview_route(
-        &handlers.routes,
+        &handlers,
         request,
         &request_path,
         &query,
@@ -1144,11 +1144,13 @@ fn collect_preview_handlers(
         collect_preview_functions(plan.functions, &mut functions);
 
         for handler in plan.handlers {
-            if !matches!(handler.kind, AxHandlerKind::Route { .. }) {
-                continue;
+            match &handler.kind {
+                AxHandlerKind::Route { .. } => routes.push(handler),
+                AxHandlerKind::Loader { .. } => {
+                    loaders.insert(handler.name.clone(), handler);
+                }
+                AxHandlerKind::Action { .. } | AxHandlerKind::Job => {}
             }
-
-            routes.push(handler);
         }
     }
 
@@ -1488,6 +1490,15 @@ fn execute_preview_function(
             AxStepPlan::Let { binding, value } => match value {
                 AxValuePlan::Expr(expr) => {
                     let value = eval_preview_expr_with_functions(expr, &scope, env, functions)?;
+                    scope.insert(binding.clone(), value);
+                }
+                AxValuePlan::Call { path, args } => {
+                    let value = eval_preview_expr_with_functions(
+                        &preview_call_expr(path, args),
+                        &scope,
+                        env,
+                        functions,
+                    )?;
                     scope.insert(binding.clone(), value);
                 }
                 AxValuePlan::Query(_) => {
@@ -1856,7 +1867,7 @@ fn with_preview_globals(mut handler: AxHandlerPlan, globals: &[AxStepPlan]) -> A
 }
 
 fn execute_preview_route(
-    routes: &[AxHandlerPlan],
+    handlers: &PreviewHandlers,
     request: &server::AxHttpRequest,
     request_path: &str,
     query: &BTreeMap<String, String>,
@@ -1868,7 +1879,8 @@ fn execute_preview_route(
     let runtime = backend.runtime;
     let validate_response = validation.enabled;
     let type_context = validation.type_context;
-    let Some(route_match) = match_preview_route(routes, &request.method, request_path) else {
+    let Some(route_match) = match_preview_route(&handlers.routes, &request.method, request_path)
+    else {
         return Ok(None);
     };
 
@@ -1911,7 +1923,15 @@ fn execute_preview_route(
                 binding,
                 value: plan,
             } => {
-                let evaluated = eval_preview_value(plan, &scope, env, runtime, store)?;
+                let evaluated = eval_preview_route_value(
+                    plan,
+                    &scope,
+                    env,
+                    runtime,
+                    store,
+                    &handlers.loaders,
+                    &handlers.functions,
+                )?;
                 scope.insert(binding.clone(), evaluated);
             }
             AxStepPlan::Insert { collection, fields } => {
@@ -2297,15 +2317,30 @@ fn eval_preview_action_error_fallback_with_functions(
     Ok(AxPreviewActionError::validation(message, value))
 }
 
-fn eval_preview_value(
+#[allow(clippy::too_many_arguments)]
+fn eval_preview_route_value(
     value: &AxValuePlan,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
     runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &AxPreviewStore,
+    loaders: &BTreeMap<String, AxHandlerPlan>,
+    functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<AxValue, PreviewError> {
-    let functions = BTreeMap::new();
-    eval_preview_value_with_functions(value, scope, env, runtime, store, &functions)
+    let AxValuePlan::Call { path, args } = value else {
+        return eval_preview_value_with_functions(value, scope, env, runtime, store, functions);
+    };
+    let Some(name) = path.first().filter(|_| path.len() == 1) else {
+        return eval_preview_value_with_functions(value, scope, env, runtime, store, functions);
+    };
+    let Some(loader) = loaders.get(name) else {
+        return eval_preview_value_with_functions(value, scope, env, runtime, store, functions);
+    };
+    let args = args
+        .iter()
+        .map(|arg| eval_preview_expr_with_functions(arg, scope, env, functions))
+        .collect::<Result<Vec<_>, _>>()?;
+    execute_preview_loader(loader, &args, scope, env, runtime, store, functions)
 }
 
 fn eval_preview_value_with_functions(
@@ -2318,6 +2353,9 @@ fn eval_preview_value_with_functions(
 ) -> Result<AxValue, PreviewError> {
     match value {
         AxValuePlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
+        AxValuePlan::Call { path, args } => {
+            eval_preview_expr_with_functions(&preview_call_expr(path, args), scope, env, functions)
+        }
         AxValuePlan::Query(query) => {
             eval_preview_query_with_functions(query, scope, env, runtime, store, functions)
         }
@@ -2325,6 +2363,16 @@ fn eval_preview_value_with_functions(
             message: "Storage.save is only evaluated by an HTTP action runtime".to_string(),
         }),
     }
+}
+
+fn preview_call_expr(path: &[String], args: &[AxRustExpr]) -> AxRustExpr {
+    let target = path.join("::");
+    let args = args
+        .iter()
+        .map(|arg| arg.code.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    AxRustExpr::new(format!("{target}({args})"))
 }
 
 fn eval_preview_return_with_functions(
@@ -9882,5 +9930,89 @@ route GET "/api/account"
             response.headers.get("Location").map(String::as_str),
             Some("/login")
         );
+    }
+
+    #[test]
+    fn preview_route_resolves_a_typed_user_from_the_authenticated_subject() {
+        let database_path = std::env::temp_dir().join(format!(
+            "axonyx-auth-user-resolver-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be valid")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&database_path);
+        let connection = rusqlite::Connection::open(&database_path)
+            .expect("user resolver sqlite database should open");
+        connection
+            .execute_batch(
+                "create table users (id text primary key, email text not null);
+                 insert into users (id, email) values ('user-42', 'foundry@example.com');",
+            )
+            .expect("user fixture should seed");
+        drop(connection);
+        let runtime = backend::runtime_from_env(
+            backend::AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", database_path.to_string_lossy())
+                .with_secret("session_key", "preview-session-secret")
+                .with_secret("session_cookie_secure", "false"),
+        )
+        .expect("sqlite runtime should initialize");
+
+        let login_source = r#"action Login(userId: String) {
+  Session.create(input.userId, { role: "editor" })
+  return ok
+}"#;
+        let mut store = AxPreviewStore::default();
+        let login_request =
+            server::AxHttpRequest::new("POST", "/login").with_body(b"userId=user-42".to_vec());
+        let login = execute_preview_action_request_sources_with_runtime_and_storage(
+            &[login_source],
+            "Login",
+            &login_request,
+            &runtime,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .expect("login should create a session");
+        let cookie = &login.cookies[0];
+        let authenticated = server::AxHttpRequest::new("GET", "/api/me")
+            .with_header("Cookie", format!("{}={}", cookie.name, cookie.value));
+        let route_source = r#"
+type User {
+  id: String
+  email: String
+}
+
+query resolveUser(subject: String) -> User? {
+  return db.users.where({ id: input.subject }).first()
+}
+
+route GET "/api/me" -> User {
+  require Auth.subject else redirect("/login")
+  data user = resolveUser(Auth.subject)
+  require user else notFound()
+  return json(user)
+}
+"#;
+
+        let response = execute_preview_route_request_sources_with_runtime_validated(
+            &[route_source],
+            &authenticated,
+            &runtime,
+            true,
+            &mut store,
+        )
+        .expect("typed user route should execute")
+        .expect("typed user route should match");
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("user response should be JSON");
+        assert_eq!(body["id"], "user-42");
+        assert_eq!(body["email"], "foundry@example.com");
+        drop(runtime);
+        std::fs::remove_file(database_path).expect("resolver database should clean up");
     }
 }
