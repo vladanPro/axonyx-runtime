@@ -238,6 +238,7 @@ pub enum AxReturnPlan {
     },
     NoContent,
     NotFound,
+    Forbidden,
     Ok,
 }
 
@@ -871,6 +872,7 @@ fn lower_return_expr(expr: &AxExpr) -> AxReturnPlan {
         }
         "noContent" | "no_content" if args.is_empty() => AxReturnPlan::NoContent,
         "notFound" | "not_found" if args.is_empty() => AxReturnPlan::NotFound,
+        "forbidden" if args.is_empty() => AxReturnPlan::Forbidden,
         _ => AxReturnPlan::Expr(lower_expr(expr)),
     }
 }
@@ -1184,7 +1186,10 @@ fn ax_return_uses_auth_subject(value: &AxReturnPlan) -> bool {
     match value {
         AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => ax_expr_uses_auth_subject(expr),
         AxReturnPlan::Redirect { target, .. } => ax_expr_uses_auth_subject(target),
-        AxReturnPlan::NoContent | AxReturnPlan::NotFound | AxReturnPlan::Ok => false,
+        AxReturnPlan::NoContent
+        | AxReturnPlan::NotFound
+        | AxReturnPlan::Forbidden
+        | AxReturnPlan::Ok => false,
     }
 }
 
@@ -1811,6 +1816,10 @@ route DELETE "/api/posts"
 
 route GET "/missing"
   return notFound()
+
+route GET "/admin"
+  require false else forbidden()
+  return json("ok")
 "#,
         )
         .expect("document should parse");
@@ -1835,6 +1844,13 @@ route GET "/missing"
         assert_eq!(
             plan.handlers[3].steps[0],
             AxStepPlan::Return(AxReturnPlan::NotFound)
+        );
+        assert_eq!(
+            plan.handlers[4].steps[0],
+            AxStepPlan::Require {
+                value: AxRustExpr::new("false"),
+                fallback: Some(AxReturnPlan::Forbidden),
+            }
         );
     }
 

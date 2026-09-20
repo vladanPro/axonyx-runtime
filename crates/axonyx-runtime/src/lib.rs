@@ -578,6 +578,14 @@ impl AxPreviewActionError {
             value,
         }
     }
+
+    pub fn forbidden() -> Self {
+        Self {
+            message: "forbidden".to_string(),
+            status: 403,
+            value: AxValue::record([("error", AxValue::String("forbidden".to_string()))]),
+        }
+    }
 }
 
 fn normalize_preview_invalidation_target(target: &str) -> String {
@@ -2196,6 +2204,13 @@ fn render_preview_require_fallback(
             set_cookies: Vec::new(),
             body: b"not found".to_vec(),
         },
+        Some(AxReturnPlan::Forbidden) => AxPreviewHttpResponse {
+            status: 403,
+            content_type: "application/json; charset=utf-8".to_string(),
+            headers: BTreeMap::new(),
+            set_cookies: Vec::new(),
+            body: br#"{"error":"forbidden"}"#.to_vec(),
+        },
         Some(AxReturnPlan::Ok) => {
             render_preview_json_response(&AxValue::record([("ok", AxValue::Bool(true))]))?
         }
@@ -2302,6 +2317,10 @@ fn eval_preview_action_error_fallback_with_functions(
     env: &backend::AxEnv,
     functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<AxPreviewActionError, PreviewError> {
+    if matches!(fallback, Some(AxReturnPlan::Forbidden)) {
+        return Ok(AxPreviewActionError::forbidden());
+    }
+
     let value = match fallback {
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
             eval_preview_expr_with_functions(expr, scope, env, functions)?
@@ -2312,6 +2331,7 @@ fn eval_preview_action_error_fallback_with_functions(
         Some(AxReturnPlan::Ok)
         | Some(AxReturnPlan::NoContent)
         | Some(AxReturnPlan::NotFound)
+        | Some(AxReturnPlan::Forbidden)
         | None => AxValue::String("Action requirement failed.".to_string()),
     };
     let message = match &value {
@@ -2393,11 +2413,12 @@ fn eval_preview_return_with_functions(
     match value {
         AxReturnPlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
         AxReturnPlan::Json(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
-        AxReturnPlan::Redirect { .. } | AxReturnPlan::NoContent | AxReturnPlan::NotFound => {
-            Err(PreviewError::Runtime {
-                message: "HTTP response helpers are only supported in route blocks".to_string(),
-            })
-        }
+        AxReturnPlan::Redirect { .. }
+        | AxReturnPlan::NoContent
+        | AxReturnPlan::NotFound
+        | AxReturnPlan::Forbidden => Err(PreviewError::Runtime {
+            message: "HTTP response helpers are only supported in route blocks".to_string(),
+        }),
         AxReturnPlan::Ok => Ok(AxValue::record([("ok", AxValue::Bool(true))])),
     }
 }
@@ -2436,6 +2457,13 @@ fn render_preview_route_return(
             headers: BTreeMap::new(),
             set_cookies: Vec::new(),
             body: b"not found".to_vec(),
+        },
+        AxReturnPlan::Forbidden => AxPreviewHttpResponse {
+            status: 403,
+            content_type: "application/json; charset=utf-8".to_string(),
+            headers: BTreeMap::new(),
+            set_cookies: Vec::new(),
+            body: br#"{"error":"forbidden"}"#.to_vec(),
         },
         AxReturnPlan::Ok => {
             render_preview_json_response(&AxValue::record([("ok", AxValue::Bool(true))]))?
@@ -9571,6 +9599,27 @@ route GET "/api/posts/:slug"
 
         assert_eq!(response.status, 404);
         assert_eq!(String::from_utf8(response.body).unwrap(), "not found");
+    }
+
+    #[test]
+    fn preview_route_sources_can_return_forbidden_fallback() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_sources(
+            &[r#"
+route GET "/api/admin"
+  require false else forbidden()
+  return json("ok")
+"#],
+            "GET",
+            "/api/admin",
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 403);
+        assert_eq!(response.content_type, "application/json; charset=utf-8");
+        assert_eq!(response.body, br#"{"error":"forbidden"}"#);
     }
 
     #[test]
