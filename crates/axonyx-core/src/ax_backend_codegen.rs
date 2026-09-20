@@ -735,6 +735,7 @@ fn render_handler_fn(
     if uses_auth_subject {
         out.push_str("    let __ax_session = runtime.load_session(request)?;\n");
     }
+    let mut typed_bindings = std::collections::BTreeMap::new();
     for step in globals.iter().chain(handler.steps.iter()) {
         out.push_str(&render_step(
             step,
@@ -742,6 +743,7 @@ fn render_handler_fn(
             handlers,
             route_response,
             action_response,
+            &mut typed_bindings,
         )?);
     }
 
@@ -1088,13 +1090,20 @@ fn render_step(
     handlers: &[AxHandlerPlan],
     route_response: bool,
     action_response: bool,
+    typed_bindings: &mut std::collections::BTreeMap<String, AxType>,
 ) -> Result<String, AxBackendCodegenError> {
     let output = match step {
         AxStepPlan::Let { binding, value } => {
-            format!(
-                "    let {binding} = {};\n",
-                render_value_plan(value, handler, handlers)?
-            )
+            let rendered = render_value_plan(value, handler, handlers)?;
+            if let Some(ty) = query_call_return_type(value, handlers)? {
+                let rust_ty = rust_function_return_type(&ty, binding)?;
+                typed_bindings.insert(binding.clone(), ty);
+                format!(
+                    "    let {binding}: {rust_ty} = serde_json::from_value({rendered}).map_err(|error| AxRuntimeError::message(format!(\"data binding `{binding}` failed `{rust_ty}` decoding: {{error}}\")))?;\n"
+                )
+            } else {
+                format!("    let {binding} = {rendered};\n")
+            }
         }
         AxStepPlan::Transaction { operations } => {
             let rendered = operations
@@ -1229,16 +1238,24 @@ fn render_step(
         AxStepPlan::SessionDestroy => {
             "    __ax_cookies.push(runtime.destroy_session(request)?);\n".to_string()
         }
-        AxStepPlan::Require { value, fallback } if route_response => format!(
-            "    if !__ax_truthy(&json!({})) {{\n{}    }}\n",
-            render_borrowed_expr(value),
-            render_require_fallback(fallback.as_ref())
-        ),
-        AxStepPlan::Require { value, fallback } if action_response => format!(
-            "    if !__ax_truthy(&json!({})) {{\n{}    }}\n",
-            render_borrowed_expr(value),
-            render_action_require_fallback(fallback.as_ref())
-        ),
+        AxStepPlan::Require { value, fallback } if route_response => {
+            let mut rendered = format!(
+                "    if !__ax_truthy(&json!({})) {{\n{}    }}\n",
+                render_borrowed_expr(value),
+                render_require_fallback(fallback.as_ref())
+            );
+            rendered.push_str(&render_optional_binding_narrowing(value, typed_bindings));
+            rendered
+        }
+        AxStepPlan::Require { value, fallback } if action_response => {
+            let mut rendered = format!(
+                "    if !__ax_truthy(&json!({})) {{\n{}    }}\n",
+                render_borrowed_expr(value),
+                render_action_require_fallback(fallback.as_ref())
+            );
+            rendered.push_str(&render_optional_binding_narrowing(value, typed_bindings));
+            rendered
+        }
         AxStepPlan::Require { value, .. } => format!("    // require {}\n", value.code),
         AxStepPlan::Return(value) => render_return_step(value, route_response, action_response),
         AxStepPlan::Send { target, payload } => format!(
@@ -1248,6 +1265,61 @@ fn render_step(
         ),
     };
     Ok(output)
+}
+
+fn query_call_return_type(
+    value: &AxValuePlan,
+    handlers: &[AxHandlerPlan],
+) -> Result<Option<AxType>, AxBackendCodegenError> {
+    let AxValuePlan::Call { path, .. } = value else {
+        return Ok(None);
+    };
+    let [name] = path.as_slice() else {
+        return Ok(None);
+    };
+    let Some(query) = handlers.iter().find(|handler| {
+        handler.name == *name && matches!(handler.kind, AxHandlerKind::Loader { .. })
+    }) else {
+        return Ok(None);
+    };
+    let AxHandlerKind::Loader { returns, .. } = &query.kind else {
+        unreachable!("query lookup only returns loader handlers");
+    };
+    let Some(returns) = returns else {
+        return Ok(None);
+    };
+    AxType::parse_annotation(returns).map(Some).map_err(|_| {
+        AxBackendCodegenError::InvalidFunctionReturnType {
+            function: query.name.clone(),
+            ty: returns.clone(),
+        }
+    })
+}
+
+fn render_optional_binding_narrowing(
+    value: &AxRustExpr,
+    typed_bindings: &mut std::collections::BTreeMap<String, AxType>,
+) -> String {
+    let binding = value.code.trim();
+    if !is_rust_identifier(binding) {
+        return String::new();
+    }
+    let Some(AxType::Optional(inner)) = typed_bindings.get(binding).cloned() else {
+        return String::new();
+    };
+    typed_bindings.insert(binding.to_string(), inner.as_ref().clone());
+    format!(
+        "    let {binding} = match {binding} {{ Some(value) => value, None => unreachable!(\"Axonyx require guard returned for an empty optional binding\") }};\n"
+    )
+}
+
+fn is_rust_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
 }
 
 fn render_transaction_operation(operation: &AxTransactionOperationPlan) -> String {
@@ -2522,6 +2594,40 @@ route GET "/api/me" -> User {
         assert!(module.contains("dispatch_loader(runtime, \"resolveUser\", \"/api/me\", request"));
         assert!(module.contains("json!(__ax_session.as_ref().map"));
         assert_eq!(module.matches("runtime.load_session(request)?").count(), 1);
+    }
+
+    #[test]
+    fn narrows_optional_query_binding_after_direct_require_guard() {
+        let module = compile_backend_ax_to_module(
+            r#"
+type User {
+  id: String
+  role: String
+}
+
+query resolveUser(subject: String) -> User? {
+  return db.users.where({ id: input.subject }).first()
+}
+
+route GET "/api/admin" -> User {
+  require Auth.subject else redirect("/login")
+  data user = resolveUser(Auth.subject)
+  require user else notFound()
+  require user.role == "admin" else forbidden()
+  return json(user)
+}
+"#,
+        )
+        .expect("optional query result should narrow after its guard");
+
+        assert!(module.contains(
+            "let user: Option<User> = serde_json::from_value(dispatch_loader(runtime, \"resolveUser\""
+        ));
+        assert!(
+            module.contains("let user = match user { Some(value) => value, None => unreachable!")
+        );
+        assert!(module.contains("json!(&(user.role == \"admin\".to_string()))"));
+        assert!(module.contains("AxHttpResponse::json(200, &json!(&user))"));
     }
 
     #[test]
