@@ -231,6 +231,9 @@ fn render_function_return(value: &AxReturnPlan, returns: &str) -> String {
         AxReturnPlan::NotFound => {
             format!("    return {};\n", default_function_return_expr(returns))
         }
+        AxReturnPlan::Forbidden => {
+            format!("    return {};\n", default_function_return_expr(returns))
+        }
         AxReturnPlan::Redirect { .. } => {
             format!("    return {};\n", default_function_return_expr(returns))
         }
@@ -1631,6 +1634,9 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
             AxReturnPlan::NotFound => {
                 "    Ok(__ax_finalize_response(AxHttpResponse::text(404, \"not found\"), __ax_headers, __ax_cookies))\n".to_string()
             }
+            AxReturnPlan::Forbidden => {
+                "    Ok(__ax_finalize_response(AxHttpResponse::json(403, &json!({\"error\":\"forbidden\"})).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies))\n".to_string()
+            }
             AxReturnPlan::Ok => {
                 "    Ok(__ax_finalize_response(AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?, __ax_headers, __ax_cookies))\n".to_string()
             }
@@ -1646,6 +1652,7 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
             AxReturnPlan::Ok
             | AxReturnPlan::NoContent
             | AxReturnPlan::NotFound
+            | AxReturnPlan::Forbidden
             | AxReturnPlan::Redirect { .. } => {
                 "    Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))\n".to_string()
             }
@@ -1659,6 +1666,7 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
         AxReturnPlan::Ok
         | AxReturnPlan::NoContent
         | AxReturnPlan::NotFound
+        | AxReturnPlan::Forbidden
         | AxReturnPlan::Redirect { .. } => "    Ok(ok_payload())\n".to_string(),
     }
 }
@@ -1684,6 +1692,7 @@ fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
             )
         }
         Some(AxReturnPlan::NotFound) => "        return Ok(AxActionOutput::new(__ax_action_error_payload(\"not found\".to_string(), json!(\"not found\"), 422, __ax_redirect)).with_cookies(__ax_cookies));\n".to_string(),
+        Some(AxReturnPlan::Forbidden) => "        return Ok(AxActionOutput::new(__ax_action_error_payload(\"forbidden\".to_string(), json!({\"error\":\"forbidden\"}), 403, __ax_redirect)).with_cookies(__ax_cookies));\n".to_string(),
         Some(AxReturnPlan::Ok) | Some(AxReturnPlan::NoContent) | None => "        return Ok(AxActionOutput::new(__ax_action_error_payload(\"Action requirement failed.\".to_string(), json!(\"Action requirement failed.\"), 422, __ax_redirect)).with_cookies(__ax_cookies));\n".to_string(),
     }
 }
@@ -1711,6 +1720,7 @@ fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
         },
         Some(AxReturnPlan::NoContent) => "AxHttpResponse::no_content()".to_string(),
         Some(AxReturnPlan::NotFound) => "AxHttpResponse::text(404, \"not found\")".to_string(),
+        Some(AxReturnPlan::Forbidden) => "AxHttpResponse::json(403, &json!({\"error\":\"forbidden\"})).map_err(|error| AxRuntimeError::message(error.to_string()))?".to_string(),
         Some(AxReturnPlan::Ok) => "AxHttpResponse::json(200, &ok_payload()).map_err(|error| AxRuntimeError::message(error.to_string()))?".to_string(),
         None => "AxHttpResponse::json(401, &json!({\"error\":\"unauthorized\"})).map_err(|error| AxRuntimeError::message(error.to_string()))?".to_string(),
     };
@@ -2383,6 +2393,10 @@ route DELETE "/api/posts"
 
 route GET "/missing"
   return notFound()
+
+route GET "/admin"
+  require false else forbidden()
+  return json("ok")
 "#,
         )
         .expect("source should compile");
@@ -2392,6 +2406,7 @@ route GET "/missing"
         assert!(module.contains(r#"AxHttpResponse::redirect("/next".to_string())"#));
         assert!(module.contains("AxHttpResponse::no_content()"));
         assert!(module.contains("AxHttpResponse::text(404, \"not found\")"));
+        assert!(module.contains("AxHttpResponse::json(403, &json!({\"error\":\"forbidden\"}))"));
     }
 
     #[test]
