@@ -136,6 +136,15 @@ fn is_json_content_type(content_type: &str) -> bool {
 
 fn parse_api_return_contract(contract: &str) -> Result<AxType, AxApiResponseValidationError> {
     let contract = contract.trim();
+    if let Some(inner) = contract.strip_suffix('?') {
+        if inner.trim().is_empty() {
+            return Err(AxApiResponseValidationError::InvalidContract {
+                contract: contract.to_string(),
+                message: "optional shorthand requires an inner type".to_string(),
+            });
+        }
+        return Ok(AxType::optional(parse_api_return_contract(inner)?));
+    }
     if let Some(inner) = contract.strip_suffix("[]") {
         return Ok(AxType::list(parse_api_return_contract(inner)?));
     }
@@ -9778,6 +9787,17 @@ page Home
             &context,
         )
         .expect("matching response should pass");
+
+        validate_api_response_bytes(200, "application/json", b"null", "Post?", &context)
+            .expect("nullable shorthand should accept null");
+        validate_api_response_bytes(
+            200,
+            "application/json",
+            br#"{"title":"Axonyx","published":true}"#,
+            "Post?",
+            &context,
+        )
+        .expect("nullable shorthand should accept its inner record");
 
         let error = validate_api_response_bytes(
             200,
