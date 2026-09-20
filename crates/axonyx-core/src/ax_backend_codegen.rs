@@ -1230,8 +1230,8 @@ fn render_step(
             "    __ax_cookies.push(runtime.destroy_session(request)?);\n".to_string()
         }
         AxStepPlan::Require { value, fallback } if route_response => format!(
-            "    if {}.is_empty() {{\n{}    }}\n",
-            render_string_expr(value),
+            "    if !__ax_truthy(&json!({})) {{\n{}    }}\n",
+            render_borrowed_expr(value),
             render_require_fallback(fallback.as_ref())
         ),
         AxStepPlan::Require { value, fallback } if action_response => format!(
@@ -2425,7 +2425,7 @@ route GET "/api/session"
 
         assert!(module.contains("let mut __ax_headers: BTreeMap<String, String>"));
         assert!(module.contains(
-            "if (request.cookie_value(\"session\").unwrap_or_default()).to_string().is_empty()"
+            "if !__ax_truthy(&json!(&request.cookie_value(\"session\").unwrap_or_default()))"
         ));
         assert!(module.contains("__ax_headers.insert((\"Cache-Control\".to_string()).to_string(), (\"no-store\".to_string()).to_string());"));
         assert!(module.contains("__ax_cookies.push(AxCookie::new((\"theme\".to_string()).to_string(), (\"gold\".to_string()).to_string()).with_path(\"/\"));"));
@@ -2560,7 +2560,7 @@ route GET "/api/admin"
         .expect("source should compile");
 
         assert!(module.contains(
-            "if (request.cookie_value(\"session\").unwrap_or_default()).to_string().is_empty()"
+            "if !__ax_truthy(&json!(&request.cookie_value(\"session\").unwrap_or_default()))"
         ));
         assert!(module.contains(r#"AxHttpResponse::redirect("/login".to_string())"#));
     }
