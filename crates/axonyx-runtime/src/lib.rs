@@ -13,10 +13,10 @@ use axonyx_core::ax_ast_prelude::{
 };
 use axonyx_core::ax_backend_lowering::AxBackendLowerError;
 use axonyx_core::ax_backend_lowering_prelude::{
-    lower_backend_document, AxFieldPlan, AxFunctionPlan, AxHandlerKind, AxHandlerPlan,
-    AxHookPhasePlan, AxQueryFilterOpPlan, AxQueryModePlan, AxQueryOrderDirectionPlan, AxQueryPlan,
-    AxQuerySourcePlan, AxReturnPlan, AxRustExpr, AxStepPlan, AxTransactionOperationPlan,
-    AxValuePlan,
+    ax_step_uses_auth_subject, lower_backend_document, AxFieldPlan, AxFunctionPlan, AxHandlerKind,
+    AxHandlerPlan, AxHookPhasePlan, AxQueryFilterOpPlan, AxQueryModePlan,
+    AxQueryOrderDirectionPlan, AxQueryPlan, AxQuerySourcePlan, AxReturnPlan, AxRustExpr,
+    AxStepPlan, AxTransactionOperationPlan, AxValuePlan,
 };
 use axonyx_core::ax_backend_parser::AxBackendParseError;
 use axonyx_core::ax_backend_parser_prelude::parse_backend_ax;
@@ -1595,6 +1595,21 @@ fn execute_preview_action(
         "input".to_string(),
         build_preview_input_record(input, input_fields, request)?,
     );
+    if let Some(request) = request {
+        let session = if action.steps.iter().any(ax_step_uses_auth_subject) {
+            runtime
+                .ok_or_else(|| PreviewError::Runtime {
+                    message: "Auth.subject requires a configured backend runtime".to_string(),
+                })?
+                .load_session(request)?
+        } else {
+            None
+        };
+        scope.insert(
+            "Auth".to_string(),
+            build_preview_auth_record(request, env, session.as_ref()),
+        );
+    }
 
     let mut redirect_to = None;
     let mut value = AxValue::record([("ok", AxValue::Bool(true))]);
@@ -1861,7 +1876,24 @@ fn execute_preview_route(
     scope.insert("params".to_string(), AxValue::Record(route_match.params));
     scope.insert("query".to_string(), build_preview_query_record(query));
     scope.insert("request".to_string(), build_preview_request_record(request));
-    scope.insert("Auth".to_string(), build_preview_auth_record(request, env));
+    let session = if route_match
+        .handler
+        .steps
+        .iter()
+        .any(ax_step_uses_auth_subject)
+    {
+        runtime
+            .ok_or_else(|| PreviewError::Runtime {
+                message: "Auth.subject requires a configured backend runtime".to_string(),
+            })?
+            .load_session(request)?
+    } else {
+        None
+    };
+    scope.insert(
+        "Auth".to_string(),
+        build_preview_auth_record(request, env, session.as_ref()),
+    );
     if let AxHandlerKind::Route { input, .. } = &route_match.handler.kind {
         if !input.is_empty() {
             scope.insert(
@@ -2177,7 +2209,7 @@ fn apply_preview_route_hook(
             headers.insert("Cache-Control".to_string(), "no-store".to_string());
             Ok(None)
         }
-        "Auth.session" | "Auth.bearer" | "Auth.signedSession" => {
+        "Auth.session" | "Auth.bearer" | "Auth.signedSession" | "Auth.subject" => {
             if !preview_require_passes(&eval_preview_require_expr(hook, scope, env)?) {
                 return render_preview_require_fallback(None, scope, env).map(Some);
             }
@@ -3478,7 +3510,11 @@ fn build_preview_request_record(request: &server::AxHttpRequest) -> AxValue {
     ]))
 }
 
-fn build_preview_auth_record(request: &server::AxHttpRequest, env: &backend::AxEnv) -> AxValue {
+fn build_preview_auth_record(
+    request: &server::AxHttpRequest,
+    env: &backend::AxEnv,
+    session: Option<&session::AxSession>,
+) -> AxValue {
     let signed_session = env
         .secret("session_key")
         .ok()
@@ -3503,6 +3539,14 @@ fn build_preview_auth_record(request: &server::AxHttpRequest, env: &backend::AxE
             ),
         ),
         ("signedSession".to_string(), AxValue::String(signed_session)),
+        (
+            "subject".to_string(),
+            AxValue::String(
+                session
+                    .map(|session| session.subject.clone())
+                    .unwrap_or_default(),
+            ),
+        ),
     ]))
 }
 
@@ -9777,5 +9821,66 @@ action Logout() {
         assert!(backend::AxSessionExecutor::load_session(&runtime, &request)
             .expect("session store should remain readable")
             .is_none());
+    }
+
+    #[test]
+    fn preview_auth_subject_loads_the_verified_server_session() {
+        let runtime = backend::runtime_from_env(
+            backend::AxEnv::new()
+                .with_secret("db_driver", "memory")
+                .with_secret("session_key", "preview-session-secret")
+                .with_secret("session_cookie_secure", "false"),
+        )
+        .expect("memory runtime should initialize");
+        let login_source = r#"action Login(userId: String) {
+  Session.create(input.userId, { role: "editor" })
+  return ok
+}"#;
+        let mut store = AxPreviewStore::default();
+        let login_request =
+            server::AxHttpRequest::new("POST", "/login").with_body(b"userId=user-42".to_vec());
+        let login = execute_preview_action_request_sources_with_runtime_and_storage(
+            &[login_source],
+            "Login",
+            &login_request,
+            &runtime,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .expect("login should create a session");
+        let cookie = &login.cookies[0];
+        let authenticated = server::AxHttpRequest::new("GET", "/api/account")
+            .with_header("Cookie", format!("{}={}", cookie.name, cookie.value));
+        let route_source = r#"
+route GET "/api/account"
+  require Auth.subject else redirect("/login")
+  return json(Auth.subject)
+"#;
+
+        let response = execute_preview_route_request_sources_with_runtime(
+            &[route_source],
+            &authenticated,
+            &runtime,
+            &mut store,
+        )
+        .expect("protected route should execute")
+        .expect("protected route should match");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, br#""user-42""#);
+
+        let anonymous = server::AxHttpRequest::new("GET", "/api/account");
+        let response = execute_preview_route_request_sources_with_runtime(
+            &[route_source],
+            &anonymous,
+            &runtime,
+            &mut store,
+        )
+        .expect("anonymous route should execute")
+        .expect("anonymous route should match");
+        assert_eq!(response.status, 303);
+        assert_eq!(
+            response.headers.get("Location").map(String::as_str),
+            Some("/login")
+        );
     }
 }
