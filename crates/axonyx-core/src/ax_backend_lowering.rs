@@ -1072,8 +1072,112 @@ fn try_render_auth(expr: &AxExpr) -> Option<String> {
         ["Auth", "bearer"] => Some("Auth.bearer".to_string()),
         ["Auth", "session"] => Some("Auth.session".to_string()),
         ["Auth", "signedSession"] => Some("Auth.signedSession".to_string()),
+        ["Auth", "subject"] => Some("Auth.subject".to_string()),
         _ => None,
     }
+}
+
+pub fn ax_steps_use_auth_subject<'a>(steps: impl IntoIterator<Item = &'a AxStepPlan>) -> bool {
+    steps.into_iter().any(ax_step_uses_auth_subject)
+}
+
+pub fn ax_step_uses_auth_subject(step: &AxStepPlan) -> bool {
+    match step {
+        AxStepPlan::Let { value, .. } => ax_value_uses_auth_subject(value),
+        AxStepPlan::Transaction { operations } => operations
+            .iter()
+            .any(ax_transaction_operation_uses_auth_subject),
+        AxStepPlan::Insert { fields, .. } => fields
+            .iter()
+            .any(|field| ax_expr_uses_auth_subject(&field.value)),
+        AxStepPlan::Update {
+            fields, filters, ..
+        } => {
+            fields
+                .iter()
+                .any(|field| ax_expr_uses_auth_subject(&field.value))
+                || filters
+                    .iter()
+                    .any(|filter| ax_expr_uses_auth_subject(&filter.value))
+        }
+        AxStepPlan::Delete { filters, .. } => filters
+            .iter()
+            .any(|filter| ax_expr_uses_auth_subject(&filter.value)),
+        AxStepPlan::Revalidate { target, .. } => ax_expr_uses_auth_subject(target),
+        AxStepPlan::Patch { signal, value } => {
+            ax_expr_uses_auth_subject(signal) || ax_expr_uses_auth_subject(value)
+        }
+        AxStepPlan::Hook { value, .. } => ax_expr_uses_auth_subject(value),
+        AxStepPlan::Header { name, value } | AxStepPlan::Cookie { name, value } => {
+            ax_expr_uses_auth_subject(name) || ax_expr_uses_auth_subject(value)
+        }
+        AxStepPlan::ClearCookie { name } => ax_expr_uses_auth_subject(name),
+        AxStepPlan::SessionCreate { subject, data } => {
+            ax_expr_uses_auth_subject(subject) || ax_expr_uses_auth_subject(data)
+        }
+        AxStepPlan::SessionDestroy => false,
+        AxStepPlan::Require { value, fallback } => {
+            ax_expr_uses_auth_subject(value)
+                || fallback.as_ref().is_some_and(ax_return_uses_auth_subject)
+        }
+        AxStepPlan::Return(value) => ax_return_uses_auth_subject(value),
+        AxStepPlan::Send { payload, .. } => ax_expr_uses_auth_subject(payload),
+    }
+}
+
+fn ax_value_uses_auth_subject(value: &AxValuePlan) -> bool {
+    match value {
+        AxValuePlan::Expr(expr) => ax_expr_uses_auth_subject(expr),
+        AxValuePlan::Query(query) => {
+            let source_uses = match &query.source {
+                AxQuerySourcePlan::RawSql { params, .. } => {
+                    params.iter().any(ax_expr_uses_auth_subject)
+                }
+                AxQuerySourcePlan::Stream { .. } | AxQuerySourcePlan::ContentCollection { .. } => {
+                    false
+                }
+            };
+            source_uses
+                || query
+                    .filters
+                    .iter()
+                    .any(|filter| ax_expr_uses_auth_subject(&filter.value))
+        }
+        AxValuePlan::StorageSave { .. } => false,
+    }
+}
+
+fn ax_transaction_operation_uses_auth_subject(operation: &AxTransactionOperationPlan) -> bool {
+    match operation {
+        AxTransactionOperationPlan::Insert { fields, .. } => fields
+            .iter()
+            .any(|field| ax_expr_uses_auth_subject(&field.value)),
+        AxTransactionOperationPlan::Update {
+            fields, filters, ..
+        } => {
+            fields
+                .iter()
+                .any(|field| ax_expr_uses_auth_subject(&field.value))
+                || filters
+                    .iter()
+                    .any(|filter| ax_expr_uses_auth_subject(&filter.value))
+        }
+        AxTransactionOperationPlan::Delete { filters, .. } => filters
+            .iter()
+            .any(|filter| ax_expr_uses_auth_subject(&filter.value)),
+    }
+}
+
+fn ax_return_uses_auth_subject(value: &AxReturnPlan) -> bool {
+    match value {
+        AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => ax_expr_uses_auth_subject(expr),
+        AxReturnPlan::Redirect { target, .. } => ax_expr_uses_auth_subject(target),
+        AxReturnPlan::NoContent | AxReturnPlan::NotFound | AxReturnPlan::Ok => false,
+    }
+}
+
+fn ax_expr_uses_auth_subject(expr: &AxRustExpr) -> bool {
+    expr.code.trim() == "Auth.subject"
 }
 
 fn try_render_runtime_env(expr: &AxExpr) -> Option<String> {
@@ -1163,6 +1267,8 @@ fn route_method_ident(method: &str) -> String {
 }
 
 pub mod prelude {
+    pub use super::ax_step_uses_auth_subject;
+    pub use super::ax_steps_use_auth_subject;
     pub use super::lower_backend_document;
     pub use super::AxAssignmentPlan;
     pub use super::AxBackendLowerError;
@@ -1900,6 +2006,35 @@ route GET "/api/admin"
                 binding: "session".to_string(),
                 value: AxValuePlan::Expr(AxRustExpr::new("Auth.signedSession")),
             }
+        );
+    }
+
+    #[test]
+    fn lowers_auth_subject_alias() {
+        let document = parse_backend_ax(
+            r#"
+route GET "/api/account"
+  require Auth.subject else redirect("/login")
+  return json(Auth.subject)
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert_eq!(
+            plan.handlers[0].steps[0],
+            AxStepPlan::Require {
+                value: AxRustExpr::new("Auth.subject"),
+                fallback: Some(AxReturnPlan::Redirect {
+                    target: AxRustExpr::new(r#""/login".to_string()"#),
+                    status: None,
+                }),
+            }
+        );
+        assert_eq!(
+            plan.handlers[0].steps[1],
+            AxStepPlan::Return(AxReturnPlan::Json(AxRustExpr::new("Auth.subject")))
         );
     }
 

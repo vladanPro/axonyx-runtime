@@ -47,6 +47,10 @@ pub enum AxBackendCodegenError {
     InvalidFunctionReturnType { function: String, ty: String },
     #[error("domain helper `{function}` cannot return `{ty}` from the Rust backend")]
     UnsupportedFunctionReturnType { function: String, ty: String },
+    #[error(
+        "Auth.subject is only supported inside server actions and routes; found in `{handler}`"
+    )]
+    AuthSubjectOutsideRequestHandler { handler: String },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -645,6 +649,16 @@ fn render_handler_fn(
     handler: &AxHandlerPlan,
     globals: &[AxStepPlan],
 ) -> Result<String, AxBackendCodegenError> {
+    let uses_auth_subject = ax_steps_use_auth_subject(globals.iter().chain(handler.steps.iter()));
+    let request_handler = matches!(
+        handler.kind,
+        AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+    );
+    if uses_auth_subject && !request_handler {
+        return Err(AxBackendCodegenError::AuthSubjectOutsideRequestHandler {
+            handler: handler.name.clone(),
+        });
+    }
     let signature = match &handler.kind {
         AxHandlerKind::Action { input, .. } if input.is_empty() => format!(
             "pub fn {}(runtime: &impl AxBackendRuntime, storage: &impl AxFileStorage, request: &AxHttpRequest) -> AxRuntimeResult<AxActionOutput>",
@@ -708,6 +722,9 @@ fn render_handler_fn(
         out.push_str("    let mut __ax_patches: Vec<Value> = Vec::new();\n");
         out.push_str("    let mut __ax_invalidations: Vec<Value> = Vec::new();\n");
         out.push_str("    let mut __ax_redirect: Option<String> = None;\n");
+    }
+    if uses_auth_subject {
+        out.push_str("    let __ax_session = runtime.load_session(request)?;\n");
     }
     for step in globals.iter().chain(handler.steps.iter()) {
         out.push_str(&render_step(step, route_response, action_response));
@@ -1253,7 +1270,7 @@ fn render_route_hook_step(phase: AxHookPhasePlan, value: &AxRustExpr) -> String 
             "    __ax_headers.insert(\"Cache-Control\".to_string(), \"no-store\".to_string());\n"
                 .to_string()
         }
-        "Auth.session" | "Auth.bearer" | "Auth.signedSession" => format!(
+        "Auth.session" | "Auth.bearer" | "Auth.signedSession" | "Auth.subject" => format!(
             "    if {}.is_empty() {{\n{}    }}\n",
             render_string_expr(value),
             render_require_fallback(None)
@@ -1649,6 +1666,10 @@ fn render_auth_lookup(field: &str) -> Option<String> {
         "session" => Some("&AxAuth::session(request).unwrap_or_default()".to_string()),
         "signedSession" => Some(
             "&AxAuth::signed_session(request, &runtime.env().secret(\"session_key\")?).unwrap_or_default()"
+                .to_string(),
+        ),
+        "subject" => Some(
+            "__ax_session.as_ref().map(|session| session.subject.as_str()).unwrap_or_default()"
                 .to_string(),
         ),
         _ => None,
@@ -2342,6 +2363,43 @@ route GET "/api/admin"
             .contains("if (AxAuth::session(request).unwrap_or_default()).to_string().is_empty()"));
         assert!(module.contains(
             "__ax_headers.insert(\"Cache-Control\".to_string(), \"no-store\".to_string())"
+        ));
+    }
+
+    #[test]
+    fn compiles_auth_subject_as_one_request_owned_session_load() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route GET "/api/account"
+  require Auth.subject else redirect("/login")
+  return json(Auth.subject)
+"#,
+        )
+        .expect("source should compile");
+
+        assert_eq!(module.matches("runtime.load_session(request)?").count(), 1);
+        assert!(module.contains(
+            "__ax_session.as_ref().map(|session| session.subject.as_str()).unwrap_or_default()"
+        ));
+        assert!(module.contains(r#"AxHttpResponse::redirect("/login".to_string())"#));
+    }
+
+    #[test]
+    fn rejects_auth_subject_outside_request_handlers() {
+        let error = compile_backend_ax_to_module(
+            r#"
+query loadAccount() {
+  return Auth.subject
+}
+"#,
+        )
+        .expect_err("loader auth should be rejected");
+
+        assert!(matches!(
+            error,
+            AxBackendCompileError::Codegen(
+                AxBackendCodegenError::AuthSubjectOutsideRequestHandler { .. }
+            )
         ));
     }
 
