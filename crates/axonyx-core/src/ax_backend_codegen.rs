@@ -198,7 +198,11 @@ fn render_function_fn(
         .transpose()?
         .unwrap_or_else(|| "Value".to_string());
 
-    let mut out = format!("pub fn {}({params}) -> {returns} {{\n", function.name);
+    let visibility = if function.exported { "pub " } else { "" };
+    let mut out = format!(
+        "{visibility}fn {}({params}) -> {returns} {{\n",
+        function.name
+    );
     for step in &function.steps {
         out.push_str(&render_function_step(
             step,
@@ -282,8 +286,49 @@ fn coerce_return_expr(expr: &AxRustExpr, returns: &str) -> String {
     match returns {
         "String" => render_string_expr(expr),
         "Value" => format!("json!({})", render_borrowed_expr(expr)),
-        _ => render_owned_expr(expr),
+        _ => {
+            let rendered = render_owned_expr(expr);
+            strip_wrapping_parentheses(&rendered)
+                .unwrap_or(&rendered)
+                .to_string()
+        }
     }
+}
+
+fn strip_wrapping_parentheses(value: &str) -> Option<&str> {
+    let inner = value.strip_prefix('(')?.strip_suffix(')')?;
+    let mut depth = 0usize;
+    let mut quote = None;
+    let mut escaped = false;
+
+    for (index, ch) in value.char_indices() {
+        if let Some(active) = quote {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == active {
+                quote = None;
+            }
+            continue;
+        }
+        if matches!(ch, '\'' | '"') {
+            quote = Some(ch);
+            continue;
+        }
+        match ch {
+            '(' => depth += 1,
+            ')' => {
+                depth = depth.checked_sub(1)?;
+                if depth == 0 && index + ch.len_utf8() != value.len() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    (depth == 0 && quote.is_none()).then_some(inner)
 }
 
 fn default_function_return_expr(returns: &str) -> String {
@@ -2742,7 +2787,9 @@ route GET "/api/admin" -> User {
         )
         .expect("record policy helper should borrow the narrowed route binding");
 
-        assert!(module.contains("pub fn hasRole(user: &User, role: String) -> bool"));
+        assert!(module.contains("fn hasRole(user: &User, role: String) -> bool"));
+        assert!(!module.contains("pub fn hasRole(user: &User"));
+        assert!(module.contains("return user.role == role;"));
         assert!(module.contains(r#"let isAdmin = json!(&hasRole(&user, "admin".to_string()));"#));
         assert!(module.contains("AxHttpResponse::json(200, &json!(&user))"));
         assert!(!module.contains("hasRole(user.clone()"));
