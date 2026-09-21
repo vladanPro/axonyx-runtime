@@ -30,6 +30,37 @@ use thiserror::Error;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
+use crate::server::{AxCookie, AxHttpRequest};
+use crate::session::{
+    AxMemorySessionStore, AxPostgresSessionStore, AxSameSite, AxSession, AxSessionCookiePolicy,
+    AxSessionManager, AxSessionStore, AxSqliteSessionStore,
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AxActionOutput {
+    pub payload: Value,
+    pub cookies: Vec<AxCookie>,
+}
+
+impl AxActionOutput {
+    pub fn new(payload: Value) -> Self {
+        Self {
+            payload,
+            cookies: Vec::new(),
+        }
+    }
+
+    pub fn with_cookie(mut self, cookie: AxCookie) -> Self {
+        self.cookies.push(cookie);
+        self
+    }
+
+    pub fn with_cookies(mut self, cookies: impl IntoIterator<Item = AxCookie>) -> Self {
+        self.cookies.extend(cookies);
+        self
+    }
+}
+
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AxRuntimeError {
     #[error("runtime operation failed: {message}")]
@@ -1015,6 +1046,37 @@ fn load_dotenv_file(path: impl AsRef<Path>) {
 
 pub trait AxRuntimeEnvAccess {
     fn env(&self) -> &AxEnv;
+
+    fn runtime_create_session(
+        &self,
+        _subject: &str,
+        _data: BTreeMap<String, Value>,
+    ) -> AxRuntimeResult<(AxSession, AxCookie)> {
+        Err(AxRuntimeError::message(
+            "session creation is unavailable for this backend runtime",
+        ))
+    }
+
+    fn runtime_load_session(&self, _request: &AxHttpRequest) -> AxRuntimeResult<Option<AxSession>> {
+        Err(AxRuntimeError::message(
+            "session loading is unavailable for this backend runtime",
+        ))
+    }
+
+    fn runtime_refresh_session(
+        &self,
+        _request: &AxHttpRequest,
+    ) -> AxRuntimeResult<Option<(AxSession, AxCookie)>> {
+        Err(AxRuntimeError::message(
+            "session refresh is unavailable for this backend runtime",
+        ))
+    }
+
+    fn runtime_destroy_session(&self, _request: &AxHttpRequest) -> AxRuntimeResult<AxCookie> {
+        Err(AxRuntimeError::message(
+            "session destruction is unavailable for this backend runtime",
+        ))
+    }
 }
 
 pub trait AxDatabaseAdapter: Send + Sync {
@@ -1162,20 +1224,78 @@ pub trait AxMessenger {
     fn send(&self, request: &AxSendRequest) -> AxRuntimeResult<()>;
 }
 
+pub trait AxSessionExecutor {
+    fn create_session(
+        &self,
+        subject: &str,
+        data: BTreeMap<String, Value>,
+    ) -> AxRuntimeResult<(AxSession, AxCookie)>;
+    fn load_session(&self, request: &AxHttpRequest) -> AxRuntimeResult<Option<AxSession>>;
+    fn refresh_session(
+        &self,
+        request: &AxHttpRequest,
+    ) -> AxRuntimeResult<Option<(AxSession, AxCookie)>>;
+    fn destroy_session(&self, request: &AxHttpRequest) -> AxRuntimeResult<AxCookie>;
+}
+
+impl<T> AxSessionExecutor for T
+where
+    T: AxRuntimeEnvAccess,
+{
+    fn create_session(
+        &self,
+        subject: &str,
+        data: BTreeMap<String, Value>,
+    ) -> AxRuntimeResult<(AxSession, AxCookie)> {
+        self.runtime_create_session(subject, data)
+    }
+
+    fn load_session(&self, request: &AxHttpRequest) -> AxRuntimeResult<Option<AxSession>> {
+        self.runtime_load_session(request)
+    }
+
+    fn refresh_session(
+        &self,
+        request: &AxHttpRequest,
+    ) -> AxRuntimeResult<Option<(AxSession, AxCookie)>> {
+        self.runtime_refresh_session(request)
+    }
+
+    fn destroy_session(&self, request: &AxHttpRequest) -> AxRuntimeResult<AxCookie> {
+        self.runtime_destroy_session(request)
+    }
+}
+
 pub trait AxBackendRuntime:
-    AxQueryExecutor + AxMutationExecutor + AxRevalidator + AxMessenger + AxRuntimeEnvAccess
+    AxQueryExecutor
+    + AxMutationExecutor
+    + AxRevalidator
+    + AxMessenger
+    + AxRuntimeEnvAccess
+    + AxSessionExecutor
 {
 }
 
 impl<T> AxBackendRuntime for T where
-    T: AxQueryExecutor + AxMutationExecutor + AxRevalidator + AxMessenger + AxRuntimeEnvAccess
+    T: AxQueryExecutor
+        + AxMutationExecutor
+        + AxRevalidator
+        + AxMessenger
+        + AxRuntimeEnvAccess
+        + AxSessionExecutor
 {
+}
+
+struct AxConfiguredSession {
+    manager: AxSessionManager,
+    secret: String,
 }
 
 pub struct AxDatabaseRuntime<A> {
     env: AxEnv,
     adapter: A,
     metrics: AxDatabaseMetrics,
+    session: OnceLock<AxConfiguredSession>,
 }
 
 impl<A> AxDatabaseRuntime<A> {
@@ -1184,13 +1304,57 @@ impl<A> AxDatabaseRuntime<A> {
             env,
             adapter,
             metrics: AxDatabaseMetrics::default(),
+            session: OnceLock::new(),
         }
+    }
+
+    fn configured_session(&self) -> AxRuntimeResult<&AxConfiguredSession> {
+        if self.session.get().is_none() {
+            let configured = configured_session_from_env(&self.env)?;
+            let _ = self.session.set(configured);
+        }
+        self.session
+            .get()
+            .ok_or_else(|| AxRuntimeError::message("session runtime failed to initialize"))
     }
 }
 
 impl<A> AxRuntimeEnvAccess for AxDatabaseRuntime<A> {
     fn env(&self) -> &AxEnv {
         &self.env
+    }
+
+    fn runtime_create_session(
+        &self,
+        subject: &str,
+        data: BTreeMap<String, Value>,
+    ) -> AxRuntimeResult<(AxSession, AxCookie)> {
+        let configured = self.configured_session()?;
+        configured
+            .manager
+            .create(subject, data, &configured.secret, current_unix_timestamp()?)
+    }
+
+    fn runtime_load_session(&self, request: &AxHttpRequest) -> AxRuntimeResult<Option<AxSession>> {
+        let configured = self.configured_session()?;
+        configured
+            .manager
+            .load(request, &configured.secret, current_unix_timestamp()?)
+    }
+
+    fn runtime_refresh_session(
+        &self,
+        request: &AxHttpRequest,
+    ) -> AxRuntimeResult<Option<(AxSession, AxCookie)>> {
+        let configured = self.configured_session()?;
+        configured
+            .manager
+            .refresh(request, &configured.secret, current_unix_timestamp()?)
+    }
+
+    fn runtime_destroy_session(&self, request: &AxHttpRequest) -> AxRuntimeResult<AxCookie> {
+        let configured = self.configured_session()?;
+        configured.manager.destroy(request, &configured.secret)
     }
 }
 
@@ -1272,9 +1436,103 @@ impl<A> AxMessenger for AxDatabaseRuntime<A> {
     }
 }
 
+fn configured_session_from_env(env: &AxEnv) -> AxRuntimeResult<AxConfiguredSession> {
+    let secret = env.secret("session_key")?;
+    let config = env.database_config()?;
+    if config.transport != AxDataTransport::Direct {
+        return Err(AxRuntimeError::message(
+            "sessions require direct database transport",
+        ));
+    }
+    let store: Arc<dyn AxSessionStore> = match config.driver {
+        AxDatabaseDriver::Memory => Arc::new(AxMemorySessionStore::default()),
+        AxDatabaseDriver::Sqlite => {
+            let url = config.url.as_deref().ok_or_else(|| {
+                AxRuntimeError::message("SQLite sessions require AX_SECRET_DB_URL")
+            })?;
+            Arc::new(AxSqliteSessionStore::open(sqlite_database_path(url))?)
+        }
+        AxDatabaseDriver::Postgres => {
+            let url = config.url.ok_or_else(|| {
+                AxRuntimeError::message("Postgres sessions require AX_SECRET_DB_URL")
+            })?;
+            Arc::new(AxPostgresSessionStore::connect_with_config(
+                url,
+                config.pool_max_size,
+                config.pool_timeout_ms,
+                config.policy.query_timeout_ms,
+            )?)
+        }
+        AxDatabaseDriver::MySql => {
+            return Err(AxRuntimeError::message(
+                "MySQL session storage is not implemented yet",
+            ));
+        }
+    };
+    let policy = session_cookie_policy_from_env(env)?;
+    Ok(AxConfiguredSession {
+        manager: AxSessionManager::new(store, policy)?,
+        secret,
+    })
+}
+
+fn session_cookie_policy_from_env(env: &AxEnv) -> AxRuntimeResult<AxSessionCookiePolicy> {
+    let mut policy = AxSessionCookiePolicy::default();
+    if let Some(value) = env.secret.get("session_cookie_name") {
+        policy.name = value.clone();
+    }
+    if let Some(value) = env.secret.get("session_cookie_path") {
+        policy.path = value.clone();
+    }
+    policy.domain = env.secret.get("session_cookie_domain").cloned();
+    if let Some(value) = env.secret.get("session_ttl_seconds") {
+        policy.ttl_seconds = value.parse::<i64>().map_err(|_| {
+            AxRuntimeError::message(format!(
+                "SESSION_TTL_SECONDS must be a positive integer, got `{value}`"
+            ))
+        })?;
+    }
+    if let Some(value) = env.secret.get("session_cookie_secure") {
+        policy.secure = parse_session_bool(value, "SESSION_COOKIE_SECURE")?;
+    }
+    if let Some(value) = env.secret.get("session_cookie_same_site") {
+        policy.same_site = match value.trim().to_ascii_lowercase().as_str() {
+            "strict" => AxSameSite::Strict,
+            "lax" => AxSameSite::Lax,
+            "none" => AxSameSite::None,
+            _ => {
+                return Err(AxRuntimeError::message(format!(
+                    "SESSION_COOKIE_SAME_SITE must be Strict, Lax, or None, got `{value}`"
+                )));
+            }
+        };
+    }
+    policy.validate()?;
+    Ok(policy)
+}
+
+fn parse_session_bool(value: &str, name: &str) -> AxRuntimeResult<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" | "on" => Ok(true),
+        "false" | "0" | "no" | "off" => Ok(false),
+        _ => Err(AxRuntimeError::message(format!(
+            "{name} must be true or false, got `{value}`"
+        ))),
+    }
+}
+
+fn current_unix_timestamp() -> AxRuntimeResult<i64> {
+    let seconds = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| AxRuntimeError::message("system clock is before the Unix epoch"))?
+        .as_secs();
+    i64::try_from(seconds)
+        .map_err(|_| AxRuntimeError::message("system clock exceeds the supported session range"))
+}
+
 type AxPostgresManager = PostgresConnectionManager<MakeRustlsConnect>;
-type AxPostgresPool = Pool<AxPostgresManager>;
-type AxPooledPostgresConnection = PooledConnection<AxPostgresManager>;
+pub(crate) type AxPostgresPool = Pool<AxPostgresManager>;
+pub(crate) type AxPooledPostgresConnection = PooledConnection<AxPostgresManager>;
 
 #[derive(Debug)]
 struct AxPostgresConnectionCustomizer {
@@ -3187,7 +3445,7 @@ fn sqlite_row_to_json(row: &rusqlite::Row<'_>, column_names: &[String]) -> rusql
     Ok(Value::Object(record))
 }
 
-fn sqlite_runtime_error(resource: &str, error: rusqlite::Error) -> AxRuntimeError {
+pub(crate) fn sqlite_runtime_error(resource: &str, error: rusqlite::Error) -> AxRuntimeError {
     AxRuntimeError::database(AxDbError::from_driver_detail(
         AxDatabaseDriver::Sqlite,
         resource,
@@ -3541,7 +3799,7 @@ fn postgres_with_client<T>(
     }
 }
 
-fn postgres_pool_connection(
+pub(crate) fn postgres_pool_connection(
     pool: &AxPostgresPool,
     resource: &str,
 ) -> AxRuntimeResult<AxPooledPostgresConnection> {
@@ -3620,7 +3878,7 @@ fn postgres_open_connection(url: &Option<String>, resource: &str) -> AxRuntimeRe
         .map_err(|error| postgres_runtime_error(resource, error))
 }
 
-fn postgres_create_pool(
+pub(crate) fn postgres_create_pool(
     url: &Option<String>,
     resource: &str,
     max_size: u32,
@@ -3837,7 +4095,7 @@ fn postgres_json_query(sql: &str) -> String {
     format!("select row_to_json(\"__ax_row\") from ({sql}) as \"__ax_row\"")
 }
 
-fn postgres_runtime_error(resource: &str, error: postgres::Error) -> AxRuntimeError {
+pub(crate) fn postgres_runtime_error(resource: &str, error: postgres::Error) -> AxRuntimeError {
     let detail = if let Some(db_error) = error.as_db_error() {
         format!("{}: {}", db_error.code().code(), db_error.message())
     } else {
@@ -4415,6 +4673,7 @@ pub mod prelude {
     pub use super::lazy_runtime_from_env;
     pub use super::ok_payload;
     pub use super::runtime_from_env;
+    pub use super::AxActionOutput;
     pub use super::AxAppliedMigration;
     pub use super::AxBackendRuntime;
     pub use super::AxDataTransport;
@@ -4451,6 +4710,7 @@ pub mod prelude {
     pub use super::AxRuntimeError;
     pub use super::AxRuntimeResult;
     pub use super::AxSendRequest;
+    pub use super::AxSessionExecutor;
     pub use super::AxTransactionOperation;
     pub use super::AxTransactionRequest;
     pub use super::AxUpdateRequest;
@@ -4466,6 +4726,74 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn action_output_keeps_response_cookies_outside_the_public_payload() {
+        let output = AxActionOutput::new(json!({ "ok": true }))
+            .with_cookie(AxCookie::new("session", "signed-id").http_only());
+
+        assert_eq!(output.payload, json!({ "ok": true }));
+        assert_eq!(output.cookies.len(), 1);
+        assert_eq!(output.cookies[0].name, "session");
+        assert!(output.payload.get("cookies").is_none());
+    }
+
+    #[test]
+    fn database_runtime_executes_memory_session_lifecycle_when_explicitly_configured() {
+        let runtime = runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_driver", "memory")
+                .with_secret("session_key", "test-secret")
+                .with_secret("session_cookie_secure", "false"),
+        )
+        .expect("runtime should initialize");
+        let (session, cookie) = runtime
+            .create_session(
+                "user-42",
+                BTreeMap::from([("role".to_string(), json!("editor"))]),
+            )
+            .expect("session should create");
+        assert_eq!(session.subject, "user-42");
+        assert_eq!(session.data["role"], "editor");
+        assert!(cookie.http_only);
+        assert!(!cookie.secure);
+
+        let request = AxHttpRequest::new("GET", "/account")
+            .with_header("Cookie", format!("{}={}", cookie.name, cookie.value));
+        assert_eq!(
+            runtime
+                .load_session(&request)
+                .expect("session should load")
+                .expect("session should exist")
+                .id,
+            session.id
+        );
+        let clear = runtime
+            .destroy_session(&request)
+            .expect("session should destroy");
+        assert_eq!(clear.max_age, Some(0));
+        assert!(runtime
+            .load_session(&request)
+            .expect("store should remain readable")
+            .is_none());
+    }
+
+    #[test]
+    fn session_runtime_never_falls_back_to_ephemeral_storage_for_missing_database_url() {
+        let runtime = lazy_runtime_from_env(
+            AxEnv::new()
+                .with_secret("db_driver", "postgres")
+                .with_secret("session_key", "test-secret"),
+        )
+        .expect("lazy runtime should initialize before database access");
+
+        let error = runtime
+            .create_session("user-42", BTreeMap::new())
+            .expect_err("session creation must require durable database config");
+        assert!(error
+            .to_string()
+            .contains("Postgres sessions require AX_SECRET_DB_URL"));
+    }
 
     #[derive(Default)]
     struct MemoryRuntime {

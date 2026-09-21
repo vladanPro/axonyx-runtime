@@ -100,4 +100,6 @@ jobs:
         uses: Swatinem/rust-cache@v2
 
       - name: Verify Postgres runtime, pool, transactions, health, and migrations
-        run: cargo test -p axonyx-runtime backend::tests::postgres_live_query_runs_when_test_url_is_configured -- --exact
+        run: |
+          cargo test -p axonyx-runtime backend::tests::postgres_live_query_runs_when_test_url_is_configured -- --exact
+          cargo test -p axonyx-runtime session::postgres::tests::postgres_live_session_lifecycle_runs_when_test_url_is_configured -- --exact

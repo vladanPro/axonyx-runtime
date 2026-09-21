@@ -169,6 +169,11 @@ pub enum AxStepPlan {
     ClearCookie {
         name: AxRustExpr,
     },
+    SessionCreate {
+        subject: AxRustExpr,
+        data: AxRustExpr,
+    },
+    SessionDestroy,
     Require {
         value: AxRustExpr,
         fallback: Option<AxReturnPlan>,
@@ -206,8 +211,15 @@ pub enum AxHookPhasePlan {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxValuePlan {
     Expr(AxRustExpr),
+    Call {
+        path: Vec<String>,
+        args: Vec<AxRustExpr>,
+    },
     Query(AxQueryPlan),
-    StorageSave { capability: String, input: String },
+    StorageSave {
+        capability: String,
+        input: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -226,6 +238,7 @@ pub enum AxReturnPlan {
     },
     NoContent,
     NotFound,
+    Forbidden,
     Ok,
 }
 
@@ -336,6 +349,8 @@ pub enum AxBackendLowerError {
     InvalidStorageSave,
     #[error("Storage.save input `{field}` is not declared as File on this action")]
     InvalidStorageFileInput { field: String },
+    #[error("Session operations are only supported inside server actions and routes")]
+    SessionOutsideRequestHandler,
     #[error("invalid runtime env path `{path}`")]
     InvalidRuntimeEnvPath { path: String },
     #[error("duplicate backend type declaration `{name}`")]
@@ -367,7 +382,7 @@ pub fn lower_backend_document(
                 for stmt in &root.body {
                     match stmt {
                         AxBackendStmt::Env(env) => envs.push(lower_env(env)),
-                        _ => globals.push(lower_step(stmt, None)?),
+                        _ => globals.push(lower_step(stmt, None, AxStepContext::Other)?),
                     }
                 }
             }
@@ -474,7 +489,7 @@ fn lower_function(function: &AxBackendFunction) -> Result<AxFunctionPlan, AxBack
         rust_fn: format!("fn_{}", normalize_ident(name)),
         returns: function.returns.clone(),
         input,
-        steps: lower_steps(&function.body, None)?,
+        steps: lower_steps(&function.body, None, AxStepContext::Other)?,
         exported: function.exported,
     })
 }
@@ -509,7 +524,7 @@ fn lower_route(route: &AxRoute) -> Result<AxHandlerPlan, AxBackendLowerError> {
             returns: route.returns.clone(),
             input,
         },
-        steps: lower_steps(&route.body, None)?,
+        steps: lower_steps(&route.body, None, AxStepContext::Request)?,
     })
 }
 
@@ -532,7 +547,7 @@ fn lower_loader(loader: &AxLoader) -> Result<AxHandlerPlan, AxBackendLowerError>
             returns: loader.returns.clone(),
             input,
         },
-        steps: lower_steps(&loader.body, None)?,
+        steps: lower_steps(&loader.body, None, AxStepContext::Other)?,
     })
 }
 
@@ -547,7 +562,7 @@ fn lower_action(action: &AxAction) -> Result<AxHandlerPlan, AxBackendLowerError>
         .iter()
         .map(lower_action_input_field)
         .collect::<Result<Vec<_>, _>>()?;
-    let steps = lower_steps(&action.body, Some(&input))?;
+    let steps = lower_steps(&action.body, Some(&input), AxStepContext::Request)?;
 
     Ok(AxHandlerPlan {
         name: action.name.clone(),
@@ -570,7 +585,7 @@ fn lower_job(job: &AxJob) -> Result<AxHandlerPlan, AxBackendLowerError> {
         name: job.name.clone(),
         rust_fn: format!("job_{}", normalize_ident(name)),
         kind: AxHandlerKind::Job,
-        steps: lower_steps(&job.body, None)?,
+        steps: lower_steps(&job.body, None, AxStepContext::Other)?,
     })
 }
 
@@ -626,16 +641,24 @@ fn lower_env(env: &AxBackendEnv) -> AxEnvPlan {
 fn lower_steps(
     steps: &[AxBackendStmt],
     action_input: Option<&[AxFieldPlan]>,
+    context: AxStepContext,
 ) -> Result<Vec<AxStepPlan>, AxBackendLowerError> {
     steps
         .iter()
-        .map(|step| lower_step(step, action_input))
+        .map(|step| lower_step(step, action_input, context))
         .collect()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AxStepContext {
+    Request,
+    Other,
 }
 
 fn lower_step(
     step: &AxBackendStmt,
     action_input: Option<&[AxFieldPlan]>,
+    context: AxStepContext,
 ) -> Result<AxStepPlan, AxBackendLowerError> {
     Ok(match step {
         AxBackendStmt::Data(data) => AxStepPlan::Let {
@@ -705,6 +728,18 @@ fn lower_step(
         AxBackendStmt::ClearCookie(name) => AxStepPlan::ClearCookie {
             name: lower_expr(name),
         },
+        AxBackendStmt::SessionCreate(session) if context == AxStepContext::Request => {
+            AxStepPlan::SessionCreate {
+                subject: lower_expr(&session.subject),
+                data: lower_expr(&session.data),
+            }
+        }
+        AxBackendStmt::SessionDestroy if context == AxStepContext::Request => {
+            AxStepPlan::SessionDestroy
+        }
+        AxBackendStmt::SessionCreate(_) | AxBackendStmt::SessionDestroy => {
+            return Err(AxBackendLowerError::SessionOutsideRequestHandler);
+        }
         AxBackendStmt::Require(requirement) => AxStepPlan::Require {
             value: lower_expr(&requirement.value),
             fallback: requirement.fallback.as_ref().map(lower_return),
@@ -784,6 +819,10 @@ fn lower_backend_value(
                 input: property.clone(),
             })
         }
+        AxBackendValue::Expr(AxExpr::Call { path, args }) => Ok(AxValuePlan::Call {
+            path: path.clone(),
+            args: args.iter().map(lower_expr).collect(),
+        }),
         AxBackendValue::Expr(expr) => Ok(AxValuePlan::Expr(lower_expr(expr))),
         AxBackendValue::Query(query) => Ok(AxValuePlan::Query(lower_query(query))),
     }
@@ -833,6 +872,7 @@ fn lower_return_expr(expr: &AxExpr) -> AxReturnPlan {
         }
         "noContent" | "no_content" if args.is_empty() => AxReturnPlan::NoContent,
         "notFound" | "not_found" if args.is_empty() => AxReturnPlan::NotFound,
+        "forbidden" if args.is_empty() => AxReturnPlan::Forbidden,
         _ => AxReturnPlan::Expr(lower_expr(expr)),
     }
 }
@@ -1045,8 +1085,116 @@ fn try_render_auth(expr: &AxExpr) -> Option<String> {
         ["Auth", "bearer"] => Some("Auth.bearer".to_string()),
         ["Auth", "session"] => Some("Auth.session".to_string()),
         ["Auth", "signedSession"] => Some("Auth.signedSession".to_string()),
+        ["Auth", "subject"] => Some("Auth.subject".to_string()),
         _ => None,
     }
+}
+
+pub fn ax_steps_use_auth_subject<'a>(steps: impl IntoIterator<Item = &'a AxStepPlan>) -> bool {
+    steps.into_iter().any(ax_step_uses_auth_subject)
+}
+
+pub fn ax_step_uses_auth_subject(step: &AxStepPlan) -> bool {
+    match step {
+        AxStepPlan::Let { value, .. } => ax_value_uses_auth_subject(value),
+        AxStepPlan::Transaction { operations } => operations
+            .iter()
+            .any(ax_transaction_operation_uses_auth_subject),
+        AxStepPlan::Insert { fields, .. } => fields
+            .iter()
+            .any(|field| ax_expr_uses_auth_subject(&field.value)),
+        AxStepPlan::Update {
+            fields, filters, ..
+        } => {
+            fields
+                .iter()
+                .any(|field| ax_expr_uses_auth_subject(&field.value))
+                || filters
+                    .iter()
+                    .any(|filter| ax_expr_uses_auth_subject(&filter.value))
+        }
+        AxStepPlan::Delete { filters, .. } => filters
+            .iter()
+            .any(|filter| ax_expr_uses_auth_subject(&filter.value)),
+        AxStepPlan::Revalidate { target, .. } => ax_expr_uses_auth_subject(target),
+        AxStepPlan::Patch { signal, value } => {
+            ax_expr_uses_auth_subject(signal) || ax_expr_uses_auth_subject(value)
+        }
+        AxStepPlan::Hook { value, .. } => ax_expr_uses_auth_subject(value),
+        AxStepPlan::Header { name, value } | AxStepPlan::Cookie { name, value } => {
+            ax_expr_uses_auth_subject(name) || ax_expr_uses_auth_subject(value)
+        }
+        AxStepPlan::ClearCookie { name } => ax_expr_uses_auth_subject(name),
+        AxStepPlan::SessionCreate { subject, data } => {
+            ax_expr_uses_auth_subject(subject) || ax_expr_uses_auth_subject(data)
+        }
+        AxStepPlan::SessionDestroy => false,
+        AxStepPlan::Require { value, fallback } => {
+            ax_expr_uses_auth_subject(value)
+                || fallback.as_ref().is_some_and(ax_return_uses_auth_subject)
+        }
+        AxStepPlan::Return(value) => ax_return_uses_auth_subject(value),
+        AxStepPlan::Send { payload, .. } => ax_expr_uses_auth_subject(payload),
+    }
+}
+
+fn ax_value_uses_auth_subject(value: &AxValuePlan) -> bool {
+    match value {
+        AxValuePlan::Expr(expr) => ax_expr_uses_auth_subject(expr),
+        AxValuePlan::Call { args, .. } => args.iter().any(ax_expr_uses_auth_subject),
+        AxValuePlan::Query(query) => {
+            let source_uses = match &query.source {
+                AxQuerySourcePlan::RawSql { params, .. } => {
+                    params.iter().any(ax_expr_uses_auth_subject)
+                }
+                AxQuerySourcePlan::Stream { .. } | AxQuerySourcePlan::ContentCollection { .. } => {
+                    false
+                }
+            };
+            source_uses
+                || query
+                    .filters
+                    .iter()
+                    .any(|filter| ax_expr_uses_auth_subject(&filter.value))
+        }
+        AxValuePlan::StorageSave { .. } => false,
+    }
+}
+
+fn ax_transaction_operation_uses_auth_subject(operation: &AxTransactionOperationPlan) -> bool {
+    match operation {
+        AxTransactionOperationPlan::Insert { fields, .. } => fields
+            .iter()
+            .any(|field| ax_expr_uses_auth_subject(&field.value)),
+        AxTransactionOperationPlan::Update {
+            fields, filters, ..
+        } => {
+            fields
+                .iter()
+                .any(|field| ax_expr_uses_auth_subject(&field.value))
+                || filters
+                    .iter()
+                    .any(|filter| ax_expr_uses_auth_subject(&filter.value))
+        }
+        AxTransactionOperationPlan::Delete { filters, .. } => filters
+            .iter()
+            .any(|filter| ax_expr_uses_auth_subject(&filter.value)),
+    }
+}
+
+fn ax_return_uses_auth_subject(value: &AxReturnPlan) -> bool {
+    match value {
+        AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => ax_expr_uses_auth_subject(expr),
+        AxReturnPlan::Redirect { target, .. } => ax_expr_uses_auth_subject(target),
+        AxReturnPlan::NoContent
+        | AxReturnPlan::NotFound
+        | AxReturnPlan::Forbidden
+        | AxReturnPlan::Ok => false,
+    }
+}
+
+fn ax_expr_uses_auth_subject(expr: &AxRustExpr) -> bool {
+    expr.code.trim() == "Auth.subject"
 }
 
 fn try_render_runtime_env(expr: &AxExpr) -> Option<String> {
@@ -1136,6 +1284,8 @@ fn route_method_ident(method: &str) -> String {
 }
 
 pub mod prelude {
+    pub use super::ax_step_uses_auth_subject;
+    pub use super::ax_steps_use_auth_subject;
     pub use super::lower_backend_document;
     pub use super::AxAssignmentPlan;
     pub use super::AxBackendLowerError;
@@ -1666,6 +1816,10 @@ route DELETE "/api/posts"
 
 route GET "/missing"
   return notFound()
+
+route GET "/admin"
+  require false else forbidden()
+  return json("ok")
 "#,
         )
         .expect("document should parse");
@@ -1690,6 +1844,13 @@ route GET "/missing"
         assert_eq!(
             plan.handlers[3].steps[0],
             AxStepPlan::Return(AxReturnPlan::NotFound)
+        );
+        assert_eq!(
+            plan.handlers[4].steps[0],
+            AxStepPlan::Require {
+                value: AxRustExpr::new("false"),
+                fallback: Some(AxReturnPlan::Forbidden),
+            }
         );
     }
 
@@ -1877,6 +2038,35 @@ route GET "/api/admin"
     }
 
     #[test]
+    fn lowers_auth_subject_alias() {
+        let document = parse_backend_ax(
+            r#"
+route GET "/api/account"
+  require Auth.subject else redirect("/login")
+  return json(Auth.subject)
+"#,
+        )
+        .expect("document should parse");
+
+        let plan = lower_backend_document(&document).expect("document should lower");
+
+        assert_eq!(
+            plan.handlers[0].steps[0],
+            AxStepPlan::Require {
+                value: AxRustExpr::new("Auth.subject"),
+                fallback: Some(AxReturnPlan::Redirect {
+                    target: AxRustExpr::new(r#""/login".to_string()"#),
+                    status: None,
+                }),
+            }
+        );
+        assert_eq!(
+            plan.handlers[0].steps[1],
+            AxStepPlan::Return(AxReturnPlan::Json(AxRustExpr::new("Auth.subject")))
+        );
+    }
+
+    #[test]
     fn lowers_backend_root_data_as_global_steps() {
         let document = parse_backend_ax(
             r#"
@@ -2049,5 +2239,35 @@ action UploadImage(image: File) -> FileRef {
                 field: "image".to_string(),
             })
         );
+    }
+
+    #[test]
+    fn lowers_session_operations_only_for_request_handlers() {
+        let action = parse_backend_ax(
+            r#"action Login(userId: String) {
+  Session.create(input.userId, { role: "editor" })
+  Session.destroy()
+  return ok
+}"#,
+        )
+        .expect("action should parse");
+        let plan = lower_backend_document(&action).expect("action should lower");
+        assert!(matches!(
+            plan.handlers[0].steps[0],
+            AxStepPlan::SessionCreate { .. }
+        ));
+        assert_eq!(plan.handlers[0].steps[1], AxStepPlan::SessionDestroy);
+
+        for source in [
+            "loader Current() {\n  Session.destroy()\n  return ok\n}",
+            "fn helper() {\n  Session.destroy()\n  return ok\n}",
+            "job Cleanup {\n  Session.destroy()\n}",
+        ] {
+            let document = parse_backend_ax(source).expect("source should parse before lowering");
+            assert_eq!(
+                lower_backend_document(&document),
+                Err(AxBackendLowerError::SessionOutsideRequestHandler)
+            );
+        }
     }
 }

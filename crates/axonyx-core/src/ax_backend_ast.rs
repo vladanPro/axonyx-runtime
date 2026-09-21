@@ -429,6 +429,8 @@ pub enum AxBackendStmt {
     Header(AxResponseHeader),
     Cookie(AxResponseCookie),
     ClearCookie(AxExpr),
+    SessionCreate(AxSessionCreate),
+    SessionDestroy,
     Require(AxRequirement),
     Revalidate(AxRevalidate),
     Return(AxReturn),
@@ -500,6 +502,14 @@ impl AxBackendStmt {
 
     pub fn clear_cookie(name: impl Into<AxExpr>) -> Self {
         Self::ClearCookie(name.into())
+    }
+
+    pub fn session_create(subject: impl Into<AxExpr>, data: impl Into<AxExpr>) -> Self {
+        Self::SessionCreate(AxSessionCreate::new(subject, data))
+    }
+
+    pub fn session_destroy() -> Self {
+        Self::SessionDestroy
     }
 
     pub fn require(value: impl Into<AxExpr>) -> Self {
@@ -789,6 +799,21 @@ impl AxResponseCookie {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxSessionCreate {
+    pub subject: AxExpr,
+    pub data: AxExpr,
+}
+
+impl AxSessionCreate {
+    pub fn new(subject: impl Into<AxExpr>, data: impl Into<AxExpr>) -> Self {
+        Self {
+            subject: subject.into(),
+            data: data.into(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxRequirement {
     pub value: AxExpr,
     pub fallback: Option<AxReturn>,
@@ -878,6 +903,7 @@ pub mod prelude {
     pub use super::AxScopeState;
     pub use super::AxScopeStmt;
     pub use super::AxSend;
+    pub use super::AxSessionCreate;
     pub use super::AxTransaction;
     pub use super::AxTransactionOperation;
 }

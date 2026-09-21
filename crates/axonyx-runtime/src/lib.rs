@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod server;
+pub mod session;
 #[cfg(feature = "storage")]
 pub mod storage;
 
@@ -12,10 +13,10 @@ use axonyx_core::ax_ast_prelude::{
 };
 use axonyx_core::ax_backend_lowering::AxBackendLowerError;
 use axonyx_core::ax_backend_lowering_prelude::{
-    lower_backend_document, AxFieldPlan, AxFunctionPlan, AxHandlerKind, AxHandlerPlan,
-    AxHookPhasePlan, AxQueryFilterOpPlan, AxQueryModePlan, AxQueryOrderDirectionPlan, AxQueryPlan,
-    AxQuerySourcePlan, AxReturnPlan, AxRustExpr, AxStepPlan, AxTransactionOperationPlan,
-    AxValuePlan,
+    ax_step_uses_auth_subject, lower_backend_document, AxFieldPlan, AxFunctionPlan, AxHandlerKind,
+    AxHandlerPlan, AxHookPhasePlan, AxQueryFilterOpPlan, AxQueryModePlan,
+    AxQueryOrderDirectionPlan, AxQueryPlan, AxQuerySourcePlan, AxReturnPlan, AxRustExpr,
+    AxStepPlan, AxTransactionOperationPlan, AxValuePlan,
 };
 use axonyx_core::ax_backend_parser::AxBackendParseError;
 use axonyx_core::ax_backend_parser_prelude::parse_backend_ax;
@@ -35,6 +36,7 @@ use thiserror::Error;
 pub use backend::prelude as backend_prelude;
 pub use serde;
 pub use server::prelude as server_prelude;
+pub use session::prelude as session_prelude;
 #[cfg(feature = "storage")]
 pub use storage::prelude as storage_prelude;
 
@@ -134,6 +136,15 @@ fn is_json_content_type(content_type: &str) -> bool {
 
 fn parse_api_return_contract(contract: &str) -> Result<AxType, AxApiResponseValidationError> {
     let contract = contract.trim();
+    if let Some(inner) = contract.strip_suffix('?') {
+        if inner.trim().is_empty() {
+            return Err(AxApiResponseValidationError::InvalidContract {
+                contract: contract.to_string(),
+                message: "optional shorthand requires an inner type".to_string(),
+            });
+        }
+        return Ok(AxType::optional(parse_api_return_contract(inner)?));
+    }
     if let Some(inner) = contract.strip_suffix("[]") {
         return Ok(AxType::list(parse_api_return_contract(inner)?));
     }
@@ -532,6 +543,7 @@ pub struct AxPreviewActionResult {
     pub value: AxValue,
     pub patches: Vec<AxPreviewStatePatch>,
     pub invalidations: Vec<AxPreviewInvalidation>,
+    pub cookies: Vec<server::AxCookie>,
     pub error: Option<AxPreviewActionError>,
 }
 
@@ -564,6 +576,14 @@ impl AxPreviewActionError {
             message: message.into(),
             status: 422,
             value,
+        }
+    }
+
+    pub fn forbidden() -> Self {
+        Self {
+            message: "forbidden".to_string(),
+            status: 403,
+            value: AxValue::record([("error", AxValue::String("forbidden".to_string()))]),
         }
     }
 }
@@ -1054,7 +1074,7 @@ pub fn execute_preview_route_request_sources_validated(
     let request_path = normalize_preview_request_path(&request.target)?;
     let query = parse_preview_query_fields(&request.target);
     execute_preview_route(
-        &handlers.routes,
+        &handlers,
         request,
         &request_path,
         &query,
@@ -1097,7 +1117,7 @@ pub fn execute_preview_route_request_sources_with_runtime_validated(
     let request_path = normalize_preview_request_path(&request.target)?;
     let query = parse_preview_query_fields(&request.target);
     execute_preview_route(
-        &handlers.routes,
+        &handlers,
         request,
         &request_path,
         &query,
@@ -1141,11 +1161,13 @@ fn collect_preview_handlers(
         collect_preview_functions(plan.functions, &mut functions);
 
         for handler in plan.handlers {
-            if !matches!(handler.kind, AxHandlerKind::Route { .. }) {
-                continue;
+            match &handler.kind {
+                AxHandlerKind::Route { .. } => routes.push(handler),
+                AxHandlerKind::Loader { .. } => {
+                    loaders.insert(handler.name.clone(), handler);
+                }
+                AxHandlerKind::Action { .. } | AxHandlerKind::Job => {}
             }
-
-            routes.push(handler);
         }
     }
 
@@ -1449,6 +1471,8 @@ fn execute_preview_loader(
             | AxStepPlan::Header { .. }
             | AxStepPlan::Cookie { .. }
             | AxStepPlan::ClearCookie { .. }
+            | AxStepPlan::SessionCreate { .. }
+            | AxStepPlan::SessionDestroy
             | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {}
         }
@@ -1485,6 +1509,15 @@ fn execute_preview_function(
                     let value = eval_preview_expr_with_functions(expr, &scope, env, functions)?;
                     scope.insert(binding.clone(), value);
                 }
+                AxValuePlan::Call { path, args } => {
+                    let value = eval_preview_expr_with_functions(
+                        &preview_call_expr(path, args),
+                        &scope,
+                        env,
+                        functions,
+                    )?;
+                    scope.insert(binding.clone(), value);
+                }
                 AxValuePlan::Query(_) => {
                     return Err(PreviewError::Runtime {
                         message: format!(
@@ -1512,6 +1545,8 @@ fn execute_preview_function(
             | AxStepPlan::Header { .. }
             | AxStepPlan::Cookie { .. }
             | AxStepPlan::ClearCookie { .. }
+            | AxStepPlan::SessionCreate { .. }
+            | AxStepPlan::SessionDestroy
             | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {
                 return Err(PreviewError::Runtime {
@@ -1588,11 +1623,27 @@ fn execute_preview_action(
         "input".to_string(),
         build_preview_input_record(input, input_fields, request)?,
     );
+    if let Some(request) = request {
+        let session = if action.steps.iter().any(ax_step_uses_auth_subject) {
+            runtime
+                .ok_or_else(|| PreviewError::Runtime {
+                    message: "Auth.subject requires a configured backend runtime".to_string(),
+                })?
+                .load_session(request)?
+        } else {
+            None
+        };
+        scope.insert(
+            "Auth".to_string(),
+            build_preview_auth_record(request, env, session.as_ref()),
+        );
+    }
 
     let mut redirect_to = None;
     let mut value = AxValue::record([("ok", AxValue::Bool(true))]);
     let mut patches = Vec::new();
     let mut invalidations = Vec::new();
+    let mut cookies = Vec::new();
 
     for step in &action.steps {
         match step {
@@ -1731,6 +1782,32 @@ fn execute_preview_action(
                 let value = eval_preview_expr_with_functions(value, &scope, env, functions)?;
                 patches.push(AxPreviewStatePatch::set(signal, value));
             }
+            AxStepPlan::SessionCreate { subject, data } => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.create requires a configured backend runtime".to_string(),
+                })?;
+                let subject =
+                    eval_preview_expr_with_functions(subject, &scope, env, functions)?.as_string();
+                let data = preview_value_to_json(&eval_preview_expr_with_functions(
+                    data, &scope, env, functions,
+                )?);
+                let serde_json::Value::Object(data) = data else {
+                    return Err(PreviewError::Runtime {
+                        message: "Session.create data must be an object".to_string(),
+                    });
+                };
+                let (_, cookie) = runtime.create_session(&subject, data.into_iter().collect())?;
+                cookies.push(cookie);
+            }
+            AxStepPlan::SessionDestroy => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.destroy requires a configured backend runtime".to_string(),
+                })?;
+                let request = request.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.destroy requires an HTTP action request".to_string(),
+                })?;
+                cookies.push(runtime.destroy_session(request)?);
+            }
             AxStepPlan::Require {
                 value: requirement,
                 fallback,
@@ -1754,17 +1831,34 @@ fn execute_preview_action(
                     value,
                     patches,
                     invalidations,
+                    cookies,
                     error: Some(error),
                 });
             }
             AxStepPlan::Return(result) => {
                 value = eval_preview_return_with_functions(result, &scope, env, functions)?;
             }
-            AxStepPlan::Header { .. }
-            | AxStepPlan::Hook { .. }
-            | AxStepPlan::Cookie { .. }
-            | AxStepPlan::ClearCookie { .. }
-            | AxStepPlan::Send { .. } => {}
+            AxStepPlan::Cookie { name, value } => {
+                cookies.push(
+                    server::AxCookie::new(
+                        eval_preview_expr_with_functions(name, &scope, env, functions)?.as_string(),
+                        eval_preview_expr_with_functions(value, &scope, env, functions)?
+                            .as_string(),
+                    )
+                    .with_path("/"),
+                );
+            }
+            AxStepPlan::ClearCookie { name } => {
+                cookies.push(
+                    server::AxCookie::new(
+                        eval_preview_expr_with_functions(name, &scope, env, functions)?.as_string(),
+                        "",
+                    )
+                    .with_path("/")
+                    .with_max_age(0),
+                );
+            }
+            AxStepPlan::Header { .. } | AxStepPlan::Hook { .. } | AxStepPlan::Send { .. } => {}
         }
     }
 
@@ -1773,6 +1867,7 @@ fn execute_preview_action(
         value,
         patches,
         invalidations,
+        cookies,
         error: None,
     })
 }
@@ -1789,7 +1884,7 @@ fn with_preview_globals(mut handler: AxHandlerPlan, globals: &[AxStepPlan]) -> A
 }
 
 fn execute_preview_route(
-    routes: &[AxHandlerPlan],
+    handlers: &PreviewHandlers,
     request: &server::AxHttpRequest,
     request_path: &str,
     query: &BTreeMap<String, String>,
@@ -1801,7 +1896,8 @@ fn execute_preview_route(
     let runtime = backend.runtime;
     let validate_response = validation.enabled;
     let type_context = validation.type_context;
-    let Some(route_match) = match_preview_route(routes, &request.method, request_path) else {
+    let Some(route_match) = match_preview_route(&handlers.routes, &request.method, request_path)
+    else {
         return Ok(None);
     };
 
@@ -1809,7 +1905,24 @@ fn execute_preview_route(
     scope.insert("params".to_string(), AxValue::Record(route_match.params));
     scope.insert("query".to_string(), build_preview_query_record(query));
     scope.insert("request".to_string(), build_preview_request_record(request));
-    scope.insert("Auth".to_string(), build_preview_auth_record(request, env));
+    let session = if route_match
+        .handler
+        .steps
+        .iter()
+        .any(ax_step_uses_auth_subject)
+    {
+        runtime
+            .ok_or_else(|| PreviewError::Runtime {
+                message: "Auth.subject requires a configured backend runtime".to_string(),
+            })?
+            .load_session(request)?
+    } else {
+        None
+    };
+    scope.insert(
+        "Auth".to_string(),
+        build_preview_auth_record(request, env, session.as_ref()),
+    );
     if let AxHandlerKind::Route { input, .. } = &route_match.handler.kind {
         if !input.is_empty() {
             scope.insert(
@@ -1827,7 +1940,15 @@ fn execute_preview_route(
                 binding,
                 value: plan,
             } => {
-                let evaluated = eval_preview_value(plan, &scope, env, runtime, store)?;
+                let evaluated = eval_preview_route_value(
+                    plan,
+                    &scope,
+                    env,
+                    runtime,
+                    store,
+                    &handlers.loaders,
+                    &handlers.functions,
+                )?;
                 scope.insert(binding.clone(), evaluated);
             }
             AxStepPlan::Insert { collection, fields } => {
@@ -1947,6 +2068,26 @@ fn execute_preview_route(
                         .render(),
                 );
             }
+            AxStepPlan::SessionCreate { subject, data } => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.create requires a configured backend runtime".to_string(),
+                })?;
+                let subject = eval_preview_expr(subject, &scope, env)?.as_string();
+                let data = preview_value_to_json(&eval_preview_expr(data, &scope, env)?);
+                let serde_json::Value::Object(data) = data else {
+                    return Err(PreviewError::Runtime {
+                        message: "Session.create data must be an object".to_string(),
+                    });
+                };
+                let (_, cookie) = runtime.create_session(&subject, data.into_iter().collect())?;
+                set_cookies.push(cookie.render());
+            }
+            AxStepPlan::SessionDestroy => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.destroy requires a configured backend runtime".to_string(),
+                })?;
+                set_cookies.push(runtime.destroy_session(request)?.render());
+            }
             AxStepPlan::Require { value, fallback } => {
                 if !preview_require_passes(&eval_preview_require_expr(value, &scope, env)?) {
                     let response = render_preview_require_fallback(fallback.as_ref(), &scope, env)?;
@@ -2063,6 +2204,13 @@ fn render_preview_require_fallback(
             set_cookies: Vec::new(),
             body: b"not found".to_vec(),
         },
+        Some(AxReturnPlan::Forbidden) => AxPreviewHttpResponse {
+            status: 403,
+            content_type: "application/json; charset=utf-8".to_string(),
+            headers: BTreeMap::new(),
+            set_cookies: Vec::new(),
+            body: br#"{"error":"forbidden"}"#.to_vec(),
+        },
         Some(AxReturnPlan::Ok) => {
             render_preview_json_response(&AxValue::record([("ok", AxValue::Bool(true))]))?
         }
@@ -2105,7 +2253,7 @@ fn apply_preview_route_hook(
             headers.insert("Cache-Control".to_string(), "no-store".to_string());
             Ok(None)
         }
-        "Auth.session" | "Auth.bearer" | "Auth.signedSession" => {
+        "Auth.session" | "Auth.bearer" | "Auth.signedSession" | "Auth.subject" => {
             if !preview_require_passes(&eval_preview_require_expr(hook, scope, env)?) {
                 return render_preview_require_fallback(None, scope, env).map(Some);
             }
@@ -2169,6 +2317,10 @@ fn eval_preview_action_error_fallback_with_functions(
     env: &backend::AxEnv,
     functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<AxPreviewActionError, PreviewError> {
+    if matches!(fallback, Some(AxReturnPlan::Forbidden)) {
+        return Ok(AxPreviewActionError::forbidden());
+    }
+
     let value = match fallback {
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
             eval_preview_expr_with_functions(expr, scope, env, functions)?
@@ -2179,6 +2331,7 @@ fn eval_preview_action_error_fallback_with_functions(
         Some(AxReturnPlan::Ok)
         | Some(AxReturnPlan::NoContent)
         | Some(AxReturnPlan::NotFound)
+        | Some(AxReturnPlan::Forbidden)
         | None => AxValue::String("Action requirement failed.".to_string()),
     };
     let message = match &value {
@@ -2193,15 +2346,30 @@ fn eval_preview_action_error_fallback_with_functions(
     Ok(AxPreviewActionError::validation(message, value))
 }
 
-fn eval_preview_value(
+#[allow(clippy::too_many_arguments)]
+fn eval_preview_route_value(
     value: &AxValuePlan,
     scope: &BTreeMap<String, AxValue>,
     env: &backend::AxEnv,
     runtime: Option<&dyn backend::AxBackendRuntime>,
     store: &AxPreviewStore,
+    loaders: &BTreeMap<String, AxHandlerPlan>,
+    functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<AxValue, PreviewError> {
-    let functions = BTreeMap::new();
-    eval_preview_value_with_functions(value, scope, env, runtime, store, &functions)
+    let AxValuePlan::Call { path, args } = value else {
+        return eval_preview_value_with_functions(value, scope, env, runtime, store, functions);
+    };
+    let Some(name) = path.first().filter(|_| path.len() == 1) else {
+        return eval_preview_value_with_functions(value, scope, env, runtime, store, functions);
+    };
+    let Some(loader) = loaders.get(name) else {
+        return eval_preview_value_with_functions(value, scope, env, runtime, store, functions);
+    };
+    let args = args
+        .iter()
+        .map(|arg| eval_preview_expr_with_functions(arg, scope, env, functions))
+        .collect::<Result<Vec<_>, _>>()?;
+    execute_preview_loader(loader, &args, scope, env, runtime, store, functions)
 }
 
 fn eval_preview_value_with_functions(
@@ -2214,6 +2382,9 @@ fn eval_preview_value_with_functions(
 ) -> Result<AxValue, PreviewError> {
     match value {
         AxValuePlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
+        AxValuePlan::Call { path, args } => {
+            eval_preview_expr_with_functions(&preview_call_expr(path, args), scope, env, functions)
+        }
         AxValuePlan::Query(query) => {
             eval_preview_query_with_functions(query, scope, env, runtime, store, functions)
         }
@@ -2221,6 +2392,16 @@ fn eval_preview_value_with_functions(
             message: "Storage.save is only evaluated by an HTTP action runtime".to_string(),
         }),
     }
+}
+
+fn preview_call_expr(path: &[String], args: &[AxRustExpr]) -> AxRustExpr {
+    let target = path.join("::");
+    let args = args
+        .iter()
+        .map(|arg| arg.code.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    AxRustExpr::new(format!("{target}({args})"))
 }
 
 fn eval_preview_return_with_functions(
@@ -2232,11 +2413,12 @@ fn eval_preview_return_with_functions(
     match value {
         AxReturnPlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
         AxReturnPlan::Json(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
-        AxReturnPlan::Redirect { .. } | AxReturnPlan::NoContent | AxReturnPlan::NotFound => {
-            Err(PreviewError::Runtime {
-                message: "HTTP response helpers are only supported in route blocks".to_string(),
-            })
-        }
+        AxReturnPlan::Redirect { .. }
+        | AxReturnPlan::NoContent
+        | AxReturnPlan::NotFound
+        | AxReturnPlan::Forbidden => Err(PreviewError::Runtime {
+            message: "HTTP response helpers are only supported in route blocks".to_string(),
+        }),
         AxReturnPlan::Ok => Ok(AxValue::record([("ok", AxValue::Bool(true))])),
     }
 }
@@ -2275,6 +2457,13 @@ fn render_preview_route_return(
             headers: BTreeMap::new(),
             set_cookies: Vec::new(),
             body: b"not found".to_vec(),
+        },
+        AxReturnPlan::Forbidden => AxPreviewHttpResponse {
+            status: 403,
+            content_type: "application/json; charset=utf-8".to_string(),
+            headers: BTreeMap::new(),
+            set_cookies: Vec::new(),
+            body: br#"{"error":"forbidden"}"#.to_vec(),
         },
         AxReturnPlan::Ok => {
             render_preview_json_response(&AxValue::record([("ok", AxValue::Bool(true))]))?
@@ -2643,6 +2832,17 @@ fn eval_preview_expr_with_functions(
             })
             .collect::<Result<Vec<_>, _>>()?;
         return Ok(AxValue::List(items));
+    }
+
+    if let Some(fields) = parse_preview_json_object(code) {
+        let fields = fields
+            .into_iter()
+            .map(|(key, value)| {
+                eval_preview_expr_with_functions(&AxRustExpr::new(value), scope, env, functions)
+                    .map(|value| (key, value))
+            })
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
+        return Ok(AxValue::Record(fields));
     }
 
     if let Some(args) = parse_preview_call_args(code, "contains") {
@@ -3395,7 +3595,11 @@ fn build_preview_request_record(request: &server::AxHttpRequest) -> AxValue {
     ]))
 }
 
-fn build_preview_auth_record(request: &server::AxHttpRequest, env: &backend::AxEnv) -> AxValue {
+fn build_preview_auth_record(
+    request: &server::AxHttpRequest,
+    env: &backend::AxEnv,
+    session: Option<&session::AxSession>,
+) -> AxValue {
     let signed_session = env
         .secret("session_key")
         .ok()
@@ -3420,6 +3624,14 @@ fn build_preview_auth_record(request: &server::AxHttpRequest, env: &backend::AxE
             ),
         ),
         ("signedSession".to_string(), AxValue::String(signed_session)),
+        (
+            "subject".to_string(),
+            AxValue::String(
+                session
+                    .map(|session| session.subject.clone())
+                    .unwrap_or_default(),
+            ),
+        ),
     ]))
 }
 
@@ -4310,6 +4522,45 @@ fn parse_preview_vec_args(code: &str) -> Option<Vec<String>> {
     )
 }
 
+fn parse_preview_json_object(code: &str) -> Option<Vec<(String, String)>> {
+    let inner = code.strip_prefix("json!({")?.strip_suffix("})")?;
+    if inner.trim().is_empty() {
+        return Some(Vec::new());
+    }
+
+    split_preview_args(inner)
+        .into_iter()
+        .map(|field| {
+            let (key, value) = split_preview_object_field(field)?;
+            Some((parse_preview_string(key.trim())?, value.trim().to_string()))
+        })
+        .collect()
+}
+
+fn split_preview_object_field(input: &str) -> Option<(&str, &str)> {
+    let mut depth = 0usize;
+    let mut in_string: Option<char> = None;
+
+    for (index, ch) in input.char_indices() {
+        match in_string {
+            Some(quote) => {
+                if ch == quote {
+                    in_string = None;
+                }
+            }
+            None => match ch {
+                '"' | '\'' => in_string = Some(ch),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ':' if depth == 0 => return Some((&input[..index], &input[index + 1..])),
+                _ => {}
+            },
+        }
+    }
+
+    None
+}
+
 fn parse_preview_named_call(code: &str) -> Option<(String, Vec<String>)> {
     let open = code.find('(')?;
     let name = code[..open].trim();
@@ -4343,8 +4594,8 @@ fn split_preview_args(input: &str) -> Vec<&str> {
             }
             None => match ch {
                 '"' | '\'' => in_string = Some(ch),
-                '(' | '[' => depth += 1,
-                ')' | ']' => depth = depth.saturating_sub(1),
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
                 ',' if depth == 0 => {
                     result.push(input[start..index].trim());
                     start = index + 1;
@@ -9351,6 +9602,27 @@ route GET "/api/posts/:slug"
     }
 
     #[test]
+    fn preview_route_sources_can_return_forbidden_fallback() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_sources(
+            &[r#"
+route GET "/api/admin"
+  require false else forbidden()
+  return json("ok")
+"#],
+            "GET",
+            "/api/admin",
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+
+        assert_eq!(response.status, 403);
+        assert_eq!(response.content_type, "application/json; charset=utf-8");
+        assert_eq!(response.body, br#"{"error":"forbidden"}"#);
+    }
+
+    #[test]
     fn preview_route_sources_prefer_static_path_over_dynamic_match() {
         let mut store = AxPreviewStore::default();
         let response = execute_preview_route_sources(
@@ -9565,6 +9837,17 @@ page Home
         )
         .expect("matching response should pass");
 
+        validate_api_response_bytes(200, "application/json", b"null", "Post?", &context)
+            .expect("nullable shorthand should accept null");
+        validate_api_response_bytes(
+            200,
+            "application/json",
+            br#"{"title":"Axonyx","published":true}"#,
+            "Post?",
+            &context,
+        )
+        .expect("nullable shorthand should accept its inner record");
+
         let error = validate_api_response_bytes(
             200,
             "application/json",
@@ -9605,5 +9888,200 @@ route GET "/api/posts" -> String {
             response.body,
             br#"{"error":"internal_server_error","message":"API response did not satisfy its declared contract."}"#
         );
+    }
+
+    #[test]
+    fn preview_session_actions_issue_and_clear_server_cookies() {
+        let runtime = backend::runtime_from_env(
+            backend::AxEnv::new()
+                .with_secret("db_driver", "memory")
+                .with_secret("session_key", "preview-session-secret")
+                .with_secret("session_cookie_secure", "false"),
+        )
+        .expect("memory runtime should initialize");
+        let source = r#"action Login(userId: String) {
+  Session.create(input.userId, { role: "editor" })
+  return ok
+}
+
+action Logout() {
+  Session.destroy()
+  return ok
+}"#;
+        let mut store = AxPreviewStore::default();
+        let login = execute_preview_action_sources_with_runtime(
+            &[source],
+            "Login",
+            &BTreeMap::from([("userId".to_string(), "user-42".to_string())]),
+            &runtime,
+            &mut store,
+        )
+        .expect("login action should execute");
+        assert_eq!(login.cookies.len(), 1);
+        assert!(login.cookies[0].http_only);
+
+        let request = server::AxHttpRequest::new("POST", "/logout").with_header(
+            "Cookie",
+            format!("{}={}", login.cookies[0].name, login.cookies[0].value),
+        );
+        let logout = execute_preview_action_request_sources_with_runtime_and_storage(
+            &[source],
+            "Logout",
+            &request,
+            &runtime,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .expect("logout action should execute");
+        assert_eq!(logout.cookies.len(), 1);
+        assert_eq!(logout.cookies[0].max_age, Some(0));
+        assert!(backend::AxSessionExecutor::load_session(&runtime, &request)
+            .expect("session store should remain readable")
+            .is_none());
+    }
+
+    #[test]
+    fn preview_auth_subject_loads_the_verified_server_session() {
+        let runtime = backend::runtime_from_env(
+            backend::AxEnv::new()
+                .with_secret("db_driver", "memory")
+                .with_secret("session_key", "preview-session-secret")
+                .with_secret("session_cookie_secure", "false"),
+        )
+        .expect("memory runtime should initialize");
+        let login_source = r#"action Login(userId: String) {
+  Session.create(input.userId, { role: "editor" })
+  return ok
+}"#;
+        let mut store = AxPreviewStore::default();
+        let login_request =
+            server::AxHttpRequest::new("POST", "/login").with_body(b"userId=user-42".to_vec());
+        let login = execute_preview_action_request_sources_with_runtime_and_storage(
+            &[login_source],
+            "Login",
+            &login_request,
+            &runtime,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .expect("login should create a session");
+        let cookie = &login.cookies[0];
+        let authenticated = server::AxHttpRequest::new("GET", "/api/account")
+            .with_header("Cookie", format!("{}={}", cookie.name, cookie.value));
+        let route_source = r#"
+route GET "/api/account"
+  require Auth.subject else redirect("/login")
+  return json(Auth.subject)
+"#;
+
+        let response = execute_preview_route_request_sources_with_runtime(
+            &[route_source],
+            &authenticated,
+            &runtime,
+            &mut store,
+        )
+        .expect("protected route should execute")
+        .expect("protected route should match");
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, br#""user-42""#);
+
+        let anonymous = server::AxHttpRequest::new("GET", "/api/account");
+        let response = execute_preview_route_request_sources_with_runtime(
+            &[route_source],
+            &anonymous,
+            &runtime,
+            &mut store,
+        )
+        .expect("anonymous route should execute")
+        .expect("anonymous route should match");
+        assert_eq!(response.status, 303);
+        assert_eq!(
+            response.headers.get("Location").map(String::as_str),
+            Some("/login")
+        );
+    }
+
+    #[test]
+    fn preview_route_resolves_a_typed_user_from_the_authenticated_subject() {
+        let database_path = std::env::temp_dir().join(format!(
+            "axonyx-auth-user-resolver-{}-{}.db",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time should be valid")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&database_path);
+        let connection = rusqlite::Connection::open(&database_path)
+            .expect("user resolver sqlite database should open");
+        connection
+            .execute_batch(
+                "create table users (id text primary key, email text not null);
+                 insert into users (id, email) values ('user-42', 'foundry@example.com');",
+            )
+            .expect("user fixture should seed");
+        drop(connection);
+        let runtime = backend::runtime_from_env(
+            backend::AxEnv::new()
+                .with_secret("db_dialect", "sqlite")
+                .with_secret("db_url", database_path.to_string_lossy())
+                .with_secret("session_key", "preview-session-secret")
+                .with_secret("session_cookie_secure", "false"),
+        )
+        .expect("sqlite runtime should initialize");
+
+        let login_source = r#"action Login(userId: String) {
+  Session.create(input.userId, { role: "editor" })
+  return ok
+}"#;
+        let mut store = AxPreviewStore::default();
+        let login_request =
+            server::AxHttpRequest::new("POST", "/login").with_body(b"userId=user-42".to_vec());
+        let login = execute_preview_action_request_sources_with_runtime_and_storage(
+            &[login_source],
+            "Login",
+            &login_request,
+            &runtime,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .expect("login should create a session");
+        let cookie = &login.cookies[0];
+        let authenticated = server::AxHttpRequest::new("GET", "/api/me")
+            .with_header("Cookie", format!("{}={}", cookie.name, cookie.value));
+        let route_source = r#"
+type User {
+  id: String
+  email: String
+}
+
+query resolveUser(subject: String) -> User? {
+  return db.users.where({ id: input.subject }).first()
+}
+
+route GET "/api/me" -> User {
+  require Auth.subject else redirect("/login")
+  data user = resolveUser(Auth.subject)
+  require user else notFound()
+  return json(user)
+}
+"#;
+
+        let response = execute_preview_route_request_sources_with_runtime_validated(
+            &[route_source],
+            &authenticated,
+            &runtime,
+            true,
+            &mut store,
+        )
+        .expect("typed user route should execute")
+        .expect("typed user route should match");
+        assert_eq!(response.status, 200);
+        let body: serde_json::Value =
+            serde_json::from_slice(&response.body).expect("user response should be JSON");
+        assert_eq!(body["id"], "user-42");
+        assert_eq!(body["email"], "foundry@example.com");
+        drop(runtime);
+        std::fs::remove_file(database_path).expect("resolver database should clean up");
     }
 }

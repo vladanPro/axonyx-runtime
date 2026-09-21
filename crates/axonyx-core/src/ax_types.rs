@@ -1080,6 +1080,15 @@ fn parse_type_annotation(input: &str) -> Result<AxType, AxTypeParseError> {
         return Err(AxTypeParseError::Empty);
     }
 
+    if let Some(inner) = input.strip_suffix('?') {
+        if inner.trim().is_empty() {
+            return Err(AxTypeParseError::Invalid {
+                raw: input.to_string(),
+            });
+        }
+        return Ok(AxType::optional(parse_type_annotation(inner)?));
+    }
+
     if let Some(item) = input.strip_suffix("[]") {
         return Ok(AxType::list(parse_type_annotation(item)?));
     }
@@ -2088,6 +2097,10 @@ let posts: List<Post> = load PostsList
     #[test]
     fn parses_type_annotations() {
         assert_eq!(AxType::parse_annotation("String"), Ok(AxType::String));
+        assert_eq!(
+            AxType::parse_annotation("Post?"),
+            Ok(AxType::optional(AxType::record("Post")))
+        );
         assert_eq!(
             AxType::parse_annotation("List<Optional<Post>>"),
             Ok(AxType::list(AxType::optional(AxType::record("Post"))))

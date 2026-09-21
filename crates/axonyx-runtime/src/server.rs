@@ -138,7 +138,15 @@ impl AxAuth {
     }
 
     pub fn signed_session<'a>(request: &'a AxHttpRequest, secret: &str) -> Option<&'a str> {
-        let cookie = request.cookie_value("session")?;
+        Self::signed_cookie(request, "session", secret)
+    }
+
+    pub fn signed_cookie<'a>(
+        request: &'a AxHttpRequest,
+        name: &str,
+        secret: &str,
+    ) -> Option<&'a str> {
+        let cookie = request.cookie_value(name)?;
         let (value, signature) = cookie.rsplit_once('.')?;
         Self::verify_signature(value, signature, secret).then_some(value)
     }
