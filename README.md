@@ -56,7 +56,22 @@ choose the keys and trusted proxy configuration; never use a password, session,
 or unverified `X-Forwarded-For` value as the identity key. They are building
 blocks, not complete account lockout, CSRF, or production authentication.
 
-### Password Primitives (Unreleased)
+### Session-bound CSRF foundation (unreleased, Rust API only)
+
+`AxSessionManager::csrf_token(request, secret, now)` issues a proof only for a
+live session. `verify_csrf(request, token, secret, now)` loads the active session
+and verifies a domain-separated HMAC-SHA-256 signature using constant-time MAC
+comparison. The secret must have at least 32 bytes and be cryptographically random.
+Tokens contain no session ID or user claims and stay stable while the same session
+is refreshed. Logout, expiration, another session or signing-key rotation rejects
+the old proof. These tokens are reusable within a live session, not one-time tokens.
+
+This foundation does not yet issue tokens over HTTP or automatically enforce them
+on actions/API routes. Delivery must be same-origin/no-store and proof sent as a
+form field or request header, never a URL; origin checks and authorization remain
+required. Anonymous/login-CSRF and browser integration are follow-up work.
+
+### Browser Mutation Guard (Unreleased)
 
 Browser mutation guard: `mutation_security::rejects_mutation_request(&request)`
 rejects unsafe cross-site/same-site requests and cookie mutations without origin
@@ -66,7 +81,9 @@ preserve public Host and explicit port when no canonical origin is configured.
 `rejects_mutation_request_with_origin(request, Some("https://axonyx.dev"))`
 instead checks source scheme, host and normalized effective port independently
 of Host/forwarded headers. Browser mutations then require Origin/Referer, not
-Fetch Metadata alone. Session-bound CSRF tokens remain follow-up work.
+Fetch Metadata alone. Automatic HTTP CSRF token integration remains follow-up work.
+
+### Password Primitives (Unreleased)
 
 `axonyx_runtime::password::AxPassword` provides server-only `hash(&str)` and
 `verify(&str, &str)` operations using Argon2id and independently generated salts.
