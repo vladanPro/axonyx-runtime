@@ -21,11 +21,13 @@ pub enum AxLoginThrottleError {
     Unavailable,
 }
 
+#[derive(Debug)]
 struct Bucket {
     start: Instant,
     attempts: u32,
 }
 
+#[derive(Debug)]
 pub struct AxLoginThrottle {
     attempts: u32,
     window: Duration,

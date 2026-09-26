@@ -6,6 +6,8 @@ use crate::ax_types::prelude::AxType;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxBackendCodegenError {
+    #[error("Login.throttle must be a route before hook with (String key, literal attempts 1..1000, literal seconds 1..86400)")]
+    InvalidLoginThrottleHook,
     #[error("Password.verify requires exactly two String arguments")]
     InvalidPasswordVerifyArguments,
     #[error(
@@ -157,6 +159,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     }
 
     for handler in &plan.handlers {
+        validate_login_throttle_hooks(handler)?;
         if let Some(input) = handler_input_fields(handler) {
             out.push_str(&render_input_struct(handler, input));
             out.push('\n');
@@ -234,6 +237,11 @@ fn render_function_step(
     function: &str,
     context: &AxBackendRenderContext<'_>,
 ) -> Result<String, AxBackendCodegenError> {
+    if let AxStepPlan::Hook { value, .. } = step {
+        if parse_login_throttle_hook(&value.code)?.is_some() {
+            return Err(AxBackendCodegenError::InvalidLoginThrottleHook);
+        }
+    }
     match step {
         AxStepPlan::Let { binding, value } => Ok(format!(
             "    let {binding} = {};\n",
@@ -1186,6 +1194,17 @@ fn render_step(
     typed_bindings: &mut std::collections::BTreeMap<String, AxType>,
     context: &AxBackendRenderContext<'_>,
 ) -> Result<String, AxBackendCodegenError> {
+    if let AxStepPlan::Hook { phase, value } = step {
+        if let Some(throttle) = parse_login_throttle_hook(&value.code)? {
+            if !route_response || *phase != AxHookPhasePlan::Before {
+                return Err(AxBackendCodegenError::InvalidLoginThrottleHook);
+            }
+            return Ok(format!(
+                "    {{\n        static THROTTLE: std::sync::OnceLock<axonyx_runtime::login_throttle::AxLoginThrottle> = std::sync::OnceLock::new();\n        let throttle = THROTTLE.get_or_init(|| axonyx_runtime::login_throttle::AxLoginThrottle::new({}, std::time::Duration::from_secs({}), 4096).expect(\"validated login throttle configuration\"));\n        let key = json!({});\n        match throttle.try_acquire(key.as_str().ok_or_else(|| AxRuntimeError::message(\"login throttle key must be String\"))?) {{\n            Ok(()) => {{}},\n            Err(axonyx_runtime::login_throttle::AxLoginThrottleError::Limited {{ retry_after }}) => {{\n                let seconds = (retry_after.as_secs() + u64::from(retry_after.subsec_nanos() != 0)).max(1);\n                let response = AxHttpResponse::json(429, &json!({{\"error\":\"too many requests\"}})).map_err(|_| AxRuntimeError::message(\"login throttle response failed\"))?.with_header(\"Retry-After\", seconds.to_string()).with_header(\"Cache-Control\", \"no-store\");\n                return Ok(__ax_finalize_response(response, __ax_headers, __ax_cookies));\n            }},\n            Err(_) => return Err(AxRuntimeError::message(\"login throttle unavailable\")),\n        }}\n    }}\n",
+                throttle.attempts, throttle.seconds, render_borrowed_expr(&throttle.key)
+            ));
+        }
+    }
     let output = match step {
         AxStepPlan::Let { binding, value } => {
             let rendered = render_value_plan(
@@ -1363,6 +1382,66 @@ fn render_step(
         ),
     };
     Ok(output)
+}
+
+pub struct AxLoginThrottleHook {
+    pub key: AxRustExpr,
+    pub attempts: u32,
+    pub seconds: u64,
+}
+
+pub fn validate_login_throttle_hooks(handler: &AxHandlerPlan) -> Result<(), AxBackendCodegenError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, step) in handler.steps.iter().enumerate() {
+        if let AxStepPlan::Hook { phase, value } = step {
+            if parse_login_throttle_hook(&value.code)?.is_some()
+                && (*phase != AxHookPhasePlan::Before
+                    || !matches!(handler.kind, AxHandlerKind::Route { .. })
+                    || !seen.insert(&value.code)
+                    || handler.steps[..index].iter().any(|step| {
+                        !matches!(
+                            step,
+                            AxStepPlan::Hook {
+                                phase: AxHookPhasePlan::Before,
+                                ..
+                            }
+                        )
+                    }))
+            {
+                return Err(AxBackendCodegenError::InvalidLoginThrottleHook);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn parse_login_throttle_hook(
+    code: &str,
+) -> Result<Option<AxLoginThrottleHook>, AxBackendCodegenError> {
+    let code = code.trim();
+    if code.starts_with("Login.throttle") {
+        return Err(AxBackendCodegenError::InvalidLoginThrottleHook);
+    }
+    if !code.starts_with("Login::throttle") {
+        return Ok(None);
+    }
+    let invalid = || AxBackendCodegenError::InvalidLoginThrottleHook;
+    let inner = code
+        .strip_prefix("Login::throttle(")
+        .and_then(|code| code.strip_suffix(')'))
+        .ok_or_else(invalid)?;
+    let (key, rest) = split_codegen_binary_args(inner).ok_or_else(invalid)?;
+    let (attempts, seconds) = split_codegen_binary_args(rest).ok_or_else(invalid)?;
+    let attempts = attempts.trim().parse::<u32>().map_err(|_| invalid())?;
+    let seconds = seconds.trim().parse::<u64>().map_err(|_| invalid())?;
+    if key.trim().is_empty() || !(1..=1000).contains(&attempts) || !(1..=86400).contains(&seconds) {
+        return Err(invalid());
+    }
+    Ok(Some(AxLoginThrottleHook {
+        key: AxRustExpr::new(key.trim()),
+        attempts,
+        seconds,
+    }))
 }
 
 fn query_call_return_type(
@@ -3016,6 +3095,46 @@ loader Login
                 AxBackendCodegenError::PasswordVerifyOutsideRequestHandler { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn compiles_login_throttle_and_rejects_invalid_guard_shapes() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route POST "/login" {
+  before Login.throttle(request.form.email, 2, 60)
+  return json("ok")
+}
+"#,
+        )
+        .unwrap();
+        assert!(module.contains("std::sync::OnceLock"));
+        assert!(module.contains("AxHttpResponse::json(429"));
+        assert!(module.contains("Retry-After"));
+        for hook in [
+            "before Login.throttle",
+            "after Login.throttle(request.form.email, 2, 60)",
+            "before Login.throttle(request.form.email, 0, 60)",
+            "before Login.throttle(request.form.email, 1001, 60)",
+            "before Login.throttle(request.form.email, 2, 0)",
+            "before Login.throttle(request.form.email, 2, 86401)",
+            "before Login.throttle(request.form.email, 2, input.seconds)",
+            "before Login.throttle(request.form.email, 2)",
+            "before Login.throttle(request.form.email, 2, 60, 4)",
+            "data value = 1\n  before Login.throttle(request.form.email, 2, 60)",
+            "before Login.throttle(request.form.email, 2, 60)\n  before Login.throttle(request.form.email, 2, 60)",
+        ] {
+            let source = format!("route POST \"/login\" {{\n  {hook}\n  return json(\"ok\")\n}}");
+            assert!(
+                matches!(
+                    compile_backend_ax_to_module(&source),
+                    Err(AxBackendCompileError::Codegen(
+                        AxBackendCodegenError::InvalidLoginThrottleHook
+                    ))
+                ),
+                "{hook}"
+            );
+        }
     }
 
     #[test]
