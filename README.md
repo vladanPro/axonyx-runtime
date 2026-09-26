@@ -38,8 +38,10 @@ Verification returns `false` for a wrong password and an error for corrupt or
 unsupported stored hashes. Password bytes are not trimmed or normalized.
 
 This initial profile accepts only hashes produced with its fixed cost parameters.
-Async callers must use a bounded blocking executor. This is not yet exposed as
-`Password.verify` in `.ax`, and does not provide login, rate limiting, account
+Async callers must use a bounded blocking executor. `.ax` action/route data
+bindings support `data verified = Password.verify(input.password, storedHash)`.
+The stored hash must come from server-owned storage. This does not provide
+login, rate limiting, account
 enumeration protection, password reset, or CSRF protection by itself.
 
 ```bash

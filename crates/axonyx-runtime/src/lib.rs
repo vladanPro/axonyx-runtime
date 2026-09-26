@@ -2383,6 +2383,25 @@ fn eval_preview_value_with_functions(
 ) -> Result<AxValue, PreviewError> {
     match value {
         AxValuePlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
+        AxValuePlan::Call { path, args } if path == &["Password", "verify"] => {
+            let [password, hash] = args.as_slice() else {
+                return Err(PreviewError::Runtime {
+                    message: "Password.verify requires exactly two String arguments".to_string(),
+                });
+            };
+            let password = eval_preview_expr_with_functions(password, scope, env, functions)?;
+            let hash = eval_preview_expr_with_functions(hash, scope, env, functions)?;
+            let (AxValue::String(password), AxValue::String(hash)) = (password, hash) else {
+                return Err(PreviewError::Runtime {
+                    message: "Password.verify requires String arguments".to_string(),
+                });
+            };
+            password::AxPassword::verify(&password, &hash)
+                .map(AxValue::Bool)
+                .map_err(|_| PreviewError::Runtime {
+                    message: "password verification failed".to_string(),
+                })
+        }
         AxValuePlan::Call { path, args } => {
             eval_preview_expr_with_functions(&preview_call_expr(path, args), scope, env, functions)
         }
@@ -9409,6 +9428,41 @@ route GET "/api/admin"
             response.headers.get("Location").map(String::as_str),
             Some("/login")
         );
+    }
+
+    #[test]
+    fn preview_password_verify_matches_runtime_without_exposing_hash_errors() {
+        let hash = password::AxPassword::hash("correct").unwrap();
+        let source = format!(
+            r#"
+route POST "/login"
+  data storedHash = "{hash}"
+  data verified = Password.verify(request.form.password, storedHash)
+  require verified
+  return json("ok")
+"#
+        );
+        for (value, status) in [("correct", 200), ("wrong", 401)] {
+            let request = server::AxHttpRequest::new("POST", "/login")
+                .with_body(format!("password={value}").into_bytes());
+            let response = execute_preview_route_request_sources(
+                &[&source],
+                &request,
+                &mut AxPreviewStore::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status, status);
+        }
+        let bad_source = source.replace(&hash, "invalid-secret-hash");
+        let error = execute_preview_route_request_sources(
+            &[&bad_source],
+            &server::AxHttpRequest::new("POST", "/login").with_body(b"password=correct".to_vec()),
+            &mut AxPreviewStore::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("password verification failed"));
+        assert!(!error.to_string().contains("invalid-secret-hash"));
     }
 
     #[test]
