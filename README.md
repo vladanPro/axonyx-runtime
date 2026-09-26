@@ -30,6 +30,25 @@ axonyx-runtime = { git = "https://github.com/vladanPro/axonyx-runtime" }
 
 ## Local Development
 
+### Login Protection Primitives (Unreleased)
+
+`password::AxPassword::verify_optional(password, stored_hash)` performs a dummy
+Argon2 verification when the account is absent and always returns false for
+that case. It removes the missing-account hashing shortcut, but does not make
+the full database/network request constant-time.
+
+`login_throttle::AxLoginThrottle` is a process-local fixed-window admission
+guard with a bounded key map, monotonic time, atomic accounting, and fail-closed
+capacity/lock errors. Keep one shared instance per server and call `try_acquire`
+before database lookup or password work. Every admitted attempt counts, even a
+successful login. It is not distributed across instances or persistent across
+restarts; window boundaries can allow two budgets close together.
+
+These Rust APIs are not wired into `.ax` login routes yet. Server policy must
+choose the keys and trusted proxy configuration; never use a password, session,
+or unverified `X-Forwarded-For` value as the identity key. They are building
+blocks, not complete account lockout, CSRF, or production authentication.
+
 ### Password Primitives (Unreleased)
 
 `axonyx_runtime::password::AxPassword` provides server-only `hash(&str)` and

@@ -15,6 +15,8 @@ const OUTPUT_BYTES: usize = 32;
 const SALT_BYTES: usize = 16;
 pub const MAX_PASSWORD_BYTES: usize = 1024;
 const MAX_HASH_BYTES: usize = 512;
+// Fixed valid PHC profile, intentionally not a real account credential.
+const DUMMY_HASH: &str = "$argon2id$v=19$m=19456,t=2,p=1$AAAAAAAAAAAAAAAAAAAAAA$AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
 pub enum AxPasswordError {
@@ -31,6 +33,16 @@ pub enum AxPasswordError {
 pub struct AxPassword;
 
 impl AxPassword {
+    /// Missing accounts still perform one Argon2 verification and always fail.
+    /// This removes the hashing shortcut, not all database/network timing leaks.
+    pub fn verify_optional(
+        password: &str,
+        encoded_hash: Option<&str>,
+    ) -> Result<bool, AxPasswordError> {
+        let verified = Self::verify(password, encoded_hash.unwrap_or(DUMMY_HASH))?;
+        Ok(encoded_hash.is_some() && verified)
+    }
+
     /// Hashes the exact UTF-8 bytes, without trimming or normalization.
     pub fn hash(password: &str) -> Result<String, AxPasswordError> {
         validate_password(password)?;
@@ -98,6 +110,21 @@ fn engine() -> Result<Argon2<'static>, AxPasswordError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_accounts_verify_a_valid_dummy_profile_and_always_fail() {
+        assert_eq!(AxPassword::verify_optional("example", None), Ok(false));
+        let hash = AxPassword::hash("example").unwrap();
+        assert_eq!(
+            AxPassword::verify_optional("example", Some(&hash)),
+            Ok(true)
+        );
+        assert_eq!(AxPassword::verify_optional("wrong", Some(&hash)), Ok(false));
+        assert_eq!(
+            AxPassword::verify_optional("example", Some("broken")),
+            Err(AxPasswordError::InvalidHash)
+        );
+    }
 
     #[test]
     fn hashes_use_independent_salts_and_verify_exact_passwords() {
