@@ -38,6 +38,9 @@ jobs:
       - name: Verify typed browser state bridge
         run: node scripts/verify-state-bridge.mjs
 
+      - name: Verify action CSRF bridge
+        run: node scripts/check-action-csrf-bridge.mjs
+
       - name: Install browser test dependencies
         run: npm ci
 

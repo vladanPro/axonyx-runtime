@@ -8,7 +8,7 @@ use uuid::Uuid;
 use crate::backend::{AxRuntimeError, AxRuntimeResult};
 use crate::server::{AxAuth, AxCookie, AxHttpRequest};
 
-mod csrf;
+pub(crate) mod csrf;
 mod postgres;
 mod sqlite;
 

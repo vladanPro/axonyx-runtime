@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod csrf_http;
 pub mod login_throttle;
 pub mod mutation_security;
 pub mod password;
@@ -4324,9 +4325,10 @@ fn ax_action_script() -> &'static str {
   const isAxonyxActionForm = (form) => {
     if (!form || !form.action) return false;
     try {
-      return new URL(form.action, window.location.href).pathname === "/__axonyx/action";
+      const url = new URL(form.action, window.location.href);
+      return url.origin === window.location.origin && url.pathname === "/__axonyx/action";
     } catch (_error) {
-      return form.getAttribute("action")?.startsWith("/__axonyx/action");
+      return false;
     }
   };
 
@@ -4585,13 +4587,19 @@ fn ax_action_script() -> &'static str {
         "X-Axonyx-Tab": getTabId(),
         ...contentHeaders,
       };
-      const response = hasFile && typeof XMLHttpRequest === "function"
+      const csrfResponse = await fetch("/__axonyx/csrf", { credentials: "same-origin", cache: "no-store", redirect: "error" });
+      if (!csrfResponse.ok) throw new Error("CSRF proof could not be loaded");
+      const csrfPayload = await csrfResponse.json();
+      if (csrfPayload.token !== null && (typeof csrfPayload.token !== "string" || !/^axcsrf1\.[a-f0-9]{64}$/.test(csrfPayload.token))) throw new Error("Invalid CSRF proof response");
+      if (typeof csrfPayload.token === "string") requestHeaders["X-Axonyx-CSRF"] = csrfPayload.token;
+      const response = hasFile && !csrfPayload.token && typeof XMLHttpRequest === "function"
         ? await uploadWithProgress(form, formData, requestHeaders)
         : await fetch(form.action, {
             method: form.method || "POST",
             headers: requestHeaders,
             body,
             cache: "no-store",
+            redirect: "error",
           });
       const contentType = response.headers.get("content-type") || "";
       if (contentType.includes("application/ax-patch+json")) {
@@ -4607,6 +4615,7 @@ fn ax_action_script() -> &'static str {
         }));
         return;
       }
+      if (!response.ok) throw new Error("Axonyx action request was rejected");
       if (response.redirected) {
         window.location.assign(response.url);
         return;

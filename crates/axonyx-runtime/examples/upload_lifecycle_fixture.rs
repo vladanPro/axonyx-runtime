@@ -93,6 +93,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if request.method == "GET" && request.target == "/" {
             return AxHttpResponse::html(200, html.as_str()).with_no_store();
         }
+        if request.method == "GET" && request.target == "/__axonyx/csrf" {
+            return AxHttpResponse::json(200, &serde_json::json!({ "token": null }))
+                .expect("fixture JSON should serialize")
+                .with_no_store();
+        }
         if request.method != "POST" || !request.target.starts_with("/__axonyx/action?") {
             return AxHttpResponse::text(404, "Not Found");
         }
