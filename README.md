@@ -58,6 +58,13 @@ blocks, not complete account lockout, CSRF, or production authentication.
 
 ### Password Primitives (Unreleased)
 
+Browser mutation guard: `mutation_security::rejects_mutation_request(&request)`
+rejects unsafe cross-site/same-site requests and cookie mutations without origin
+proof. Cookie-less metadata-free API clients are permitted; this is not auth.
+Origin/Referer authority must match Host. Forwarded host is ignored; proxies must
+preserve public Host and explicit port. Full-origin scheme policy and session-bound
+CSRF tokens remain follow-up work.
+
 `axonyx_runtime::password::AxPassword` provides server-only `hash(&str)` and
 `verify(&str, &str)` operations using Argon2id and independently generated salts.
 Verification returns `false` for a wrong password and an error for corrupt or
