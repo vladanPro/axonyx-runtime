@@ -1,4 +1,8 @@
 pub mod backend;
+pub mod csrf_http;
+pub mod login_throttle;
+pub mod mutation_security;
+pub mod password;
 pub mod server;
 pub mod session;
 #[cfg(feature = "storage")]
@@ -493,7 +497,18 @@ pub fn preview_ax_route_stream_response_with_loaders(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxPreviewStore {
     collections: BTreeMap<String, Vec<AxValue>>,
+    throttles: BTreeMap<String, AxPreviewThrottle>,
 }
+
+#[derive(Debug, Clone)]
+struct AxPreviewThrottle(std::sync::Arc<login_throttle::AxLoginThrottle>);
+
+impl PartialEq for AxPreviewThrottle {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for AxPreviewThrottle {}
 
 impl Default for AxPreviewStore {
     fn default() -> Self {
@@ -506,7 +521,10 @@ impl Default for AxPreviewStore {
             "users".to_string(),
             sample_preview_collection_items("users"),
         );
-        Self { collections }
+        Self {
+            collections,
+            throttles: BTreeMap::new(),
+        }
     }
 }
 
@@ -1473,6 +1491,7 @@ fn execute_preview_loader(
             | AxStepPlan::ClearCookie { .. }
             | AxStepPlan::SessionCreate { .. }
             | AxStepPlan::SessionDestroy
+            | AxStepPlan::SessionRefresh
             | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {}
         }
@@ -1547,6 +1566,7 @@ fn execute_preview_function(
             | AxStepPlan::ClearCookie { .. }
             | AxStepPlan::SessionCreate { .. }
             | AxStepPlan::SessionDestroy
+            | AxStepPlan::SessionRefresh
             | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {
                 return Err(PreviewError::Runtime {
@@ -1617,6 +1637,11 @@ fn execute_preview_action(
             message: format!("handler `{action_name}` is not an action"),
         });
     };
+    axonyx_core::ax_backend_codegen::validate_login_throttle_hooks(action).map_err(|_| {
+        PreviewError::Runtime {
+            message: "invalid Login.throttle hook".to_string(),
+        }
+    })?;
 
     let mut scope = BTreeMap::new();
     scope.insert(
@@ -1808,6 +1833,21 @@ fn execute_preview_action(
                 })?;
                 cookies.push(runtime.destroy_session(request)?);
             }
+            AxStepPlan::SessionRefresh => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.refresh requires a configured backend runtime".into(),
+                })?;
+                let request = request.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.refresh requires an HTTP action request".into(),
+                })?;
+                let (_, cookie) =
+                    runtime
+                        .refresh_session(request)?
+                        .ok_or_else(|| PreviewError::Runtime {
+                            message: "Session.refresh requires an active session".into(),
+                        })?;
+                cookies.push(cookie);
+            }
             AxStepPlan::Require {
                 value: requirement,
                 fallback,
@@ -1900,6 +1940,11 @@ fn execute_preview_route(
     else {
         return Ok(None);
     };
+    axonyx_core::ax_backend_codegen::validate_login_throttle_hooks(route_match.handler).map_err(
+        |_| PreviewError::Runtime {
+            message: "invalid Login.throttle hook".to_string(),
+        },
+    )?;
 
     let mut scope = BTreeMap::new();
     scope.insert("params".to_string(), AxValue::Record(route_match.params));
@@ -2028,6 +2073,62 @@ fn execute_preview_route(
             }
             AxStepPlan::Hook { phase, value } => match phase {
                 AxHookPhasePlan::Before => {
+                    if let Some(throttle) =
+                        axonyx_core::ax_backend_codegen::parse_login_throttle_hook(&value.code)
+                            .map_err(|_| PreviewError::Runtime {
+                                message: "invalid Login.throttle hook".to_string(),
+                            })?
+                    {
+                        let key = eval_preview_expr(&throttle.key, &scope, env)?;
+                        let AxValue::String(key) = key else {
+                            return Err(PreviewError::Runtime {
+                                message: "login throttle key must be String".to_string(),
+                            });
+                        };
+                        let identity = format!("{}:{}", route_match.handler.name, value.code);
+                        let limiter = store.throttles.entry(identity).or_insert_with(|| {
+                            AxPreviewThrottle(std::sync::Arc::new(
+                                login_throttle::AxLoginThrottle::new(
+                                    throttle.attempts,
+                                    std::time::Duration::from_secs(throttle.seconds),
+                                    4096,
+                                )
+                                .expect("validated login throttle configuration"),
+                            ))
+                        });
+                        match limiter.0.try_acquire(&key) {
+                            Ok(()) => {}
+                            Err(login_throttle::AxLoginThrottleError::Limited { retry_after }) => {
+                                let seconds = (retry_after.as_secs()
+                                    + u64::from(retry_after.subsec_nanos() != 0))
+                                .max(1);
+                                let mut response = render_preview_json_response(&AxValue::Record(
+                                    BTreeMap::from([(
+                                        "error".to_string(),
+                                        AxValue::String("too many requests".to_string()),
+                                    )]),
+                                ))?;
+                                response.status = 429;
+                                response
+                                    .headers
+                                    .insert("Retry-After".to_string(), seconds.to_string());
+                                response
+                                    .headers
+                                    .insert("Cache-Control".to_string(), "no-store".to_string());
+                                return Ok(Some(apply_preview_response_metadata(
+                                    response,
+                                    headers,
+                                    set_cookies,
+                                )));
+                            }
+                            Err(_) => {
+                                return Err(PreviewError::Runtime {
+                                    message: "login throttle unavailable".to_string(),
+                                })
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(response) =
                         apply_preview_route_hook(value, &scope, env, &mut headers)?
                     {
@@ -2042,7 +2143,19 @@ fn execute_preview_route(
                         )));
                     }
                 }
-                AxHookPhasePlan::After => after_hooks.push(value),
+                AxHookPhasePlan::After => {
+                    if axonyx_core::ax_backend_codegen::parse_login_throttle_hook(&value.code)
+                        .map_err(|_| PreviewError::Runtime {
+                            message: "invalid Login.throttle hook".to_string(),
+                        })?
+                        .is_some()
+                    {
+                        return Err(PreviewError::Runtime {
+                            message: "Login.throttle requires a before hook".to_string(),
+                        });
+                    }
+                    after_hooks.push(value);
+                }
             },
             AxStepPlan::Header { name, value } => {
                 headers.insert(
@@ -2087,6 +2200,18 @@ fn execute_preview_route(
                     message: "Session.destroy requires a configured backend runtime".to_string(),
                 })?;
                 set_cookies.push(runtime.destroy_session(request)?.render());
+            }
+            AxStepPlan::SessionRefresh => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.refresh requires a configured backend runtime".into(),
+                })?;
+                let (_, cookie) =
+                    runtime
+                        .refresh_session(request)?
+                        .ok_or_else(|| PreviewError::Runtime {
+                            message: "Session.refresh requires an active session".into(),
+                        })?;
+                set_cookies.push(cookie.render());
             }
             AxStepPlan::Require { value, fallback } => {
                 if !preview_require_passes(&eval_preview_require_expr(value, &scope, env)?) {
@@ -2382,6 +2507,52 @@ fn eval_preview_value_with_functions(
 ) -> Result<AxValue, PreviewError> {
     match value {
         AxValuePlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
+        AxValuePlan::Call { path, args } if path == &["Password", "verifyOptional"] => {
+            let invalid = || {
+                PreviewError::Runtime { message: "Password.verifyOptional requires (String password, optionalRecord?.stringField)".to_string() }
+            };
+            let [password, hash] = args.as_slice() else {
+                return Err(invalid());
+            };
+            let AxValue::String(password) =
+                eval_preview_expr_with_functions(password, scope, env, functions)?
+            else {
+                return Err(invalid());
+            };
+            let (binding, field) = hash.code.split_once("?.").ok_or_else(invalid)?;
+            let hash = match scope.get(binding) {
+                Some(AxValue::Null) => None,
+                Some(AxValue::Record(record)) => match record.get(field) {
+                    Some(AxValue::String(hash)) => Some(hash.as_str()),
+                    _ => return Err(invalid()),
+                },
+                _ => return Err(invalid()),
+            };
+            password::AxPassword::verify_optional(&password, hash)
+                .map(AxValue::Bool)
+                .map_err(|_| PreviewError::Runtime {
+                    message: "password verification failed".to_string(),
+                })
+        }
+        AxValuePlan::Call { path, args } if path == &["Password", "verify"] => {
+            let [password, hash] = args.as_slice() else {
+                return Err(PreviewError::Runtime {
+                    message: "Password.verify requires exactly two String arguments".to_string(),
+                });
+            };
+            let password = eval_preview_expr_with_functions(password, scope, env, functions)?;
+            let hash = eval_preview_expr_with_functions(hash, scope, env, functions)?;
+            let (AxValue::String(password), AxValue::String(hash)) = (password, hash) else {
+                return Err(PreviewError::Runtime {
+                    message: "Password.verify requires String arguments".to_string(),
+                });
+            };
+            password::AxPassword::verify(&password, &hash)
+                .map(AxValue::Bool)
+                .map_err(|_| PreviewError::Runtime {
+                    message: "password verification failed".to_string(),
+                })
+        }
         AxValuePlan::Call { path, args } => {
             eval_preview_expr_with_functions(&preview_call_expr(path, args), scope, env, functions)
         }
@@ -4183,9 +4354,10 @@ fn ax_action_script() -> &'static str {
   const isAxonyxActionForm = (form) => {
     if (!form || !form.action) return false;
     try {
-      return new URL(form.action, window.location.href).pathname === "/__axonyx/action";
+      const url = new URL(form.action, window.location.href);
+      return url.origin === window.location.origin && url.pathname === "/__axonyx/action";
     } catch (_error) {
-      return form.getAttribute("action")?.startsWith("/__axonyx/action");
+      return false;
     }
   };
 
@@ -4444,13 +4616,19 @@ fn ax_action_script() -> &'static str {
         "X-Axonyx-Tab": getTabId(),
         ...contentHeaders,
       };
-      const response = hasFile && typeof XMLHttpRequest === "function"
+      const csrfResponse = await fetch("/__axonyx/csrf", { credentials: "same-origin", cache: "no-store", redirect: "error" });
+      if (!csrfResponse.ok) throw new Error("CSRF proof could not be loaded");
+      const csrfPayload = await csrfResponse.json();
+      if (csrfPayload.token !== null && (typeof csrfPayload.token !== "string" || !/^axcsrf1\.[a-f0-9]{64}$/.test(csrfPayload.token))) throw new Error("Invalid CSRF proof response");
+      if (typeof csrfPayload.token === "string") requestHeaders["X-Axonyx-CSRF"] = csrfPayload.token;
+      const response = hasFile && !csrfPayload.token && typeof XMLHttpRequest === "function"
         ? await uploadWithProgress(form, formData, requestHeaders)
         : await fetch(form.action, {
             method: form.method || "POST",
             headers: requestHeaders,
             body,
             cache: "no-store",
+            redirect: "error",
           });
       const contentType = response.headers.get("content-type") || "";
       if (contentType.includes("application/ax-patch+json")) {
@@ -4466,6 +4644,7 @@ fn ax_action_script() -> &'static str {
         }));
         return;
       }
+      if (!response.ok) throw new Error("Axonyx action request was rejected");
       if (response.redirected) {
         window.location.assign(response.url);
         return;
@@ -6791,6 +6970,16 @@ fn render_node(node: &AxNode, out: &mut String) {
                 push_attr(attr, out);
             }
             out.push('>');
+            if *tag == "form"
+                && attrs
+                    .iter()
+                    .any(|attr| attr.name == "method" && attr.value.eq_ignore_ascii_case("post"))
+                && attrs.iter().any(|attr| {
+                    attr.name == "action" && attr.value.starts_with("/__axonyx/action?")
+                })
+            {
+                out.push_str(crate::csrf_http::FORM_MARKER);
+            }
             for child in children {
                 render_node(child, out);
             }
@@ -7195,6 +7384,24 @@ page Home
         assert!(html.contains("Edit app/page.ax"));
         assert!(html.contains("class=\"ax-container\""));
         assert!(html.contains("class=\"ax-card__title\""));
+    }
+
+    #[test]
+    fn csrf_placeholders_only_target_local_post_action_forms() {
+        for (method, action, expected) in [
+            ("post", "/__axonyx/action?path=%2F&name=Save", true),
+            ("get", "/__axonyx/action?path=%2F&name=Save", false),
+            (
+                "post",
+                "https://other.test/__axonyx/action?name=Save",
+                false,
+            ),
+            ("post", "/external", false),
+        ] {
+            let source = format!("page Home() {{\n return ASX {{\n <form method=\"{method}\" action=\"{action}\"><button>Save</button></form>\n }}\n}}");
+            let html = preview_ax_page(&source).unwrap();
+            assert_eq!(html.contains(crate::csrf_http::FORM_MARKER), expected);
+        }
     }
 
     #[test]
@@ -9407,6 +9614,126 @@ route GET "/api/admin"
         assert_eq!(
             response.headers.get("Location").map(String::as_str),
             Some("/login")
+        );
+    }
+
+    #[test]
+    fn preview_optional_password_verification_handles_missing_and_corrupt_credentials() {
+        let hash = password::AxPassword::hash("correct").unwrap();
+        let value = AxValuePlan::Call {
+            path: vec!["Password".into(), "verifyOptional".into()],
+            args: vec![
+                AxRustExpr::new("\"correct\""),
+                AxRustExpr::new("credential?.password_hash"),
+            ],
+        };
+        for (credential, expected) in [
+            (AxValue::Null, Some(false)),
+            (
+                AxValue::Record(BTreeMap::from([(
+                    "password_hash".into(),
+                    AxValue::String(hash),
+                )])),
+                Some(true),
+            ),
+            (
+                AxValue::Record(BTreeMap::from([(
+                    "password_hash".into(),
+                    AxValue::String("secret-invalid-hash".into()),
+                )])),
+                None,
+            ),
+        ] {
+            let result = eval_preview_value_with_functions(
+                &value,
+                &BTreeMap::from([("credential".into(), credential)]),
+                &backend::AxEnv::default(),
+                None,
+                &AxPreviewStore::default(),
+                &BTreeMap::new(),
+            );
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), AxValue::Bool(expected)),
+                None => {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("password verification failed"));
+                    assert!(!error.contains("secret-invalid-hash"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn preview_password_verify_matches_runtime_without_exposing_hash_errors() {
+        let hash = password::AxPassword::hash("correct").unwrap();
+        let source = format!(
+            r#"
+route POST "/login"
+  data storedHash = "{hash}"
+  data verified = Password.verify(request.form.password, storedHash)
+  require verified
+  return json("ok")
+"#
+        );
+        for (value, status) in [("correct", 200), ("wrong", 401)] {
+            let request = server::AxHttpRequest::new("POST", "/login")
+                .with_body(format!("password={value}").into_bytes());
+            let response = execute_preview_route_request_sources(
+                &[&source],
+                &request,
+                &mut AxPreviewStore::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(response.status, status);
+        }
+        let bad_source = source.replace(&hash, "invalid-secret-hash");
+        let error = execute_preview_route_request_sources(
+            &[&bad_source],
+            &server::AxHttpRequest::new("POST", "/login").with_body(b"password=correct".to_vec()),
+            &mut AxPreviewStore::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("password verification failed"));
+        assert!(!error.to_string().contains("invalid-secret-hash"));
+    }
+
+    #[test]
+    fn preview_login_throttle_returns_429_and_preserves_independent_keys() {
+        let source = r#"
+route POST "/login" {
+  before Login.throttle(request.form.email, 1, 60)
+  return json("ok")
+}
+"#;
+        let mut store = AxPreviewStore::default();
+        let request = server::AxHttpRequest::new("POST", "/login").with_body(b"email=one".to_vec());
+        let first = execute_preview_route_request_sources(&[source], &request, &mut store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status, 200);
+        let blocked = execute_preview_route_request_sources(&[source], &request, &mut store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(blocked.status, 429);
+        let retry = blocked
+            .headers
+            .get("Retry-After")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!((1..=60).contains(&retry));
+        assert_eq!(
+            blocked.headers.get("Cache-Control").map(String::as_str),
+            Some("no-store")
+        );
+        let other = server::AxHttpRequest::new("POST", "/login").with_body(b"email=two".to_vec());
+        assert_eq!(
+            execute_preview_route_request_sources(&[source], &other, &mut store)
+                .unwrap()
+                .unwrap()
+                .status,
+            200
         );
     }
 

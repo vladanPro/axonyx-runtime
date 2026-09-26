@@ -30,6 +30,84 @@ axonyx-runtime = { git = "https://github.com/vladanPro/axonyx-runtime" }
 
 ## Local Development
 
+### Login Protection Primitives (Unreleased)
+
+`password::AxPassword::verify_optional(password, stored_hash)` performs a dummy
+Argon2 verification when the account is absent and always returns false for
+that case. It removes the missing-account hashing shortcut, but does not make
+the full database/network request constant-time.
+
+`login_throttle::AxLoginThrottle` is a process-local fixed-window admission
+guard with a bounded key map, monotonic time, atomic accounting, and fail-closed
+capacity/lock errors. Keep one shared instance per server and call `try_acquire`
+before database lookup or password work. Every admitted attempt counts, even a
+successful login. It is not distributed across instances or persistent across
+restarts; window boundaries can allow two budgets close together.
+
+The limiter supports `.ax` route `before Login.throttle(key, attempts, seconds)`
+with literal attempts 1..1000 and seconds 1..86400. The hook must precede data
+or other operations. Generated routes and preview both enforce it; rejected
+requests return 429 with Retry-After and no-store. Each guard supports 4096 keys.
+`Password.verifyOptional(password, credential?.password_hash)` supports a typed
+optional record with a String hash field in request data bindings. Call it before
+`require credential`: a missing record performs dummy verification and returns false.
+Malformed stored hashes remain operational errors. Server policy must
+choose the keys and trusted proxy configuration; never use a password, session,
+or unverified `X-Forwarded-For` value as the identity key. They are building
+blocks, not complete account lockout, CSRF, or production authentication.
+
+### Session-bound CSRF foundation (unreleased, Rust API only)
+
+`AxSessionManager::csrf_token(request, secret, now)` issues a proof only for a
+live session. `verify_csrf(request, token, secret, now)` loads the active session
+and verifies a domain-separated HMAC-SHA-256 signature using constant-time MAC
+comparison. The secret must have at least 32 bytes and be cryptographically random.
+Tokens contain no session ID or user claims and stay stable while the same session
+is refreshed. Logout, expiration, another session or signing-key rotation rejects
+the old proof. These tokens are reusable within a live session, not one-time tokens.
+
+`csrf_http::token_response` issues a no-store/Vary-Cookie JSON response; anonymous
+requests receive a signed anonymous proof and a 30-minute HttpOnly cookie.
+`reject_mutation` verifies header or form/JSON
+proof against the active managed session. Framework transport integrates these
+helpers with `/__axonyx/csrf`, action/API dispatch and the same-origin action bridge.
+Custom Rust servers must invoke the origin and proof guards explicitly.
+`protect_form_response` fills renderer-owned local action-form placeholders at
+HTTP delivery and marks personalized HTML no-store. This supports native no-JS
+forms and pre-login CSRF protection. Production anonymous cookies are Secure,
+host-only `__Host-axonyx-csrf`; loopback development uses `axonyx_csrf`.
+Metadata-free cookie-free API clients remain exempt, not authenticated.
+Legacy signed-cookie authentication and raw HTML forms need explicit integration.
+Form-containing streams are buffered for injection. Tokens must never go in URLs,
+logs or shared caches. Proof-carrying bridge requests refuse redirects; authenticated
+uploads use fetch instead of redirect-following XHR (limited progress reporting).
+
+### Browser Mutation Guard (Unreleased)
+
+Browser mutation guard: `mutation_security::rejects_mutation_request(&request)`
+rejects unsafe cross-site/same-site requests and cookie mutations without origin
+proof. Cookie-less metadata-free API clients are permitted; this is not auth.
+Origin/Referer authority must match Host. Forwarded host is ignored; proxies must
+preserve public Host and explicit port when no canonical origin is configured.
+`rejects_mutation_request_with_origin(request, Some("https://axonyx.dev"))`
+instead checks source scheme, host and normalized effective port independently
+of Host/forwarded headers. Browser mutations then require Origin/Referer, not
+Fetch Metadata alone. Framework transport also enforces the CSRF proof guard.
+
+### Password Primitives (Unreleased)
+
+`axonyx_runtime::password::AxPassword` provides server-only `hash(&str)` and
+`verify(&str, &str)` operations using Argon2id and independently generated salts.
+Verification returns `false` for a wrong password and an error for corrupt or
+unsupported stored hashes. Password bytes are not trimmed or normalized.
+
+This initial profile accepts only hashes produced with its fixed cost parameters.
+Async callers must use a bounded blocking executor. `.ax` action/route data
+bindings support `data verified = Password.verify(input.password, storedHash)`.
+The stored hash must come from server-owned storage. This does not provide
+login, rate limiting, account
+enumeration protection, password reset, or CSRF protection by itself.
+
 ```bash
 cargo test
 ```

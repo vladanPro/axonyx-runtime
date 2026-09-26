@@ -1361,6 +1361,7 @@ fn parse_session_stmt(
             args[1].clone(),
         ))),
         "Session.destroy" if args.is_empty() => Ok(Some(AxBackendStmt::session_destroy())),
+        "Session.refresh" if args.is_empty() => Ok(Some(AxBackendStmt::session_refresh())),
         "Session.create" | "Session.destroy" | "Session.refresh" => {
             Err(AxBackendParseError::InvalidSession { line })
         }
@@ -4386,7 +4387,7 @@ action Logout() {
         for source in [
             "action Login() {\n  Session.create(\"user\")\n}",
             "action Logout() {\n  Session.destroy(\"unexpected\")\n}",
-            "action Refresh() {\n  Session.refresh()\n}",
+            "action Refresh() {\n  Session.refresh(\"unexpected\")\n}",
         ] {
             assert!(matches!(
                 parse_backend_ax(source),

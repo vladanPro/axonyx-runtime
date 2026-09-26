@@ -174,6 +174,7 @@ pub enum AxStepPlan {
         data: AxRustExpr,
     },
     SessionDestroy,
+    SessionRefresh,
     Require {
         value: AxRustExpr,
         fallback: Option<AxReturnPlan>,
@@ -737,7 +738,12 @@ fn lower_step(
         AxBackendStmt::SessionDestroy if context == AxStepContext::Request => {
             AxStepPlan::SessionDestroy
         }
-        AxBackendStmt::SessionCreate(_) | AxBackendStmt::SessionDestroy => {
+        AxBackendStmt::SessionRefresh if context == AxStepContext::Request => {
+            AxStepPlan::SessionRefresh
+        }
+        AxBackendStmt::SessionCreate(_)
+        | AxBackendStmt::SessionDestroy
+        | AxBackendStmt::SessionRefresh => {
             return Err(AxBackendLowerError::SessionOutsideRequestHandler);
         }
         AxBackendStmt::Require(requirement) => AxStepPlan::Require {
@@ -817,6 +823,24 @@ fn lower_backend_value(
             Ok(AxValuePlan::StorageSave {
                 capability: capability.clone(),
                 input: property.clone(),
+            })
+        }
+        AxBackendValue::Expr(AxExpr::Call { path, args })
+            if path == &["Password", "verifyOptional"] =>
+        {
+            Ok(AxValuePlan::Call {
+                path: path.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| match arg {
+                        AxExpr::OptionalMember { object, property }
+                            if matches!(object.as_ref(), AxExpr::Identifier(_)) =>
+                        {
+                            AxRustExpr::new(format!("{}?.{property}", render_expr(object)))
+                        }
+                        _ => lower_expr(arg),
+                    })
+                    .collect(),
             })
         }
         AxBackendValue::Expr(AxExpr::Call { path, args }) => Ok(AxValuePlan::Call {
@@ -1128,7 +1152,7 @@ pub fn ax_step_uses_auth_subject(step: &AxStepPlan) -> bool {
         AxStepPlan::SessionCreate { subject, data } => {
             ax_expr_uses_auth_subject(subject) || ax_expr_uses_auth_subject(data)
         }
-        AxStepPlan::SessionDestroy => false,
+        AxStepPlan::SessionDestroy | AxStepPlan::SessionRefresh => false,
         AxStepPlan::Require { value, fallback } => {
             ax_expr_uses_auth_subject(value)
                 || fallback.as_ref().is_some_and(ax_return_uses_auth_subject)
@@ -2247,6 +2271,7 @@ action UploadImage(image: File) -> FileRef {
             r#"action Login(userId: String) {
   Session.create(input.userId, { role: "editor" })
   Session.destroy()
+  Session.refresh()
   return ok
 }"#,
         )
@@ -2257,6 +2282,7 @@ action UploadImage(image: File) -> FileRef {
             AxStepPlan::SessionCreate { .. }
         ));
         assert_eq!(plan.handlers[0].steps[1], AxStepPlan::SessionDestroy);
+        assert_eq!(plan.handlers[0].steps[2], AxStepPlan::SessionRefresh);
 
         for source in [
             "loader Current() {\n  Session.destroy()\n  return ok\n}",

@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::backend::{AxRuntimeError, AxRuntimeResult};
 use crate::server::{AxAuth, AxCookie, AxHttpRequest};
 
+pub(crate) mod csrf;
 mod postgres;
 mod sqlite;
 
@@ -39,6 +40,9 @@ pub struct AxSessionCookiePolicy {
     pub path: String,
     pub domain: Option<String>,
     pub ttl_seconds: i64,
+    /// Absolute lifetime from creation, independent of sliding refresh.
+    #[serde(default = "default_absolute_ttl")]
+    pub absolute_ttl_seconds: i64,
     pub secure: bool,
     pub same_site: AxSameSite,
 }
@@ -50,6 +54,7 @@ impl Default for AxSessionCookiePolicy {
             path: "/".to_string(),
             domain: None,
             ttl_seconds: DEFAULT_SESSION_TTL_SECONDS,
+            absolute_ttl_seconds: DEFAULT_SESSION_TTL_SECONDS,
             secure: true,
             same_site: AxSameSite::Lax,
         }
@@ -75,7 +80,7 @@ impl AxSessionCookiePolicy {
                 "session cookie path must not be empty",
             ));
         }
-        if self.ttl_seconds <= 0 {
+        if self.ttl_seconds <= 0 || self.absolute_ttl_seconds <= 0 {
             return Err(AxRuntimeError::message(
                 "session TTL must be greater than zero",
             ));
@@ -136,6 +141,12 @@ pub trait AxSessionStore: Send + Sync {
     fn save(&self, session: &AxSession) -> AxRuntimeResult<()>;
     fn load(&self, session_id: &str) -> AxRuntimeResult<Option<AxSession>>;
     fn delete(&self, session_id: &str) -> AxRuntimeResult<()>;
+    /// Atomically extend an existing live row; never upsert a revoked session.
+    fn refresh_live(&self, _session: &AxSession, _now_unix: i64) -> AxRuntimeResult<bool> {
+        Err(AxRuntimeError::message(
+            "session store does not support atomic refresh",
+        ))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -168,6 +179,18 @@ impl AxMemorySessionStore {
 }
 
 impl AxSessionStore for AxMemorySessionStore {
+    fn refresh_live(&self, session: &AxSession, now_unix: i64) -> AxRuntimeResult<bool> {
+        let mut sessions = self.write()?;
+        let Some(current) = sessions.get_mut(&session.id) else {
+            return Ok(false);
+        };
+        if current.is_expired(now_unix) || current.created_at_unix != session.created_at_unix {
+            return Ok(false);
+        }
+        current.last_seen_at_unix = current.last_seen_at_unix.max(session.last_seen_at_unix);
+        current.expires_at_unix = current.expires_at_unix.max(session.expires_at_unix);
+        Ok(true)
+    }
     fn save(&self, session: &AxSession) -> AxRuntimeResult<()> {
         self.write()?.insert(session.id.clone(), session.clone());
         Ok(())
@@ -220,10 +243,17 @@ impl AxSessionManager {
             data,
             created_at_unix: now_unix,
             last_seen_at_unix: now_unix,
-            expires_at_unix: now_unix.saturating_add(self.policy.ttl_seconds),
+            expires_at_unix: now_unix.saturating_add(
+                self.policy
+                    .ttl_seconds
+                    .min(self.policy.absolute_ttl_seconds),
+            ),
         };
         self.store.save(&session)?;
-        let cookie = self.policy.issue_cookie(&session.id, secret)?;
+        let cookie = self.policy.cookie(
+            AxAuth::sign_session(&session.id, secret),
+            session.expires_at_unix.saturating_sub(now_unix),
+        );
         Ok((session, cookie))
     }
 
@@ -240,7 +270,12 @@ impl AxSessionManager {
         let Some(session) = self.store.load(session_id)? else {
             return Ok(None);
         };
-        if session.is_expired(now_unix) {
+        if session.is_expired(now_unix)
+            || now_unix
+                >= session
+                    .created_at_unix
+                    .saturating_add(self.policy.absolute_ttl_seconds)
+        {
             self.store.delete(session_id)?;
             return Ok(None);
         }
@@ -257,10 +292,48 @@ impl AxSessionManager {
             return Ok(None);
         };
         session.last_seen_at_unix = now_unix;
-        session.expires_at_unix = now_unix.saturating_add(self.policy.ttl_seconds);
-        self.store.save(&session)?;
-        let cookie = self.policy.issue_cookie(&session.id, secret)?;
+        session.expires_at_unix = now_unix.saturating_add(self.policy.ttl_seconds).min(
+            session
+                .created_at_unix
+                .saturating_add(self.policy.absolute_ttl_seconds),
+        );
+        if !self.store.refresh_live(&session, now_unix)? {
+            return Ok(None);
+        }
+        let cookie = self.policy.cookie(
+            AxAuth::sign_session(&session.id, secret),
+            session.expires_at_unix.saturating_sub(now_unix),
+        );
         Ok(Some((session, cookie)))
+    }
+
+    /// Issue a proof only for an authenticated, unexpired server-side session.
+    /// Deliver it through a no-store same-origin response or an escaped form field.
+    pub fn csrf_token(
+        &self,
+        request: &AxHttpRequest,
+        secret: &str,
+        now_unix: i64,
+    ) -> AxRuntimeResult<Option<String>> {
+        let Some(session) = self.load(request, secret, now_unix)? else {
+            return Ok(None);
+        };
+        csrf::issue(&session.id, secret).map(Some)
+    }
+
+    /// Validate proof against the active session, not a session ID from the client.
+    /// Call together with origin validation, before running a mutation.
+    pub fn verify_csrf(
+        &self,
+        request: &AxHttpRequest,
+        token: &str,
+        secret: &str,
+        now_unix: i64,
+    ) -> AxRuntimeResult<bool> {
+        let Some(session) = self.load(request, secret, now_unix)? else {
+            return Ok(false);
+        };
+        csrf::verify(&session.id, token, secret)
     }
 
     pub fn destroy(&self, request: &AxHttpRequest, secret: &str) -> AxRuntimeResult<AxCookie> {
@@ -281,6 +354,10 @@ fn validate_secret(secret: &str) -> AxRuntimeResult<()> {
     Ok(())
 }
 
+fn default_absolute_ttl() -> i64 {
+    DEFAULT_SESSION_TTL_SECONDS
+}
+
 pub mod prelude {
     pub use super::{
         AxMemorySessionStore, AxPostgresSessionStore, AxSameSite, AxSession, AxSessionCookiePolicy,
@@ -294,11 +371,182 @@ mod tests {
 
     use serde_json::json;
 
+    #[test]
+    fn refresh_caps_lifetime_and_cannot_restore_deleted_rows() {
+        let stores: Vec<Arc<dyn AxSessionStore>> = vec![
+            Arc::new(AxMemorySessionStore::default()),
+            Arc::new(AxSqliteSessionStore::in_memory().unwrap()),
+        ];
+        for store in stores {
+            let manager = AxSessionManager::new(
+                store.clone(),
+                AxSessionCookiePolicy {
+                    ttl_seconds: 10,
+                    absolute_ttl_seconds: 25,
+                    ..AxSessionCookiePolicy::development()
+                },
+            )
+            .unwrap();
+            let secret = "session-refresh-test-secret-32-bytes";
+            let (session, cookie) = manager
+                .create("user", BTreeMap::new(), secret, 100)
+                .unwrap();
+            let request = request_with_cookie(&cookie);
+            let proof = manager.csrf_token(&request, secret, 100).unwrap().unwrap();
+            let (refreshed, _) = manager.refresh(&request, secret, 109).unwrap().unwrap();
+            assert_eq!(refreshed.id, session.id);
+            assert_eq!(refreshed.expires_at_unix, 119);
+            assert!(manager.verify_csrf(&request, &proof, secret, 109).unwrap());
+            assert_eq!(
+                manager
+                    .refresh(&request, secret, 118)
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .expires_at_unix,
+                125
+            );
+            let (_, capped_cookie) = manager.refresh(&request, secret, 124).unwrap().unwrap();
+            assert_eq!(capped_cookie.max_age, Some(1));
+            assert!(manager.refresh(&request, secret, 125).unwrap().is_none());
+            assert!(!manager.verify_csrf(&request, &proof, secret, 125).unwrap());
+            assert!(store.load(&session.id).unwrap().is_none());
+            let (session, cookie) = manager
+                .create("user", BTreeMap::new(), secret, 200)
+                .unwrap();
+            manager
+                .destroy(&request_with_cookie(&cookie), secret)
+                .unwrap();
+            assert!(!store.refresh_live(&session, 201).unwrap());
+            assert!(store.load(&session.id).unwrap().is_none());
+        }
+    }
+
     use super::*;
 
     fn request_with_cookie(cookie: &AxCookie) -> AxHttpRequest {
         AxHttpRequest::new("GET", "/account")
             .with_header("Cookie", format!("{}={}", cookie.name, cookie.value))
+    }
+
+    #[test]
+    fn csrf_proofs_follow_memory_session_lifecycle() {
+        assert_csrf_lifecycle(Arc::new(AxMemorySessionStore::default()));
+    }
+
+    #[test]
+    fn csrf_proofs_follow_sqlite_session_lifecycle() {
+        let path = std::env::temp_dir().join(format!("axonyx-csrf-{}.sqlite", Uuid::new_v4()));
+        assert_csrf_lifecycle(Arc::new(AxSqliteSessionStore::open(&path).unwrap()));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn assert_csrf_lifecycle(store: Arc<dyn AxSessionStore>) {
+        let manager = AxSessionManager::new(
+            store,
+            AxSessionCookiePolicy {
+                ttl_seconds: 60,
+                ..AxSessionCookiePolicy::development()
+            },
+        )
+        .unwrap();
+        let secret = "0123456789abcdef0123456789abcdef";
+        let anonymous = AxHttpRequest::new("POST", "/save");
+        assert_eq!(manager.csrf_token(&anonymous, secret, 100).unwrap(), None);
+        assert!(!manager
+            .verify_csrf(&anonymous, "anything", secret, 100)
+            .unwrap());
+        let (session, cookie) = manager
+            .create("user-1", BTreeMap::new(), secret, 100)
+            .unwrap();
+        let request = request_with_cookie(&cookie);
+        let token = manager.csrf_token(&request, secret, 101).unwrap().unwrap();
+        assert_eq!(token.len(), 72);
+        assert!(!token.contains(&session.id));
+        assert!(!token.contains(secret));
+        assert!(manager.verify_csrf(&request, &token, secret, 101).unwrap());
+        assert_eq!(
+            manager.csrf_token(&request, secret, 102).unwrap().unwrap(),
+            token
+        );
+        for bad in [
+            String::new(),
+            "x".repeat(100_000),
+            "axcsrf2.invalid".into(),
+            format!("axcsrf1.{}", "0".repeat(64)),
+            format!("{token}x"),
+            format!("axcsrf1.{}", "é".repeat(32)),
+        ] {
+            assert!(!manager.verify_csrf(&request, &bad, secret, 101).unwrap());
+        }
+        let (_, other_cookie) = manager
+            .create("user-1", BTreeMap::new(), secret, 102)
+            .unwrap();
+        let other_request = request_with_cookie(&other_cookie);
+        assert!(!manager
+            .verify_csrf(&other_request, &token, secret, 102)
+            .unwrap());
+        assert!(!manager
+            .verify_csrf(&request, &token, "abcdef0123456789abcdef0123456789", 102)
+            .unwrap());
+        let rotated_secret = "abcdef0123456789abcdef0123456789ab";
+        let rotated_cookie = manager
+            .policy()
+            .issue_cookie(&session.id, rotated_secret)
+            .unwrap();
+        let rotated_request = request_with_cookie(&rotated_cookie);
+        assert!(manager
+            .load(&rotated_request, rotated_secret, 102)
+            .unwrap()
+            .is_some());
+        assert!(!manager
+            .verify_csrf(&rotated_request, &token, rotated_secret, 102)
+            .unwrap());
+        manager.refresh(&request, secret, 110).unwrap().unwrap();
+        assert!(manager.verify_csrf(&request, &token, secret, 165).unwrap());
+        manager.destroy(&request, secret).unwrap();
+        assert!(!manager.verify_csrf(&request, &token, secret, 166).unwrap());
+        assert!(manager.csrf_token(&request, secret, 166).unwrap().is_none());
+        let other_token = manager
+            .csrf_token(&other_request, secret, 103)
+            .unwrap()
+            .unwrap();
+        assert!(!manager
+            .verify_csrf(&other_request, &other_token, secret, 162)
+            .unwrap());
+        assert!(manager
+            .csrf_token(&other_request, secret, 162)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn csrf_rejects_weak_keys_and_modified_signatures() {
+        let manager = AxSessionManager::new(
+            Arc::new(AxMemorySessionStore::default()),
+            AxSessionCookiePolicy::development(),
+        )
+        .unwrap();
+        let (_, cookie) = manager
+            .create("user", BTreeMap::new(), "short-key", 100)
+            .unwrap();
+        assert!(manager
+            .csrf_token(&request_with_cookie(&cookie), "short-key", 101)
+            .is_err());
+        assert!(manager
+            .verify_csrf(&request_with_cookie(&cookie), "anything", "short-key", 101)
+            .is_err());
+        let secret = "0123456789abcdef0123456789abcdef";
+        let (_, cookie) = manager
+            .create("user", BTreeMap::new(), secret, 100)
+            .unwrap();
+        let request = request_with_cookie(&cookie);
+        let token = manager.csrf_token(&request, secret, 101).unwrap().unwrap();
+        let mut bytes = token.into_bytes();
+        bytes[8] = if bytes[8] == b'0' { b'1' } else { b'0' };
+        assert!(!manager
+            .verify_csrf(&request, &String::from_utf8(bytes).unwrap(), secret, 101)
+            .unwrap());
     }
 
     #[test]

@@ -6,6 +6,16 @@ use crate::ax_types::prelude::AxType;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxBackendCodegenError {
+    #[error("Login.throttle must be a route before hook with (String key, literal attempts 1..1000, literal seconds 1..86400)")]
+    InvalidLoginThrottleHook,
+    #[error("Password.verify requires exactly two String arguments")]
+    InvalidPasswordVerifyArguments,
+    #[error("Password.verifyOptional requires (String password, optionalRecord?.stringField) before narrowing the record")]
+    InvalidOptionalPasswordVerifyArguments,
+    #[error(
+        "Password.verify is only supported in action/route data bindings; found in `{handler}`"
+    )]
+    PasswordVerifyOutsideRequestHandler { handler: String },
     #[error("route path is required to generate a route handler")]
     MissingRoutePath,
     #[error("domain helper `{function}` parameter `{field}` cannot be optional or defaulted yet")]
@@ -78,6 +88,7 @@ pub enum AxBackendBundleError {
 }
 
 struct AxBackendRenderContext<'a> {
+    records: &'a [AxRecordPlan],
     handlers: &'a [AxHandlerPlan],
     functions: &'a [AxFunctionPlan],
     record_names: &'a std::collections::BTreeSet<String>,
@@ -91,6 +102,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
         .map(|record| record.name.clone())
         .collect::<std::collections::BTreeSet<_>>();
     let context = AxBackendRenderContext {
+        records: &plan.types,
         handlers: &plan.handlers,
         functions: &plan.functions,
         record_names: &record_names,
@@ -151,6 +163,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     }
 
     for handler in &plan.handlers {
+        validate_login_throttle_hooks(handler)?;
         if let Some(input) = handler_input_fields(handler) {
             out.push_str(&render_input_struct(handler, input));
             out.push('\n');
@@ -228,6 +241,11 @@ fn render_function_step(
     function: &str,
     context: &AxBackendRenderContext<'_>,
 ) -> Result<String, AxBackendCodegenError> {
+    if let AxStepPlan::Hook { value, .. } = step {
+        if parse_login_throttle_hook(&value.code)?.is_some() {
+            return Err(AxBackendCodegenError::InvalidLoginThrottleHook);
+        }
+    }
     match step {
         AxStepPlan::Let { binding, value } => Ok(format!(
             "    let {binding} = {};\n",
@@ -246,6 +264,13 @@ fn render_function_value_plan(
 ) -> Result<String, AxBackendCodegenError> {
     match value {
         AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
+        AxValuePlan::Call { path, .. }
+            if path == &["Password", "verify"] || path == &["Password", "verifyOptional"] =>
+        {
+            Err(AxBackendCodegenError::PasswordVerifyOutsideRequestHandler {
+                handler: function.to_string(),
+            })
+        }
         AxValuePlan::Call { path, args } => Ok(render_declared_function_call(
             path,
             args,
@@ -1175,12 +1200,24 @@ fn render_step(
     typed_bindings: &mut std::collections::BTreeMap<String, AxType>,
     context: &AxBackendRenderContext<'_>,
 ) -> Result<String, AxBackendCodegenError> {
+    if let AxStepPlan::Hook { phase, value } = step {
+        if let Some(throttle) = parse_login_throttle_hook(&value.code)? {
+            if !route_response || *phase != AxHookPhasePlan::Before {
+                return Err(AxBackendCodegenError::InvalidLoginThrottleHook);
+            }
+            return Ok(format!(
+                "    {{\n        static THROTTLE: std::sync::OnceLock<axonyx_runtime::login_throttle::AxLoginThrottle> = std::sync::OnceLock::new();\n        let throttle = THROTTLE.get_or_init(|| axonyx_runtime::login_throttle::AxLoginThrottle::new({}, std::time::Duration::from_secs({}), 4096).expect(\"validated login throttle configuration\"));\n        let key = json!({});\n        match throttle.try_acquire(key.as_str().ok_or_else(|| AxRuntimeError::message(\"login throttle key must be String\"))?) {{\n            Ok(()) => {{}},\n            Err(axonyx_runtime::login_throttle::AxLoginThrottleError::Limited {{ retry_after }}) => {{\n                let seconds = (retry_after.as_secs() + u64::from(retry_after.subsec_nanos() != 0)).max(1);\n                let response = AxHttpResponse::json(429, &json!({{\"error\":\"too many requests\"}})).map_err(|_| AxRuntimeError::message(\"login throttle response failed\"))?.with_header(\"Retry-After\", seconds.to_string()).with_header(\"Cache-Control\", \"no-store\");\n                return Ok(__ax_finalize_response(response, __ax_headers, __ax_cookies));\n            }},\n            Err(_) => return Err(AxRuntimeError::message(\"login throttle unavailable\")),\n        }}\n    }}\n",
+                throttle.attempts, throttle.seconds, render_borrowed_expr(&throttle.key)
+            ));
+        }
+    }
     let output = match step {
         AxStepPlan::Let { binding, value } => {
             let rendered = render_value_plan(
                 value,
                 handler,
                 context,
+                typed_bindings,
             )?;
             if let Some(ty) = query_call_return_type(value, context.handlers)? {
                 let rust_ty = rust_function_return_type(&ty, binding)?;
@@ -1325,6 +1362,7 @@ fn render_step(
         AxStepPlan::SessionDestroy => {
             "    __ax_cookies.push(runtime.destroy_session(request)?);\n".to_string()
         }
+        AxStepPlan::SessionRefresh => "    let (_, __ax_session_cookie) = runtime.refresh_session(request)?.ok_or_else(|| AxRuntimeError::message(\"Session.refresh requires an active session\"))?;\n    __ax_cookies.push(__ax_session_cookie);\n".to_string(),
         AxStepPlan::Require { value, fallback } if route_response => {
             let mut rendered = format!(
                 "    if !__ax_truthy(&json!({})) {{\n{}    }}\n",
@@ -1352,6 +1390,66 @@ fn render_step(
         ),
     };
     Ok(output)
+}
+
+pub struct AxLoginThrottleHook {
+    pub key: AxRustExpr,
+    pub attempts: u32,
+    pub seconds: u64,
+}
+
+pub fn validate_login_throttle_hooks(handler: &AxHandlerPlan) -> Result<(), AxBackendCodegenError> {
+    let mut seen = std::collections::BTreeSet::new();
+    for (index, step) in handler.steps.iter().enumerate() {
+        if let AxStepPlan::Hook { phase, value } = step {
+            if parse_login_throttle_hook(&value.code)?.is_some()
+                && (*phase != AxHookPhasePlan::Before
+                    || !matches!(handler.kind, AxHandlerKind::Route { .. })
+                    || !seen.insert(&value.code)
+                    || handler.steps[..index].iter().any(|step| {
+                        !matches!(
+                            step,
+                            AxStepPlan::Hook {
+                                phase: AxHookPhasePlan::Before,
+                                ..
+                            }
+                        )
+                    }))
+            {
+                return Err(AxBackendCodegenError::InvalidLoginThrottleHook);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn parse_login_throttle_hook(
+    code: &str,
+) -> Result<Option<AxLoginThrottleHook>, AxBackendCodegenError> {
+    let code = code.trim();
+    if code.starts_with("Login.throttle") {
+        return Err(AxBackendCodegenError::InvalidLoginThrottleHook);
+    }
+    if !code.starts_with("Login::throttle") {
+        return Ok(None);
+    }
+    let invalid = || AxBackendCodegenError::InvalidLoginThrottleHook;
+    let inner = code
+        .strip_prefix("Login::throttle(")
+        .and_then(|code| code.strip_suffix(')'))
+        .ok_or_else(invalid)?;
+    let (key, rest) = split_codegen_binary_args(inner).ok_or_else(invalid)?;
+    let (attempts, seconds) = split_codegen_binary_args(rest).ok_or_else(invalid)?;
+    let attempts = attempts.trim().parse::<u32>().map_err(|_| invalid())?;
+    let seconds = seconds.trim().parse::<u64>().map_err(|_| invalid())?;
+    if key.trim().is_empty() || !(1..=1000).contains(&attempts) || !(1..=86400).contains(&seconds) {
+        return Err(invalid());
+    }
+    Ok(Some(AxLoginThrottleHook {
+        key: AxRustExpr::new(key.trim()),
+        attempts,
+        seconds,
+    }))
 }
 
 fn query_call_return_type(
@@ -1473,10 +1571,59 @@ fn render_value_plan(
     value: &AxValuePlan,
     handler: &AxHandlerPlan,
     context: &AxBackendRenderContext<'_>,
+    typed_bindings: &std::collections::BTreeMap<String, AxType>,
 ) -> Result<String, AxBackendCodegenError> {
     let output = match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
         AxValuePlan::Call { path, args } => {
+            if path == &["Password", "verifyOptional"] {
+                if !matches!(
+                    handler.kind,
+                    AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+                ) {
+                    return Err(AxBackendCodegenError::PasswordVerifyOutsideRequestHandler {
+                        handler: handler.name.clone(),
+                    });
+                }
+                let invalid = || AxBackendCodegenError::InvalidOptionalPasswordVerifyArguments;
+                let [password, hash] = args.as_slice() else {
+                    return Err(invalid());
+                };
+                let (binding, field) = hash.code.split_once("?.").ok_or_else(invalid)?;
+                let Some(AxType::Optional(inner)) = typed_bindings.get(binding) else {
+                    return Err(invalid());
+                };
+                let AxType::Record(record) = inner.as_ref() else {
+                    return Err(invalid());
+                };
+                if !context.records.iter().any(|item| {
+                    item.name == *record
+                        && item
+                            .fields
+                            .iter()
+                            .any(|item| item.name == field && item.ty == AxType::String)
+                }) {
+                    return Err(invalid());
+                }
+                return Ok(format!("{{ let __ax_password = json!({}); json!(axonyx_runtime::password::AxPassword::verify_optional(__ax_password.as_str().ok_or_else(|| AxRuntimeError::message(\"Password.verifyOptional requires String password\"))?, {binding}.as_ref().map(|record| record.{field}.as_str())).map_err(|_| AxRuntimeError::message(\"password verification failed\"))?) }}", render_borrowed_expr(password)));
+            }
+            if path == &["Password", "verify"] {
+                if !matches!(
+                    handler.kind,
+                    AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+                ) {
+                    return Err(AxBackendCodegenError::PasswordVerifyOutsideRequestHandler {
+                        handler: handler.name.clone(),
+                    });
+                }
+                let [password, hash] = args.as_slice() else {
+                    return Err(AxBackendCodegenError::InvalidPasswordVerifyArguments);
+                };
+                return Ok(format!(
+                    "{{ let __ax_password = json!({}); let __ax_hash = json!({}); json!(axonyx_runtime::password::AxPassword::verify(__ax_password.as_str().ok_or_else(|| AxRuntimeError::message(\"Password.verify requires String arguments\"))?, __ax_hash.as_str().ok_or_else(|| AxRuntimeError::message(\"Password.verify requires String arguments\"))?).map_err(|_| AxRuntimeError::message(\"password verification failed\"))?) }}",
+                    render_borrowed_expr(password), render_borrowed_expr(hash)
+                ));
+            }
             let query = path.first().filter(|_| path.len() == 1).and_then(|name| {
                 context.handlers.iter().find(|candidate| {
                     candidate.name == *name
@@ -2935,6 +3082,134 @@ route POST "/api/posts"
         assert!(module.contains("parse::<i64>()"));
         assert!(module.contains("let input = RoutePostApiPostsInput"));
         assert!(module.contains("AxHttpResponse::json(200, &json!(&input.title))"));
+    }
+
+    #[test]
+    fn compiles_optional_password_verification_with_typed_credential() {
+        let source = r#"
+type Credential {
+  password_hash: String
+}
+query credential() -> Credential? {
+  return db.credentials.first()
+}
+route POST "/login" {
+  data account = credential()
+  data verified = Password.verifyOptional("password", account?.password_hash)
+  require verified
+  require account
+  return json(verified)
+}
+"#;
+        let module = compile_backend_ax_to_module(source).unwrap();
+        assert!(module.contains("AxPassword::verify_optional("));
+        assert!(module.contains("account.as_ref().map(|record| record.password_hash.as_str())"));
+        for invalid in [
+            source.replace("account?.password_hash", "account.password_hash"),
+            source.replace("account?.password_hash", "account?.missing"),
+            source.replace("password_hash: String", "password_hash: Bool"),
+            source.replace("data verified =", "require account\n  data verified ="),
+        ] {
+            assert!(matches!(
+                compile_backend_ax_to_module(&invalid),
+                Err(AxBackendCompileError::Codegen(
+                    AxBackendCodegenError::InvalidOptionalPasswordVerifyArguments
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn compiles_password_verification_in_request_data_bindings() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route POST "/login"
+  data verified = Password.verify(request.form.password, request.form.hash)
+  require verified
+  return json(verified)
+"#,
+        )
+        .unwrap();
+        assert!(module.contains("axonyx_runtime::password::AxPassword::verify("));
+        assert!(module.contains("password verification failed"));
+        assert!(!module.contains("json!(&Password::verify("));
+        assert!(compile_backend_ax_to_module(
+            r#"
+action Login {
+  data verified = Password.verify("password", "hash")
+  require verified
+  return ok
+}
+"#
+        )
+        .unwrap()
+        .contains("axonyx_runtime::password::AxPassword::verify("));
+
+        assert!(matches!(
+            compile_backend_ax_to_module(
+                r#"
+route POST "/login"
+  data verified = Password.verify("only one")
+  return json(verified)
+"#
+            ),
+            Err(AxBackendCompileError::Codegen(
+                AxBackendCodegenError::InvalidPasswordVerifyArguments
+            ))
+        ));
+
+        assert!(matches!(
+            compile_backend_ax_to_module(
+                r#"
+loader Login
+  data verified = Password.verify("password", "hash")
+  return verified
+"#
+            ),
+            Err(AxBackendCompileError::Codegen(
+                AxBackendCodegenError::PasswordVerifyOutsideRequestHandler { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn compiles_login_throttle_and_rejects_invalid_guard_shapes() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route POST "/login" {
+  before Login.throttle(request.form.email, 2, 60)
+  return json("ok")
+}
+"#,
+        )
+        .unwrap();
+        assert!(module.contains("std::sync::OnceLock"));
+        assert!(module.contains("AxHttpResponse::json(429"));
+        assert!(module.contains("Retry-After"));
+        for hook in [
+            "before Login.throttle",
+            "after Login.throttle(request.form.email, 2, 60)",
+            "before Login.throttle(request.form.email, 0, 60)",
+            "before Login.throttle(request.form.email, 1001, 60)",
+            "before Login.throttle(request.form.email, 2, 0)",
+            "before Login.throttle(request.form.email, 2, 86401)",
+            "before Login.throttle(request.form.email, 2, input.seconds)",
+            "before Login.throttle(request.form.email, 2)",
+            "before Login.throttle(request.form.email, 2, 60, 4)",
+            "data value = 1\n  before Login.throttle(request.form.email, 2, 60)",
+            "before Login.throttle(request.form.email, 2, 60)\n  before Login.throttle(request.form.email, 2, 60)",
+        ] {
+            let source = format!("route POST \"/login\" {{\n  {hook}\n  return json(\"ok\")\n}}");
+            assert!(
+                matches!(
+                    compile_backend_ax_to_module(&source),
+                    Err(AxBackendCompileError::Codegen(
+                        AxBackendCodegenError::InvalidLoginThrottleHook
+                    ))
+                ),
+                "{hook}"
+            );
+        }
     }
 
     #[test]
