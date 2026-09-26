@@ -1026,7 +1026,7 @@ fn render_expr(expr: &AxExpr) -> String {
                 return format!("({}).unwrap_or({})", render_expr(left), render_expr(right));
             }
             if *op == AxBinaryOp::In {
-                return format!("({}).contains(&{})", render_expr(right), render_expr(left));
+                return format!("contains({}, {})", render_expr(right), render_expr(left));
             }
             format!(
                 "({} {} {})",
@@ -1256,10 +1256,10 @@ fn expr_member_path(expr: &AxExpr) -> Option<Vec<String>> {
 fn map_input_type(ty: &str) -> String {
     match ty.trim() {
         "string" => "String".to_string(),
-        "bool" | "boolean" => "bool".to_string(),
-        "i64" | "int" | "integer" => "i64".to_string(),
+        "Bool" | "bool" | "boolean" => "bool".to_string(),
+        "Int" | "i64" | "int" | "integer" => "i64".to_string(),
         "u64" => "u64".to_string(),
-        "f64" | "float" | "number" => "f64".to_string(),
+        "Float" | "Number" | "f64" | "float" | "number" => "f64".to_string(),
         "File" => "AxIncomingFile".to_string(),
         "FileRef" => "AxFileRef".to_string(),
         other => other.to_string(),
