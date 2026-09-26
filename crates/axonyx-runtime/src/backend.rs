@@ -1346,6 +1346,14 @@ impl<A> AxRuntimeEnvAccess for AxDatabaseRuntime<A> {
         &self,
         request: &AxHttpRequest,
     ) -> AxRuntimeResult<Option<(AxSession, AxCookie)>> {
+        if matches!(
+            request.method.to_ascii_uppercase().as_str(),
+            "GET" | "HEAD" | "OPTIONS"
+        ) {
+            return Err(AxRuntimeError::message(
+                "Session.refresh requires a mutating HTTP request",
+            ));
+        }
         let configured = self.configured_session()?;
         configured
             .manager
@@ -1490,6 +1498,11 @@ fn session_cookie_policy_from_env(env: &AxEnv) -> AxRuntimeResult<AxSessionCooki
             AxRuntimeError::message(format!(
                 "SESSION_TTL_SECONDS must be a positive integer, got `{value}`"
             ))
+        })?;
+    }
+    if let Some(value) = env.secret.get("session_absolute_ttl_seconds") {
+        policy.absolute_ttl_seconds = value.parse::<i64>().map_err(|_| {
+            AxRuntimeError::message("SESSION_ABSOLUTE_TTL_SECONDS must be a positive integer")
         })?;
     }
     if let Some(value) = env.secret.get("session_cookie_secure") {
@@ -4765,6 +4778,18 @@ mod tests {
                 .load_session(&request)
                 .expect("session should load")
                 .expect("session should exist")
+                .id,
+            session.id
+        );
+        assert!(runtime.refresh_session(&request).is_err());
+        let mut refresh_request = request.clone();
+        refresh_request.method = "POST".into();
+        assert_eq!(
+            runtime
+                .refresh_session(&refresh_request)
+                .unwrap()
+                .unwrap()
+                .0
                 .id,
             session.id
         );

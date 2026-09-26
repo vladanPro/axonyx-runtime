@@ -1362,6 +1362,7 @@ fn render_step(
         AxStepPlan::SessionDestroy => {
             "    __ax_cookies.push(runtime.destroy_session(request)?);\n".to_string()
         }
+        AxStepPlan::SessionRefresh => "    let (_, __ax_session_cookie) = runtime.refresh_session(request)?.ok_or_else(|| AxRuntimeError::message(\"Session.refresh requires an active session\"))?;\n    __ax_cookies.push(__ax_session_cookie);\n".to_string(),
         AxStepPlan::Require { value, fallback } if route_response => {
             let mut rendered = format!(
                 "    if !__ax_truthy(&json!({})) {{\n{}    }}\n",

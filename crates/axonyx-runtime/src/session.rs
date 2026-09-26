@@ -40,6 +40,9 @@ pub struct AxSessionCookiePolicy {
     pub path: String,
     pub domain: Option<String>,
     pub ttl_seconds: i64,
+    /// Absolute lifetime from creation, independent of sliding refresh.
+    #[serde(default = "default_absolute_ttl")]
+    pub absolute_ttl_seconds: i64,
     pub secure: bool,
     pub same_site: AxSameSite,
 }
@@ -51,6 +54,7 @@ impl Default for AxSessionCookiePolicy {
             path: "/".to_string(),
             domain: None,
             ttl_seconds: DEFAULT_SESSION_TTL_SECONDS,
+            absolute_ttl_seconds: DEFAULT_SESSION_TTL_SECONDS,
             secure: true,
             same_site: AxSameSite::Lax,
         }
@@ -76,7 +80,7 @@ impl AxSessionCookiePolicy {
                 "session cookie path must not be empty",
             ));
         }
-        if self.ttl_seconds <= 0 {
+        if self.ttl_seconds <= 0 || self.absolute_ttl_seconds <= 0 {
             return Err(AxRuntimeError::message(
                 "session TTL must be greater than zero",
             ));
@@ -137,6 +141,12 @@ pub trait AxSessionStore: Send + Sync {
     fn save(&self, session: &AxSession) -> AxRuntimeResult<()>;
     fn load(&self, session_id: &str) -> AxRuntimeResult<Option<AxSession>>;
     fn delete(&self, session_id: &str) -> AxRuntimeResult<()>;
+    /// Atomically extend an existing live row; never upsert a revoked session.
+    fn refresh_live(&self, _session: &AxSession, _now_unix: i64) -> AxRuntimeResult<bool> {
+        Err(AxRuntimeError::message(
+            "session store does not support atomic refresh",
+        ))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -169,6 +179,18 @@ impl AxMemorySessionStore {
 }
 
 impl AxSessionStore for AxMemorySessionStore {
+    fn refresh_live(&self, session: &AxSession, now_unix: i64) -> AxRuntimeResult<bool> {
+        let mut sessions = self.write()?;
+        let Some(current) = sessions.get_mut(&session.id) else {
+            return Ok(false);
+        };
+        if current.is_expired(now_unix) || current.created_at_unix != session.created_at_unix {
+            return Ok(false);
+        }
+        current.last_seen_at_unix = current.last_seen_at_unix.max(session.last_seen_at_unix);
+        current.expires_at_unix = current.expires_at_unix.max(session.expires_at_unix);
+        Ok(true)
+    }
     fn save(&self, session: &AxSession) -> AxRuntimeResult<()> {
         self.write()?.insert(session.id.clone(), session.clone());
         Ok(())
@@ -221,10 +243,17 @@ impl AxSessionManager {
             data,
             created_at_unix: now_unix,
             last_seen_at_unix: now_unix,
-            expires_at_unix: now_unix.saturating_add(self.policy.ttl_seconds),
+            expires_at_unix: now_unix.saturating_add(
+                self.policy
+                    .ttl_seconds
+                    .min(self.policy.absolute_ttl_seconds),
+            ),
         };
         self.store.save(&session)?;
-        let cookie = self.policy.issue_cookie(&session.id, secret)?;
+        let cookie = self.policy.cookie(
+            AxAuth::sign_session(&session.id, secret),
+            session.expires_at_unix.saturating_sub(now_unix),
+        );
         Ok((session, cookie))
     }
 
@@ -241,7 +270,12 @@ impl AxSessionManager {
         let Some(session) = self.store.load(session_id)? else {
             return Ok(None);
         };
-        if session.is_expired(now_unix) {
+        if session.is_expired(now_unix)
+            || now_unix
+                >= session
+                    .created_at_unix
+                    .saturating_add(self.policy.absolute_ttl_seconds)
+        {
             self.store.delete(session_id)?;
             return Ok(None);
         }
@@ -258,9 +292,18 @@ impl AxSessionManager {
             return Ok(None);
         };
         session.last_seen_at_unix = now_unix;
-        session.expires_at_unix = now_unix.saturating_add(self.policy.ttl_seconds);
-        self.store.save(&session)?;
-        let cookie = self.policy.issue_cookie(&session.id, secret)?;
+        session.expires_at_unix = now_unix.saturating_add(self.policy.ttl_seconds).min(
+            session
+                .created_at_unix
+                .saturating_add(self.policy.absolute_ttl_seconds),
+        );
+        if !self.store.refresh_live(&session, now_unix)? {
+            return Ok(None);
+        }
+        let cookie = self.policy.cookie(
+            AxAuth::sign_session(&session.id, secret),
+            session.expires_at_unix.saturating_sub(now_unix),
+        );
         Ok(Some((session, cookie)))
     }
 
@@ -311,6 +354,10 @@ fn validate_secret(secret: &str) -> AxRuntimeResult<()> {
     Ok(())
 }
 
+fn default_absolute_ttl() -> i64 {
+    DEFAULT_SESSION_TTL_SECONDS
+}
+
 pub mod prelude {
     pub use super::{
         AxMemorySessionStore, AxPostgresSessionStore, AxSameSite, AxSession, AxSessionCookiePolicy,
@@ -323,6 +370,57 @@ mod tests {
     use std::sync::Arc;
 
     use serde_json::json;
+
+    #[test]
+    fn refresh_caps_lifetime_and_cannot_restore_deleted_rows() {
+        let stores: Vec<Arc<dyn AxSessionStore>> = vec![
+            Arc::new(AxMemorySessionStore::default()),
+            Arc::new(AxSqliteSessionStore::in_memory().unwrap()),
+        ];
+        for store in stores {
+            let manager = AxSessionManager::new(
+                store.clone(),
+                AxSessionCookiePolicy {
+                    ttl_seconds: 10,
+                    absolute_ttl_seconds: 25,
+                    ..AxSessionCookiePolicy::development()
+                },
+            )
+            .unwrap();
+            let secret = "session-refresh-test-secret-32-bytes";
+            let (session, cookie) = manager
+                .create("user", BTreeMap::new(), secret, 100)
+                .unwrap();
+            let request = request_with_cookie(&cookie);
+            let proof = manager.csrf_token(&request, secret, 100).unwrap().unwrap();
+            let (refreshed, _) = manager.refresh(&request, secret, 109).unwrap().unwrap();
+            assert_eq!(refreshed.id, session.id);
+            assert_eq!(refreshed.expires_at_unix, 119);
+            assert!(manager.verify_csrf(&request, &proof, secret, 109).unwrap());
+            assert_eq!(
+                manager
+                    .refresh(&request, secret, 118)
+                    .unwrap()
+                    .unwrap()
+                    .0
+                    .expires_at_unix,
+                125
+            );
+            let (_, capped_cookie) = manager.refresh(&request, secret, 124).unwrap().unwrap();
+            assert_eq!(capped_cookie.max_age, Some(1));
+            assert!(manager.refresh(&request, secret, 125).unwrap().is_none());
+            assert!(!manager.verify_csrf(&request, &proof, secret, 125).unwrap());
+            assert!(store.load(&session.id).unwrap().is_none());
+            let (session, cookie) = manager
+                .create("user", BTreeMap::new(), secret, 200)
+                .unwrap();
+            manager
+                .destroy(&request_with_cookie(&cookie), secret)
+                .unwrap();
+            assert!(!store.refresh_live(&session, 201).unwrap());
+            assert!(store.load(&session.id).unwrap().is_none());
+        }
+    }
 
     use super::*;
 

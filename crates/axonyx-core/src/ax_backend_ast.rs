@@ -431,6 +431,7 @@ pub enum AxBackendStmt {
     ClearCookie(AxExpr),
     SessionCreate(AxSessionCreate),
     SessionDestroy,
+    SessionRefresh,
     Require(AxRequirement),
     Revalidate(AxRevalidate),
     Return(AxReturn),
@@ -510,6 +511,10 @@ impl AxBackendStmt {
 
     pub fn session_destroy() -> Self {
         Self::SessionDestroy
+    }
+
+    pub fn session_refresh() -> Self {
+        Self::SessionRefresh
     }
 
     pub fn require(value: impl Into<AxExpr>) -> Self {

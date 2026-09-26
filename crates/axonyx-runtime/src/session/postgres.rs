@@ -92,6 +92,14 @@ impl AxPostgresSessionStore {
 }
 
 impl AxSessionStore for AxPostgresSessionStore {
+    fn refresh_live(&self, session: &AxSession, now_unix: i64) -> AxRuntimeResult<bool> {
+        self.with_client(|client| {
+            client.execute(
+                "UPDATE ax_sessions SET last_seen_at_unix = GREATEST(last_seen_at_unix, $1), expires_at_unix = GREATEST(expires_at_unix, $2) WHERE id = $3 AND created_at_unix = $4 AND expires_at_unix > $5",
+                &[&session.last_seen_at_unix, &session.expires_at_unix, &session.id, &session.created_at_unix, &now_unix],
+            ).map(|count| count == 1).map_err(|error| postgres_runtime_error(SESSION_RESOURCE, error))
+        })
+    }
     fn save(&self, session: &AxSession) -> AxRuntimeResult<()> {
         let data_json = serde_json::to_value(&session.data).map_err(|error| {
             crate::backend::AxRuntimeError::message(format!(
@@ -236,5 +244,6 @@ mod tests {
             .load(&loaded.id)
             .expect("store should remain readable")
             .is_none());
+        assert!(!store.refresh_live(&loaded, 1_030).unwrap());
     }
 }
