@@ -2285,7 +2285,8 @@ route POST "/api/probe" {
 backend
   data themes = ["silver", "bronze", "gold"]
 action SetTheme(theme: String) {
-  require input.theme in themes else error "Choose silver, bronze, or gold."
+  data allowed = input.theme in themes
+  require allowed else error "Choose silver, bronze, or gold."
   return ok()
 }
 route POST "/api/theme" {
