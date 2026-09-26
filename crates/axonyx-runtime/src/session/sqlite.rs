@@ -63,6 +63,12 @@ impl AxSqliteSessionStore {
 }
 
 impl AxSessionStore for AxSqliteSessionStore {
+    fn refresh_live(&self, session: &AxSession, now_unix: i64) -> AxRuntimeResult<bool> {
+        self.connection()?.execute(
+            "UPDATE ax_sessions SET last_seen_at_unix = MAX(last_seen_at_unix, ?1), expires_at_unix = MAX(expires_at_unix, ?2) WHERE id = ?3 AND created_at_unix = ?4 AND expires_at_unix > ?5",
+            params![session.last_seen_at_unix, session.expires_at_unix, session.id, session.created_at_unix, now_unix],
+        ).map(|count| count == 1).map_err(|error| sqlite_runtime_error(SESSION_RESOURCE, error))
+    }
     fn save(&self, session: &AxSession) -> AxRuntimeResult<()> {
         let data_json = serde_json::to_string(&session.data).map_err(|error| {
             AxRuntimeError::message(format!("session data serialization failed: {error}"))

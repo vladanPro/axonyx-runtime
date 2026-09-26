@@ -1491,6 +1491,7 @@ fn execute_preview_loader(
             | AxStepPlan::ClearCookie { .. }
             | AxStepPlan::SessionCreate { .. }
             | AxStepPlan::SessionDestroy
+            | AxStepPlan::SessionRefresh
             | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {}
         }
@@ -1565,6 +1566,7 @@ fn execute_preview_function(
             | AxStepPlan::ClearCookie { .. }
             | AxStepPlan::SessionCreate { .. }
             | AxStepPlan::SessionDestroy
+            | AxStepPlan::SessionRefresh
             | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {
                 return Err(PreviewError::Runtime {
@@ -1830,6 +1832,21 @@ fn execute_preview_action(
                     message: "Session.destroy requires an HTTP action request".to_string(),
                 })?;
                 cookies.push(runtime.destroy_session(request)?);
+            }
+            AxStepPlan::SessionRefresh => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.refresh requires a configured backend runtime".into(),
+                })?;
+                let request = request.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.refresh requires an HTTP action request".into(),
+                })?;
+                let (_, cookie) =
+                    runtime
+                        .refresh_session(request)?
+                        .ok_or_else(|| PreviewError::Runtime {
+                            message: "Session.refresh requires an active session".into(),
+                        })?;
+                cookies.push(cookie);
             }
             AxStepPlan::Require {
                 value: requirement,
@@ -2183,6 +2200,18 @@ fn execute_preview_route(
                     message: "Session.destroy requires a configured backend runtime".to_string(),
                 })?;
                 set_cookies.push(runtime.destroy_session(request)?.render());
+            }
+            AxStepPlan::SessionRefresh => {
+                let runtime = runtime.ok_or_else(|| PreviewError::Runtime {
+                    message: "Session.refresh requires a configured backend runtime".into(),
+                })?;
+                let (_, cookie) =
+                    runtime
+                        .refresh_session(request)?
+                        .ok_or_else(|| PreviewError::Runtime {
+                            message: "Session.refresh requires an active session".into(),
+                        })?;
+                set_cookies.push(cookie.render());
             }
             AxStepPlan::Require { value, fallback } => {
                 if !preview_require_passes(&eval_preview_require_expr(value, &scope, env)?) {
