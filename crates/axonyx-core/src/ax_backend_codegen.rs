@@ -6,6 +6,12 @@ use crate::ax_types::prelude::AxType;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxBackendCodegenError {
+    #[error("Password.verify requires exactly two String arguments")]
+    InvalidPasswordVerifyArguments,
+    #[error(
+        "Password.verify is only supported in action/route data bindings; found in `{handler}`"
+    )]
+    PasswordVerifyOutsideRequestHandler { handler: String },
     #[error("route path is required to generate a route handler")]
     MissingRoutePath,
     #[error("domain helper `{function}` parameter `{field}` cannot be optional or defaulted yet")]
@@ -246,6 +252,11 @@ fn render_function_value_plan(
 ) -> Result<String, AxBackendCodegenError> {
     match value {
         AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
+        AxValuePlan::Call { path, .. } if path == &["Password", "verify"] => {
+            Err(AxBackendCodegenError::PasswordVerifyOutsideRequestHandler {
+                handler: function.to_string(),
+            })
+        }
         AxValuePlan::Call { path, args } => Ok(render_declared_function_call(
             path,
             args,
@@ -1477,6 +1488,23 @@ fn render_value_plan(
     let output = match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
         AxValuePlan::Call { path, args } => {
+            if path == &["Password", "verify"] {
+                if !matches!(
+                    handler.kind,
+                    AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+                ) {
+                    return Err(AxBackendCodegenError::PasswordVerifyOutsideRequestHandler {
+                        handler: handler.name.clone(),
+                    });
+                }
+                let [password, hash] = args.as_slice() else {
+                    return Err(AxBackendCodegenError::InvalidPasswordVerifyArguments);
+                };
+                return Ok(format!(
+                    "{{ let __ax_password = json!({}); let __ax_hash = json!({}); json!(axonyx_runtime::password::AxPassword::verify(__ax_password.as_str().ok_or_else(|| AxRuntimeError::message(\"Password.verify requires String arguments\"))?, __ax_hash.as_str().ok_or_else(|| AxRuntimeError::message(\"Password.verify requires String arguments\"))?).map_err(|_| AxRuntimeError::message(\"password verification failed\"))?) }}",
+                    render_borrowed_expr(password), render_borrowed_expr(hash)
+                ));
+            }
             let query = path.first().filter(|_| path.len() == 1).and_then(|name| {
                 context.handlers.iter().find(|candidate| {
                     candidate.name == *name
@@ -2935,6 +2963,59 @@ route POST "/api/posts"
         assert!(module.contains("parse::<i64>()"));
         assert!(module.contains("let input = RoutePostApiPostsInput"));
         assert!(module.contains("AxHttpResponse::json(200, &json!(&input.title))"));
+    }
+
+    #[test]
+    fn compiles_password_verification_in_request_data_bindings() {
+        let module = compile_backend_ax_to_module(
+            r#"
+route POST "/login"
+  data verified = Password.verify(request.form.password, request.form.hash)
+  require verified
+  return json(verified)
+"#,
+        )
+        .unwrap();
+        assert!(module.contains("axonyx_runtime::password::AxPassword::verify("));
+        assert!(module.contains("password verification failed"));
+        assert!(!module.contains("json!(&Password::verify("));
+        assert!(compile_backend_ax_to_module(
+            r#"
+action Login {
+  data verified = Password.verify("password", "hash")
+  require verified
+  return ok
+}
+"#
+        )
+        .unwrap()
+        .contains("axonyx_runtime::password::AxPassword::verify("));
+
+        assert!(matches!(
+            compile_backend_ax_to_module(
+                r#"
+route POST "/login"
+  data verified = Password.verify("only one")
+  return json(verified)
+"#
+            ),
+            Err(AxBackendCompileError::Codegen(
+                AxBackendCodegenError::InvalidPasswordVerifyArguments
+            ))
+        ));
+
+        assert!(matches!(
+            compile_backend_ax_to_module(
+                r#"
+loader Login
+  data verified = Password.verify("password", "hash")
+  return verified
+"#
+            ),
+            Err(AxBackendCompileError::Codegen(
+                AxBackendCodegenError::PasswordVerifyOutsideRequestHandler { .. }
+            ))
+        ));
     }
 
     #[test]
