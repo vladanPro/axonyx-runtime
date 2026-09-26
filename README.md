@@ -62,8 +62,11 @@ Browser mutation guard: `mutation_security::rejects_mutation_request(&request)`
 rejects unsafe cross-site/same-site requests and cookie mutations without origin
 proof. Cookie-less metadata-free API clients are permitted; this is not auth.
 Origin/Referer authority must match Host. Forwarded host is ignored; proxies must
-preserve public Host and explicit port. Full-origin scheme policy and session-bound
-CSRF tokens remain follow-up work.
+preserve public Host and explicit port when no canonical origin is configured.
+`rejects_mutation_request_with_origin(request, Some("https://axonyx.dev"))`
+instead checks source scheme, host and normalized effective port independently
+of Host/forwarded headers. Browser mutations then require Origin/Referer, not
+Fetch Metadata alone. Session-bound CSRF tokens remain follow-up work.
 
 `axonyx_runtime::password::AxPassword` provides server-only `hash(&str)` and
 `verify(&str, &str)` operations using Argon2id and independently generated salts.
