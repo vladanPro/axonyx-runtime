@@ -21,7 +21,7 @@ fn session_mac(session_id: &str, secret: &str) -> AxRuntimeResult<HmacSha256> {
     Ok(mac)
 }
 
-pub(super) fn issue(session_id: &str, secret: &str) -> AxRuntimeResult<String> {
+pub(crate) fn issue(session_id: &str, secret: &str) -> AxRuntimeResult<String> {
     use std::fmt::Write;
     let bytes = session_mac(session_id, secret)?.finalize().into_bytes();
     let mut token = String::with_capacity(PREFIX.len() + 64);
@@ -32,7 +32,7 @@ pub(super) fn issue(session_id: &str, secret: &str) -> AxRuntimeResult<String> {
     Ok(token)
 }
 
-pub(super) fn verify(session_id: &str, token: &str, secret: &str) -> AxRuntimeResult<bool> {
+pub(crate) fn verify(session_id: &str, token: &str, secret: &str) -> AxRuntimeResult<bool> {
     let mac = session_mac(session_id, secret)?;
     let Some(hex) = token.strip_prefix(PREFIX).filter(|value| value.len() == 64) else {
         return Ok(false);

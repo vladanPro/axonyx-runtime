@@ -66,10 +66,15 @@ Tokens contain no session ID or user claims and stay stable while the same sessi
 is refreshed. Logout, expiration, another session or signing-key rotation rejects
 the old proof. These tokens are reusable within a live session, not one-time tokens.
 
-This foundation does not yet issue tokens over HTTP or automatically enforce them
-on actions/API routes. Delivery must be same-origin/no-store and proof sent as a
-form field or request header, never a URL; origin checks and authorization remain
-required. Anonymous/login-CSRF and browser integration are follow-up work.
+`csrf_http::token_response` issues a no-store/Vary-Cookie JSON response; anonymous
+requests receive a null token. `reject_mutation` verifies header or form/JSON
+proof against the active managed session. Framework transport integrates these
+helpers with `/__axonyx/csrf`, action/API dispatch and the same-origin action bridge.
+Custom Rust servers must invoke the origin and proof guards explicitly.
+Native forms still need an explicit hidden proof; anonymous/login-CSRF and legacy
+signed-cookie authentication remain follow-up work. Tokens must never go in URLs,
+logs or shared caches. Proof-carrying bridge requests refuse redirects; authenticated
+uploads use fetch instead of redirect-following XHR (limited progress reporting).
 
 ### Browser Mutation Guard (Unreleased)
 
