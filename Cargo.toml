@@ -24,6 +24,8 @@ hmac = "0.12.1"
 argon2 = { version = "=0.5.3", features = ["std"] }
 sha2 = "0.10.9"
 axum = "0.8.9"
+# hyper-util 0.1.21 requires Cargo edition2024 support; preserve Rust 1.82.
+hyper-util = "=0.1.20"
 bytes = "1.11.1"
 futures-util = "0.3.32"
 multer = "3.1.0"
