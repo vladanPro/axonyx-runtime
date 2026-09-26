@@ -67,12 +67,18 @@ is refreshed. Logout, expiration, another session or signing-key rotation reject
 the old proof. These tokens are reusable within a live session, not one-time tokens.
 
 `csrf_http::token_response` issues a no-store/Vary-Cookie JSON response; anonymous
-requests receive a null token. `reject_mutation` verifies header or form/JSON
+requests receive a signed anonymous proof and a 30-minute HttpOnly cookie.
+`reject_mutation` verifies header or form/JSON
 proof against the active managed session. Framework transport integrates these
 helpers with `/__axonyx/csrf`, action/API dispatch and the same-origin action bridge.
 Custom Rust servers must invoke the origin and proof guards explicitly.
-Native forms still need an explicit hidden proof; anonymous/login-CSRF and legacy
-signed-cookie authentication remain follow-up work. Tokens must never go in URLs,
+`protect_form_response` fills renderer-owned local action-form placeholders at
+HTTP delivery and marks personalized HTML no-store. This supports native no-JS
+forms and pre-login CSRF protection. Production anonymous cookies are Secure,
+host-only `__Host-axonyx-csrf`; loopback development uses `axonyx_csrf`.
+Metadata-free cookie-free API clients remain exempt, not authenticated.
+Legacy signed-cookie authentication and raw HTML forms need explicit integration.
+Form-containing streams are buffered for injection. Tokens must never go in URLs,
 logs or shared caches. Proof-carrying bridge requests refuse redirects; authenticated
 uploads use fetch instead of redirect-following XHR (limited progress reporting).
 
@@ -86,7 +92,7 @@ preserve public Host and explicit port when no canonical origin is configured.
 `rejects_mutation_request_with_origin(request, Some("https://axonyx.dev"))`
 instead checks source scheme, host and normalized effective port independently
 of Host/forwarded headers. Browser mutations then require Origin/Referer, not
-Fetch Metadata alone. Automatic HTTP CSRF token integration remains follow-up work.
+Fetch Metadata alone. Framework transport also enforces the CSRF proof guard.
 
 ### Password Primitives (Unreleased)
 

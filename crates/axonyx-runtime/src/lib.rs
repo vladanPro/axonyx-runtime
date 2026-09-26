@@ -6941,6 +6941,16 @@ fn render_node(node: &AxNode, out: &mut String) {
                 push_attr(attr, out);
             }
             out.push('>');
+            if *tag == "form"
+                && attrs
+                    .iter()
+                    .any(|attr| attr.name == "method" && attr.value.eq_ignore_ascii_case("post"))
+                && attrs.iter().any(|attr| {
+                    attr.name == "action" && attr.value.starts_with("/__axonyx/action?")
+                })
+            {
+                out.push_str(crate::csrf_http::FORM_MARKER);
+            }
             for child in children {
                 render_node(child, out);
             }
@@ -7345,6 +7355,24 @@ page Home
         assert!(html.contains("Edit app/page.ax"));
         assert!(html.contains("class=\"ax-container\""));
         assert!(html.contains("class=\"ax-card__title\""));
+    }
+
+    #[test]
+    fn csrf_placeholders_only_target_local_post_action_forms() {
+        for (method, action, expected) in [
+            ("post", "/__axonyx/action?path=%2F&name=Save", true),
+            ("get", "/__axonyx/action?path=%2F&name=Save", false),
+            (
+                "post",
+                "https://other.test/__axonyx/action?name=Save",
+                false,
+            ),
+            ("post", "/external", false),
+        ] {
+            let source = format!("page Home() {{\n return ASX {{\n <form method=\"{method}\" action=\"{action}\"><button>Save</button></form>\n }}\n}}");
+            let html = preview_ax_page(&source).unwrap();
+            assert_eq!(html.contains(crate::csrf_http::FORM_MARKER), expected);
+        }
     }
 
     #[test]
