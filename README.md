@@ -44,7 +44,11 @@ before database lookup or password work. Every admitted attempt counts, even a
 successful login. It is not distributed across instances or persistent across
 restarts; window boundaries can allow two budgets close together.
 
-These Rust APIs are not wired into `.ax` login routes yet. Server policy must
+The limiter supports `.ax` route `before Login.throttle(key, attempts, seconds)`
+with literal attempts 1..1000 and seconds 1..86400. The hook must precede data
+or other operations. Generated routes and preview both enforce it; rejected
+requests return 429 with Retry-After and no-store. Each guard supports 4096 keys.
+The optional dummy-password API is still Rust-only. Server policy must
 choose the keys and trusted proxy configuration; never use a password, session,
 or unverified `X-Forwarded-For` value as the identity key. They are building
 blocks, not complete account lockout, CSRF, or production authentication.

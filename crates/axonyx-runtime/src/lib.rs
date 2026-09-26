@@ -495,7 +495,18 @@ pub fn preview_ax_route_stream_response_with_loaders(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AxPreviewStore {
     collections: BTreeMap<String, Vec<AxValue>>,
+    throttles: BTreeMap<String, AxPreviewThrottle>,
 }
+
+#[derive(Debug, Clone)]
+struct AxPreviewThrottle(std::sync::Arc<login_throttle::AxLoginThrottle>);
+
+impl PartialEq for AxPreviewThrottle {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+impl Eq for AxPreviewThrottle {}
 
 impl Default for AxPreviewStore {
     fn default() -> Self {
@@ -508,7 +519,10 @@ impl Default for AxPreviewStore {
             "users".to_string(),
             sample_preview_collection_items("users"),
         );
-        Self { collections }
+        Self {
+            collections,
+            throttles: BTreeMap::new(),
+        }
     }
 }
 
@@ -1619,6 +1633,11 @@ fn execute_preview_action(
             message: format!("handler `{action_name}` is not an action"),
         });
     };
+    axonyx_core::ax_backend_codegen::validate_login_throttle_hooks(action).map_err(|_| {
+        PreviewError::Runtime {
+            message: "invalid Login.throttle hook".to_string(),
+        }
+    })?;
 
     let mut scope = BTreeMap::new();
     scope.insert(
@@ -1902,6 +1921,11 @@ fn execute_preview_route(
     else {
         return Ok(None);
     };
+    axonyx_core::ax_backend_codegen::validate_login_throttle_hooks(route_match.handler).map_err(
+        |_| PreviewError::Runtime {
+            message: "invalid Login.throttle hook".to_string(),
+        },
+    )?;
 
     let mut scope = BTreeMap::new();
     scope.insert("params".to_string(), AxValue::Record(route_match.params));
@@ -2030,6 +2054,62 @@ fn execute_preview_route(
             }
             AxStepPlan::Hook { phase, value } => match phase {
                 AxHookPhasePlan::Before => {
+                    if let Some(throttle) =
+                        axonyx_core::ax_backend_codegen::parse_login_throttle_hook(&value.code)
+                            .map_err(|_| PreviewError::Runtime {
+                                message: "invalid Login.throttle hook".to_string(),
+                            })?
+                    {
+                        let key = eval_preview_expr(&throttle.key, &scope, env)?;
+                        let AxValue::String(key) = key else {
+                            return Err(PreviewError::Runtime {
+                                message: "login throttle key must be String".to_string(),
+                            });
+                        };
+                        let identity = format!("{}:{}", route_match.handler.name, value.code);
+                        let limiter = store.throttles.entry(identity).or_insert_with(|| {
+                            AxPreviewThrottle(std::sync::Arc::new(
+                                login_throttle::AxLoginThrottle::new(
+                                    throttle.attempts,
+                                    std::time::Duration::from_secs(throttle.seconds),
+                                    4096,
+                                )
+                                .expect("validated login throttle configuration"),
+                            ))
+                        });
+                        match limiter.0.try_acquire(&key) {
+                            Ok(()) => {}
+                            Err(login_throttle::AxLoginThrottleError::Limited { retry_after }) => {
+                                let seconds = (retry_after.as_secs()
+                                    + u64::from(retry_after.subsec_nanos() != 0))
+                                .max(1);
+                                let mut response = render_preview_json_response(&AxValue::Record(
+                                    BTreeMap::from([(
+                                        "error".to_string(),
+                                        AxValue::String("too many requests".to_string()),
+                                    )]),
+                                ))?;
+                                response.status = 429;
+                                response
+                                    .headers
+                                    .insert("Retry-After".to_string(), seconds.to_string());
+                                response
+                                    .headers
+                                    .insert("Cache-Control".to_string(), "no-store".to_string());
+                                return Ok(Some(apply_preview_response_metadata(
+                                    response,
+                                    headers,
+                                    set_cookies,
+                                )));
+                            }
+                            Err(_) => {
+                                return Err(PreviewError::Runtime {
+                                    message: "login throttle unavailable".to_string(),
+                                })
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(response) =
                         apply_preview_route_hook(value, &scope, env, &mut headers)?
                     {
@@ -2044,7 +2124,19 @@ fn execute_preview_route(
                         )));
                     }
                 }
-                AxHookPhasePlan::After => after_hooks.push(value),
+                AxHookPhasePlan::After => {
+                    if axonyx_core::ax_backend_codegen::parse_login_throttle_hook(&value.code)
+                        .map_err(|_| PreviewError::Runtime {
+                            message: "invalid Login.throttle hook".to_string(),
+                        })?
+                        .is_some()
+                    {
+                        return Err(PreviewError::Runtime {
+                            message: "Login.throttle requires a before hook".to_string(),
+                        });
+                    }
+                    after_hooks.push(value);
+                }
             },
             AxStepPlan::Header { name, value } => {
                 headers.insert(
@@ -9464,6 +9556,45 @@ route POST "/login"
         .unwrap_err();
         assert!(error.to_string().contains("password verification failed"));
         assert!(!error.to_string().contains("invalid-secret-hash"));
+    }
+
+    #[test]
+    fn preview_login_throttle_returns_429_and_preserves_independent_keys() {
+        let source = r#"
+route POST "/login" {
+  before Login.throttle(request.form.email, 1, 60)
+  return json("ok")
+}
+"#;
+        let mut store = AxPreviewStore::default();
+        let request = server::AxHttpRequest::new("POST", "/login").with_body(b"email=one".to_vec());
+        let first = execute_preview_route_request_sources(&[source], &request, &mut store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.status, 200);
+        let blocked = execute_preview_route_request_sources(&[source], &request, &mut store)
+            .unwrap()
+            .unwrap();
+        assert_eq!(blocked.status, 429);
+        let retry = blocked
+            .headers
+            .get("Retry-After")
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!((1..=60).contains(&retry));
+        assert_eq!(
+            blocked.headers.get("Cache-Control").map(String::as_str),
+            Some("no-store")
+        );
+        let other = server::AxHttpRequest::new("POST", "/login").with_body(b"email=two".to_vec());
+        assert_eq!(
+            execute_preview_route_request_sources(&[source], &other, &mut store)
+                .unwrap()
+                .unwrap()
+                .status,
+            200
+        );
     }
 
     #[test]
