@@ -8,6 +8,7 @@ use uuid::Uuid;
 use crate::backend::{AxRuntimeError, AxRuntimeResult};
 use crate::server::{AxAuth, AxCookie, AxHttpRequest};
 
+mod csrf;
 mod postgres;
 mod sqlite;
 
@@ -263,6 +264,35 @@ impl AxSessionManager {
         Ok(Some((session, cookie)))
     }
 
+    /// Issue a proof only for an authenticated, unexpired server-side session.
+    /// Deliver it through a no-store same-origin response or an escaped form field.
+    pub fn csrf_token(
+        &self,
+        request: &AxHttpRequest,
+        secret: &str,
+        now_unix: i64,
+    ) -> AxRuntimeResult<Option<String>> {
+        let Some(session) = self.load(request, secret, now_unix)? else {
+            return Ok(None);
+        };
+        csrf::issue(&session.id, secret).map(Some)
+    }
+
+    /// Validate proof against the active session, not a session ID from the client.
+    /// Call together with origin validation, before running a mutation.
+    pub fn verify_csrf(
+        &self,
+        request: &AxHttpRequest,
+        token: &str,
+        secret: &str,
+        now_unix: i64,
+    ) -> AxRuntimeResult<bool> {
+        let Some(session) = self.load(request, secret, now_unix)? else {
+            return Ok(false);
+        };
+        csrf::verify(&session.id, token, secret)
+    }
+
     pub fn destroy(&self, request: &AxHttpRequest, secret: &str) -> AxRuntimeResult<AxCookie> {
         validate_secret(secret)?;
         if let Some(session_id) = AxAuth::signed_cookie(request, &self.policy.name, secret) {
@@ -299,6 +329,126 @@ mod tests {
     fn request_with_cookie(cookie: &AxCookie) -> AxHttpRequest {
         AxHttpRequest::new("GET", "/account")
             .with_header("Cookie", format!("{}={}", cookie.name, cookie.value))
+    }
+
+    #[test]
+    fn csrf_proofs_follow_memory_session_lifecycle() {
+        assert_csrf_lifecycle(Arc::new(AxMemorySessionStore::default()));
+    }
+
+    #[test]
+    fn csrf_proofs_follow_sqlite_session_lifecycle() {
+        let path = std::env::temp_dir().join(format!("axonyx-csrf-{}.sqlite", Uuid::new_v4()));
+        assert_csrf_lifecycle(Arc::new(AxSqliteSessionStore::open(&path).unwrap()));
+        std::fs::remove_file(path).unwrap();
+    }
+
+    fn assert_csrf_lifecycle(store: Arc<dyn AxSessionStore>) {
+        let manager = AxSessionManager::new(
+            store,
+            AxSessionCookiePolicy {
+                ttl_seconds: 60,
+                ..AxSessionCookiePolicy::development()
+            },
+        )
+        .unwrap();
+        let secret = "0123456789abcdef0123456789abcdef";
+        let anonymous = AxHttpRequest::new("POST", "/save");
+        assert_eq!(manager.csrf_token(&anonymous, secret, 100).unwrap(), None);
+        assert!(!manager
+            .verify_csrf(&anonymous, "anything", secret, 100)
+            .unwrap());
+        let (session, cookie) = manager
+            .create("user-1", BTreeMap::new(), secret, 100)
+            .unwrap();
+        let request = request_with_cookie(&cookie);
+        let token = manager.csrf_token(&request, secret, 101).unwrap().unwrap();
+        assert_eq!(token.len(), 72);
+        assert!(!token.contains(&session.id));
+        assert!(!token.contains(secret));
+        assert!(manager.verify_csrf(&request, &token, secret, 101).unwrap());
+        assert_eq!(
+            manager.csrf_token(&request, secret, 102).unwrap().unwrap(),
+            token
+        );
+        for bad in [
+            String::new(),
+            "x".repeat(100_000),
+            "axcsrf2.invalid".into(),
+            format!("axcsrf1.{}", "0".repeat(64)),
+            format!("{token}x"),
+            format!("axcsrf1.{}", "é".repeat(32)),
+        ] {
+            assert!(!manager.verify_csrf(&request, &bad, secret, 101).unwrap());
+        }
+        let (_, other_cookie) = manager
+            .create("user-1", BTreeMap::new(), secret, 102)
+            .unwrap();
+        let other_request = request_with_cookie(&other_cookie);
+        assert!(!manager
+            .verify_csrf(&other_request, &token, secret, 102)
+            .unwrap());
+        assert!(!manager
+            .verify_csrf(&request, &token, "abcdef0123456789abcdef0123456789", 102)
+            .unwrap());
+        let rotated_secret = "abcdef0123456789abcdef0123456789ab";
+        let rotated_cookie = manager
+            .policy()
+            .issue_cookie(&session.id, rotated_secret)
+            .unwrap();
+        let rotated_request = request_with_cookie(&rotated_cookie);
+        assert!(manager
+            .load(&rotated_request, rotated_secret, 102)
+            .unwrap()
+            .is_some());
+        assert!(!manager
+            .verify_csrf(&rotated_request, &token, rotated_secret, 102)
+            .unwrap());
+        manager.refresh(&request, secret, 110).unwrap().unwrap();
+        assert!(manager.verify_csrf(&request, &token, secret, 165).unwrap());
+        manager.destroy(&request, secret).unwrap();
+        assert!(!manager.verify_csrf(&request, &token, secret, 166).unwrap());
+        assert!(manager.csrf_token(&request, secret, 166).unwrap().is_none());
+        let other_token = manager
+            .csrf_token(&other_request, secret, 103)
+            .unwrap()
+            .unwrap();
+        assert!(!manager
+            .verify_csrf(&other_request, &other_token, secret, 162)
+            .unwrap());
+        assert!(manager
+            .csrf_token(&other_request, secret, 162)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn csrf_rejects_weak_keys_and_modified_signatures() {
+        let manager = AxSessionManager::new(
+            Arc::new(AxMemorySessionStore::default()),
+            AxSessionCookiePolicy::development(),
+        )
+        .unwrap();
+        let (_, cookie) = manager
+            .create("user", BTreeMap::new(), "short-key", 100)
+            .unwrap();
+        assert!(manager
+            .csrf_token(&request_with_cookie(&cookie), "short-key", 101)
+            .is_err());
+        assert!(manager
+            .verify_csrf(&request_with_cookie(&cookie), "anything", "short-key", 101)
+            .is_err());
+        let secret = "0123456789abcdef0123456789abcdef";
+        let (_, cookie) = manager
+            .create("user", BTreeMap::new(), secret, 100)
+            .unwrap();
+        let request = request_with_cookie(&cookie);
+        let token = manager.csrf_token(&request, secret, 101).unwrap().unwrap();
+        let mut bytes = token.into_bytes();
+        bytes[8] = if bytes[8] == b'0' { b'1' } else { b'0' };
+        assert!(!manager
+            .verify_csrf(&request, &String::from_utf8(bytes).unwrap(), secret, 101)
+            .unwrap());
     }
 
     #[test]
