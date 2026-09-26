@@ -18,7 +18,7 @@ For generated Axonyx apps, prefer the crates.io package:
 
 ```toml
 [dependencies]
-axonyx-runtime = "0.4.1"
+axonyx-runtime = "0.5.1"
 ```
 
 Use the Git dependency only when testing unreleased runtime work:
@@ -30,7 +30,7 @@ axonyx-runtime = { git = "https://github.com/vladanPro/axonyx-runtime" }
 
 ## Local Development
 
-### Login Protection Primitives (Unreleased)
+### Login Protection Primitives (Since 0.5.0)
 
 `password::AxPassword::verify_optional(password, stored_hash)` performs a dummy
 Argon2 verification when the account is absent and always returns false for
@@ -82,7 +82,7 @@ Form-containing streams are buffered for injection. Tokens must never go in URLs
 logs or shared caches. Proof-carrying bridge requests refuse redirects; authenticated
 uploads use fetch instead of redirect-following XHR (limited progress reporting).
 
-### Browser Mutation Guard (Unreleased)
+### Browser Mutation Guard (Since 0.5.0)
 
 Browser mutation guard: `mutation_security::rejects_mutation_request(&request)`
 rejects unsafe cross-site/same-site requests and cookie mutations without origin
@@ -94,7 +94,7 @@ instead checks source scheme, host and normalized effective port independently
 of Host/forwarded headers. Browser mutations then require Origin/Referer, not
 Fetch Metadata alone. Framework transport also enforces the CSRF proof guard.
 
-### Password Primitives (Unreleased)
+### Password Primitives (Since 0.5.0)
 
 `axonyx_runtime::password::AxPassword` provides server-only `hash(&str)` and
 `verify(&str, &str)` operations using Argon2id and independently generated salts.
