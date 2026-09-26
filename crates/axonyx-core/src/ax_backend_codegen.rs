@@ -1917,14 +1917,39 @@ fn render_codegen_expr(code: &str) -> String {
     let Some((items, value)) = split_codegen_binary_args(inner) else {
         return code.to_string();
     };
+    let items = render_codegen_expr(items);
+    // Literal lists must not require a Rust element type for an empty vec![].
+    let options = match items
+        .strip_prefix("vec![")
+        .and_then(|items| items.strip_suffix(']'))
+    {
+        Some(items) => format!("serde_json::json!([{items}])"),
+        None => format!("serde_json::json!({items})"),
+    };
     format!(
-        "({}).contains(&{})",
-        render_codegen_expr(items),
+        "({options}).as_array().is_some_and(|__ax_items| __ax_items.contains(&serde_json::json!({})))",
         render_codegen_expr(value)
     )
 }
 
 fn split_codegen_binary_args(input: &str) -> Option<(&str, &str)> {
+    let args = split_codegen_args(input);
+    if args.len() < 2 {
+        return None;
+    }
+    let left = args[0];
+    let right = input
+        .trim_start()
+        .strip_prefix(left)?
+        .trim_start()
+        .strip_prefix(',')?
+        .trim();
+    (!left.is_empty() && !right.is_empty()).then_some((left, right))
+}
+
+fn split_codegen_args(input: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut start = 0;
     let mut depth = 0usize;
     let mut quote = None;
     let mut escaped = false;
@@ -1944,14 +1969,14 @@ fn split_codegen_binary_args(input: &str) -> Option<(&str, &str)> {
             '(' | '[' | '{' => depth += 1,
             ')' | ']' | '}' => depth = depth.saturating_sub(1),
             ',' if depth == 0 => {
-                let left = input[..index].trim();
-                let right = input[index + ch.len_utf8()..].trim();
-                return (!left.is_empty() && !right.is_empty()).then_some((left, right));
+                args.push(input[start..index].trim());
+                start = index + ch.len_utf8();
             }
             _ => {}
         }
     }
-    None
+    args.push(input[start..].trim());
+    args
 }
 
 fn render_string_expr(expr: &AxRustExpr) -> String {
@@ -2078,10 +2103,14 @@ fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
 fn render_error_call_message(expr: &AxRustExpr) -> Option<String> {
     let code = expr.code.trim();
     let inner = code.strip_prefix("error(")?.strip_suffix(')')?.trim();
-    if inner.is_empty() || inner.contains(',') {
+    let args = split_codegen_args(inner);
+    let [message] = args.as_slice() else {
+        return None;
+    };
+    if message.is_empty() {
         return None;
     }
-    Some(render_borrowed_expr(&AxRustExpr::new(inner)))
+    Some(render_borrowed_expr(&AxRustExpr::new(*message)))
 }
 
 fn render_context_lookup(code: &str) -> Option<String> {
@@ -2204,6 +2233,75 @@ mod tests {
     use crate::ax_ast::prelude::AxExpr;
     use crate::ax_backend_ast::prelude::*;
     use crate::ax_backend_lowering::lower_backend_document;
+
+    #[test]
+    fn compiles_canonical_scalar_action_and_route_inputs() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action Probe(id: Int, ratio: Float, amount: Number, enabled: Bool) {
+  return ok()
+}
+route POST "/api/probe" {
+  input:
+    id: Int
+    enabled: Bool
+  return json(input.id)
+}
+"#,
+        )
+        .expect("canonical input aliases should compile");
+        for field in [
+            "pub id: i64",
+            "pub ratio: f64",
+            "pub amount: f64",
+            "pub enabled: bool",
+        ] {
+            assert!(module.contains(field), "missing mapped input: {field}");
+        }
+        assert!(!module.contains("pub id: Int"));
+    }
+
+    #[test]
+    fn error_fallback_arguments_respect_strings_and_nested_calls() {
+        for code in [
+            r#"error("silver, bronze, gold".to_string())"#,
+            r#"error("say \"silver, gold\"".to_string())"#,
+            r#"error(message("silver".to_string(), "gold".to_string()))"#,
+        ] {
+            assert!(
+                render_error_call_message(&AxRustExpr::new(code)).is_some(),
+                "{code}"
+            );
+        }
+        for code in ["error()", r#"error("first", "second")"#] {
+            assert!(render_error_call_message(&AxRustExpr::new(code)).is_none());
+        }
+    }
+
+    #[test]
+    fn compiles_global_membership_and_comma_message_fallbacks() {
+        let module = compile_backend_ax_to_module(
+            r#"
+backend
+  data themes = ["silver", "bronze", "gold"]
+action SetTheme(theme: String) {
+  data allowed = input.theme in themes
+  require allowed else error "Choose silver, bronze, or gold."
+  return ok()
+}
+route POST "/api/theme" {
+  input:
+    theme: String
+  require input.theme in themes else error("Choose silver, bronze, or gold.")
+  return json(input.theme)
+}
+"#,
+        )
+        .expect("global membership and comma messages should compile");
+        assert!(module.contains("serde_json::json!(themes)).as_array().is_some_and"));
+        assert!(!module.contains("json!(&error("));
+        assert!(module.contains("Choose silver, bronze, or gold."));
+    }
 
     #[test]
     fn generates_rust_records_for_canonical_backend_types() {
@@ -2503,7 +2601,8 @@ action SaveTheme(theme: string) {
 
         assert!(module.contains("let mut __ax_invalidations: Vec<Value> = Vec::new();"));
         assert!(module.contains("let mut __ax_redirect: Option<String> = None;"));
-        assert!(module.contains("__ax_truthy(&json!(&(vec![\"silver\".to_string(), \"bronze\".to_string(), \"gold\".to_string()]).contains(&input.theme)))"));
+        assert!(module.contains("__ax_items.contains(&serde_json::json!(input.theme))"));
+        assert!(module.contains("serde_json::json!([\"silver\".to_string(), \"bronze\".to_string(), \"gold\".to_string()])"));
         assert!(module.contains("__ax_action_error_payload"));
         assert!(module.contains(
             "__ax_push_invalidation(&mut __ax_invalidations, \"settings\".to_string(), false)"
