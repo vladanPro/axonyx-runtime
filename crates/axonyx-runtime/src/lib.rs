@@ -1,4 +1,5 @@
 pub mod backend;
+pub mod password;
 pub mod server;
 pub mod session;
 #[cfg(feature = "storage")]

@@ -30,6 +30,18 @@ axonyx-runtime = { git = "https://github.com/vladanPro/axonyx-runtime" }
 
 ## Local Development
 
+### Password Primitives (Unreleased)
+
+`axonyx_runtime::password::AxPassword` provides server-only `hash(&str)` and
+`verify(&str, &str)` operations using Argon2id and independently generated salts.
+Verification returns `false` for a wrong password and an error for corrupt or
+unsupported stored hashes. Password bytes are not trimmed or normalized.
+
+This initial profile accepts only hashes produced with its fixed cost parameters.
+Async callers must use a bounded blocking executor. This is not yet exposed as
+`Password.verify` in `.ax`, and does not provide login, rate limiting, account
+enumeration protection, password reset, or CSRF protection by itself.
+
 ```bash
 cargo test
 ```
