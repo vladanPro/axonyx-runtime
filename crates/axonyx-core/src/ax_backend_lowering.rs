@@ -819,6 +819,24 @@ fn lower_backend_value(
                 input: property.clone(),
             })
         }
+        AxBackendValue::Expr(AxExpr::Call { path, args })
+            if path == &["Password", "verifyOptional"] =>
+        {
+            Ok(AxValuePlan::Call {
+                path: path.clone(),
+                args: args
+                    .iter()
+                    .map(|arg| match arg {
+                        AxExpr::OptionalMember { object, property }
+                            if matches!(object.as_ref(), AxExpr::Identifier(_)) =>
+                        {
+                            AxRustExpr::new(format!("{}?.{property}", render_expr(object)))
+                        }
+                        _ => lower_expr(arg),
+                    })
+                    .collect(),
+            })
+        }
         AxBackendValue::Expr(AxExpr::Call { path, args }) => Ok(AxValuePlan::Call {
             path: path.clone(),
             args: args.iter().map(lower_expr).collect(),
