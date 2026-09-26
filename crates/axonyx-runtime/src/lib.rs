@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod login_throttle;
+pub mod mutation_security;
 pub mod password;
 pub mod server;
 pub mod session;
