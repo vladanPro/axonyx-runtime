@@ -2476,6 +2476,33 @@ fn eval_preview_value_with_functions(
 ) -> Result<AxValue, PreviewError> {
     match value {
         AxValuePlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
+        AxValuePlan::Call { path, args } if path == &["Password", "verifyOptional"] => {
+            let invalid = || {
+                PreviewError::Runtime { message: "Password.verifyOptional requires (String password, optionalRecord?.stringField)".to_string() }
+            };
+            let [password, hash] = args.as_slice() else {
+                return Err(invalid());
+            };
+            let AxValue::String(password) =
+                eval_preview_expr_with_functions(password, scope, env, functions)?
+            else {
+                return Err(invalid());
+            };
+            let (binding, field) = hash.code.split_once("?.").ok_or_else(invalid)?;
+            let hash = match scope.get(binding) {
+                Some(AxValue::Null) => None,
+                Some(AxValue::Record(record)) => match record.get(field) {
+                    Some(AxValue::String(hash)) => Some(hash.as_str()),
+                    _ => return Err(invalid()),
+                },
+                _ => return Err(invalid()),
+            };
+            password::AxPassword::verify_optional(&password, hash)
+                .map(AxValue::Bool)
+                .map_err(|_| PreviewError::Runtime {
+                    message: "password verification failed".to_string(),
+                })
+        }
         AxValuePlan::Call { path, args } if path == &["Password", "verify"] => {
             let [password, hash] = args.as_slice() else {
                 return Err(PreviewError::Runtime {
@@ -9521,6 +9548,52 @@ route GET "/api/admin"
             response.headers.get("Location").map(String::as_str),
             Some("/login")
         );
+    }
+
+    #[test]
+    fn preview_optional_password_verification_handles_missing_and_corrupt_credentials() {
+        let hash = password::AxPassword::hash("correct").unwrap();
+        let value = AxValuePlan::Call {
+            path: vec!["Password".into(), "verifyOptional".into()],
+            args: vec![
+                AxRustExpr::new("\"correct\""),
+                AxRustExpr::new("credential?.password_hash"),
+            ],
+        };
+        for (credential, expected) in [
+            (AxValue::Null, Some(false)),
+            (
+                AxValue::Record(BTreeMap::from([(
+                    "password_hash".into(),
+                    AxValue::String(hash),
+                )])),
+                Some(true),
+            ),
+            (
+                AxValue::Record(BTreeMap::from([(
+                    "password_hash".into(),
+                    AxValue::String("secret-invalid-hash".into()),
+                )])),
+                None,
+            ),
+        ] {
+            let result = eval_preview_value_with_functions(
+                &value,
+                &BTreeMap::from([("credential".into(), credential)]),
+                &backend::AxEnv::default(),
+                None,
+                &AxPreviewStore::default(),
+                &BTreeMap::new(),
+            );
+            match expected {
+                Some(expected) => assert_eq!(result.unwrap(), AxValue::Bool(expected)),
+                None => {
+                    let error = result.unwrap_err().to_string();
+                    assert!(error.contains("password verification failed"));
+                    assert!(!error.contains("secret-invalid-hash"));
+                }
+            }
+        }
     }
 
     #[test]

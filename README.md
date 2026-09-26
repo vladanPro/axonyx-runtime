@@ -48,7 +48,10 @@ The limiter supports `.ax` route `before Login.throttle(key, attempts, seconds)`
 with literal attempts 1..1000 and seconds 1..86400. The hook must precede data
 or other operations. Generated routes and preview both enforce it; rejected
 requests return 429 with Retry-After and no-store. Each guard supports 4096 keys.
-The optional dummy-password API is still Rust-only. Server policy must
+`Password.verifyOptional(password, credential?.password_hash)` supports a typed
+optional record with a String hash field in request data bindings. Call it before
+`require credential`: a missing record performs dummy verification and returns false.
+Malformed stored hashes remain operational errors. Server policy must
 choose the keys and trusted proxy configuration; never use a password, session,
 or unverified `X-Forwarded-For` value as the identity key. They are building
 blocks, not complete account lockout, CSRF, or production authentication.

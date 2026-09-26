@@ -10,6 +10,8 @@ pub enum AxBackendCodegenError {
     InvalidLoginThrottleHook,
     #[error("Password.verify requires exactly two String arguments")]
     InvalidPasswordVerifyArguments,
+    #[error("Password.verifyOptional requires (String password, optionalRecord?.stringField) before narrowing the record")]
+    InvalidOptionalPasswordVerifyArguments,
     #[error(
         "Password.verify is only supported in action/route data bindings; found in `{handler}`"
     )]
@@ -86,6 +88,7 @@ pub enum AxBackendBundleError {
 }
 
 struct AxBackendRenderContext<'a> {
+    records: &'a [AxRecordPlan],
     handlers: &'a [AxHandlerPlan],
     functions: &'a [AxFunctionPlan],
     record_names: &'a std::collections::BTreeSet<String>,
@@ -99,6 +102,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
         .map(|record| record.name.clone())
         .collect::<std::collections::BTreeSet<_>>();
     let context = AxBackendRenderContext {
+        records: &plan.types,
         handlers: &plan.handlers,
         functions: &plan.functions,
         record_names: &record_names,
@@ -260,7 +264,9 @@ fn render_function_value_plan(
 ) -> Result<String, AxBackendCodegenError> {
     match value {
         AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
-        AxValuePlan::Call { path, .. } if path == &["Password", "verify"] => {
+        AxValuePlan::Call { path, .. }
+            if path == &["Password", "verify"] || path == &["Password", "verifyOptional"] =>
+        {
             Err(AxBackendCodegenError::PasswordVerifyOutsideRequestHandler {
                 handler: function.to_string(),
             })
@@ -1211,6 +1217,7 @@ fn render_step(
                 value,
                 handler,
                 context,
+                typed_bindings,
             )?;
             if let Some(ty) = query_call_return_type(value, context.handlers)? {
                 let rust_ty = rust_function_return_type(&ty, binding)?;
@@ -1563,10 +1570,42 @@ fn render_value_plan(
     value: &AxValuePlan,
     handler: &AxHandlerPlan,
     context: &AxBackendRenderContext<'_>,
+    typed_bindings: &std::collections::BTreeMap<String, AxType>,
 ) -> Result<String, AxBackendCodegenError> {
     let output = match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
         AxValuePlan::Call { path, args } => {
+            if path == &["Password", "verifyOptional"] {
+                if !matches!(
+                    handler.kind,
+                    AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+                ) {
+                    return Err(AxBackendCodegenError::PasswordVerifyOutsideRequestHandler {
+                        handler: handler.name.clone(),
+                    });
+                }
+                let invalid = || AxBackendCodegenError::InvalidOptionalPasswordVerifyArguments;
+                let [password, hash] = args.as_slice() else {
+                    return Err(invalid());
+                };
+                let (binding, field) = hash.code.split_once("?.").ok_or_else(invalid)?;
+                let Some(AxType::Optional(inner)) = typed_bindings.get(binding) else {
+                    return Err(invalid());
+                };
+                let AxType::Record(record) = inner.as_ref() else {
+                    return Err(invalid());
+                };
+                if !context.records.iter().any(|item| {
+                    item.name == *record
+                        && item
+                            .fields
+                            .iter()
+                            .any(|item| item.name == field && item.ty == AxType::String)
+                }) {
+                    return Err(invalid());
+                }
+                return Ok(format!("{{ let __ax_password = json!({}); json!(axonyx_runtime::password::AxPassword::verify_optional(__ax_password.as_str().ok_or_else(|| AxRuntimeError::message(\"Password.verifyOptional requires String password\"))?, {binding}.as_ref().map(|record| record.{field}.as_str())).map_err(|_| AxRuntimeError::message(\"password verification failed\"))?) }}", render_borrowed_expr(password)));
+            }
             if path == &["Password", "verify"] {
                 if !matches!(
                     handler.kind,
@@ -3042,6 +3081,41 @@ route POST "/api/posts"
         assert!(module.contains("parse::<i64>()"));
         assert!(module.contains("let input = RoutePostApiPostsInput"));
         assert!(module.contains("AxHttpResponse::json(200, &json!(&input.title))"));
+    }
+
+    #[test]
+    fn compiles_optional_password_verification_with_typed_credential() {
+        let source = r#"
+type Credential {
+  password_hash: String
+}
+query credential() -> Credential? {
+  return db.credentials.first()
+}
+route POST "/login" {
+  data account = credential()
+  data verified = Password.verifyOptional("password", account?.password_hash)
+  require verified
+  require account
+  return json(verified)
+}
+"#;
+        let module = compile_backend_ax_to_module(source).unwrap();
+        assert!(module.contains("AxPassword::verify_optional("));
+        assert!(module.contains("account.as_ref().map(|record| record.password_hash.as_str())"));
+        for invalid in [
+            source.replace("account?.password_hash", "account.password_hash"),
+            source.replace("account?.password_hash", "account?.missing"),
+            source.replace("password_hash: String", "password_hash: Bool"),
+            source.replace("data verified =", "require account\n  data verified ="),
+        ] {
+            assert!(matches!(
+                compile_backend_ax_to_module(&invalid),
+                Err(AxBackendCompileError::Codegen(
+                    AxBackendCodegenError::InvalidOptionalPasswordVerifyArguments
+                ))
+            ));
+        }
     }
 
     #[test]
