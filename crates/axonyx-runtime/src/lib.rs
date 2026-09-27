@@ -2534,6 +2534,25 @@ fn eval_preview_value_with_functions(
                     message: "password verification failed".to_string(),
                 })
         }
+        AxValuePlan::Call { path, args } if path == &["Password", "hash"] => {
+            let [password] = args.as_slice() else {
+                return Err(PreviewError::Runtime {
+                    message: "Password.hash requires exactly one String argument".to_string(),
+                });
+            };
+            let AxValue::String(password) =
+                eval_preview_expr_with_functions(password, scope, env, functions)?
+            else {
+                return Err(PreviewError::Runtime {
+                    message: "Password.hash requires String argument".to_string(),
+                });
+            };
+            password::AxPassword::hash(&password)
+                .map(AxValue::String)
+                .map_err(|_| PreviewError::Runtime {
+                    message: "password hashing failed".to_string(),
+                })
+        }
         AxValuePlan::Call { path, args } if path == &["Password", "verify"] => {
             let [password, hash] = args.as_slice() else {
                 return Err(PreviewError::Runtime {
@@ -9696,6 +9715,46 @@ route POST "/login"
         .unwrap_err();
         assert!(error.to_string().contains("password verification failed"));
         assert!(!error.to_string().contains("invalid-secret-hash"));
+    }
+
+    #[test]
+    fn preview_password_hash_round_trip_and_secret_free_errors() {
+        let source = r#"
+route POST "/register"
+  data hash = Password.hash(request.form.password)
+  data verified = Password.verify(request.form.password, hash)
+  require verified
+  return json("ok")
+"#;
+        let request = server::AxHttpRequest::new("POST", "/register")
+            .with_body(b"password=correct-secret".to_vec());
+        let response = execute_preview_route_request_sources(
+            &[source],
+            &request,
+            &mut AxPreviewStore::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status, 200);
+        let error = execute_preview_route_request_sources(
+            &[&source.replace("request.form.password)", "42)")],
+            &request,
+            &mut AxPreviewStore::default(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Password.hash requires String argument"));
+        assert!(!error.to_string().contains("correct-secret"));
+        let empty =
+            server::AxHttpRequest::new("POST", "/register").with_body(b"password=".to_vec());
+        let error = execute_preview_route_request_sources(
+            &[source],
+            &empty,
+            &mut AxPreviewStore::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("password hashing failed"));
     }
 
     #[test]

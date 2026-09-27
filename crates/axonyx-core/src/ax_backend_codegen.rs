@@ -6,6 +6,10 @@ use crate::ax_types::prelude::AxType;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxBackendCodegenError {
+    #[error("Password.hash requires exactly one String argument")]
+    InvalidPasswordHashArguments,
+    #[error("Password.hash is only supported in action/route data bindings; found in `{handler}`")]
+    PasswordHashOutsideRequestHandler { handler: String },
     #[error("Login.throttle must be a route before hook with (String key, literal attempts 1..1000, literal seconds 1..86400)")]
     InvalidLoginThrottleHook,
     #[error("Password.verify requires exactly two String arguments")]
@@ -264,6 +268,11 @@ fn render_function_value_plan(
 ) -> Result<String, AxBackendCodegenError> {
     match value {
         AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
+        AxValuePlan::Call { path, .. } if path == &["Password", "hash"] => {
+            Err(AxBackendCodegenError::PasswordHashOutsideRequestHandler {
+                handler: function.to_string(),
+            })
+        }
         AxValuePlan::Call { path, .. }
             if path == &["Password", "verify"] || path == &["Password", "verifyOptional"] =>
         {
@@ -1576,6 +1585,23 @@ fn render_value_plan(
     let output = match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
         AxValuePlan::Call { path, args } => {
+            if path == &["Password", "hash"] {
+                if !matches!(
+                    handler.kind,
+                    AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+                ) {
+                    return Err(AxBackendCodegenError::PasswordHashOutsideRequestHandler {
+                        handler: handler.name.clone(),
+                    });
+                }
+                let [password] = args.as_slice() else {
+                    return Err(AxBackendCodegenError::InvalidPasswordHashArguments);
+                };
+                return Ok(format!(
+                    "{{ let __ax_password = json!({}); json!(axonyx_runtime::password::AxPassword::hash(__ax_password.as_str().ok_or_else(|| AxRuntimeError::message(\"Password.hash requires String argument\"))?).map_err(|_| AxRuntimeError::message(\"password hashing failed\"))?) }}",
+                    render_borrowed_expr(password)
+                ));
+            }
             if path == &["Password", "verifyOptional"] {
                 if !matches!(
                     handler.kind,
@@ -3269,6 +3295,35 @@ loader Login
                 AxBackendCodegenError::PasswordVerifyOutsideRequestHandler { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn compiles_password_hash_and_rejects_invalid_handler_shapes() {
+        for source in [
+            "route POST \"/register\"\n  data hash = Password.hash(request.form.password)\n  return json(\"ok\")\n",
+            "action Register(password: String) {\n  data hash = Password.hash(input.password)\n  return json(\"ok\")\n}\n",
+        ] {
+            let module = compile_backend_ax_to_module(source).unwrap();
+            assert!(module.contains("axonyx_runtime::password::AxPassword::hash("));
+            assert!(module.contains("password hashing failed"));
+            assert!(!module.contains("json!(&Password::hash("));
+        }
+        for args in ["", "\"one\", \"two\""] {
+            let source = format!("route POST \"/register\"\n  data hash = Password.hash({args})\n  return json(\"ok\")\n");
+            assert!(matches!(
+                compile_backend_ax_to_module(&source),
+                Err(AxBackendCompileError::Codegen(
+                    AxBackendCodegenError::InvalidPasswordHashArguments
+                ))
+            ));
+        }
+        for source in [
+            "loader Register\n  data hash = Password.hash(\"secret\")\n  return hash\n",
+            "fn hashPassword(password: String) -> String {\n  data hash = Password.hash(password)\n  return hash\n}\n",
+        ] {
+            assert!(matches!(compile_backend_ax_to_module(source),
+                Err(AxBackendCompileError::Codegen(AxBackendCodegenError::PasswordHashOutsideRequestHandler { .. }))));
+        }
     }
 
     #[test]
