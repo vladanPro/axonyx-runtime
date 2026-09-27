@@ -63,6 +63,10 @@ impl AxActionOutput {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AxRuntimeError {
+    #[error("authentication required")]
+    Unauthorized,
+    #[error("access forbidden")]
+    Forbidden,
     #[error("invalid request input `{field}`")]
     InvalidInput { field: String },
     #[error("runtime operation failed: {message}")]
@@ -72,6 +76,13 @@ pub enum AxRuntimeError {
 }
 
 impl AxRuntimeError {
+    pub fn access_denial_status(&self) -> Option<u16> {
+        match self {
+            Self::Unauthorized => Some(401),
+            Self::Forbidden => Some(403),
+            _ => None,
+        }
+    }
     pub fn invalid_input(field: impl Into<String>) -> Self {
         Self::InvalidInput {
             field: field.into(),
@@ -92,6 +103,10 @@ impl AxRuntimeError {
 
     pub fn public_error_payload(&self) -> Value {
         match self {
+            Self::Unauthorized => {
+                json!({"error": "unauthorized", "message": "Authentication required."})
+            }
+            Self::Forbidden => json!({"error": "forbidden", "message": "Access denied."}),
             Self::InvalidInput { field } => {
                 let fields = BTreeMap::from([(field.clone(), "Missing or invalid input.")]);
                 json!({"error": "invalid_input", "message": "Invalid input.", "fields": fields})
@@ -501,11 +516,21 @@ pub struct AxSendRequest {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxLoaderContext {
+    #[serde(skip)]
+    request: Option<AxHttpRequest>,
     pub params: BTreeMap<String, String>,
     pub query: BTreeMap<String, String>,
 }
 
 impl AxLoaderContext {
+    pub fn with_request(mut self, request: &AxHttpRequest) -> Self {
+        self.request = Some(request.clone());
+        self
+    }
+
+    pub fn request(&self) -> AxRuntimeResult<&AxHttpRequest> {
+        self.request.as_ref().ok_or(AxRuntimeError::Unauthorized)
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -4781,6 +4806,47 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loader_request_identity_is_not_serialized_or_deserialized() {
+        let mut request = AxHttpRequest::new("GET", "/private");
+        request
+            .headers
+            .insert("Cookie".into(), "session=private-cookie".into());
+        let context = AxLoaderContext::new().with_request(&request);
+        assert_eq!(context.request().unwrap(), &request);
+        let serialized = serde_json::to_string(&context).unwrap();
+        assert!(!serialized.contains("private-cookie"));
+        assert!(!serialized.contains("request"));
+        let injected = json!({"params":{}, "query":{}, "request": request});
+        let decoded: AxLoaderContext = serde_json::from_value(injected).unwrap();
+        assert_eq!(decoded.request(), Err(AxRuntimeError::Unauthorized));
+    }
+
+    #[test]
+    fn access_denials_have_fixed_public_payloads_and_typed_statuses() {
+        assert_eq!(
+            AxRuntimeError::Unauthorized.access_denial_status(),
+            Some(401)
+        );
+        assert_eq!(AxRuntimeError::Forbidden.access_denial_status(), Some(403));
+        assert_eq!(
+            AxRuntimeError::Unauthorized.public_error_payload(),
+            json!({"error":"unauthorized", "message":"Authentication required."})
+        );
+        assert_eq!(
+            AxRuntimeError::Forbidden.public_error_payload(),
+            json!({"error":"forbidden", "message":"Access denied."})
+        );
+        assert_eq!(
+            AxRuntimeError::message("internal failure").access_denial_status(),
+            None
+        );
+        assert_eq!(
+            AxRuntimeError::invalid_input("email").access_denial_status(),
+            None
+        );
+    }
 
     #[test]
     fn input_error_payload_contains_only_field_and_fixed_message() {

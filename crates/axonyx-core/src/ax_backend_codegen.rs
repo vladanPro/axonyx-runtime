@@ -64,7 +64,7 @@ pub enum AxBackendCodegenError {
     #[error("domain helper `{function}` cannot return `{ty}` from the Rust backend")]
     UnsupportedFunctionReturnType { function: String, ty: String },
     #[error(
-        "Auth.subject is only supported inside server actions and routes; found in `{handler}`"
+        "Auth.subject is only supported inside server actions, routes and request-bound loaders; found in `{handler}`"
     )]
     AuthSubjectOutsideRequestHandler { handler: String },
     #[error(
@@ -784,7 +784,7 @@ fn render_handler_fn(
     let uses_auth_subject = ax_steps_use_auth_subject(globals.iter().chain(handler.steps.iter()));
     let request_handler = matches!(
         handler.kind,
-        AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+        AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. } | AxHandlerKind::Loader { .. }
     );
     if uses_auth_subject && !request_handler {
         return Err(AxBackendCodegenError::AuthSubjectOutsideRequestHandler {
@@ -856,6 +856,9 @@ fn render_handler_fn(
         out.push_str("    let mut __ax_redirect: Option<String> = None;\n");
     }
     if uses_auth_subject {
+        if matches!(handler.kind, AxHandlerKind::Loader { .. }) {
+            out.push_str("    let request = context.request()?;\n");
+        }
         out.push_str("    let __ax_session = runtime.load_session(request)?;\n");
     }
     let mut typed_bindings = std::collections::BTreeMap::new();
@@ -990,6 +993,9 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
         };
         out.push_str(&format!("        {:?} => {{\n", handler.name));
         out.push_str("            let context = __ax_loader_context(pattern, request)?;\n");
+        if ax_steps_use_auth_subject(plan.globals.iter().chain(handler.steps.iter())) {
+            out.push_str("            let context = context.with_request(request);\n");
+        }
         if input.is_empty() {
             out.push_str("            if !args.is_empty() { return Err(AxRuntimeError::message(\"compiled loader expected 0 arguments\")); }\n");
             out.push_str(&format!(
@@ -1397,7 +1403,20 @@ fn render_step(
             rendered.push_str(&render_optional_binding_narrowing(value, typed_bindings));
             rendered
         }
-        AxStepPlan::Require { value, .. } => format!("    // require {}\n", value.code),
+        AxStepPlan::Require { value, fallback } => {
+            let error = match fallback.as_ref() {
+                Some(AxReturnPlan::Forbidden) => "AxRuntimeError::Forbidden",
+                Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
+                    if render_error_call_message(expr).is_some() => "AxRuntimeError::Unauthorized",
+                _ => "AxRuntimeError::message(\"Backend requirement was not satisfied\")",
+            };
+            let mut rendered = format!(
+                "    if !__ax_truthy(&json!({})) {{\n        return Err({error});\n    }}\n",
+                render_borrowed_expr(value)
+            );
+            rendered.push_str(&render_optional_binding_narrowing(value, typed_bindings));
+            rendered
+        }
         AxStepPlan::Return(value) => render_return_step(value, route_response, action_response),
         AxStepPlan::Send { target, payload } => format!(
             "    runtime.send(&AxSendRequest {{\n        target: {:?}.to_string(),\n        payload: json!({}),\n    }})?;\n",
@@ -2806,6 +2825,38 @@ action publishPost(id: String, title: String) {
     }
 
     #[test]
+    fn loader_require_stops_before_database_access() {
+        let module = compile_backend_ax_to_module(
+            r#"
+query deniedPosts() {
+  require false else error("private policy detail")
+  data posts = db.posts.all()
+  return posts
+}
+"#,
+        )
+        .expect("guarded query should compile");
+        let denial = module
+            .find("return Err(AxRuntimeError::Unauthorized)")
+            .expect("loader must enforce guard");
+        let query = module
+            .find("runtime.load(&AxQueryRequest")
+            .expect("query should compile");
+        assert!(denial < query);
+        assert!(!module.contains("// require false"));
+        assert!(!module.contains("private policy detail"));
+        let forbidden = compile_backend_ax_to_module(
+            "query restricted() {\n  require false else forbidden()\n  return 1\n}",
+        )
+        .expect("forbidden query should compile");
+        assert!(forbidden.contains("return Err(AxRuntimeError::Forbidden)"));
+        let ordinary =
+            compile_backend_ax_to_module("query checked() {\n  require false\n  return 1\n}")
+                .expect("ordinary requirement should compile");
+        assert!(ordinary.contains("Backend requirement was not satisfied"));
+    }
+
+    #[test]
     fn compiles_backend_ax_source_directly_into_module() {
         let module = compile_backend_ax_to_module(
             r#"
@@ -3206,15 +3257,24 @@ route GET "/api/account"
     }
 
     #[test]
+    fn loader_auth_uses_server_request_context() {
+        let module = compile_backend_ax_to_module("query privatePosts() {\n  require Auth.subject else error(\"private policy\")\n  return 1\n}").expect("request-bound loader should compile");
+        assert!(module.contains("let request = context.request()?;"));
+        assert!(module.contains("let context = context.with_request(request);"));
+        assert!(module.contains("runtime.load_session(request)?"));
+        assert!(!module.contains("private policy"));
+    }
+
+    #[test]
     fn rejects_auth_subject_outside_request_handlers() {
         let error = compile_backend_ax_to_module(
             r#"
-query loadAccount() {
+job loadAccount {
   return Auth.subject
 }
 "#,
         )
-        .expect_err("loader auth should be rejected");
+        .expect_err("job auth should be rejected");
 
         assert!(matches!(
             error,
