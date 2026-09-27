@@ -835,7 +835,16 @@ impl AxDataContext {
                             Ok(promote_numeric_type(left, right))
                         }
                         (AxType::Unknown, _) | (_, AxType::Unknown) => Ok(AxType::Unknown),
-                        _ => Ok(AxType::String),
+                        (AxType::String, scalar) | (scalar, AxType::String)
+                            if matches!(scalar, AxType::String | AxType::Bool)
+                                || is_numeric_type(scalar) =>
+                        {
+                            Ok(AxType::String)
+                        }
+                        _ => Err(AxTypeError::InvalidAdditionOperands {
+                            left: left_type.display_name(),
+                            right: right_type.display_name(),
+                        }),
                     },
                     AxBinaryOp::Sub | AxBinaryOp::Mul | AxBinaryOp::Div | AxBinaryOp::Rem => {
                         if matches!(
@@ -1268,6 +1277,10 @@ fn is_type_identifier(input: &str) -> bool {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxTypeError {
+    #[error(
+        "`+` requires two numbers or a String with a scalar operand; found {left} and {right}"
+    )]
+    InvalidAdditionOperands { left: String, right: String },
     #[error("unknown binding `{name}`")]
     UnknownBinding { name: String },
     #[error("unknown record type `{name}`")]
@@ -1871,6 +1884,45 @@ mod tests {
             context.resolve_expr_type(&AxExpr::float(0.5)),
             Ok(AxType::Float)
         );
+    }
+
+    #[test]
+    fn addition_accepts_scalar_strings_but_rejects_implicit_structured_coercion() {
+        for scalar in [
+            AxType::String,
+            AxType::Int,
+            AxType::Float,
+            AxType::Number,
+            AxType::Bool,
+        ] {
+            let context = AxDataContext::new()
+                .with_binding("text", AxType::String)
+                .with_binding("scalar", scalar);
+            for (left, right) in [("text", "scalar"), ("scalar", "text")] {
+                assert_eq!(
+                    context.resolve_expr_type(&AxExpr::binary(
+                        AxBinaryOp::Add,
+                        AxExpr::ident(left),
+                        AxExpr::ident(right)
+                    )),
+                    Ok(AxType::String)
+                );
+            }
+        }
+        let context = AxDataContext::new()
+            .with_binding("text", AxType::String)
+            .with_binding("items", AxType::List(Box::new(AxType::String)))
+            .with_binding("flag", AxType::Bool);
+        for (left, right) in [("text", "items"), ("items", "text"), ("flag", "flag")] {
+            assert!(matches!(
+                context.resolve_expr_type(&AxExpr::binary(
+                    AxBinaryOp::Add,
+                    AxExpr::ident(left),
+                    AxExpr::ident(right)
+                )),
+                Err(AxTypeError::InvalidAdditionOperands { .. })
+            ));
+        }
     }
 
     #[test]
