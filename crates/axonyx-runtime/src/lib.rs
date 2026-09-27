@@ -290,10 +290,15 @@ pub enum PreviewError {
     Runtime { message: String },
     #[error("access denied")]
     AccessDenied { status: u16 },
+    #[error("invalid request input `{field}`")]
+    InvalidInput { field: String },
 }
 
 impl From<backend::AxRuntimeError> for PreviewError {
     fn from(error: backend::AxRuntimeError) -> Self {
+        if let backend::AxRuntimeError::InvalidInput { field } = error {
+            return Self::InvalidInput { field };
+        }
         if let Some(status) = error.access_denial_status() {
             return Self::AccessDenied { status };
         }
@@ -3770,16 +3775,15 @@ fn build_preview_input_record(
                 .and_then(|request| request.incoming_file(&field.name))
                 .is_none()
             {
-                return Err(PreviewError::Runtime {
-                    message: format!("missing required file input `{}`", field.name),
-                });
+                return Err(backend::AxRuntimeError::invalid_input(&field.name).into());
             }
             continue;
         }
         let value = input_fields
             .get(&field.name)
             .cloned()
-            .or_else(|| request.and_then(|request| request.form_value(&field.name)));
+            .or_else(|| request.and_then(|request| request.form_value(&field.name)))
+            .or_else(|| request.and_then(|request| request.json_field_string(&field.name)));
         let Some(value) = value else {
             if let Some(default) = &field.default {
                 record.insert(
@@ -3796,13 +3800,15 @@ fn build_preview_input_record(
                 record.insert(field.name.clone(), AxValue::Bool(false));
                 continue;
             }
-            return Err(PreviewError::Runtime {
-                message: format!("missing required input `{}`", field.name),
-            });
+            return Err(backend::AxRuntimeError::invalid_input(&field.name).into());
         };
         record.insert(
             field.name.clone(),
-            coerce_preview_input_value(&field.name, &field.rust_ty, value)?,
+            coerce_preview_input_value(&field.name, &field.rust_ty, value).map_err(|_| {
+                PreviewError::InvalidInput {
+                    field: field.name.clone(),
+                }
+            })?,
         );
     }
     Ok(AxValue::Record(record))
@@ -9632,6 +9638,44 @@ action UpdatePreferences
     }
 
     #[test]
+    fn preview_action_json_inputs_decode_without_exposing_rejected_values() {
+        let source = "action Save(count: Int) {\n  return input.count\n}";
+        let mut store = AxPreviewStore::default();
+        for body in [
+            r#"{}"#,
+            r#"{"count":"PRIVATE_VALUE"}"#,
+            r#"{"count":[]}"#,
+            "broken-json",
+        ] {
+            let request = server::AxHttpRequest::new("POST", "/save")
+                .with_header("Content-Type", "application/json")
+                .with_body(body.as_bytes().to_vec());
+            let error = execute_preview_action_request_sources_with_storage(
+                &[source],
+                "Save",
+                &request,
+                &server::AxUnavailableFileStorage,
+                &mut store,
+            )
+            .unwrap_err();
+            assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "count"));
+            assert!(!error.to_string().contains("PRIVATE_VALUE"));
+        }
+        let request = server::AxHttpRequest::new("POST", "/save")
+            .with_header("Content-Type", "application/json")
+            .with_body(br#"{"count":42}"#.to_vec());
+        let result = execute_preview_action_request_sources_with_storage(
+            &[source],
+            "Save",
+            &request,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(result.value, AxValue::Number(42));
+    }
+
+    #[test]
     fn preview_action_rejects_invalid_integer_input() {
         let mut store = AxPreviewStore::default();
         let error = execute_preview_action_sources(
@@ -9648,9 +9692,7 @@ action UpdateCount
         )
         .expect_err("invalid integer should fail");
 
-        assert!(error
-            .to_string()
-            .contains("input `count` expected i64 but received `many`"));
+        assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "count"));
     }
 
     #[test]
@@ -9698,7 +9740,7 @@ action CreatePost
         )
         .expect_err("missing required input should fail");
 
-        assert!(error.to_string().contains("missing required input `title`"));
+        assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "title"));
     }
 
     #[test]
@@ -10360,7 +10402,7 @@ route POST "/api/posts"
         let error = execute_preview_route_request_sources(&[source], &request, &mut store)
             .expect_err("missing typed input should fail");
 
-        assert!(error.to_string().contains("missing required input `count`"));
+        assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "count"));
     }
 
     #[test]
