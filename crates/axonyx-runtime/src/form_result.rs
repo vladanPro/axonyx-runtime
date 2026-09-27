@@ -118,6 +118,40 @@ mod tests {
     use super::*;
 
     #[test]
+    fn compiled_document_keeps_head_and_nested_layouts_with_form_errors() {
+        let document = crate::compose_compiled_page_document(&[
+            "page Shell\n<header>Application header</header>\n<Slot />",
+            "page Section\n<section id=\"section\"><Slot /></section>",
+        ], "page Register\n  title \"Registration\"\n<form method=\"post\" action=\"/__axonyx/action?name=Register&amp;path=%2Fregister\"><input name=\"email\" /><span data-ax-field-error=\"email\"></span></form>").unwrap();
+        let mut document = document;
+        document.head.title = Some("Registration".into());
+        let result = AxFormResult::validation(
+            "Register",
+            "/register",
+            &serde_json::json!({"email":"Invalid email."}),
+        )
+        .unwrap();
+        let encoded = serde_json::to_string(&document)
+            .unwrap()
+            .replace("&amp;", "&");
+        let html = crate::render_compiled_page_document(
+            &encoded,
+            &[],
+            "/register",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some(&result),
+        )
+        .unwrap();
+        assert!(html.contains("<!DOCTYPE html>"));
+        assert!(html.contains("<title>Registration</title>"));
+        assert!(html.contains("Application header"));
+        assert!(html.contains("id=\"section\""));
+        assert!(html.contains("Invalid email."));
+        assert!(html.contains("aria-invalid=\"true\""));
+    }
+
+    #[test]
     fn node_rendering_targets_only_the_matching_form_and_escapes_text() {
         use axonyx_core::reactive::{attr, AxNode};
         let result = AxFormResult::validation(
