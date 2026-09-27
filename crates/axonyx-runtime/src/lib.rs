@@ -955,6 +955,7 @@ pub fn preview_ax_route_with_request_context_and_imports(
         request_target,
         route_params,
         None,
+        None,
         store,
         import_resolver,
     )
@@ -981,6 +982,34 @@ pub fn preview_ax_route_with_request_context_and_runtime_and_imports(
         request_target,
         route_params,
         Some(runtime),
+        None,
+        store,
+        import_resolver,
+    )
+}
+
+/// Render using only the server-owned HTTP request for authentication.
+#[allow(clippy::too_many_arguments)]
+pub fn preview_ax_route_with_http_request_and_runtime_and_imports(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request: &server::AxHttpRequest,
+    route_params: &BTreeMap<String, String>,
+    runtime: &dyn backend::AxBackendRuntime,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
+) -> Result<String, PreviewError> {
+    preview_ax_route_with_request_context_runtime_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        &request.target,
+        route_params,
+        Some(runtime),
+        Some(request),
         store,
         import_resolver,
     )
@@ -996,6 +1025,7 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
     request_target: &str,
     route_params: &BTreeMap<String, String>,
     runtime: Option<&dyn backend::AxBackendRuntime>,
+    request: Option<&server::AxHttpRequest>,
     store: &AxPreviewStore,
     import_resolver: &impl AxImportResolver,
 ) -> Result<String, PreviewError> {
@@ -1021,13 +1051,33 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
         route_params,
         &parse_preview_query_fields(request_target),
     );
+    let mut loader_scope = route_scope.clone();
+    if let Some(request) = request {
+        let session = if handlers
+            .loaders
+            .values()
+            .any(|loader| loader.steps.iter().any(ax_step_uses_auth_subject))
+        {
+            runtime
+                .ok_or_else(|| PreviewError::Runtime {
+                    message: "Auth.subject requires a configured backend runtime".to_string(),
+                })?
+                .load_session(request)?
+        } else {
+            None
+        };
+        loader_scope.insert(
+            "Auth".to_string(),
+            build_preview_auth_record(request, env, session.as_ref()),
+        );
+    }
     let resolve_context = PreviewResolveContext {
         handlers: &handlers,
         cache: &cache,
         env,
         runtime,
         request_target,
-        route_scope: &route_scope,
+        route_scope: &loader_scope,
         store,
     };
     let resolver_error = RefCell::new(None);
@@ -10667,6 +10717,54 @@ action Logout() {
         let cookie = &login.cookies[0];
         let authenticated = server::AxHttpRequest::new("GET", "/api/account")
             .with_header("Cookie", format!("{}={}", cookie.name, cookie.value));
+        let loader = "query loadIdentity() {\n  require Auth.subject else error(\"private policy\")\n  return Auth.subject\n}";
+        let page =
+            "page Account() { data identity = loadIdentity()\n return ASX { <p>{identity}</p> } }";
+        let html = preview_ax_route_with_http_request_and_runtime_and_imports(
+            &[],
+            &[loader],
+            &[],
+            page,
+            &authenticated,
+            &BTreeMap::new(),
+            &runtime,
+            &store,
+            &|_: &str| None,
+        )
+        .unwrap();
+        assert!(html.contains("user-42"));
+        assert!(!html.contains(&cookie.value));
+        let credential_page = "page Account() { data identity = loadIdentity()\n return ASX { <p>{Auth.session}</p> } }";
+        assert!(
+            preview_ax_route_with_http_request_and_runtime_and_imports(
+                &[],
+                &[loader],
+                &[],
+                credential_page,
+                &authenticated,
+                &BTreeMap::new(),
+                &runtime,
+                &store,
+                &|_: &str| None,
+            )
+            .is_err(),
+            "backend credentials must not become page markup scope"
+        );
+        let forged = server::AxHttpRequest::new("GET", "/api/account?subject=user-42")
+            .with_header("X-User-Id", "user-42");
+        let error = preview_ax_route_with_http_request_and_runtime_and_imports(
+            &[],
+            &[loader],
+            &[],
+            page,
+            &forged,
+            &BTreeMap::new(),
+            &runtime,
+            &store,
+            &|_: &str| None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PreviewError::AccessDenied { status: 401 }));
         let route_source = r#"
 route GET "/api/account"
   require Auth.subject else redirect("/login")
