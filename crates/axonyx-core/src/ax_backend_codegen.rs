@@ -1997,11 +1997,70 @@ macro_rules! __ax_numeric_add {
     ($($ty:ty),*) => {$(
         impl __AxAdd<$ty> for $ty {
             type Output = $ty;
-            fn ax_add(&self, rhs: &$ty) -> $ty { *self + *rhs }
+            fn ax_add(&self, rhs: &$ty) -> $ty {
+                self.checked_add(*rhs).expect("integer addition overflow")
+            }
         }
     )*};
 }
-__ax_numeric_add!(i32, i64, u64, f64);
+__ax_numeric_add!(i32, i64, u64);
+fn __ax_finite_add(left: f64, right: f64) -> f64 {
+    let result = left + right;
+    assert!(result.is_finite(), "non-finite addition result");
+    result
+}
+impl __AxAdd<f64> for f64 {
+    type Output = f64;
+    fn ax_add(&self, rhs: &f64) -> f64 { __ax_finite_add(*self, *rhs) }
+}
+macro_rules! __ax_string_scalar_add {
+    ($($ty:ty),*) => {$(
+        impl __AxAdd<$ty> for String {
+            type Output = String;
+            fn ax_add(&self, rhs: &$ty) -> String { format!("{}{}", self, rhs) }
+        }
+        impl __AxAdd<String> for $ty {
+            type Output = String;
+            fn ax_add(&self, rhs: &String) -> String { format!("{}{}", self, rhs) }
+        }
+    )*};
+}
+__ax_string_scalar_add!(i32, i64, u64, bool);
+impl __AxAdd<f64> for String {
+    type Output = String;
+    fn ax_add(&self, rhs: &f64) -> String {
+        assert!(rhs.is_finite(), "non-finite String operand");
+        format!("{}{}", self, if *rhs == 0.0 { 0.0 } else { *rhs })
+    }
+}
+impl __AxAdd<String> for f64 {
+    type Output = String;
+    fn ax_add(&self, rhs: &String) -> String {
+        assert!(self.is_finite(), "non-finite String operand");
+        format!("{}{}", if *self == 0.0 { 0.0 } else { *self }, rhs)
+    }
+}
+macro_rules! __ax_float_add {
+    ($($ty:ty),*) => {$(
+        impl __AxAdd<f64> for $ty {
+            type Output = f64;
+            fn ax_add(&self, rhs: &f64) -> f64 { __ax_finite_add(*self as f64, *rhs) }
+        }
+        impl __AxAdd<$ty> for f64 {
+            type Output = f64;
+            fn ax_add(&self, rhs: &$ty) -> f64 { __ax_finite_add(*self, *rhs as f64) }
+        }
+    )*};
+}
+__ax_float_add!(i32, i64, u64);
+impl __AxAdd<i32> for i64 {
+    type Output = i64;
+    fn ax_add(&self, rhs: &i32) -> i64 { self.checked_add(i64::from(*rhs)).expect("integer addition overflow") }
+}
+impl __AxAdd<i64> for i32 {
+    type Output = i64;
+    fn ax_add(&self, rhs: &i64) -> i64 { i64::from(*self).checked_add(*rhs).expect("integer addition overflow") }
+}
 
 "#;
 
@@ -2333,6 +2392,15 @@ fn main() {
     assert_eq!(__ax_add(&2_i64, &3_i64), 5_i64);
     assert_eq!(__ax_add(&2_u64, &3_u64), 5_u64);
     assert_eq!(__ax_add(&2.5_f64, &3.0_f64), 5.5_f64);
+    assert_eq!(__ax_add(&"Count: ".to_string(), &42_i64), "Count: 42");
+    assert_eq!(__ax_add(&42_i64, &" items".to_string()), "42 items");
+    assert_eq!(__ax_add(&"enabled=".to_string(), &true), "enabled=true");
+    assert_eq!(__ax_add(&false, &"!".to_string()), "false!");
+    assert_eq!(__ax_add(&"ratio=".to_string(), &2.5_f64), "ratio=2.5");
+    assert_eq!(__ax_add(&"zero=".to_string(), &-0.0_f64), "zero=0");
+    assert_eq!(__ax_add(&2_i64, &0.5_f64), 2.5_f64);
+    assert_eq!(__ax_add(&0.5_f64, &2_i64), 2.5_f64);
+    assert_eq!(__ax_add(&2_i64, &3), 5_i64);
 }
 "#)).unwrap();
         let compilation = std::process::Command::new("rustc")

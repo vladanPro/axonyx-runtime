@@ -522,11 +522,23 @@ fn expr_add(left: ExprValue, right: ExprValue) -> Option<ExprValue> {
         (ExprValue::Float(left), ExprValue::Float(right)) => finite_float(left + right),
         (ExprValue::Int(left), ExprValue::Float(right)) => finite_float(left as f64 + right),
         (ExprValue::Float(left), ExprValue::Int(right)) => finite_float(left + right as f64),
-        (left, right) => Some(ExprValue::String(format!(
-            "{}{}",
-            expr_string(&left),
-            expr_string(&right)
-        ))),
+        (left, right)
+            if matches!(&left, ExprValue::String(_)) || matches!(&right, ExprValue::String(_)) =>
+        {
+            let scalar = |value: &ExprValue| match value {
+                ExprValue::String(value) => Some(value.clone()),
+                ExprValue::Int(value) => Some(value.to_string()),
+                ExprValue::Float(value) => Some(if *value == 0.0 {
+                    "0".to_string()
+                } else {
+                    value.to_string()
+                }),
+                ExprValue::Bool(value) => Some(value.to_string()),
+                _ => None,
+            };
+            Some(ExprValue::String(scalar(&left)? + &scalar(&right)?))
+        }
+        _ => None,
     }
 }
 
@@ -605,17 +617,6 @@ fn expr_truthy(value: &ExprValue) -> bool {
         ExprValue::Bytes(value) => !value.is_empty(),
         ExprValue::List(value) => !value.is_empty(),
         ExprValue::Object(value) => !value.is_empty(),
-    }
-}
-
-fn expr_string(value: &ExprValue) -> String {
-    match value {
-        ExprValue::Null => String::new(),
-        ExprValue::String(value) => value.clone(),
-        ExprValue::Bool(value) => value.to_string(),
-        ExprValue::Float(value) => value.to_string(),
-        ExprValue::Int(value) => value.to_string(),
-        ExprValue::Bytes(_) | ExprValue::List(_) | ExprValue::Object(_) => String::new(),
     }
 }
 
@@ -1181,6 +1182,64 @@ mod tests {
 
     fn string_value(value: &str) -> ExprValue {
         ExprValue::String(value.to_string())
+    }
+
+    #[test]
+    fn addition_matches_scalar_contract_and_rejects_structured_values() {
+        for (left, right, expected) in [
+            (
+                string_value("Count: "),
+                ExprValue::Int(42),
+                string_value("Count: 42"),
+            ),
+            (
+                ExprValue::Int(42),
+                string_value(" items"),
+                string_value("42 items"),
+            ),
+            (
+                string_value("ratio="),
+                ExprValue::Float(2.5),
+                string_value("ratio=2.5"),
+            ),
+            (
+                string_value("zero="),
+                ExprValue::Float(-0.0),
+                string_value("zero=0"),
+            ),
+            (
+                string_value("enabled="),
+                ExprValue::Bool(true),
+                string_value("enabled=true"),
+            ),
+            (
+                ExprValue::Bool(false),
+                string_value("!"),
+                string_value("false!"),
+            ),
+            (
+                ExprValue::Int(2),
+                ExprValue::Float(0.5),
+                ExprValue::Float(2.5),
+            ),
+            (
+                ExprValue::Float(0.5),
+                ExprValue::Int(2),
+                ExprValue::Float(2.5),
+            ),
+        ] {
+            assert_eq!(expr_add(left, right), Some(expected));
+        }
+        for invalid in [
+            ExprValue::Null,
+            ExprValue::Bytes(vec![]),
+            ExprValue::List(vec![]),
+            ExprValue::Object(vec![]),
+        ] {
+            assert_eq!(expr_add(string_value("x"), invalid.clone()), None);
+            assert_eq!(expr_add(invalid, string_value("x")), None);
+        }
+        assert_eq!(expr_add(ExprValue::Bool(true), ExprValue::Int(1)), None);
     }
 
     fn value_frame(tag: u8, payload: &[u8]) -> Vec<u8> {

@@ -2986,6 +2986,29 @@ fn eval_preview_expr_with_functions(
         return Ok(AxValue::String(value));
     }
 
+    if let Some(inner) = code
+        .strip_prefix("&(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return eval_preview_expr_with_functions(&AxRustExpr::new(inner), scope, env, functions);
+    }
+    if let Some(args) = parse_preview_call_args(code, "__ax_add") {
+        if args.len() != 2 {
+            return Err(PreviewError::Runtime {
+                message: "invalid lowered addition".to_string(),
+            });
+        }
+        let left =
+            eval_preview_expr_with_functions(&AxRustExpr::new(&args[0]), scope, env, functions)?;
+        let right =
+            eval_preview_expr_with_functions(&AxRustExpr::new(&args[1]), scope, env, functions)?;
+        return axonyx_core::ax_lowering::add_values(left, right).map_err(|error| {
+            PreviewError::Runtime {
+                message: error.to_string(),
+            }
+        });
+    }
+
     if code == "true" {
         return Ok(AxValue::Bool(true));
     }
@@ -9748,6 +9771,31 @@ route POST "/login"
             values.push(value);
         }
         assert_ne!(values[0], values[1]);
+    }
+
+    #[test]
+    fn preview_evaluates_lowered_addition_with_compiled_scalar_semantics() {
+        for (expression, expected) in [
+            (r#""Count: " + 42"#, AxValue::from("Count: 42")),
+            (r#"42 + " items""#, AxValue::from("42 items")),
+            (r#""ratio=" + 2.5"#, AxValue::from("ratio=2.5")),
+            (r#""enabled=" + true"#, AxValue::from("enabled=true")),
+            ("2 + 0.5", AxValue::from(2.5)),
+            (r#""1" + 2 + 3"#, AxValue::from("123")),
+        ] {
+            let source = format!("route GET \"/sum\" {{\n  return json({expression})\n}}");
+            let response = execute_preview_route_request_sources(
+                &[&source],
+                &server::AxHttpRequest::new("GET", "/sum"),
+                &mut AxPreviewStore::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+                preview_value_to_json(&expected)
+            );
+        }
     }
 
     #[test]
