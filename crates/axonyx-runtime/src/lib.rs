@@ -956,6 +956,7 @@ pub fn preview_ax_route_with_request_context_and_imports(
         route_params,
         None,
         None,
+        None,
         store,
         import_resolver,
     )
@@ -982,6 +983,7 @@ pub fn preview_ax_route_with_request_context_and_runtime_and_imports(
         request_target,
         route_params,
         Some(runtime),
+        None,
         None,
         store,
         import_resolver,
@@ -1010,6 +1012,36 @@ pub fn preview_ax_route_with_http_request_and_runtime_and_imports(
         route_params,
         Some(runtime),
         Some(request),
+        None,
+        store,
+        import_resolver,
+    )
+}
+
+/// Render request-local validation metadata into the tree, before serialization.
+#[allow(clippy::too_many_arguments)]
+pub fn preview_ax_route_with_form_result_and_imports(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request: &server::AxHttpRequest,
+    route_params: &BTreeMap<String, String>,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
+    form: &form_result::AxFormResult,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
+) -> Result<String, PreviewError> {
+    preview_ax_route_with_request_context_runtime_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        &request.target,
+        route_params,
+        runtime,
+        Some(request),
+        Some(form),
         store,
         import_resolver,
     )
@@ -1026,6 +1058,7 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
     route_params: &BTreeMap<String, String>,
     runtime: Option<&dyn backend::AxBackendRuntime>,
     request: Option<&server::AxHttpRequest>,
+    form: Option<&form_result::AxFormResult>,
     store: &AxPreviewStore,
     import_resolver: &impl AxImportResolver,
 ) -> Result<String, PreviewError> {
@@ -1094,7 +1127,7 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
         }
     };
 
-    let node = match lower_document_with_scope_and_imports(
+    let mut node = match lower_document_with_scope_and_imports(
         &document,
         route_scope.clone(),
         &resolver,
@@ -1113,6 +1146,9 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
         return Err(runtime_error);
     }
 
+    if let Some(form) = form {
+        form.apply_to_node(&mut node);
+    }
     Ok(render_preview_document(&document, &node))
 }
 
@@ -8489,6 +8525,28 @@ page DocsHome
         assert!(html.contains("Docs Shell"));
         assert!(html.contains("Nested page"));
         assert!(html.contains("data-ax-page=\"DocsHome\""));
+    }
+
+    #[test]
+    fn preview_form_result_applies_only_to_the_matching_native_form() {
+        let form = form_result::AxFormResult::validation(
+            "Validate",
+            "/forms",
+            &json!({"email": "Use <valid> email"}),
+        )
+        .unwrap();
+        let request = server::AxHttpRequest::new("GET", "/forms");
+        let html = preview_ax_route_with_form_result_and_imports(
+            &[], &[], &[],
+            r#"page Forms() { return ASX {
+              <form action="/__axonyx/action?path=%2Fforms&name=Validate"><input name="email" /><span data-ax-field-error="email"></span></form>
+              <form action="/__axonyx/action?path=%2Fforms&name=Other"><input name="email" /><span data-ax-field-error="email"></span></form>
+            } }"#,
+            &request, &BTreeMap::new(), None, &form, &AxPreviewStore::default(), &|_: &str| None,
+        ).unwrap();
+        assert_eq!(html.matches("aria-invalid=\"true\"").count(), 1);
+        assert!(html.contains("Use &lt;valid&gt; email"));
+        assert!(!html.contains("Use <valid> email"));
     }
 
     #[test]
