@@ -6,6 +6,8 @@ use crate::ax_types::prelude::AxType;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxBackendCodegenError {
+    #[error("Uuid.new requires no arguments and is only supported in action/route data bindings")]
+    InvalidUuidNewCall,
     #[error("Password.hash requires exactly one String argument")]
     InvalidPasswordHashArguments,
     #[error("Password.hash is only supported in action/route data bindings; found in `{handler}`")]
@@ -268,6 +270,9 @@ fn render_function_value_plan(
 ) -> Result<String, AxBackendCodegenError> {
     match value {
         AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
+        AxValuePlan::Call { path, .. } if path == &["Uuid", "new"] => {
+            Err(AxBackendCodegenError::InvalidUuidNewCall)
+        }
         AxValuePlan::Call { path, .. } if path == &["Password", "hash"] => {
             Err(AxBackendCodegenError::PasswordHashOutsideRequestHandler {
                 handler: function.to_string(),
@@ -1364,9 +1369,9 @@ fn render_step(
         ),
         AxStepPlan::ClearCookie { name } => format!("    // clearCookie {}\n", name.code),
         AxStepPlan::SessionCreate { subject, data } => format!(
-            "    let __ax_session_data: BTreeMap<String, Value> = serde_json::from_value(json!({})).map_err(|_| AxRuntimeError::message(\"Session.create data must be an object\"))?;\n    let (_, __ax_session_cookie) = runtime.create_session(&{}, __ax_session_data)?;\n    __ax_cookies.push(__ax_session_cookie);\n",
+            "    let __ax_session_data: BTreeMap<String, Value> = serde_json::from_value(json!({})).map_err(|_| AxRuntimeError::message(\"Session.create data must be an object\"))?;\n    let __ax_session_subject = json!({});\n    let (_, __ax_session_cookie) = runtime.create_session(__ax_session_subject.as_str().ok_or_else(|| AxRuntimeError::message(\"Session.create subject must be String\"))?, __ax_session_data)?;\n    __ax_cookies.push(__ax_session_cookie);\n",
             render_borrowed_expr(data),
-            render_string_expr(subject)
+            render_borrowed_expr(subject)
         ),
         AxStepPlan::SessionDestroy => {
             "    __ax_cookies.push(runtime.destroy_session(request)?);\n".to_string()
@@ -1585,6 +1590,17 @@ fn render_value_plan(
     let output = match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
         AxValuePlan::Call { path, args } => {
+            if path == &["Uuid", "new"] {
+                if !args.is_empty()
+                    || !matches!(
+                        handler.kind,
+                        AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+                    )
+                {
+                    return Err(AxBackendCodegenError::InvalidUuidNewCall);
+                }
+                return Ok("json!(axonyx_runtime::new_uuid())".to_string());
+            }
             if path == &["Password", "hash"] {
                 if !matches!(
                     handler.kind,
@@ -3295,6 +3311,33 @@ loader Login
                 AxBackendCodegenError::PasswordVerifyOutsideRequestHandler { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn compiles_server_owned_uuid_and_rejects_invalid_calls() {
+        let source = "route POST \"/register\"\n  data id = Uuid.new()\n  return json(id)\n";
+        assert!(compile_backend_ax_to_module(source)
+            .unwrap()
+            .contains("json!(axonyx_runtime::new_uuid())"));
+        let session = compile_backend_ax_to_module(&source.replace(
+            "return json(id)",
+            "Session.create(id, {})\n  return json(\"ok\")",
+        ))
+        .unwrap();
+        assert!(session.contains("let __ax_session_subject = json!(&id)"));
+        assert!(session.contains("__ax_session_subject.as_str()"));
+        for invalid in [
+            source.replace("Uuid.new()", "Uuid.new(\"caller-id\")"),
+            "loader IDs\n  data id = Uuid.new()\n  return id\n".to_string(),
+            "fn makeId() -> String {\n  data id = Uuid.new()\n  return id\n}\n".to_string(),
+        ] {
+            assert!(matches!(
+                compile_backend_ax_to_module(&invalid),
+                Err(AxBackendCompileError::Codegen(
+                    AxBackendCodegenError::InvalidUuidNewCall
+                ))
+            ));
+        }
     }
 
     #[test]

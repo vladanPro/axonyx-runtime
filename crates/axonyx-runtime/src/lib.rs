@@ -8,6 +8,11 @@ pub mod session;
 #[cfg(feature = "storage")]
 pub mod storage;
 
+/// Generates a server-owned identifier, not a session or authentication token.
+pub fn new_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
+
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 
@@ -2533,6 +2538,14 @@ fn eval_preview_value_with_functions(
                 .map_err(|_| PreviewError::Runtime {
                     message: "password verification failed".to_string(),
                 })
+        }
+        AxValuePlan::Call { path, args } if path == &["Uuid", "new"] => {
+            if !args.is_empty() {
+                return Err(PreviewError::Runtime {
+                    message: "Uuid.new requires no arguments".to_string(),
+                });
+            }
+            Ok(AxValue::String(new_uuid()))
         }
         AxValuePlan::Call { path, args } if path == &["Password", "hash"] => {
             let [password] = args.as_slice() else {
@@ -9715,6 +9728,26 @@ route POST "/login"
         .unwrap_err();
         assert!(error.to_string().contains("password verification failed"));
         assert!(!error.to_string().contains("invalid-secret-hash"));
+    }
+
+    #[test]
+    fn preview_uuid_new_generates_distinct_v4_identifiers() {
+        let source = "route POST \"/id\"\n  data id = Uuid.new()\n  return json(id)\n";
+        let request = server::AxHttpRequest::new("POST", "/id");
+        let mut values = Vec::new();
+        for _ in 0..2 {
+            let response = execute_preview_route_request_sources(
+                &[source],
+                &request,
+                &mut AxPreviewStore::default(),
+            )
+            .unwrap()
+            .unwrap();
+            let value: String = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(uuid::Uuid::parse_str(&value).unwrap().get_version_num(), 4);
+            values.push(value);
+        }
+        assert_ne!(values[0], values[1]);
     }
 
     #[test]
