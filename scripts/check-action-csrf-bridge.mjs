@@ -8,7 +8,7 @@ const start = source.indexOf(marker);
 assert.notEqual(start, -1);
 const script = source.slice(start + marker.length, source.indexOf('</script>"##', start));
 
-async function run(action, token, denied = false, invalid = false) {
+async function run(action, token, denied = false, invalid = false, result = undefined) {
   let submit;
   const calls = [];
   const attributes = new Map();
@@ -49,7 +49,7 @@ async function run(action, token, denied = false, invalid = false) {
       return url === "/__axonyx/csrf"
         ? { ok: !denied, json: async () => ({ token }) }
         : invalid
-          ? { ok: false, headers: { get: () => "application/ax-error+json" }, json: async () => ({ error: { status: 422, value: { fields: { email: "<script>not executable</script>" } } } }) }
+          ? { ok: false, headers: { get: () => "application/ax-error+json" }, json: async () => ({ form: result, error: { status: 422, value: { fields: { email: "<script>not executable</script>" } } } }) }
           : { ok: true, headers: { get: () => "application/ax-patch+json" }, json: async () => ({ patches: [], invalidations: [], refreshes: [] }) };
     },
   });
@@ -77,4 +77,9 @@ const invalid = await run("https://axonyx.dev/__axonyx/action?name=Register", pr
 assert.equal(invalid.attributes.get("data-ax-action-state"), "error");
 assert.equal(invalid.fieldAttributes.get("aria-invalid"), "true");
 assert.equal(invalid.message.textContent, "<script>not executable</script>");
-console.log("Action CSRF bridge checks passed (6 scenarios).");
+const matching = await run("https://axonyx.dev/__axonyx/action?name=Register&path=%2Fposts", proof, false, true, { version: 1, action: "Register", route: "/posts", fields: { email: "Contract message" } });
+assert.equal(matching.message.textContent, "Contract message");
+const foreignResult = await run("https://axonyx.dev/__axonyx/action?name=Register&path=%2Fposts", proof, false, true, { version: 1, action: "Login", route: "/posts", fields: { email: "Wrong form" } });
+assert.equal(foreignResult.message.textContent, "");
+assert.equal(foreignResult.fieldAttributes.has("aria-invalid"), false);
+console.log("Action CSRF bridge checks passed (8 scenarios).");
