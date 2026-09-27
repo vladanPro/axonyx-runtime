@@ -59,11 +59,104 @@ impl AxFormResult {
     pub fn fields(&self) -> &BTreeMap<String, String> {
         &self.fields
     }
+
+    /// Apply public errors to a render tree, never to serialized HTML.
+    pub fn apply_to_node(&self, node: &mut axonyx_core::reactive::AxNode) {
+        self.apply_node(node, false);
+    }
+
+    fn apply_node(&self, node: &mut axonyx_core::reactive::AxNode, mut matching: bool) {
+        use axonyx_core::reactive::{attr, AxNode};
+        let AxNode::Element {
+            tag,
+            attrs,
+            children,
+        } = node
+        else {
+            return;
+        };
+        if *tag == "form" {
+            matching = attrs
+                .iter()
+                .find(|attr| attr.name == "action")
+                .is_some_and(|action| {
+                    if action.value.split('?').next() != Some("/__axonyx/action") {
+                        return false;
+                    }
+                    let query = crate::parse_preview_query_fields(&action.value);
+                    query.get("name").is_some_and(|name| name == &self.action)
+                        && query.get("path").map(String::as_str).unwrap_or("/") == self.route
+                });
+        }
+        if matching {
+            if let Some(message) = attrs
+                .iter()
+                .find(|attr| attr.name == "data-ax-field-error")
+                .and_then(|attr| self.fields.get(&attr.value))
+            {
+                *children = vec![AxNode::Text(message.clone())];
+                attrs.retain(|attr| attr.name != "aria-live");
+                attrs.push(attr("aria-live", "polite"));
+            }
+            if matches!(*tag, "input" | "select" | "textarea")
+                && attrs
+                    .iter()
+                    .any(|attr| attr.name == "name" && self.fields.contains_key(&attr.value))
+            {
+                attrs.retain(|attr| attr.name != "aria-invalid");
+                attrs.push(attr("aria-invalid", "true"));
+            }
+        }
+        for child in children {
+            self.apply_node(child, matching);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_rendering_targets_only_the_matching_form_and_escapes_text() {
+        use axonyx_core::reactive::{attr, AxNode};
+        let result = AxFormResult::validation(
+            "Save",
+            "/posts",
+            &serde_json::json!({"email":"<script>bad</script>"}),
+        )
+        .unwrap();
+        let form = |name| AxNode::Element {
+            tag: "form",
+            attrs: vec![attr(
+                "action",
+                format!("/__axonyx/action?name={name}&path=%2Fposts"),
+            )],
+            children: vec![
+                AxNode::Element {
+                    tag: "input",
+                    attrs: vec![attr("name", "email")],
+                    children: vec![],
+                },
+                AxNode::Element {
+                    tag: "span",
+                    attrs: vec![attr("data-ax-field-error", "email")],
+                    children: vec![],
+                },
+            ],
+        };
+        let mut node = AxNode::Element {
+            tag: "div",
+            attrs: vec![],
+            children: vec![form("Save"), form("Other")],
+        };
+        result.apply_to_node(&mut node);
+        let mut html = String::new();
+        crate::render_node(&node, &mut html);
+        assert_eq!(html.matches("aria-invalid=\"true\"").count(), 1);
+        assert_eq!(html.matches("&lt;script&gt;").count(), 1);
+        assert!(!html.contains("<script>"));
+    }
 
     #[test]
     fn result_is_bound_to_action_and_route_without_input_values() {

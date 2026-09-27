@@ -309,6 +309,24 @@ pub fn render_compiled_page_fragment(
     route_params: &BTreeMap<String, String>,
     loader_values: &BTreeMap<String, serde_json::Value>,
 ) -> Result<String, PreviewError> {
+    render_compiled_page_fragment_with_form(
+        document_json,
+        import_sources,
+        request_target,
+        route_params,
+        loader_values,
+        None,
+    )
+}
+
+pub fn render_compiled_page_fragment_with_form(
+    document_json: &str,
+    import_sources: &[(&str, &str)],
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    loader_values: &BTreeMap<String, serde_json::Value>,
+    form_result: Option<&form_result::AxFormResult>,
+) -> Result<String, PreviewError> {
     let document = serde_json::from_str::<AxDocument>(document_json).map_err(|error| {
         PreviewError::Runtime {
             message: format!("failed to decode compiled page AST: {error}"),
@@ -332,8 +350,11 @@ pub fn render_compiled_page_fragment(
             .iter()
             .find_map(|(name, contents)| (*name == source).then(|| (*contents).to_string()))
     };
-    let node =
+    let mut node =
         lower_document_with_scope_and_imports(&document, scope, &resolver, &import_resolver)?;
+    if let Some(result) = form_result {
+        result.apply_to_node(&mut node);
+    }
     let mut html = String::new();
     render_node(&node, &mut html);
     Ok(html)
