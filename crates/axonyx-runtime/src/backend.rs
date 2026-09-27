@@ -63,6 +63,8 @@ impl AxActionOutput {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AxRuntimeError {
+    #[error("invalid request input `{field}`")]
+    InvalidInput { field: String },
     #[error("runtime operation failed: {message}")]
     Message { message: String },
     #[error("runtime database operation failed: {error}")]
@@ -70,6 +72,12 @@ pub enum AxRuntimeError {
 }
 
 impl AxRuntimeError {
+    pub fn invalid_input(field: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            field: field.into(),
+        }
+    }
+
     pub fn message(message: impl Into<String>) -> Self {
         Self::Message {
             message: message.into(),
@@ -84,6 +92,10 @@ impl AxRuntimeError {
 
     pub fn public_error_payload(&self) -> Value {
         match self {
+            Self::InvalidInput { field } => {
+                let fields = BTreeMap::from([(field.clone(), "Missing or invalid input.")]);
+                json!({"error": "invalid_input", "message": "Invalid input.", "fields": fields})
+            }
             Self::Message { message } => json!({
                 "ok": false,
                 "code": "runtime.error",
@@ -4769,6 +4781,19 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn input_error_payload_contains_only_field_and_fixed_message() {
+        let error = AxRuntimeError::invalid_input("password");
+        assert_eq!(
+            error.public_error_payload(),
+            json!({
+                "error": "invalid_input", "message": "Invalid input.",
+                "fields": {"password": "Missing or invalid input."}
+            })
+        );
+        assert_eq!(error.to_string(), "invalid request input `password`");
+    }
 
     #[test]
     fn action_output_keeps_response_cookies_outside_the_public_payload() {

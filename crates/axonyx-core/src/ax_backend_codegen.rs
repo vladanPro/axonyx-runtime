@@ -1160,11 +1160,12 @@ fn render_input_field(field: &AxFieldPlan, raw: &str) -> String {
 
     if !field.optional && field.default.is_none() && field.rust_ty != "bool" {
         return match field.rust_ty.as_str() {
-            "String" => format!("{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?"),
+            "String" => format!("{raw}.ok_or_else(|| AxRuntimeError::invalid_input({:?}))?", field.name),
             "i64" | "u64" | "f64" => format!(
-                "{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?.trim().parse::<{}>().map_err(|_| AxRuntimeError::message({:?}))?",
+                "{raw}.ok_or_else(|| AxRuntimeError::invalid_input({:?}))?.trim().parse::<{}>().map_err(|_| AxRuntimeError::invalid_input({:?}))?",
+                field.name,
                 field.rust_ty,
-                format!("input `{}` expected {}", field.name, field.rust_ty)
+                field.name
             ),
             "AxFileRef" => format!(
                 "serde_json::from_str::<AxFileRef>(&{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?).map_err(|_| AxRuntimeError::message({:?}))?",
@@ -3458,7 +3459,7 @@ route POST "/api/posts"
 
         assert!(module.contains("pub struct RoutePostApiPostsInput"));
         assert!(module.contains("__ax_request_input_field(request, \"title\")"));
-        assert!(module.contains("missing required input `title`"));
+        assert!(module.contains("AxRuntimeError::invalid_input(\"title\")"));
         assert!(module.contains("parse::<i64>()"));
         assert!(module.contains("let input = RoutePostApiPostsInput"));
         assert!(module.contains("AxHttpResponse::json(200, &json!(&input.title))"));
