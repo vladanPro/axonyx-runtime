@@ -288,10 +288,15 @@ pub enum PreviewError {
     Lower(#[from] AxLowerError),
     #[error("failed to execute preview runtime: {message}")]
     Runtime { message: String },
+    #[error("access denied")]
+    AccessDenied { status: u16 },
 }
 
 impl From<backend::AxRuntimeError> for PreviewError {
     fn from(error: backend::AxRuntimeError) -> Self {
+        if let Some(status) = error.access_denial_status() {
+            return Self::AccessDenied { status };
+        }
         Self::Runtime {
             message: error.to_string(),
         }
@@ -1538,6 +1543,10 @@ fn execute_preview_loader(
     functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<AxValue, PreviewError> {
     let mut scope = initial_scope.clone();
+    // Request-free rendering must never invent an authenticated identity.
+    scope
+        .entry("Auth".to_string())
+        .or_insert_with(|| AxValue::record([("subject", AxValue::Null)]));
     let AxHandlerKind::Loader { input, .. } = &loader.kind else {
         return Err(PreviewError::Runtime {
             message: format!("handler `{}` is not a loader", loader.name),
@@ -1571,6 +1580,23 @@ fn execute_preview_loader(
             AxStepPlan::Return(value) => {
                 return eval_preview_return_with_functions(value, &scope, env, functions)
             }
+            AxStepPlan::Require { value, fallback } => {
+                let requirement =
+                    eval_preview_require_expr_with_functions(value, &scope, env, functions)?;
+                if !preview_require_passes(&requirement) {
+                    return Err(match fallback {
+                        Some(AxReturnPlan::Forbidden) => backend::AxRuntimeError::Forbidden.into(),
+                        Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
+                            if expr.code.trim().starts_with("error(") =>
+                        {
+                            backend::AxRuntimeError::Unauthorized.into()
+                        }
+                        _ => PreviewError::Runtime {
+                            message: "Loader requirement failed.".to_string(),
+                        },
+                    });
+                }
+            }
             AxStepPlan::Insert { .. }
             | AxStepPlan::Transaction { .. }
             | AxStepPlan::Update { .. }
@@ -1584,7 +1610,6 @@ fn execute_preview_loader(
             | AxStepPlan::SessionCreate { .. }
             | AxStepPlan::SessionDestroy
             | AxStepPlan::SessionRefresh
-            | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {}
         }
     }
@@ -8414,6 +8439,30 @@ page DocsHome
         assert!(html.contains("Docs Shell"));
         assert!(html.contains("Nested page"));
         assert!(html.contains("data-ax-page=\"DocsHome\""));
+    }
+
+    #[test]
+    fn preview_loader_guards_deny_before_returning_private_data() {
+        for (fallback, status) in [("error(\"private policy\")", 401), ("forbidden()", 403)] {
+            let loader = format!("query loadPrivate() {{\n  require Auth.subject else {fallback}\n  return \"private data\"\n}}");
+            let error = preview_ax_route_with_loaders(
+                &[],
+                &[&loader],
+                "page Private() { data secret = loadPrivate()\n return ASX { <p>{secret}</p> } }",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, PreviewError::AccessDenied { status: actual } if actual == status),
+                "{error:?}"
+            );
+        }
+        let html = preview_ax_route_with_loaders(
+            &[],
+            &["query loadPublic() {\n  require true else forbidden()\n  return \"public data\"\n}"],
+            "page Public() { data result = loadPublic()\n return ASX { <p>{result}</p> } }",
+        )
+        .unwrap();
+        assert!(html.contains("public data"));
     }
 
     #[test]
