@@ -3459,11 +3459,31 @@ fn sqlite_row_to_json(row: &rusqlite::Row<'_>, column_names: &[String]) -> rusql
 }
 
 pub(crate) fn sqlite_runtime_error(resource: &str, error: rusqlite::Error) -> AxRuntimeError {
-    AxRuntimeError::database(AxDbError::from_driver_detail(
-        AxDatabaseDriver::Sqlite,
-        resource,
-        error.to_string(),
-    ))
+    let native_constraint = match &error {
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            ) =>
+        {
+            Some(AxDbErrorCode::UniqueViolation)
+        }
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Some(AxDbErrorCode::ConstraintViolation)
+        }
+        _ => None,
+    };
+    let mut translated =
+        AxDbError::from_driver_detail(AxDatabaseDriver::Sqlite, resource, error.to_string());
+    if let Some(code) = native_constraint {
+        translated.code = code.as_str().to_string();
+        translated.status = code.status();
+        translated.message = code.default_message().to_string();
+    }
+    AxRuntimeError::database(translated)
 }
 
 fn postgres_execute_query(
@@ -4109,6 +4129,13 @@ fn postgres_json_query(sql: &str) -> String {
 }
 
 pub(crate) fn postgres_runtime_error(resource: &str, error: postgres::Error) -> AxRuntimeError {
+    let native_constraint = error
+        .as_db_error()
+        .and_then(|error| match error.code().code() {
+            "23505" => Some(AxDbErrorCode::UniqueViolation),
+            "23502" | "23503" | "23514" | "23P01" => Some(AxDbErrorCode::ConstraintViolation),
+            _ => None,
+        });
     let detail = if let Some(db_error) = error.as_db_error() {
         format!("{}: {}", db_error.code().code(), db_error.message())
     } else {
@@ -4121,11 +4148,14 @@ pub(crate) fn postgres_runtime_error(resource: &str, error: postgres::Error) -> 
         }
         detail
     };
-    AxRuntimeError::database(AxDbError::from_driver_detail(
-        AxDatabaseDriver::Postgres,
-        resource,
-        detail,
-    ))
+    let mut translated =
+        AxDbError::from_driver_detail(AxDatabaseDriver::Postgres, resource, detail);
+    if let Some(code) = native_constraint {
+        translated.code = code.as_str().to_string();
+        translated.status = code.status();
+        translated.message = code.default_message().to_string();
+    }
+    AxRuntimeError::database(translated)
 }
 
 fn database_health_error(driver: AxDatabaseDriver, detail: impl Into<String>) -> AxRuntimeError {
@@ -4922,6 +4952,38 @@ mod tests {
     #[test]
     fn ok_payload_returns_framework_success_shape() {
         assert_eq!(ok_payload(), json!({ "ok": true }));
+    }
+
+    #[test]
+    fn sqlite_native_constraint_codes_override_message_classification() {
+        for (extended, expected) in [
+            (
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
+                AxDbErrorCode::UniqueViolation,
+            ),
+            (
+                rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+                AxDbErrorCode::UniqueViolation,
+            ),
+            (
+                rusqlite::ffi::SQLITE_CONSTRAINT_CHECK,
+                AxDbErrorCode::ConstraintViolation,
+            ),
+        ] {
+            let error = sqlite_runtime_error(
+                "credentials",
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(extended),
+                    Some("localized opaque driver message".to_string()),
+                ),
+            );
+            let AxRuntimeError::Database { error } = error else {
+                panic!("expected typed database error");
+            };
+            assert_eq!(error.code, expected.as_str());
+            assert_eq!(error.status, 409);
+            assert_eq!(error.message, expected.default_message());
+        }
     }
 
     #[test]
