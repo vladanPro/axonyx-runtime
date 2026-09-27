@@ -302,6 +302,37 @@ pub fn preview_ax_page(ax_source: &str) -> Result<String, PreviewError> {
     preview_ax_app(None, ax_source)
 }
 
+/// Compose the complete document during Melt using the normal layout rules.
+pub fn compose_compiled_page_document(
+    layout_sources: &[&str],
+    page_source: &str,
+) -> Result<AxDocument, PreviewError> {
+    let mut document = parse_ax_auto(page_source)?;
+    for source in layout_sources.iter().rev() {
+        document = compose_layout_with_page(parse_ax_auto(source)?, document);
+    }
+    Ok(document)
+}
+
+pub fn render_compiled_page_document(
+    document_json: &str,
+    import_sources: &[(&str, &str)],
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    loader_values: &BTreeMap<String, serde_json::Value>,
+    form_result: Option<&form_result::AxFormResult>,
+) -> Result<String, PreviewError> {
+    render_compiled_document(
+        document_json,
+        import_sources,
+        request_target,
+        route_params,
+        loader_values,
+        form_result,
+        true,
+    )
+}
+
 pub fn render_compiled_page_fragment(
     document_json: &str,
     import_sources: &[(&str, &str)],
@@ -326,6 +357,26 @@ pub fn render_compiled_page_fragment_with_form(
     route_params: &BTreeMap<String, String>,
     loader_values: &BTreeMap<String, serde_json::Value>,
     form_result: Option<&form_result::AxFormResult>,
+) -> Result<String, PreviewError> {
+    render_compiled_document(
+        document_json,
+        import_sources,
+        request_target,
+        route_params,
+        loader_values,
+        form_result,
+        false,
+    )
+}
+
+fn render_compiled_document(
+    document_json: &str,
+    import_sources: &[(&str, &str)],
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    loader_values: &BTreeMap<String, serde_json::Value>,
+    form_result: Option<&form_result::AxFormResult>,
+    full_document: bool,
 ) -> Result<String, PreviewError> {
     let document = serde_json::from_str::<AxDocument>(document_json).map_err(|error| {
         PreviewError::Runtime {
@@ -354,6 +405,9 @@ pub fn render_compiled_page_fragment_with_form(
         lower_document_with_scope_and_imports(&document, scope, &resolver, &import_resolver)?;
     if let Some(result) = form_result {
         result.apply_to_node(&mut node);
+    }
+    if full_document {
+        return Ok(render_preview_document(&document, &node));
     }
     let mut html = String::new();
     render_node(&node, &mut html);
