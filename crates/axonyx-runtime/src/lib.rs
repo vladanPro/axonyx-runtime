@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod csrf_http;
 pub mod form_result;
+pub mod input;
 pub mod login_throttle;
 pub mod mutation_security;
 pub mod password;
@@ -773,6 +774,7 @@ struct PreviewBackendContext<'a> {
 }
 
 struct PreviewActionContext<'a> {
+    type_context: &'a AxDataContext,
     env: &'a backend::AxEnv,
     runtime: Option<&'a dyn backend::AxBackendRuntime>,
     request: Option<&'a server::AxHttpRequest>,
@@ -1171,6 +1173,7 @@ pub fn execute_preview_action_sources(
         action_name,
         input_fields,
         PreviewActionContext {
+            type_context: &handlers.type_context,
             env: &env,
             runtime: None,
             request: None,
@@ -1194,6 +1197,7 @@ pub fn execute_preview_action_sources_with_runtime(
         action_name,
         input_fields,
         PreviewActionContext {
+            type_context: &handlers.type_context,
             env: runtime.env(),
             runtime: Some(runtime),
             request: None,
@@ -1218,6 +1222,7 @@ pub fn execute_preview_action_request_sources_with_storage(
         action_name,
         &BTreeMap::new(),
         PreviewActionContext {
+            type_context: &handlers.type_context,
             env: &env,
             runtime: None,
             request: Some(request),
@@ -1242,6 +1247,7 @@ pub fn execute_preview_action_request_sources_with_runtime_and_storage(
         action_name,
         &BTreeMap::new(),
         PreviewActionContext {
+            type_context: &handlers.type_context,
             env: runtime.env(),
             runtime: Some(runtime),
             request: Some(request),
@@ -1829,6 +1835,7 @@ fn execute_preview_action(
     store: &mut AxPreviewStore,
 ) -> Result<AxPreviewActionResult, PreviewError> {
     let PreviewActionContext {
+        type_context,
         env,
         runtime,
         request,
@@ -1854,7 +1861,7 @@ fn execute_preview_action(
     let mut scope = BTreeMap::new();
     scope.insert(
         "input".to_string(),
-        build_preview_input_record(input, input_fields, request)?,
+        build_preview_input_record(input, input_fields, request, type_context)?,
     );
     if let Some(request) = request {
         let session = if action.steps.iter().any(ax_step_uses_auth_subject) {
@@ -2180,7 +2187,7 @@ fn execute_preview_route(
         if !input.is_empty() {
             scope.insert(
                 "input".to_string(),
-                build_preview_route_input_record(input, request)?,
+                build_preview_route_input_record(input, request, type_context)?,
             );
         }
     }
@@ -3767,9 +3774,24 @@ fn build_preview_input_record(
     fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
     input_fields: &BTreeMap<String, String>,
     request: Option<&server::AxHttpRequest>,
+    type_context: &AxDataContext,
 ) -> Result<AxValue, PreviewError> {
     let mut record = BTreeMap::new();
     for field in fields {
+        if !field.optional
+            && field.default.is_none()
+            && type_context.record(&field.rust_ty).is_some()
+        {
+            let value = input::decode_record(
+                request,
+                input_fields.get(&field.name).map(String::as_str),
+                &field.name,
+                &field.rust_ty,
+                type_context,
+            )?;
+            record.insert(field.name.clone(), preview_record_json_to_value(value));
+            continue;
+        }
         if field.rust_ty == "AxIncomingFile" {
             if request
                 .and_then(|request| request.incoming_file(&field.name))
@@ -3851,18 +3873,9 @@ fn build_preview_loader_input_record(
 fn build_preview_route_input_record(
     fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
     request: &server::AxHttpRequest,
+    type_context: &AxDataContext,
 ) -> Result<AxValue, PreviewError> {
-    let input_fields = fields
-        .iter()
-        .filter_map(|field| {
-            request
-                .form_value(&field.name)
-                .or_else(|| request.json_field_string(&field.name))
-                .map(|value| (field.name.clone(), value))
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    build_preview_input_record(fields, &input_fields, Some(request))
+    build_preview_input_record(fields, &BTreeMap::new(), Some(request), type_context)
 }
 
 fn coerce_preview_loader_input_value(
@@ -4167,6 +4180,28 @@ fn preview_json_to_value(value: serde_json::Value) -> AxValue {
                 .map(|(key, value)| (key, preview_json_to_value(value)))
                 .collect(),
         ),
+    }
+}
+
+fn preview_record_json_to_value(value: serde_json::Value) -> AxValue {
+    match value {
+        serde_json::Value::Number(value) if value.is_f64() => AxValue::Float(
+            AxFloat::new(value.as_f64().expect("JSON floating point number"))
+                .expect("finite JSON number"),
+        ),
+        serde_json::Value::Array(items) => AxValue::List(
+            items
+                .into_iter()
+                .map(preview_record_json_to_value)
+                .collect(),
+        ),
+        serde_json::Value::Object(fields) => AxValue::Record(
+            fields
+                .into_iter()
+                .map(|(name, value)| (name, preview_record_json_to_value(value)))
+                .collect(),
+        ),
+        value => preview_json_to_value(value),
     }
 }
 
@@ -9673,6 +9708,95 @@ action UpdatePreferences
         )
         .unwrap();
         assert_eq!(result.value, AxValue::Number(42));
+    }
+
+    #[test]
+    fn preview_record_inputs_validate_before_action_steps() {
+        let source = r#"
+export type Author {
+  name: String
+}
+export type PostInput {
+  title: String
+  summary?: String
+  tags: String[]
+  author: Author
+  count: Int
+  score: Float
+}
+action Save(post: PostInput) {
+  return input.post
+}
+"#;
+        let route_source = format!("{source}\nroute POST \"/save\" {{\n  input:\n    post: PostInput\n  return json(input.post)\n}}");
+        let mut store = AxPreviewStore::default();
+        let valid = serde_json::json!({"title":"Hello", "tags":["rust"], "author":{"name":"Ada", "extra":true}, "count":3, "score":1.25, "extra":true});
+        let request = server::AxHttpRequest::new("POST", "/save")
+            .with_header("Content-Type", "application/json")
+            .with_body(serde_json::to_vec(&serde_json::json!({"post":valid})).unwrap());
+        let result = execute_preview_action_request_sources_with_storage(
+            &[source],
+            "Save",
+            &request,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(
+            preview_value_to_json(&result.value),
+            serde_json::json!({"title":"Hello", "summary":null, "tags":["rust"], "author":{"name":"Ada"}, "count":3, "score":1.25})
+        );
+        let response =
+            execute_preview_route_request_sources(&[&route_source], &request, &mut store)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+            preview_value_to_json(&result.value)
+        );
+        for value in [
+            serde_json::Value::Null,
+            serde_json::Value::String(valid.to_string()),
+            serde_json::json!({"title":"PRIVATE_VALUE"}),
+            {
+                let mut value = valid.clone();
+                value["title"] = serde_json::json!(123);
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["tags"] = serde_json::json!([1]);
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["author"] = serde_json::json!({"name":false});
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["count"] = serde_json::json!(18446744073709551615_u64);
+                value
+            },
+        ] {
+            let request = server::AxHttpRequest::new("POST", "/save")
+                .with_header("Content-Type", "application/json")
+                .with_body(serde_json::to_vec(&serde_json::json!({"post":value})).unwrap());
+            let error = execute_preview_action_request_sources_with_storage(
+                &[source],
+                "Save",
+                &request,
+                &server::AxUnavailableFileStorage,
+                &mut store,
+            )
+            .unwrap_err();
+            assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "post"));
+            assert!(!error.to_string().contains("PRIVATE_VALUE"));
+            let error =
+                execute_preview_route_request_sources(&[&route_source], &request, &mut store)
+                    .unwrap_err();
+            assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "post"));
+        }
     }
 
     #[test]
