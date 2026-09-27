@@ -1397,7 +1397,14 @@ fn render_step(
             rendered.push_str(&render_optional_binding_narrowing(value, typed_bindings));
             rendered
         }
-        AxStepPlan::Require { value, .. } => format!("    // require {}\n", value.code),
+        AxStepPlan::Require { value, .. } => {
+            let mut rendered = format!(
+                "    if !__ax_truthy(&json!({})) {{\n        return Err(AxRuntimeError::message(\"Backend requirement was not satisfied\"));\n    }}\n",
+                render_borrowed_expr(value)
+            );
+            rendered.push_str(&render_optional_binding_narrowing(value, typed_bindings));
+            rendered
+        }
         AxStepPlan::Return(value) => render_return_step(value, route_response, action_response),
         AxStepPlan::Send { target, payload } => format!(
             "    runtime.send(&AxSendRequest {{\n        target: {:?}.to_string(),\n        payload: json!({}),\n    }})?;\n",
@@ -2803,6 +2810,28 @@ action publishPost(id: String, title: String) {
             "__ax_push_invalidation(&mut __ax_invalidations, \"posts\".to_string(), false)"
         ));
         assert!(module.contains("Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))"));
+    }
+
+    #[test]
+    fn loader_require_stops_before_database_access() {
+        let module = compile_backend_ax_to_module(
+            r#"
+query deniedPosts() {
+  require false else error("private policy detail")
+  data posts = db.posts.all()
+  return posts
+}
+"#,
+        )
+        .expect("guarded query should compile");
+        let denial = module
+            .find("return Err(AxRuntimeError::message(\"Backend requirement was not satisfied\"))")
+            .expect("loader must enforce guard");
+        let query = module
+            .find("runtime.load(&AxQueryRequest")
+            .expect("query should compile");
+        assert!(denial < query);
+        assert!(!module.contains("// require false"));
     }
 
     #[test]
