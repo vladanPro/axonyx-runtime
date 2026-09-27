@@ -1022,6 +1022,13 @@ fn render_expr(expr: &AxExpr) -> String {
         AxExpr::Identifier(name) => name.clone(),
         AxExpr::Unary { op, expr } => format!("({}{})", render_unary_op(*op), render_expr(expr)),
         AxExpr::Binary { op, left, right } => {
+            if *op == AxBinaryOp::Add {
+                return format!(
+                    "__ax_add(&({}), &({}))",
+                    render_expr(left),
+                    render_expr(right)
+                );
+            }
             if *op == AxBinaryOp::Fallback {
                 return format!("({}).unwrap_or({})", render_expr(left), render_expr(right));
             }

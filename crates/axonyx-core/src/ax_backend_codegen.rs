@@ -119,6 +119,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("use axonyx_runtime::backend_prelude::*;\n");
     out.push_str("use axonyx_runtime::server_prelude::*;\n");
     out.push_str("use serde_json::{json, Value};\n\n");
+    out.push_str(BACKEND_ADDITION_HELPER);
 
     validate_type_contracts(&plan.types, &plan.literal_unions)?;
     for literal_union in &plan.literal_unions {
@@ -1974,6 +1975,36 @@ fn render_codegen_expr(code: &str) -> String {
     )
 }
 
+// Borrow operands so a concatenation does not consume reusable handler inputs.
+const BACKEND_ADDITION_HELPER: &str = r#"
+trait __AxAdd<Rhs> {
+    type Output;
+    fn ax_add(&self, rhs: &Rhs) -> Self::Output;
+}
+fn __ax_add<L, R>(left: &L, right: &R) -> L::Output
+where L: __AxAdd<R> {
+    left.ax_add(right)
+}
+impl __AxAdd<String> for String {
+    type Output = String;
+    fn ax_add(&self, rhs: &String) -> String {
+        let mut result = self.clone();
+        result.push_str(rhs);
+        result
+    }
+}
+macro_rules! __ax_numeric_add {
+    ($($ty:ty),*) => {$(
+        impl __AxAdd<$ty> for $ty {
+            type Output = $ty;
+            fn ax_add(&self, rhs: &$ty) -> $ty { *self + *rhs }
+        }
+    )*};
+}
+__ax_numeric_add!(i32, i64, u64, f64);
+
+"#;
+
 fn split_codegen_binary_args(input: &str) -> Option<(&str, &str)> {
     let args = split_codegen_args(input);
     if args.len() < 2 {
@@ -2275,6 +2306,77 @@ mod tests {
     use crate::ax_ast::prelude::AxExpr;
     use crate::ax_backend_ast::prelude::*;
     use crate::ax_backend_lowering::lower_backend_document;
+
+    #[test]
+    fn backend_addition_compiles_without_consuming_string_operands() {
+        let directory = std::env::temp_dir().join(format!(
+            "axonyx-addition-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("addition.rs");
+        let binary = directory.join(format!("addition{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&source, format!("{BACKEND_ADDITION_HELPER}\n{}", r#"
+fn main() {
+    let email = "foundry@example.com".to_string();
+    let prefix = "register:".to_string();
+    assert_eq!(__ax_add(&prefix, &email), "register:foundry@example.com");
+    assert_eq!(__ax_add(&__ax_add(&prefix, &email), &"!".to_string()), "register:foundry@example.com!");
+    assert_eq!(__ax_add(&"".to_string(), &email), email);
+    assert_eq!(prefix, "register:");
+    assert_eq!(email, "foundry@example.com");
+    assert_eq!(__ax_add(&2, &3), 5);
+    assert_eq!(__ax_add(&2_i64, &3_i64), 5_i64);
+    assert_eq!(__ax_add(&2_u64, &3_u64), 5_u64);
+    assert_eq!(__ax_add(&2.5_f64, &3.0_f64), 5.5_f64);
+}
+"#)).unwrap();
+        let compilation = std::process::Command::new("rustc")
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .unwrap();
+        let execution = compilation
+            .status
+            .success()
+            .then(|| std::process::Command::new(&binary).output().unwrap());
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(
+            compilation.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compilation.stderr)
+        );
+        assert!(execution.unwrap().status.success());
+    }
+
+    #[test]
+    fn lowers_addition_in_hooks_and_domain_helpers() {
+        let module = compile_backend_ax_to_module(
+            r#"
+export fn join(left: String, right: String) -> String {
+  return left + right
+}
+export fn sum(left: Int, right: Int) -> Int {
+  return left + right
+}
+route POST "/api/register" {
+  input:
+    email: String
+  before Login.throttle("register:" + input.email, 10, 60)
+  return json(input.email)
+}
+"#,
+        )
+        .expect("addition should compile");
+        assert!(module.contains("__ax_add(&(left), &(right))"));
+        assert!(module.contains("__ax_add(&(\"register:\".to_string()), &(input.email))"));
+    }
 
     #[test]
     fn compiles_canonical_scalar_action_and_route_inputs() {
