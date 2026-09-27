@@ -2358,7 +2358,14 @@ fn render_preview_require_fallback(
         fallback,
         Some(AxReturnPlan::Expr(_)) | Some(AxReturnPlan::Json(_))
     ) {
-        response.status = 401;
+        response.status = match fallback {
+            Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
+                if parse_preview_call_args(expr.code.trim(), "invalid").is_some() =>
+            {
+                422
+            }
+            _ => 401,
+        };
     }
 
     Ok(response)
@@ -3085,6 +3092,21 @@ fn eval_preview_expr_with_functions(
             return Ok(AxValue::Bool(false));
         };
         return Ok(AxValue::Bool(items.iter().any(|item| item == &needle)));
+    }
+
+    if let Some(args) = parse_preview_call_args(code, "invalid") {
+        let [fields] = args.as_slice() else {
+            return Err(PreviewError::Runtime {
+                message: "invalid(fields) expects exactly one argument".to_string(),
+            });
+        };
+        let fields =
+            eval_preview_expr_with_functions(&AxRustExpr::new(fields), scope, env, functions)?;
+        return Ok(AxValue::record([
+            ("error", AxValue::String("invalid_input".to_string())),
+            ("message", AxValue::String("Invalid input.".to_string())),
+            ("fields", fields),
+        ]));
     }
 
     if let Some(args) = parse_preview_call_args(code, "error") {
@@ -9670,6 +9692,28 @@ route GET "/api/admin"
             response.headers.get("Location").map(String::as_str),
             Some("/login")
         );
+    }
+
+    #[test]
+    fn preview_invalid_guard_returns_422_with_field_messages() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_request_sources(
+            &[r#"
+route GET "/api/register" {
+  require false else invalid({email: "Email is required."})
+  return json("ok")
+}
+"#],
+            &server::AxHttpRequest::new("GET", "/api/register"),
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+        assert_eq!(response.status, 422);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "invalid_input");
+        assert_eq!(body["fields"]["email"], "Email is required.");
+        assert!(response.set_cookies.is_empty());
     }
 
     #[test]
