@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod csrf_http;
+pub mod form_result;
 pub mod login_throttle;
 pub mod mutation_security;
 pub mod password;
@@ -4764,7 +4765,10 @@ fn ax_action_script() -> &'static str {
       }
       if (contentType.includes("application/ax-error+json")) {
         const payload = await response.json();
-        showFieldErrors(form, payload?.error?.value?.fields);
+        const result = payload?.form;
+        const target = new URL(form.action, window.location.href);
+        const matchingResult = result?.version === 1 && result.action === target.searchParams.get("name") && result.route === (target.searchParams.get("path") || "/");
+        showFieldErrors(form, result ? (matchingResult ? result.fields : null) : payload?.error?.value?.fields);
         setActionState(form, "error");
         window.dispatchEvent(new CustomEvent("axonyx:action-error", {
           detail: { form, payload, error: payload?.error },
