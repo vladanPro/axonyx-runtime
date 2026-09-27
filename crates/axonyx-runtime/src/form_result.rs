@@ -1,5 +1,30 @@
 use std::collections::BTreeMap;
 
+/// Keep request identity/context, but never forward mutation payloads to reads.
+pub fn page_read_request(
+    request: &crate::server::AxHttpRequest,
+    target: &str,
+) -> crate::server::AxHttpRequest {
+    let mut read = crate::server::AxHttpRequest::new("GET", target);
+    read.headers = request
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            ![
+                "content-type",
+                "content-length",
+                "transfer-encoding",
+                "expect",
+                "x-axonyx-csrf",
+            ]
+            .iter()
+            .any(|excluded| name.eq_ignore_ascii_case(excluded))
+        })
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect();
+    read
+}
+
 /// Request-local public validation metadata. Never accepts submitted values.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -116,6 +141,41 @@ impl AxFormResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_read_context_drops_mutation_body_and_transport_headers() {
+        let request = crate::server::AxHttpRequest::new("POST", "/__axonyx/action")
+            .with_header("Cookie", "session=identity")
+            .with_header("Content-Type", "application/x-www-form-urlencoded")
+            .with_header("Content-Length", "18")
+            .with_body(b"password=nevercopy".to_vec());
+        let read = page_read_request(&request, "/forms");
+        assert_eq!(read.method, "GET");
+        assert_eq!(read.target, "/forms");
+        assert!(read.body.is_empty());
+        assert_eq!(read.header_value("Cookie"), Some("session=identity"));
+        assert!(read.header_value("Content-Type").is_none());
+        assert!(read.header_value("Content-Length").is_none());
+    }
+
+    #[test]
+    fn compiled_action_form_url_uses_original_page_route() {
+        let document = crate::compose_compiled_page_document(
+            &[],
+            "page Form\n<ActionForm name=\"Save\"><input name=\"email\" /></ActionForm>",
+        )
+        .unwrap();
+        let html = crate::render_compiled_page_document(
+            &serde_json::to_string(&document).unwrap(),
+            &[],
+            "/forms?ignored=1",
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        assert!(html.contains("action=\"/__axonyx/action?path=%2Fforms&amp;name=Save\""));
+    }
 
     #[test]
     fn compiled_document_keeps_head_and_nested_layouts_with_form_errors() {

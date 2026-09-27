@@ -389,6 +389,16 @@ fn render_compiled_document(
         &parse_preview_query_fields(request_target),
     );
     let resolver = |path: &[String], args: &[AxValue]| {
+        if path == ["action"] {
+            if let [AxValue::String(name)] = args {
+                let route = request_target.split('?').next().unwrap_or("/");
+                return Some(AxValue::String(format!(
+                    "/__axonyx/action?path={}&name={}",
+                    url_encode(route),
+                    url_encode(name)
+                )));
+            }
+        }
         let args = args.iter().map(preview_value_to_json).collect::<Vec<_>>();
         path.last()
             .map(|name| compiled_loader_call_key(name, &args))
