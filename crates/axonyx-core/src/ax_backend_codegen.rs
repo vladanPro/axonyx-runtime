@@ -1397,9 +1397,15 @@ fn render_step(
             rendered.push_str(&render_optional_binding_narrowing(value, typed_bindings));
             rendered
         }
-        AxStepPlan::Require { value, .. } => {
+        AxStepPlan::Require { value, fallback } => {
+            let error = match fallback.as_ref() {
+                Some(AxReturnPlan::Forbidden) => "AxRuntimeError::Forbidden",
+                Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
+                    if render_error_call_message(expr).is_some() => "AxRuntimeError::Unauthorized",
+                _ => "AxRuntimeError::message(\"Backend requirement was not satisfied\")",
+            };
             let mut rendered = format!(
-                "    if !__ax_truthy(&json!({})) {{\n        return Err(AxRuntimeError::message(\"Backend requirement was not satisfied\"));\n    }}\n",
+                "    if !__ax_truthy(&json!({})) {{\n        return Err({error});\n    }}\n",
                 render_borrowed_expr(value)
             );
             rendered.push_str(&render_optional_binding_narrowing(value, typed_bindings));
@@ -2825,13 +2831,23 @@ query deniedPosts() {
         )
         .expect("guarded query should compile");
         let denial = module
-            .find("return Err(AxRuntimeError::message(\"Backend requirement was not satisfied\"))")
+            .find("return Err(AxRuntimeError::Unauthorized)")
             .expect("loader must enforce guard");
         let query = module
             .find("runtime.load(&AxQueryRequest")
             .expect("query should compile");
         assert!(denial < query);
         assert!(!module.contains("// require false"));
+        assert!(!module.contains("private policy detail"));
+        let forbidden = compile_backend_ax_to_module(
+            "query restricted() {\n  require false else forbidden()\n  return 1\n}",
+        )
+        .expect("forbidden query should compile");
+        assert!(forbidden.contains("return Err(AxRuntimeError::Forbidden)"));
+        let ordinary =
+            compile_backend_ax_to_module("query checked() {\n  require false\n  return 1\n}")
+                .expect("ordinary requirement should compile");
+        assert!(ordinary.contains("Backend requirement was not satisfied"));
     }
 
     #[test]
