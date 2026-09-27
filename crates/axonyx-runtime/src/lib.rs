@@ -7,6 +7,7 @@ pub mod server;
 pub mod session;
 #[cfg(feature = "storage")]
 pub mod storage;
+pub mod validation;
 
 /// Generates a server-owned identifier, not a session or authentication token.
 pub fn new_uuid() -> String {
@@ -3094,6 +3095,35 @@ fn eval_preview_expr_with_functions(
         return Ok(AxValue::Bool(items.iter().any(|item| item == &needle)));
     }
 
+    for (name, predicate) in [
+        ("Validate.email", validation::email as fn(&str) -> bool),
+        ("Validate::email", validation::email as fn(&str) -> bool),
+        (
+            "Validate::password",
+            validation::password as fn(&str) -> bool,
+        ),
+        (
+            "Validate.password",
+            validation::password as fn(&str) -> bool,
+        ),
+    ] {
+        if let Some(args) = parse_preview_call_args(code, name) {
+            let [arg] = args.as_slice() else {
+                return Err(PreviewError::Runtime {
+                    message: "Validation expects one String argument".to_string(),
+                });
+            };
+            let value =
+                eval_preview_expr_with_functions(&AxRustExpr::new(arg), scope, env, functions)?;
+            let AxValue::String(value) = value else {
+                return Err(PreviewError::Runtime {
+                    message: "Validation expects one String argument".to_string(),
+                });
+            };
+            return Ok(AxValue::Bool(predicate(&value)));
+        }
+    }
+
     if let Some(args) = parse_preview_call_args(code, "invalid") {
         let [fields] = args.as_slice() else {
             return Err(PreviewError::Runtime {
@@ -4439,6 +4469,24 @@ fn ax_action_script() -> &'static str {
   };
 
   const actionStatuses = (form) => Array.from(form.querySelectorAll(".ax-action-status[data-state]"));
+  const showFieldErrors = (form, fields) => {
+    form.querySelectorAll("[data-ax-field-error]").forEach((node) => {
+      const name = node.getAttribute("data-ax-field-error");
+      const message = fields && Object.prototype.hasOwnProperty.call(fields, name) ? fields[name] : "";
+      node.textContent = typeof message === "string" ? message : "";
+      node.setAttribute("aria-live", "polite");
+    });
+    Array.from(form.elements || []).forEach((control) => {
+      if (control.hasAttribute("data-ax-validation-invalid")) {
+        control.removeAttribute("aria-invalid");
+        control.removeAttribute("data-ax-validation-invalid");
+      }
+      if (fields && Object.prototype.hasOwnProperty.call(fields, control.name) && typeof fields[control.name] === "string") {
+        control.setAttribute("aria-invalid", "true");
+        control.setAttribute("data-ax-validation-invalid", "true");
+      }
+    });
+  };
   const actionProgress = (form) => Array.from(form.querySelectorAll("[data-ax-action-progress]"));
   const actionSubmitControls = (form) => Array.from(form.querySelectorAll(
     'button:not([type]), button[type="submit"], input[type="submit"], input[type="image"]'
@@ -4681,6 +4729,7 @@ fn ax_action_script() -> &'static str {
       "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
     };
     resetUploadProgress(form);
+    showFieldErrors(form, null);
     setActionState(form, "pending");
     window.dispatchEvent(new CustomEvent("axonyx:action-start", {
       detail: { form },
@@ -4715,6 +4764,7 @@ fn ax_action_script() -> &'static str {
       }
       if (contentType.includes("application/ax-error+json")) {
         const payload = await response.json();
+        showFieldErrors(form, payload?.error?.value?.fields);
         setActionState(form, "error");
         window.dispatchEvent(new CustomEvent("axonyx:action-error", {
           detail: { form, payload, error: payload?.error },
@@ -9700,7 +9750,7 @@ route GET "/api/admin"
         let response = execute_preview_route_request_sources(
             &[r#"
 route GET "/api/register" {
-  require false else invalid({email: "Email is required."})
+  require Validate.email("invalid") else invalid({email: "Email is required."})
   return json("ok")
 }
 "#],

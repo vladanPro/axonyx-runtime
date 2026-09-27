@@ -1951,6 +1951,25 @@ fn render_owned_expr(expr: &AxRustExpr) -> String {
 
 fn render_codegen_expr(code: &str) -> String {
     let code = code.trim();
+    for (name, predicate) in [
+        ("Validate.email", "email"),
+        ("Validate.password", "password"),
+        ("Validate::email", "email"),
+        ("Validate::password", "password"),
+    ] {
+        if let Some(inner) = code
+            .strip_prefix(&format!("{name}("))
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let args = split_codegen_args(inner);
+            if let [arg] = args.as_slice() {
+                return format!(
+                    "axonyx_runtime::validation::{predicate}(&({}))",
+                    render_codegen_expr(arg)
+                );
+            }
+        }
+    }
     let Some(inner) = code
         .strip_prefix("contains(")
         .and_then(|value| value.strip_suffix(')'))
@@ -2499,7 +2518,7 @@ route POST "/api/probe" {
         let module = compile_backend_ax_to_module(
             r#"
 action Register(email: String) {
-  require input.email != "" else invalid({email: "Email is required."})
+  require Validate.email(input.email) else invalid({email: "Email is required."})
   return ok()
 }
 route POST "/api/register" {
@@ -2514,6 +2533,8 @@ route POST "/api/register" {
         assert!(module.contains("AxHttpResponse::json(422"));
         assert!(module.contains("invalid_input"));
         assert!(module.contains("Email is required."));
+        assert!(module.contains("axonyx_runtime::validation::email"));
+        assert!(!module.contains("Validate::"));
         assert!(!module.contains("&invalid("));
         let auth = render_require_fallback(Some(&AxReturnPlan::Expr(AxRustExpr::new(
             "error(\"Unauthorized\")",
