@@ -1160,11 +1160,12 @@ fn render_input_field(field: &AxFieldPlan, raw: &str) -> String {
 
     if !field.optional && field.default.is_none() && field.rust_ty != "bool" {
         return match field.rust_ty.as_str() {
-            "String" => format!("{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?"),
+            "String" => format!("{raw}.ok_or_else(|| AxRuntimeError::invalid_input({:?}))?", field.name),
             "i64" | "u64" | "f64" => format!(
-                "{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?.trim().parse::<{}>().map_err(|_| AxRuntimeError::message({:?}))?",
+                "{raw}.ok_or_else(|| AxRuntimeError::invalid_input({:?}))?.trim().parse::<{}>().map_err(|_| AxRuntimeError::invalid_input({:?}))?",
+                field.name,
                 field.rust_ty,
-                format!("input `{}` expected {}", field.name, field.rust_ty)
+                field.name
             ),
             "AxFileRef" => format!(
                 "serde_json::from_str::<AxFileRef>(&{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?).map_err(|_| AxRuntimeError::message({:?}))?",
@@ -1951,6 +1952,25 @@ fn render_owned_expr(expr: &AxRustExpr) -> String {
 
 fn render_codegen_expr(code: &str) -> String {
     let code = code.trim();
+    for (name, predicate) in [
+        ("Validate.email", "email"),
+        ("Validate.password", "password"),
+        ("Validate::email", "email"),
+        ("Validate::password", "password"),
+    ] {
+        if let Some(inner) = code
+            .strip_prefix(&format!("{name}("))
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let args = split_codegen_args(inner);
+            if let [arg] = args.as_slice() {
+                return format!(
+                    "axonyx_runtime::validation::{predicate}(&({}))",
+                    render_codegen_expr(arg)
+                );
+            }
+        }
+    }
     let Some(inner) = code
         .strip_prefix("contains(")
         .and_then(|value| value.strip_suffix(')'))
@@ -2178,6 +2198,9 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
 fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     match fallback {
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
+            if let Some(fields) = render_invalid_call_fields(expr) {
+                return format!("        let __ax_error_value = json!({{\"fields\": {fields}}});\n        return Ok(AxActionOutput::new(__ax_action_error_payload(\"Invalid input.\".to_string(), __ax_error_value, 422, __ax_redirect)).with_cookies(__ax_cookies));\n");
+            }
             if let Some(message) = render_error_call_message(expr) {
                 format!(
                     "        let __ax_error_message = ({message}).to_string();\n        let __ax_error_value = json!(&__ax_error_message);\n        return Ok(AxActionOutput::new(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect)).with_cookies(__ax_cookies));\n"
@@ -2204,7 +2227,9 @@ fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
 fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     let response = match fallback {
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
-            if let Some(message) = render_error_call_message(expr) {
+            if let Some(fields) = render_invalid_call_fields(expr) {
+                format!("AxHttpResponse::json(422, &json!({{\"error\": \"invalid_input\", \"message\": \"Invalid input.\", \"fields\": {fields}}})).map_err(|error| AxRuntimeError::message(error.to_string()))?")
+            } else if let Some(message) = render_error_call_message(expr) {
                 format!(
                     "AxHttpResponse::json(401, &json!({{\"error\": {message}}})).map_err(|error| AxRuntimeError::message(error.to_string()))?"
                 )
@@ -2230,6 +2255,22 @@ fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     };
 
     format!("        return Ok(__ax_finalize_response({response}, __ax_headers, __ax_cookies));\n")
+}
+
+fn render_invalid_call_fields(expr: &AxRustExpr) -> Option<String> {
+    let inner = expr
+        .code
+        .trim()
+        .strip_prefix("invalid(")?
+        .strip_suffix(')')?;
+    let args = split_codegen_args(inner);
+    let [fields] = args.as_slice() else {
+        return None;
+    };
+    if fields.trim().is_empty() {
+        return None;
+    }
+    Some(render_borrowed_expr(&AxRustExpr::new(*fields)))
 }
 
 fn render_error_call_message(expr: &AxRustExpr) -> Option<String> {
@@ -2471,6 +2512,35 @@ route POST "/api/probe" {
             assert!(module.contains(field), "missing mapped input: {field}");
         }
         assert!(!module.contains("pub id: Int"));
+    }
+
+    #[test]
+    fn invalid_guard_emits_field_errors_without_changing_auth_status() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action Register(email: String) {
+  require Validate.email(input.email) else invalid({email: "Email is required."})
+  return ok()
+}
+route POST "/api/register" {
+  input:
+    email: String
+  require input.email != "" else invalid({email: "Email is required."})
+  return json("ok")
+}
+"#,
+        )
+        .expect("validation guards should compile");
+        assert!(module.contains("AxHttpResponse::json(422"));
+        assert!(module.contains("invalid_input"));
+        assert!(module.contains("Email is required."));
+        assert!(module.contains("axonyx_runtime::validation::email"));
+        assert!(!module.contains("Validate::"));
+        assert!(!module.contains("&invalid("));
+        let auth = render_require_fallback(Some(&AxReturnPlan::Expr(AxRustExpr::new(
+            "error(\"Unauthorized\")",
+        ))));
+        assert!(auth.contains("AxHttpResponse::json(401"));
     }
 
     #[test]
@@ -3389,7 +3459,7 @@ route POST "/api/posts"
 
         assert!(module.contains("pub struct RoutePostApiPostsInput"));
         assert!(module.contains("__ax_request_input_field(request, \"title\")"));
-        assert!(module.contains("missing required input `title`"));
+        assert!(module.contains("AxRuntimeError::invalid_input(\"title\")"));
         assert!(module.contains("parse::<i64>()"));
         assert!(module.contains("let input = RoutePostApiPostsInput"));
         assert!(module.contains("AxHttpResponse::json(200, &json!(&input.title))"));

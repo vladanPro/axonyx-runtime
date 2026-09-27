@@ -8,17 +8,20 @@ const start = source.indexOf(marker);
 assert.notEqual(start, -1);
 const script = source.slice(start + marker.length, source.indexOf('</script>"##', start));
 
-async function run(action, token, denied = false) {
+async function run(action, token, denied = false, invalid = false) {
   let submit;
   const calls = [];
   const attributes = new Map();
+  const fieldAttributes = new Map();
+  const field = { name: "email", hasAttribute: (key) => fieldAttributes.has(key), setAttribute: (key, value) => fieldAttributes.set(key, value), removeAttribute: (key) => fieldAttributes.delete(key) };
+  const message = { textContent: "", getAttribute: () => "email", setAttribute() {} };
   class Form {
-    constructor() { this.action = action; this.method = "POST"; }
+    constructor() { this.action = action; this.method = "POST"; this.elements = [field]; }
     getAttribute(name) { return attributes.get(name); }
     hasAttribute(name) { return attributes.has(name); }
     setAttribute(name, value) { attributes.set(name, value); }
     removeAttribute(name) { attributes.delete(name); }
-    querySelectorAll() { return []; }
+    querySelectorAll(selector) { return selector === "[data-ax-field-error]" ? [message] : []; }
   }
   class Data {
     constructor() { this.fields = new Map(); }
@@ -45,11 +48,13 @@ async function run(action, token, denied = false) {
       calls.push({ url, options });
       return url === "/__axonyx/csrf"
         ? { ok: !denied, json: async () => ({ token }) }
-        : { ok: true, headers: { get: () => "application/ax-patch+json" }, json: async () => ({ patches: [], invalidations: [], refreshes: [] }) };
+        : invalid
+          ? { ok: false, headers: { get: () => "application/ax-error+json" }, json: async () => ({ error: { status: 422, value: { fields: { email: "<script>not executable</script>" } } } }) }
+          : { ok: true, headers: { get: () => "application/ax-patch+json" }, json: async () => ({ patches: [], invalidations: [], refreshes: [] }) };
     },
   });
   await submit({ target: form, preventDefault() {} });
-  return { calls, attributes };
+  return { calls, attributes, fieldAttributes, message };
 }
 
 const proof = "axcsrf1." + "a".repeat(64);
@@ -68,4 +73,8 @@ assert.equal(denied.calls.length, 1);
 assert.equal(denied.attributes.get("data-ax-action-state"), "error");
 const malformed = await run("https://axonyx.dev/__axonyx/action", "bad");
 assert.equal(malformed.calls.length, 1);
-console.log("Action CSRF bridge checks passed (5 scenarios).");
+const invalid = await run("https://axonyx.dev/__axonyx/action?name=Register", proof, false, true);
+assert.equal(invalid.attributes.get("data-ax-action-state"), "error");
+assert.equal(invalid.fieldAttributes.get("aria-invalid"), "true");
+assert.equal(invalid.message.textContent, "<script>not executable</script>");
+console.log("Action CSRF bridge checks passed (6 scenarios).");
