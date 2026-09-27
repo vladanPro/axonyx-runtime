@@ -1197,8 +1197,8 @@ fn render_input_field(field: &AxFieldPlan, raw: &str) -> String {
             "{raw}.map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), \"true\" | \"1\" | \"on\" | \"yes\")).unwrap_or({missing})"
         ),
         "i64" | "u64" | "f64" => format!(
-            "{raw}.map(|value| value.trim().parse::<{}>().map_err(|_| AxRuntimeError::message(format!(\"input `{}` expected {} but received `{{}}`\", value)))).transpose()?.unwrap_or({missing})",
-            field.rust_ty, field.name, field.rust_ty
+            "{raw}.map(|value| value.trim().parse::<{}>().map_err(|_| AxRuntimeError::invalid_input({:?}))).transpose()?.unwrap_or({missing})",
+            field.rust_ty, field.name
         ),
         _ => format!("{raw}.unwrap_or_else(|| ({missing}).to_string())"),
     }
@@ -2425,6 +2425,31 @@ mod tests {
     use crate::ax_ast::prelude::AxExpr;
     use crate::ax_backend_ast::prelude::*;
     use crate::ax_backend_lowering::lower_backend_document;
+
+    #[test]
+    fn numeric_input_errors_are_typed_for_required_optional_and_default_fields() {
+        for rust_ty in ["i64", "u64", "f64"] {
+            for (optional, default) in [
+                (false, None),
+                (true, None),
+                (false, Some(AxRustExpr::new("7"))),
+            ] {
+                let field = AxFieldPlan {
+                    name: "count".to_string(),
+                    rust_ty: rust_ty.to_string(),
+                    optional,
+                    default,
+                };
+                let rendered = render_input_field(&field, "raw");
+                assert!(rendered.contains("AxRuntimeError::invalid_input(\"count\")"));
+                assert!(!rendered.contains("AxRuntimeError::message"));
+                assert!(!rendered.contains("received"));
+                if optional || field.default.is_some() {
+                    assert!(rendered.contains(".transpose()?.unwrap_or("));
+                }
+            }
+        }
+    }
 
     #[test]
     fn backend_addition_compiles_without_consuming_string_operands() {
