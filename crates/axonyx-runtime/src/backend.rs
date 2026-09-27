@@ -516,11 +516,21 @@ pub struct AxSendRequest {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxLoaderContext {
+    #[serde(skip)]
+    request: Option<AxHttpRequest>,
     pub params: BTreeMap<String, String>,
     pub query: BTreeMap<String, String>,
 }
 
 impl AxLoaderContext {
+    pub fn with_request(mut self, request: &AxHttpRequest) -> Self {
+        self.request = Some(request.clone());
+        self
+    }
+
+    pub fn request(&self) -> AxRuntimeResult<&AxHttpRequest> {
+        self.request.as_ref().ok_or(AxRuntimeError::Unauthorized)
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -4796,6 +4806,22 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn loader_request_identity_is_not_serialized_or_deserialized() {
+        let mut request = AxHttpRequest::new("GET", "/private");
+        request
+            .headers
+            .insert("Cookie".into(), "session=private-cookie".into());
+        let context = AxLoaderContext::new().with_request(&request);
+        assert_eq!(context.request().unwrap(), &request);
+        let serialized = serde_json::to_string(&context).unwrap();
+        assert!(!serialized.contains("private-cookie"));
+        assert!(!serialized.contains("request"));
+        let injected = json!({"params":{}, "query":{}, "request": request});
+        let decoded: AxLoaderContext = serde_json::from_value(injected).unwrap();
+        assert_eq!(decoded.request(), Err(AxRuntimeError::Unauthorized));
+    }
 
     #[test]
     fn access_denials_have_fixed_public_payloads_and_typed_statuses() {

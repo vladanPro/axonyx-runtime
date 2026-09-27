@@ -64,7 +64,7 @@ pub enum AxBackendCodegenError {
     #[error("domain helper `{function}` cannot return `{ty}` from the Rust backend")]
     UnsupportedFunctionReturnType { function: String, ty: String },
     #[error(
-        "Auth.subject is only supported inside server actions and routes; found in `{handler}`"
+        "Auth.subject is only supported inside server actions, routes and request-bound loaders; found in `{handler}`"
     )]
     AuthSubjectOutsideRequestHandler { handler: String },
     #[error(
@@ -784,7 +784,7 @@ fn render_handler_fn(
     let uses_auth_subject = ax_steps_use_auth_subject(globals.iter().chain(handler.steps.iter()));
     let request_handler = matches!(
         handler.kind,
-        AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+        AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. } | AxHandlerKind::Loader { .. }
     );
     if uses_auth_subject && !request_handler {
         return Err(AxBackendCodegenError::AuthSubjectOutsideRequestHandler {
@@ -856,6 +856,9 @@ fn render_handler_fn(
         out.push_str("    let mut __ax_redirect: Option<String> = None;\n");
     }
     if uses_auth_subject {
+        if matches!(handler.kind, AxHandlerKind::Loader { .. }) {
+            out.push_str("    let request = context.request()?;\n");
+        }
         out.push_str("    let __ax_session = runtime.load_session(request)?;\n");
     }
     let mut typed_bindings = std::collections::BTreeMap::new();
@@ -990,6 +993,9 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
         };
         out.push_str(&format!("        {:?} => {{\n", handler.name));
         out.push_str("            let context = __ax_loader_context(pattern, request)?;\n");
+        if ax_steps_use_auth_subject(plan.globals.iter().chain(handler.steps.iter())) {
+            out.push_str("            let context = context.with_request(request);\n");
+        }
         if input.is_empty() {
             out.push_str("            if !args.is_empty() { return Err(AxRuntimeError::message(\"compiled loader expected 0 arguments\")); }\n");
             out.push_str(&format!(
@@ -3251,15 +3257,24 @@ route GET "/api/account"
     }
 
     #[test]
+    fn loader_auth_uses_server_request_context() {
+        let module = compile_backend_ax_to_module("query privatePosts() {\n  require Auth.subject else error(\"private policy\")\n  return 1\n}").expect("request-bound loader should compile");
+        assert!(module.contains("let request = context.request()?;"));
+        assert!(module.contains("let context = context.with_request(request);"));
+        assert!(module.contains("runtime.load_session(request)?"));
+        assert!(!module.contains("private policy"));
+    }
+
+    #[test]
     fn rejects_auth_subject_outside_request_handlers() {
         let error = compile_backend_ax_to_module(
             r#"
-query loadAccount() {
+job loadAccount {
   return Auth.subject
 }
 "#,
         )
-        .expect_err("loader auth should be rejected");
+        .expect_err("job auth should be rejected");
 
         assert!(matches!(
             error,
