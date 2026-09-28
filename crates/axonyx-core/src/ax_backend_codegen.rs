@@ -839,7 +839,7 @@ fn render_handler_fn(
             "    let context = __ax_loader_context({path:?}, request)?;\n"
         ));
         if !input.is_empty() {
-            out.push_str(&render_route_input_binding(handler, input));
+            out.push_str(&render_route_input_binding(handler, input, context.records));
         }
     }
 
@@ -973,7 +973,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
                 out.push_str(&format!(
                     "                {}: {},\n",
                     field.name,
-                    render_route_input_field(field)
+                    render_route_input_field(field, &plan.types)
                 ));
             }
             out.push_str("            };\n");
@@ -1123,7 +1123,11 @@ fn handler_input_fields(handler: &AxHandlerPlan) -> Option<&[AxFieldPlan]> {
     }
 }
 
-fn render_route_input_binding(handler: &AxHandlerPlan, input: &[AxFieldPlan]) -> String {
+fn render_route_input_binding(
+    handler: &AxHandlerPlan,
+    input: &[AxFieldPlan],
+    records: &[AxRecordPlan],
+) -> String {
     let mut out = format!(
         "    let input = {} {{\n",
         input_struct_name(&handler.rust_fn)
@@ -1133,7 +1137,7 @@ fn render_route_input_binding(handler: &AxHandlerPlan, input: &[AxFieldPlan]) ->
         out.push_str(&format!(
             "        {}: {},\n",
             field.name,
-            render_route_input_field(field)
+            render_route_input_field(field, records)
         ));
     }
 
@@ -1141,7 +1145,16 @@ fn render_route_input_binding(handler: &AxHandlerPlan, input: &[AxFieldPlan]) ->
     out
 }
 
-fn render_route_input_field(field: &AxFieldPlan) -> String {
+fn render_route_input_field(field: &AxFieldPlan, records: &[AxRecordPlan]) -> String {
+    if !field.optional
+        && field.default.is_none()
+        && records.iter().any(|record| record.name == field.rust_ty)
+    {
+        return format!(
+            "serde_json::from_value::<{}>(axonyx_runtime::input::decode_record(Some(request), None, {:?}, {:?}, __ax_api_contract_context())?).map_err(|_| AxRuntimeError::invalid_input({:?}))?",
+            field.rust_ty, field.name, field.rust_ty, field.name
+        );
+    }
     if field.rust_ty == "AxIncomingFile" {
         let missing_error = format!("missing required file input `{}`", field.name);
         return format!(
@@ -2425,6 +2438,27 @@ mod tests {
     use crate::ax_ast::prelude::AxExpr;
     use crate::ax_backend_ast::prelude::*;
     use crate::ax_backend_lowering::lower_backend_document;
+
+    #[test]
+    fn record_action_and_api_inputs_use_shared_contract_decoder() {
+        let source = r#"
+export type PostInput {
+  title: String
+  tags: String[]
+}
+action Save(post: PostInput) {
+  return input.post
+}
+route POST "/api/posts" {
+  input:
+    post: PostInput
+  return json(input.post)
+}
+"#;
+        let module = compile_backend_ax_to_module(source).unwrap();
+        assert_eq!(module.matches("axonyx_runtime::input::decode_record(Some(request), None, \"post\", \"PostInput\", __ax_api_contract_context())?").count(), 2);
+        assert!(module.contains("serde_json::from_value::<PostInput>"));
+    }
 
     #[test]
     fn numeric_input_errors_are_typed_for_required_optional_and_default_fields() {
