@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod csrf_http;
+pub mod form_result;
+pub mod input;
 pub mod login_throttle;
 pub mod mutation_security;
 pub mod password;
@@ -7,6 +9,12 @@ pub mod server;
 pub mod session;
 #[cfg(feature = "storage")]
 pub mod storage;
+pub mod validation;
+
+/// Generates a server-owned identifier, not a session or authentication token.
+pub fn new_uuid() -> String {
+    uuid::Uuid::new_v4().to_string()
+}
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
@@ -281,10 +289,20 @@ pub enum PreviewError {
     Lower(#[from] AxLowerError),
     #[error("failed to execute preview runtime: {message}")]
     Runtime { message: String },
+    #[error("access denied")]
+    AccessDenied { status: u16 },
+    #[error("invalid request input `{field}`")]
+    InvalidInput { field: String },
 }
 
 impl From<backend::AxRuntimeError> for PreviewError {
     fn from(error: backend::AxRuntimeError) -> Self {
+        if let backend::AxRuntimeError::InvalidInput { field } = error {
+            return Self::InvalidInput { field };
+        }
+        if let Some(status) = error.access_denial_status() {
+            return Self::AccessDenied { status };
+        }
         Self::Runtime {
             message: error.to_string(),
         }
@@ -295,12 +313,81 @@ pub fn preview_ax_page(ax_source: &str) -> Result<String, PreviewError> {
     preview_ax_app(None, ax_source)
 }
 
+/// Compose the complete document during Melt using the normal layout rules.
+pub fn compose_compiled_page_document(
+    layout_sources: &[&str],
+    page_source: &str,
+) -> Result<AxDocument, PreviewError> {
+    let mut document = parse_ax_auto(page_source)?;
+    for source in layout_sources.iter().rev() {
+        document = compose_layout_with_page(parse_ax_auto(source)?, document);
+    }
+    Ok(document)
+}
+
+pub fn render_compiled_page_document(
+    document_json: &str,
+    import_sources: &[(&str, &str)],
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    loader_values: &BTreeMap<String, serde_json::Value>,
+    form_result: Option<&form_result::AxFormResult>,
+) -> Result<String, PreviewError> {
+    render_compiled_document(
+        document_json,
+        import_sources,
+        request_target,
+        route_params,
+        loader_values,
+        form_result,
+        true,
+    )
+}
+
 pub fn render_compiled_page_fragment(
     document_json: &str,
     import_sources: &[(&str, &str)],
     request_target: &str,
     route_params: &BTreeMap<String, String>,
     loader_values: &BTreeMap<String, serde_json::Value>,
+) -> Result<String, PreviewError> {
+    render_compiled_page_fragment_with_form(
+        document_json,
+        import_sources,
+        request_target,
+        route_params,
+        loader_values,
+        None,
+    )
+}
+
+pub fn render_compiled_page_fragment_with_form(
+    document_json: &str,
+    import_sources: &[(&str, &str)],
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    loader_values: &BTreeMap<String, serde_json::Value>,
+    form_result: Option<&form_result::AxFormResult>,
+) -> Result<String, PreviewError> {
+    render_compiled_document(
+        document_json,
+        import_sources,
+        request_target,
+        route_params,
+        loader_values,
+        form_result,
+        false,
+    )
+}
+
+fn render_compiled_document(
+    document_json: &str,
+    import_sources: &[(&str, &str)],
+    request_target: &str,
+    route_params: &BTreeMap<String, String>,
+    loader_values: &BTreeMap<String, serde_json::Value>,
+    form_result: Option<&form_result::AxFormResult>,
+    full_document: bool,
 ) -> Result<String, PreviewError> {
     let document = serde_json::from_str::<AxDocument>(document_json).map_err(|error| {
         PreviewError::Runtime {
@@ -313,6 +400,16 @@ pub fn render_compiled_page_fragment(
         &parse_preview_query_fields(request_target),
     );
     let resolver = |path: &[String], args: &[AxValue]| {
+        if path == ["action"] {
+            if let [AxValue::String(name)] = args {
+                let route = request_target.split('?').next().unwrap_or("/");
+                return Some(AxValue::String(format!(
+                    "/__axonyx/action?path={}&name={}",
+                    url_encode(route),
+                    url_encode(name)
+                )));
+            }
+        }
         let args = args.iter().map(preview_value_to_json).collect::<Vec<_>>();
         path.last()
             .map(|name| compiled_loader_call_key(name, &args))
@@ -325,8 +422,14 @@ pub fn render_compiled_page_fragment(
             .iter()
             .find_map(|(name, contents)| (*name == source).then(|| (*contents).to_string()))
     };
-    let node =
+    let mut node =
         lower_document_with_scope_and_imports(&document, scope, &resolver, &import_resolver)?;
+    if let Some(result) = form_result {
+        result.apply_to_node(&mut node);
+    }
+    if full_document {
+        return Ok(render_preview_document(&document, &node));
+    }
     let mut html = String::new();
     render_node(&node, &mut html);
     Ok(html)
@@ -671,6 +774,7 @@ struct PreviewBackendContext<'a> {
 }
 
 struct PreviewActionContext<'a> {
+    type_context: &'a AxDataContext,
     env: &'a backend::AxEnv,
     runtime: Option<&'a dyn backend::AxBackendRuntime>,
     request: Option<&'a server::AxHttpRequest>,
@@ -858,6 +962,8 @@ pub fn preview_ax_route_with_request_context_and_imports(
         request_target,
         route_params,
         None,
+        None,
+        None,
         store,
         import_resolver,
     )
@@ -884,6 +990,65 @@ pub fn preview_ax_route_with_request_context_and_runtime_and_imports(
         request_target,
         route_params,
         Some(runtime),
+        None,
+        None,
+        store,
+        import_resolver,
+    )
+}
+
+/// Render using only the server-owned HTTP request for authentication.
+#[allow(clippy::too_many_arguments)]
+pub fn preview_ax_route_with_http_request_and_runtime_and_imports(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request: &server::AxHttpRequest,
+    route_params: &BTreeMap<String, String>,
+    runtime: &dyn backend::AxBackendRuntime,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
+) -> Result<String, PreviewError> {
+    preview_ax_route_with_request_context_runtime_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        &request.target,
+        route_params,
+        Some(runtime),
+        Some(request),
+        None,
+        store,
+        import_resolver,
+    )
+}
+
+/// Render request-local validation metadata into the tree, before serialization.
+#[allow(clippy::too_many_arguments)]
+pub fn preview_ax_route_with_form_result_and_imports(
+    layout_sources: &[&str],
+    loader_sources: &[&str],
+    action_sources: &[&str],
+    page_source: &str,
+    request: &server::AxHttpRequest,
+    route_params: &BTreeMap<String, String>,
+    runtime: Option<&dyn backend::AxBackendRuntime>,
+    form: &form_result::AxFormResult,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
+) -> Result<String, PreviewError> {
+    preview_ax_route_with_request_context_runtime_and_imports(
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        &request.target,
+        route_params,
+        runtime,
+        Some(request),
+        Some(form),
         store,
         import_resolver,
     )
@@ -899,6 +1064,8 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
     request_target: &str,
     route_params: &BTreeMap<String, String>,
     runtime: Option<&dyn backend::AxBackendRuntime>,
+    request: Option<&server::AxHttpRequest>,
+    form: Option<&form_result::AxFormResult>,
     store: &AxPreviewStore,
     import_resolver: &impl AxImportResolver,
 ) -> Result<String, PreviewError> {
@@ -924,13 +1091,33 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
         route_params,
         &parse_preview_query_fields(request_target),
     );
+    let mut loader_scope = route_scope.clone();
+    if let Some(request) = request {
+        let session = if handlers
+            .loaders
+            .values()
+            .any(|loader| loader.steps.iter().any(ax_step_uses_auth_subject))
+        {
+            runtime
+                .ok_or_else(|| PreviewError::Runtime {
+                    message: "Auth.subject requires a configured backend runtime".to_string(),
+                })?
+                .load_session(request)?
+        } else {
+            None
+        };
+        loader_scope.insert(
+            "Auth".to_string(),
+            build_preview_auth_record(request, env, session.as_ref()),
+        );
+    }
     let resolve_context = PreviewResolveContext {
         handlers: &handlers,
         cache: &cache,
         env,
         runtime,
         request_target,
-        route_scope: &route_scope,
+        route_scope: &loader_scope,
         store,
     };
     let resolver_error = RefCell::new(None);
@@ -947,7 +1134,7 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
         }
     };
 
-    let node = match lower_document_with_scope_and_imports(
+    let mut node = match lower_document_with_scope_and_imports(
         &document,
         route_scope.clone(),
         &resolver,
@@ -966,6 +1153,9 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
         return Err(runtime_error);
     }
 
+    if let Some(form) = form {
+        form.apply_to_node(&mut node);
+    }
     Ok(render_preview_document(&document, &node))
 }
 
@@ -983,6 +1173,7 @@ pub fn execute_preview_action_sources(
         action_name,
         input_fields,
         PreviewActionContext {
+            type_context: &handlers.type_context,
             env: &env,
             runtime: None,
             request: None,
@@ -1006,6 +1197,7 @@ pub fn execute_preview_action_sources_with_runtime(
         action_name,
         input_fields,
         PreviewActionContext {
+            type_context: &handlers.type_context,
             env: runtime.env(),
             runtime: Some(runtime),
             request: None,
@@ -1030,6 +1222,7 @@ pub fn execute_preview_action_request_sources_with_storage(
         action_name,
         &BTreeMap::new(),
         PreviewActionContext {
+            type_context: &handlers.type_context,
             env: &env,
             runtime: None,
             request: Some(request),
@@ -1054,6 +1247,7 @@ pub fn execute_preview_action_request_sources_with_runtime_and_storage(
         action_name,
         &BTreeMap::new(),
         PreviewActionContext {
+            type_context: &handlers.type_context,
             env: runtime.env(),
             runtime: Some(runtime),
             request: Some(request),
@@ -1446,6 +1640,10 @@ fn execute_preview_loader(
     functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<AxValue, PreviewError> {
     let mut scope = initial_scope.clone();
+    // Request-free rendering must never invent an authenticated identity.
+    scope
+        .entry("Auth".to_string())
+        .or_insert_with(|| AxValue::record([("subject", AxValue::Null)]));
     let AxHandlerKind::Loader { input, .. } = &loader.kind else {
         return Err(PreviewError::Runtime {
             message: format!("handler `{}` is not a loader", loader.name),
@@ -1479,6 +1677,23 @@ fn execute_preview_loader(
             AxStepPlan::Return(value) => {
                 return eval_preview_return_with_functions(value, &scope, env, functions)
             }
+            AxStepPlan::Require { value, fallback } => {
+                let requirement =
+                    eval_preview_require_expr_with_functions(value, &scope, env, functions)?;
+                if !preview_require_passes(&requirement) {
+                    return Err(match fallback {
+                        Some(AxReturnPlan::Forbidden) => backend::AxRuntimeError::Forbidden.into(),
+                        Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
+                            if expr.code.trim().starts_with("error(") =>
+                        {
+                            backend::AxRuntimeError::Unauthorized.into()
+                        }
+                        _ => PreviewError::Runtime {
+                            message: "Loader requirement failed.".to_string(),
+                        },
+                    });
+                }
+            }
             AxStepPlan::Insert { .. }
             | AxStepPlan::Transaction { .. }
             | AxStepPlan::Update { .. }
@@ -1492,7 +1707,6 @@ fn execute_preview_loader(
             | AxStepPlan::SessionCreate { .. }
             | AxStepPlan::SessionDestroy
             | AxStepPlan::SessionRefresh
-            | AxStepPlan::Require { .. }
             | AxStepPlan::Send { .. } => {}
         }
     }
@@ -1621,6 +1835,7 @@ fn execute_preview_action(
     store: &mut AxPreviewStore,
 ) -> Result<AxPreviewActionResult, PreviewError> {
     let PreviewActionContext {
+        type_context,
         env,
         runtime,
         request,
@@ -1646,7 +1861,7 @@ fn execute_preview_action(
     let mut scope = BTreeMap::new();
     scope.insert(
         "input".to_string(),
-        build_preview_input_record(input, input_fields, request)?,
+        build_preview_input_record(input, input_fields, request, type_context)?,
     );
     if let Some(request) = request {
         let session = if action.steps.iter().any(ax_step_uses_auth_subject) {
@@ -1972,7 +2187,7 @@ fn execute_preview_route(
         if !input.is_empty() {
             scope.insert(
                 "input".to_string(),
-                build_preview_route_input_record(input, request)?,
+                build_preview_route_input_record(input, request, type_context)?,
             );
         }
     }
@@ -2353,7 +2568,14 @@ fn render_preview_require_fallback(
         fallback,
         Some(AxReturnPlan::Expr(_)) | Some(AxReturnPlan::Json(_))
     ) {
-        response.status = 401;
+        response.status = match fallback {
+            Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
+                if parse_preview_call_args(expr.code.trim(), "invalid").is_some() =>
+            {
+                422
+            }
+            _ => 401,
+        };
     }
 
     Ok(response)
@@ -2532,6 +2754,33 @@ fn eval_preview_value_with_functions(
                 .map(AxValue::Bool)
                 .map_err(|_| PreviewError::Runtime {
                     message: "password verification failed".to_string(),
+                })
+        }
+        AxValuePlan::Call { path, args } if path == &["Uuid", "new"] => {
+            if !args.is_empty() {
+                return Err(PreviewError::Runtime {
+                    message: "Uuid.new requires no arguments".to_string(),
+                });
+            }
+            Ok(AxValue::String(new_uuid()))
+        }
+        AxValuePlan::Call { path, args } if path == &["Password", "hash"] => {
+            let [password] = args.as_slice() else {
+                return Err(PreviewError::Runtime {
+                    message: "Password.hash requires exactly one String argument".to_string(),
+                });
+            };
+            let AxValue::String(password) =
+                eval_preview_expr_with_functions(password, scope, env, functions)?
+            else {
+                return Err(PreviewError::Runtime {
+                    message: "Password.hash requires String argument".to_string(),
+                });
+            };
+            password::AxPassword::hash(&password)
+                .map(AxValue::String)
+                .map_err(|_| PreviewError::Runtime {
+                    message: "password hashing failed".to_string(),
                 })
         }
         AxValuePlan::Call { path, args } if path == &["Password", "verify"] => {
@@ -2954,6 +3203,29 @@ fn eval_preview_expr_with_functions(
         return Ok(AxValue::String(value));
     }
 
+    if let Some(inner) = code
+        .strip_prefix("&(")
+        .and_then(|value| value.strip_suffix(')'))
+    {
+        return eval_preview_expr_with_functions(&AxRustExpr::new(inner), scope, env, functions);
+    }
+    if let Some(args) = parse_preview_call_args(code, "__ax_add") {
+        if args.len() != 2 {
+            return Err(PreviewError::Runtime {
+                message: "invalid lowered addition".to_string(),
+            });
+        }
+        let left =
+            eval_preview_expr_with_functions(&AxRustExpr::new(&args[0]), scope, env, functions)?;
+        let right =
+            eval_preview_expr_with_functions(&AxRustExpr::new(&args[1]), scope, env, functions)?;
+        return axonyx_core::ax_lowering::add_values(left, right).map_err(|error| {
+            PreviewError::Runtime {
+                message: error.to_string(),
+            }
+        });
+    }
+
     if code == "true" {
         return Ok(AxValue::Bool(true));
     }
@@ -3030,6 +3302,50 @@ fn eval_preview_expr_with_functions(
             return Ok(AxValue::Bool(false));
         };
         return Ok(AxValue::Bool(items.iter().any(|item| item == &needle)));
+    }
+
+    for (name, predicate) in [
+        ("Validate.email", validation::email as fn(&str) -> bool),
+        ("Validate::email", validation::email as fn(&str) -> bool),
+        (
+            "Validate::password",
+            validation::password as fn(&str) -> bool,
+        ),
+        (
+            "Validate.password",
+            validation::password as fn(&str) -> bool,
+        ),
+    ] {
+        if let Some(args) = parse_preview_call_args(code, name) {
+            let [arg] = args.as_slice() else {
+                return Err(PreviewError::Runtime {
+                    message: "Validation expects one String argument".to_string(),
+                });
+            };
+            let value =
+                eval_preview_expr_with_functions(&AxRustExpr::new(arg), scope, env, functions)?;
+            let AxValue::String(value) = value else {
+                return Err(PreviewError::Runtime {
+                    message: "Validation expects one String argument".to_string(),
+                });
+            };
+            return Ok(AxValue::Bool(predicate(&value)));
+        }
+    }
+
+    if let Some(args) = parse_preview_call_args(code, "invalid") {
+        let [fields] = args.as_slice() else {
+            return Err(PreviewError::Runtime {
+                message: "invalid(fields) expects exactly one argument".to_string(),
+            });
+        };
+        let fields =
+            eval_preview_expr_with_functions(&AxRustExpr::new(fields), scope, env, functions)?;
+        return Ok(AxValue::record([
+            ("error", AxValue::String("invalid_input".to_string())),
+            ("message", AxValue::String("Invalid input.".to_string())),
+            ("fields", fields),
+        ]));
     }
 
     if let Some(args) = parse_preview_call_args(code, "error") {
@@ -3458,24 +3774,38 @@ fn build_preview_input_record(
     fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
     input_fields: &BTreeMap<String, String>,
     request: Option<&server::AxHttpRequest>,
+    type_context: &AxDataContext,
 ) -> Result<AxValue, PreviewError> {
     let mut record = BTreeMap::new();
     for field in fields {
+        if !field.optional
+            && field.default.is_none()
+            && type_context.record(&field.rust_ty).is_some()
+        {
+            let value = input::decode_record(
+                request,
+                input_fields.get(&field.name).map(String::as_str),
+                &field.name,
+                &field.rust_ty,
+                type_context,
+            )?;
+            record.insert(field.name.clone(), preview_record_json_to_value(value));
+            continue;
+        }
         if field.rust_ty == "AxIncomingFile" {
             if request
                 .and_then(|request| request.incoming_file(&field.name))
                 .is_none()
             {
-                return Err(PreviewError::Runtime {
-                    message: format!("missing required file input `{}`", field.name),
-                });
+                return Err(backend::AxRuntimeError::invalid_input(&field.name).into());
             }
             continue;
         }
         let value = input_fields
             .get(&field.name)
             .cloned()
-            .or_else(|| request.and_then(|request| request.form_value(&field.name)));
+            .or_else(|| request.and_then(|request| request.form_value(&field.name)))
+            .or_else(|| request.and_then(|request| request.json_field_string(&field.name)));
         let Some(value) = value else {
             if let Some(default) = &field.default {
                 record.insert(
@@ -3492,13 +3822,15 @@ fn build_preview_input_record(
                 record.insert(field.name.clone(), AxValue::Bool(false));
                 continue;
             }
-            return Err(PreviewError::Runtime {
-                message: format!("missing required input `{}`", field.name),
-            });
+            return Err(backend::AxRuntimeError::invalid_input(&field.name).into());
         };
         record.insert(
             field.name.clone(),
-            coerce_preview_input_value(&field.name, &field.rust_ty, value)?,
+            coerce_preview_input_value(&field.name, &field.rust_ty, value).map_err(|_| {
+                PreviewError::InvalidInput {
+                    field: field.name.clone(),
+                }
+            })?,
         );
     }
     Ok(AxValue::Record(record))
@@ -3541,18 +3873,9 @@ fn build_preview_loader_input_record(
 fn build_preview_route_input_record(
     fields: &[axonyx_core::ax_backend_lowering_prelude::AxFieldPlan],
     request: &server::AxHttpRequest,
+    type_context: &AxDataContext,
 ) -> Result<AxValue, PreviewError> {
-    let input_fields = fields
-        .iter()
-        .filter_map(|field| {
-            request
-                .form_value(&field.name)
-                .or_else(|| request.json_field_string(&field.name))
-                .map(|value| (field.name.clone(), value))
-        })
-        .collect::<BTreeMap<_, _>>();
-
-    build_preview_input_record(fields, &input_fields, Some(request))
+    build_preview_input_record(fields, &BTreeMap::new(), Some(request), type_context)
 }
 
 fn coerce_preview_loader_input_value(
@@ -3857,6 +4180,28 @@ fn preview_json_to_value(value: serde_json::Value) -> AxValue {
                 .map(|(key, value)| (key, preview_json_to_value(value)))
                 .collect(),
         ),
+    }
+}
+
+fn preview_record_json_to_value(value: serde_json::Value) -> AxValue {
+    match value {
+        serde_json::Value::Number(value) if value.is_f64() => AxValue::Float(
+            AxFloat::new(value.as_f64().expect("JSON floating point number"))
+                .expect("finite JSON number"),
+        ),
+        serde_json::Value::Array(items) => AxValue::List(
+            items
+                .into_iter()
+                .map(preview_record_json_to_value)
+                .collect(),
+        ),
+        serde_json::Value::Object(fields) => AxValue::Record(
+            fields
+                .into_iter()
+                .map(|(name, value)| (name, preview_record_json_to_value(value)))
+                .collect(),
+        ),
+        value => preview_json_to_value(value),
     }
 }
 
@@ -4362,6 +4707,24 @@ fn ax_action_script() -> &'static str {
   };
 
   const actionStatuses = (form) => Array.from(form.querySelectorAll(".ax-action-status[data-state]"));
+  const showFieldErrors = (form, fields) => {
+    form.querySelectorAll("[data-ax-field-error]").forEach((node) => {
+      const name = node.getAttribute("data-ax-field-error");
+      const message = fields && Object.prototype.hasOwnProperty.call(fields, name) ? fields[name] : "";
+      node.textContent = typeof message === "string" ? message : "";
+      node.setAttribute("aria-live", "polite");
+    });
+    Array.from(form.elements || []).forEach((control) => {
+      if (control.hasAttribute("data-ax-validation-invalid")) {
+        control.removeAttribute("aria-invalid");
+        control.removeAttribute("data-ax-validation-invalid");
+      }
+      if (fields && Object.prototype.hasOwnProperty.call(fields, control.name) && typeof fields[control.name] === "string") {
+        control.setAttribute("aria-invalid", "true");
+        control.setAttribute("data-ax-validation-invalid", "true");
+      }
+    });
+  };
   const actionProgress = (form) => Array.from(form.querySelectorAll("[data-ax-action-progress]"));
   const actionSubmitControls = (form) => Array.from(form.querySelectorAll(
     'button:not([type]), button[type="submit"], input[type="submit"], input[type="image"]'
@@ -4604,6 +4967,7 @@ fn ax_action_script() -> &'static str {
       "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
     };
     resetUploadProgress(form);
+    showFieldErrors(form, null);
     setActionState(form, "pending");
     window.dispatchEvent(new CustomEvent("axonyx:action-start", {
       detail: { form },
@@ -4638,6 +5002,10 @@ fn ax_action_script() -> &'static str {
       }
       if (contentType.includes("application/ax-error+json")) {
         const payload = await response.json();
+        const result = payload?.form;
+        const target = new URL(form.action, window.location.href);
+        const matchingResult = result?.version === 1 && result.action === target.searchParams.get("name") && result.route === (target.searchParams.get("path") || "/");
+        showFieldErrors(form, result ? (matchingResult ? result.fields : null) : payload?.error?.value?.fields);
         setActionState(form, "error");
         window.dispatchEvent(new CustomEvent("axonyx:action-error", {
           detail: { form, payload, error: payload?.error },
@@ -8201,6 +8569,52 @@ page DocsHome
     }
 
     #[test]
+    fn preview_form_result_applies_only_to_the_matching_native_form() {
+        let form = form_result::AxFormResult::validation(
+            "Validate",
+            "/forms",
+            &json!({"email": "Use <valid> email"}),
+        )
+        .unwrap();
+        let request = server::AxHttpRequest::new("GET", "/forms");
+        let html = preview_ax_route_with_form_result_and_imports(
+            &[], &[], &[],
+            r#"page Forms() { return ASX {
+              <form action="/__axonyx/action?path=%2Fforms&name=Validate"><input name="email" /><span data-ax-field-error="email"></span></form>
+              <form action="/__axonyx/action?path=%2Fforms&name=Other"><input name="email" /><span data-ax-field-error="email"></span></form>
+            } }"#,
+            &request, &BTreeMap::new(), None, &form, &AxPreviewStore::default(), &|_: &str| None,
+        ).unwrap();
+        assert_eq!(html.matches("aria-invalid=\"true\"").count(), 1);
+        assert!(html.contains("Use &lt;valid&gt; email"));
+        assert!(!html.contains("Use <valid> email"));
+    }
+
+    #[test]
+    fn preview_loader_guards_deny_before_returning_private_data() {
+        for (fallback, status) in [("error(\"private policy\")", 401), ("forbidden()", 403)] {
+            let loader = format!("query loadPrivate() {{\n  require Auth.subject else {fallback}\n  return \"private data\"\n}}");
+            let error = preview_ax_route_with_loaders(
+                &[],
+                &[&loader],
+                "page Private() { data secret = loadPrivate()\n return ASX { <p>{secret}</p> } }",
+            )
+            .unwrap_err();
+            assert!(
+                matches!(error, PreviewError::AccessDenied { status: actual } if actual == status),
+                "{error:?}"
+            );
+        }
+        let html = preview_ax_route_with_loaders(
+            &[],
+            &["query loadPublic() {\n  require true else forbidden()\n  return \"public data\"\n}"],
+            "page Public() { data result = loadPublic()\n return ASX { <p>{result}</p> } }",
+        )
+        .unwrap();
+        assert!(html.contains("public data"));
+    }
+
+    #[test]
     fn previews_route_loader_data_inside_page() {
         let html = preview_ax_route_with_loaders(
             &[],
@@ -9259,6 +9673,133 @@ action UpdatePreferences
     }
 
     #[test]
+    fn preview_action_json_inputs_decode_without_exposing_rejected_values() {
+        let source = "action Save(count: Int) {\n  return input.count\n}";
+        let mut store = AxPreviewStore::default();
+        for body in [
+            r#"{}"#,
+            r#"{"count":"PRIVATE_VALUE"}"#,
+            r#"{"count":[]}"#,
+            "broken-json",
+        ] {
+            let request = server::AxHttpRequest::new("POST", "/save")
+                .with_header("Content-Type", "application/json")
+                .with_body(body.as_bytes().to_vec());
+            let error = execute_preview_action_request_sources_with_storage(
+                &[source],
+                "Save",
+                &request,
+                &server::AxUnavailableFileStorage,
+                &mut store,
+            )
+            .unwrap_err();
+            assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "count"));
+            assert!(!error.to_string().contains("PRIVATE_VALUE"));
+        }
+        let request = server::AxHttpRequest::new("POST", "/save")
+            .with_header("Content-Type", "application/json")
+            .with_body(br#"{"count":42}"#.to_vec());
+        let result = execute_preview_action_request_sources_with_storage(
+            &[source],
+            "Save",
+            &request,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(result.value, AxValue::Number(42));
+    }
+
+    #[test]
+    fn preview_record_inputs_validate_before_action_steps() {
+        let source = r#"
+export type Author {
+  name: String
+}
+export type PostInput {
+  title: String
+  summary?: String
+  tags: String[]
+  author: Author
+  count: Int
+  score: Float
+}
+action Save(post: PostInput) {
+  return input.post
+}
+"#;
+        let route_source = format!("{source}\nroute POST \"/save\" {{\n  input:\n    post: PostInput\n  return json(input.post)\n}}");
+        let mut store = AxPreviewStore::default();
+        let valid = serde_json::json!({"title":"Hello", "tags":["rust"], "author":{"name":"Ada", "extra":true}, "count":3, "score":1.25, "extra":true});
+        let request = server::AxHttpRequest::new("POST", "/save")
+            .with_header("Content-Type", "application/json")
+            .with_body(serde_json::to_vec(&serde_json::json!({"post":valid})).unwrap());
+        let result = execute_preview_action_request_sources_with_storage(
+            &[source],
+            "Save",
+            &request,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(
+            preview_value_to_json(&result.value),
+            serde_json::json!({"title":"Hello", "summary":null, "tags":["rust"], "author":{"name":"Ada"}, "count":3, "score":1.25})
+        );
+        let response =
+            execute_preview_route_request_sources(&[&route_source], &request, &mut store)
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+            preview_value_to_json(&result.value)
+        );
+        for value in [
+            serde_json::Value::Null,
+            serde_json::Value::String(valid.to_string()),
+            serde_json::json!({"title":"PRIVATE_VALUE"}),
+            {
+                let mut value = valid.clone();
+                value["title"] = serde_json::json!(123);
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["tags"] = serde_json::json!([1]);
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["author"] = serde_json::json!({"name":false});
+                value
+            },
+            {
+                let mut value = valid.clone();
+                value["count"] = serde_json::json!(18446744073709551615_u64);
+                value
+            },
+        ] {
+            let request = server::AxHttpRequest::new("POST", "/save")
+                .with_header("Content-Type", "application/json")
+                .with_body(serde_json::to_vec(&serde_json::json!({"post":value})).unwrap());
+            let error = execute_preview_action_request_sources_with_storage(
+                &[source],
+                "Save",
+                &request,
+                &server::AxUnavailableFileStorage,
+                &mut store,
+            )
+            .unwrap_err();
+            assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "post"));
+            assert!(!error.to_string().contains("PRIVATE_VALUE"));
+            let error =
+                execute_preview_route_request_sources(&[&route_source], &request, &mut store)
+                    .unwrap_err();
+            assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "post"));
+        }
+    }
+
+    #[test]
     fn preview_action_rejects_invalid_integer_input() {
         let mut store = AxPreviewStore::default();
         let error = execute_preview_action_sources(
@@ -9275,9 +9816,7 @@ action UpdateCount
         )
         .expect_err("invalid integer should fail");
 
-        assert!(error
-            .to_string()
-            .contains("input `count` expected i64 but received `many`"));
+        assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "count"));
     }
 
     #[test]
@@ -9325,7 +9864,7 @@ action CreatePost
         )
         .expect_err("missing required input should fail");
 
-        assert!(error.to_string().contains("missing required input `title`"));
+        assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "title"));
     }
 
     #[test]
@@ -9618,6 +10157,28 @@ route GET "/api/admin"
     }
 
     #[test]
+    fn preview_invalid_guard_returns_422_with_field_messages() {
+        let mut store = AxPreviewStore::default();
+        let response = execute_preview_route_request_sources(
+            &[r#"
+route GET "/api/register" {
+  require Validate.email("invalid") else invalid({email: "Email is required."})
+  return json("ok")
+}
+"#],
+            &server::AxHttpRequest::new("GET", "/api/register"),
+            &mut store,
+        )
+        .expect("route should execute")
+        .expect("route should match");
+        assert_eq!(response.status, 422);
+        let body: serde_json::Value = serde_json::from_slice(&response.body).unwrap();
+        assert_eq!(body["error"], "invalid_input");
+        assert_eq!(body["fields"]["email"], "Email is required.");
+        assert!(response.set_cookies.is_empty());
+    }
+
+    #[test]
     fn preview_optional_password_verification_handles_missing_and_corrupt_credentials() {
         let hash = password::AxPassword::hash("correct").unwrap();
         let value = AxValuePlan::Call {
@@ -9696,6 +10257,91 @@ route POST "/login"
         .unwrap_err();
         assert!(error.to_string().contains("password verification failed"));
         assert!(!error.to_string().contains("invalid-secret-hash"));
+    }
+
+    #[test]
+    fn preview_uuid_new_generates_distinct_v4_identifiers() {
+        let source = "route POST \"/id\"\n  data id = Uuid.new()\n  return json(id)\n";
+        let request = server::AxHttpRequest::new("POST", "/id");
+        let mut values = Vec::new();
+        for _ in 0..2 {
+            let response = execute_preview_route_request_sources(
+                &[source],
+                &request,
+                &mut AxPreviewStore::default(),
+            )
+            .unwrap()
+            .unwrap();
+            let value: String = serde_json::from_slice(&response.body).unwrap();
+            assert_eq!(uuid::Uuid::parse_str(&value).unwrap().get_version_num(), 4);
+            values.push(value);
+        }
+        assert_ne!(values[0], values[1]);
+    }
+
+    #[test]
+    fn preview_evaluates_lowered_addition_with_compiled_scalar_semantics() {
+        for (expression, expected) in [
+            (r#""Count: " + 42"#, AxValue::from("Count: 42")),
+            (r#"42 + " items""#, AxValue::from("42 items")),
+            (r#""ratio=" + 2.5"#, AxValue::from("ratio=2.5")),
+            (r#""enabled=" + true"#, AxValue::from("enabled=true")),
+            ("2 + 0.5", AxValue::from(2.5)),
+            (r#""1" + 2 + 3"#, AxValue::from("123")),
+        ] {
+            let source = format!("route GET \"/sum\" {{\n  return json({expression})\n}}");
+            let response = execute_preview_route_request_sources(
+                &[&source],
+                &server::AxHttpRequest::new("GET", "/sum"),
+                &mut AxPreviewStore::default(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&response.body).unwrap(),
+                preview_value_to_json(&expected)
+            );
+        }
+    }
+
+    #[test]
+    fn preview_password_hash_round_trip_and_secret_free_errors() {
+        let source = r#"
+route POST "/register"
+  data hash = Password.hash(request.form.password)
+  data verified = Password.verify(request.form.password, hash)
+  require verified
+  return json("ok")
+"#;
+        let request = server::AxHttpRequest::new("POST", "/register")
+            .with_body(b"password=correct-secret".to_vec());
+        let response = execute_preview_route_request_sources(
+            &[source],
+            &request,
+            &mut AxPreviewStore::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(response.status, 200);
+        let error = execute_preview_route_request_sources(
+            &[&source.replace("request.form.password)", "42)")],
+            &request,
+            &mut AxPreviewStore::default(),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Password.hash requires String argument"));
+        assert!(!error.to_string().contains("correct-secret"));
+        let empty =
+            server::AxHttpRequest::new("POST", "/register").with_body(b"password=".to_vec());
+        let error = execute_preview_route_request_sources(
+            &[source],
+            &empty,
+            &mut AxPreviewStore::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("password hashing failed"));
     }
 
     #[test]
@@ -9880,7 +10526,7 @@ route POST "/api/posts"
         let error = execute_preview_route_request_sources(&[source], &request, &mut store)
             .expect_err("missing typed input should fail");
 
-        assert!(error.to_string().contains("missing required input `count`"));
+        assert!(matches!(error, PreviewError::InvalidInput { ref field } if field == "count"));
     }
 
     #[test]
@@ -10295,6 +10941,54 @@ action Logout() {
         let cookie = &login.cookies[0];
         let authenticated = server::AxHttpRequest::new("GET", "/api/account")
             .with_header("Cookie", format!("{}={}", cookie.name, cookie.value));
+        let loader = "query loadIdentity() {\n  require Auth.subject else error(\"private policy\")\n  return Auth.subject\n}";
+        let page =
+            "page Account() { data identity = loadIdentity()\n return ASX { <p>{identity}</p> } }";
+        let html = preview_ax_route_with_http_request_and_runtime_and_imports(
+            &[],
+            &[loader],
+            &[],
+            page,
+            &authenticated,
+            &BTreeMap::new(),
+            &runtime,
+            &store,
+            &|_: &str| None,
+        )
+        .unwrap();
+        assert!(html.contains("user-42"));
+        assert!(!html.contains(&cookie.value));
+        let credential_page = "page Account() { data identity = loadIdentity()\n return ASX { <p>{Auth.session}</p> } }";
+        assert!(
+            preview_ax_route_with_http_request_and_runtime_and_imports(
+                &[],
+                &[loader],
+                &[],
+                credential_page,
+                &authenticated,
+                &BTreeMap::new(),
+                &runtime,
+                &store,
+                &|_: &str| None,
+            )
+            .is_err(),
+            "backend credentials must not become page markup scope"
+        );
+        let forged = server::AxHttpRequest::new("GET", "/api/account?subject=user-42")
+            .with_header("X-User-Id", "user-42");
+        let error = preview_ax_route_with_http_request_and_runtime_and_imports(
+            &[],
+            &[loader],
+            &[],
+            page,
+            &forged,
+            &BTreeMap::new(),
+            &runtime,
+            &store,
+            &|_: &str| None,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PreviewError::AccessDenied { status: 401 }));
         let route_source = r#"
 route GET "/api/account"
   require Auth.subject else redirect("/login")

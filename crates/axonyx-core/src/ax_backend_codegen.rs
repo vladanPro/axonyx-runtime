@@ -6,6 +6,12 @@ use crate::ax_types::prelude::AxType;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxBackendCodegenError {
+    #[error("Uuid.new requires no arguments and is only supported in action/route data bindings")]
+    InvalidUuidNewCall,
+    #[error("Password.hash requires exactly one String argument")]
+    InvalidPasswordHashArguments,
+    #[error("Password.hash is only supported in action/route data bindings; found in `{handler}`")]
+    PasswordHashOutsideRequestHandler { handler: String },
     #[error("Login.throttle must be a route before hook with (String key, literal attempts 1..1000, literal seconds 1..86400)")]
     InvalidLoginThrottleHook,
     #[error("Password.verify requires exactly two String arguments")]
@@ -58,13 +64,19 @@ pub enum AxBackendCodegenError {
     #[error("domain helper `{function}` cannot return `{ty}` from the Rust backend")]
     UnsupportedFunctionReturnType { function: String, ty: String },
     #[error(
-        "Auth.subject is only supported inside server actions and routes; found in `{handler}`"
+        "Auth.subject is only supported inside server actions, routes and request-bound loaders; found in `{handler}`"
     )]
     AuthSubjectOutsideRequestHandler { handler: String },
     #[error(
         "query function `{query}` can only be called from a route data binding; found in `{handler}`"
     )]
     QueryCallOutsideRequestHandler { query: String, handler: String },
+    #[error("request record input `{handler}.{field}` is not supported: {reason}")]
+    UnsupportedRequestRecordInput {
+        handler: String,
+        field: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -113,8 +125,10 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("use axonyx_runtime::backend_prelude::*;\n");
     out.push_str("use axonyx_runtime::server_prelude::*;\n");
     out.push_str("use serde_json::{json, Value};\n\n");
+    out.push_str(BACKEND_ADDITION_HELPER);
 
     validate_type_contracts(&plan.types, &plan.literal_unions)?;
+    validate_request_record_inputs(plan)?;
     for literal_union in &plan.literal_unions {
         out.push_str(&render_literal_union_type(literal_union)?);
         out.push('\n');
@@ -264,6 +278,14 @@ fn render_function_value_plan(
 ) -> Result<String, AxBackendCodegenError> {
     match value {
         AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
+        AxValuePlan::Call { path, .. } if path == &["Uuid", "new"] => {
+            Err(AxBackendCodegenError::InvalidUuidNewCall)
+        }
+        AxValuePlan::Call { path, .. } if path == &["Password", "hash"] => {
+            Err(AxBackendCodegenError::PasswordHashOutsideRequestHandler {
+                handler: function.to_string(),
+            })
+        }
         AxValuePlan::Call { path, .. }
             if path == &["Password", "verify"] || path == &["Password", "verifyOptional"] =>
         {
@@ -518,6 +540,86 @@ fn validate_type_contracts(
     Ok(())
 }
 
+pub fn validate_request_record_inputs(plan: &AxBackendPlan) -> Result<(), AxBackendCodegenError> {
+    for handler in &plan.handlers {
+        let input = match &handler.kind {
+            AxHandlerKind::Action { input, .. } | AxHandlerKind::Route { input, .. } => input,
+            _ => continue,
+        };
+        for field in input {
+            let Some(record) = plan
+                .types
+                .iter()
+                .find(|record| record.name == field.rust_ty)
+            else {
+                continue;
+            };
+            let reason = if field.optional || field.default.is_some() {
+                Some("the record itself must be required and have no default".to_string())
+            } else {
+                unsupported_record_input_field(record, plan, 0)
+            };
+            if let Some(reason) = reason {
+                return Err(AxBackendCodegenError::UnsupportedRequestRecordInput {
+                    handler: handler.name.clone(),
+                    field: field.name.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_record_input_field(
+    record: &AxRecordPlan,
+    plan: &AxBackendPlan,
+    depth: usize,
+) -> Option<String> {
+    if depth > 64 {
+        return Some("record nesting exceeds 64 levels".to_string());
+    }
+    for field in &record.fields {
+        if let Some(ty) = unsupported_record_input_type(&field.ty, plan, depth + 1) {
+            return Some(format!("`{}.{}` uses `{ty}`; use String, Bool, Int, Number, Float, date/UUID strings, optional fields, lists, maps or declared records", record.name, field.name));
+        }
+    }
+    None
+}
+
+fn unsupported_record_input_type(
+    ty: &AxType,
+    plan: &AxBackendPlan,
+    depth: usize,
+) -> Option<String> {
+    match ty {
+        AxType::String
+        | AxType::Bool
+        | AxType::Int
+        | AxType::Number
+        | AxType::Float
+        | AxType::DateTime
+        | AxType::Date
+        | AxType::Time
+        | AxType::Uuid => None,
+        AxType::Optional(inner) | AxType::List(inner) => {
+            unsupported_record_input_type(inner, plan, depth)
+        }
+        AxType::Map(key, value) => unsupported_record_input_type(key, plan, depth)
+            .or_else(|| unsupported_record_input_type(value, plan, depth)),
+        AxType::Record(name) if plan.literal_unions.iter().any(|union| union.name == *name) => None,
+        AxType::Record(name) => plan
+            .types
+            .iter()
+            .find(|record| record.name == *name)
+            .map_or_else(
+                || Some(ty.display_name()),
+                |record| unsupported_record_input_field(record, plan, depth),
+            ),
+        _ => Some(ty.display_name()),
+    }
+}
+
 fn render_literal_union_type(
     literal_union: &AxLiteralUnionPlan,
 ) -> Result<String, AxBackendCodegenError> {
@@ -769,7 +871,7 @@ fn render_handler_fn(
     let uses_auth_subject = ax_steps_use_auth_subject(globals.iter().chain(handler.steps.iter()));
     let request_handler = matches!(
         handler.kind,
-        AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+        AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. } | AxHandlerKind::Loader { .. }
     );
     if uses_auth_subject && !request_handler {
         return Err(AxBackendCodegenError::AuthSubjectOutsideRequestHandler {
@@ -824,7 +926,7 @@ fn render_handler_fn(
             "    let context = __ax_loader_context({path:?}, request)?;\n"
         ));
         if !input.is_empty() {
-            out.push_str(&render_route_input_binding(handler, input));
+            out.push_str(&render_route_input_binding(handler, input, context.records));
         }
     }
 
@@ -841,6 +943,9 @@ fn render_handler_fn(
         out.push_str("    let mut __ax_redirect: Option<String> = None;\n");
     }
     if uses_auth_subject {
+        if matches!(handler.kind, AxHandlerKind::Loader { .. }) {
+            out.push_str("    let request = context.request()?;\n");
+        }
         out.push_str("    let __ax_session = runtime.load_session(request)?;\n");
     }
     let mut typed_bindings = std::collections::BTreeMap::new();
@@ -955,7 +1060,7 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
                 out.push_str(&format!(
                     "                {}: {},\n",
                     field.name,
-                    render_route_input_field(field)
+                    render_route_input_field(field, &plan.types)
                 ));
             }
             out.push_str("            };\n");
@@ -975,6 +1080,9 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
         };
         out.push_str(&format!("        {:?} => {{\n", handler.name));
         out.push_str("            let context = __ax_loader_context(pattern, request)?;\n");
+        if ax_steps_use_auth_subject(plan.globals.iter().chain(handler.steps.iter())) {
+            out.push_str("            let context = context.with_request(request);\n");
+        }
         if input.is_empty() {
             out.push_str("            if !args.is_empty() { return Err(AxRuntimeError::message(\"compiled loader expected 0 arguments\")); }\n");
             out.push_str(&format!(
@@ -1102,7 +1210,11 @@ fn handler_input_fields(handler: &AxHandlerPlan) -> Option<&[AxFieldPlan]> {
     }
 }
 
-fn render_route_input_binding(handler: &AxHandlerPlan, input: &[AxFieldPlan]) -> String {
+fn render_route_input_binding(
+    handler: &AxHandlerPlan,
+    input: &[AxFieldPlan],
+    records: &[AxRecordPlan],
+) -> String {
     let mut out = format!(
         "    let input = {} {{\n",
         input_struct_name(&handler.rust_fn)
@@ -1112,7 +1224,7 @@ fn render_route_input_binding(handler: &AxHandlerPlan, input: &[AxFieldPlan]) ->
         out.push_str(&format!(
             "        {}: {},\n",
             field.name,
-            render_route_input_field(field)
+            render_route_input_field(field, records)
         ));
     }
 
@@ -1120,7 +1232,16 @@ fn render_route_input_binding(handler: &AxHandlerPlan, input: &[AxFieldPlan]) ->
     out
 }
 
-fn render_route_input_field(field: &AxFieldPlan) -> String {
+fn render_route_input_field(field: &AxFieldPlan, records: &[AxRecordPlan]) -> String {
+    if !field.optional
+        && field.default.is_none()
+        && records.iter().any(|record| record.name == field.rust_ty)
+    {
+        return format!(
+            "serde_json::from_value::<{}>(axonyx_runtime::input::decode_record(Some(request), None, {:?}, {:?}, __ax_api_contract_context())?).map_err(|_| AxRuntimeError::invalid_input({:?}))?",
+            field.rust_ty, field.name, field.rust_ty, field.name
+        );
+    }
     if field.rust_ty == "AxIncomingFile" {
         let missing_error = format!("missing required file input `{}`", field.name);
         return format!(
@@ -1145,11 +1266,12 @@ fn render_input_field(field: &AxFieldPlan, raw: &str) -> String {
 
     if !field.optional && field.default.is_none() && field.rust_ty != "bool" {
         return match field.rust_ty.as_str() {
-            "String" => format!("{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?"),
+            "String" => format!("{raw}.ok_or_else(|| AxRuntimeError::invalid_input({:?}))?", field.name),
             "i64" | "u64" | "f64" => format!(
-                "{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?.trim().parse::<{}>().map_err(|_| AxRuntimeError::message({:?}))?",
+                "{raw}.ok_or_else(|| AxRuntimeError::invalid_input({:?}))?.trim().parse::<{}>().map_err(|_| AxRuntimeError::invalid_input({:?}))?",
+                field.name,
                 field.rust_ty,
-                format!("input `{}` expected {}", field.name, field.rust_ty)
+                field.name
             ),
             "AxFileRef" => format!(
                 "serde_json::from_str::<AxFileRef>(&{raw}.ok_or_else(|| AxRuntimeError::message({missing_error:?}))?).map_err(|_| AxRuntimeError::message({:?}))?",
@@ -1175,8 +1297,8 @@ fn render_input_field(field: &AxFieldPlan, raw: &str) -> String {
             "{raw}.map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), \"true\" | \"1\" | \"on\" | \"yes\")).unwrap_or({missing})"
         ),
         "i64" | "u64" | "f64" => format!(
-            "{raw}.map(|value| value.trim().parse::<{}>().map_err(|_| AxRuntimeError::message(format!(\"input `{}` expected {} but received `{{}}`\", value)))).transpose()?.unwrap_or({missing})",
-            field.rust_ty, field.name, field.rust_ty
+            "{raw}.map(|value| value.trim().parse::<{}>().map_err(|_| AxRuntimeError::invalid_input({:?}))).transpose()?.unwrap_or({missing})",
+            field.rust_ty, field.name
         ),
         _ => format!("{raw}.unwrap_or_else(|| ({missing}).to_string())"),
     }
@@ -1355,9 +1477,9 @@ fn render_step(
         ),
         AxStepPlan::ClearCookie { name } => format!("    // clearCookie {}\n", name.code),
         AxStepPlan::SessionCreate { subject, data } => format!(
-            "    let __ax_session_data: BTreeMap<String, Value> = serde_json::from_value(json!({})).map_err(|_| AxRuntimeError::message(\"Session.create data must be an object\"))?;\n    let (_, __ax_session_cookie) = runtime.create_session(&{}, __ax_session_data)?;\n    __ax_cookies.push(__ax_session_cookie);\n",
+            "    let __ax_session_data: BTreeMap<String, Value> = serde_json::from_value(json!({})).map_err(|_| AxRuntimeError::message(\"Session.create data must be an object\"))?;\n    let __ax_session_subject = json!({});\n    let (_, __ax_session_cookie) = runtime.create_session(__ax_session_subject.as_str().ok_or_else(|| AxRuntimeError::message(\"Session.create subject must be String\"))?, __ax_session_data)?;\n    __ax_cookies.push(__ax_session_cookie);\n",
             render_borrowed_expr(data),
-            render_string_expr(subject)
+            render_borrowed_expr(subject)
         ),
         AxStepPlan::SessionDestroy => {
             "    __ax_cookies.push(runtime.destroy_session(request)?);\n".to_string()
@@ -1381,7 +1503,20 @@ fn render_step(
             rendered.push_str(&render_optional_binding_narrowing(value, typed_bindings));
             rendered
         }
-        AxStepPlan::Require { value, .. } => format!("    // require {}\n", value.code),
+        AxStepPlan::Require { value, fallback } => {
+            let error = match fallback.as_ref() {
+                Some(AxReturnPlan::Forbidden) => "AxRuntimeError::Forbidden",
+                Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
+                    if render_error_call_message(expr).is_some() => "AxRuntimeError::Unauthorized",
+                _ => "AxRuntimeError::message(\"Backend requirement was not satisfied\")",
+            };
+            let mut rendered = format!(
+                "    if !__ax_truthy(&json!({})) {{\n        return Err({error});\n    }}\n",
+                render_borrowed_expr(value)
+            );
+            rendered.push_str(&render_optional_binding_narrowing(value, typed_bindings));
+            rendered
+        }
         AxStepPlan::Return(value) => render_return_step(value, route_response, action_response),
         AxStepPlan::Send { target, payload } => format!(
             "    runtime.send(&AxSendRequest {{\n        target: {:?}.to_string(),\n        payload: json!({}),\n    }})?;\n",
@@ -1576,6 +1711,34 @@ fn render_value_plan(
     let output = match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
         AxValuePlan::Call { path, args } => {
+            if path == &["Uuid", "new"] {
+                if !args.is_empty()
+                    || !matches!(
+                        handler.kind,
+                        AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+                    )
+                {
+                    return Err(AxBackendCodegenError::InvalidUuidNewCall);
+                }
+                return Ok("json!(axonyx_runtime::new_uuid())".to_string());
+            }
+            if path == &["Password", "hash"] {
+                if !matches!(
+                    handler.kind,
+                    AxHandlerKind::Action { .. } | AxHandlerKind::Route { .. }
+                ) {
+                    return Err(AxBackendCodegenError::PasswordHashOutsideRequestHandler {
+                        handler: handler.name.clone(),
+                    });
+                }
+                let [password] = args.as_slice() else {
+                    return Err(AxBackendCodegenError::InvalidPasswordHashArguments);
+                };
+                return Ok(format!(
+                    "{{ let __ax_password = json!({}); json!(axonyx_runtime::password::AxPassword::hash(__ax_password.as_str().ok_or_else(|| AxRuntimeError::message(\"Password.hash requires String argument\"))?).map_err(|_| AxRuntimeError::message(\"password hashing failed\"))?) }}",
+                    render_borrowed_expr(password)
+                ));
+            }
             if path == &["Password", "verifyOptional"] {
                 if !matches!(
                     handler.kind,
@@ -1908,6 +2071,25 @@ fn render_owned_expr(expr: &AxRustExpr) -> String {
 
 fn render_codegen_expr(code: &str) -> String {
     let code = code.trim();
+    for (name, predicate) in [
+        ("Validate.email", "email"),
+        ("Validate.password", "password"),
+        ("Validate::email", "email"),
+        ("Validate::password", "password"),
+    ] {
+        if let Some(inner) = code
+            .strip_prefix(&format!("{name}("))
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let args = split_codegen_args(inner);
+            if let [arg] = args.as_slice() {
+                return format!(
+                    "axonyx_runtime::validation::{predicate}(&({}))",
+                    render_codegen_expr(arg)
+                );
+            }
+        }
+    }
     let Some(inner) = code
         .strip_prefix("contains(")
         .and_then(|value| value.strip_suffix(')'))
@@ -1931,6 +2113,95 @@ fn render_codegen_expr(code: &str) -> String {
         render_codegen_expr(value)
     )
 }
+
+// Borrow operands so a concatenation does not consume reusable handler inputs.
+const BACKEND_ADDITION_HELPER: &str = r#"
+trait __AxAdd<Rhs> {
+    type Output;
+    fn ax_add(&self, rhs: &Rhs) -> Self::Output;
+}
+fn __ax_add<L, R>(left: &L, right: &R) -> L::Output
+where L: __AxAdd<R> {
+    left.ax_add(right)
+}
+impl __AxAdd<String> for String {
+    type Output = String;
+    fn ax_add(&self, rhs: &String) -> String {
+        let mut result = self.clone();
+        result.push_str(rhs);
+        result
+    }
+}
+macro_rules! __ax_numeric_add {
+    ($($ty:ty),*) => {$(
+        impl __AxAdd<$ty> for $ty {
+            type Output = $ty;
+            fn ax_add(&self, rhs: &$ty) -> $ty {
+                self.checked_add(*rhs).expect("integer addition overflow")
+            }
+        }
+    )*};
+}
+__ax_numeric_add!(i32, i64, u64);
+fn __ax_finite_add(left: f64, right: f64) -> f64 {
+    let result = left + right;
+    assert!(result.is_finite(), "non-finite addition result");
+    result
+}
+impl __AxAdd<f64> for f64 {
+    type Output = f64;
+    fn ax_add(&self, rhs: &f64) -> f64 { __ax_finite_add(*self, *rhs) }
+}
+macro_rules! __ax_string_scalar_add {
+    ($($ty:ty),*) => {$(
+        impl __AxAdd<$ty> for String {
+            type Output = String;
+            fn ax_add(&self, rhs: &$ty) -> String { format!("{}{}", self, rhs) }
+        }
+        impl __AxAdd<String> for $ty {
+            type Output = String;
+            fn ax_add(&self, rhs: &String) -> String { format!("{}{}", self, rhs) }
+        }
+    )*};
+}
+__ax_string_scalar_add!(i32, i64, u64, bool);
+impl __AxAdd<f64> for String {
+    type Output = String;
+    fn ax_add(&self, rhs: &f64) -> String {
+        assert!(rhs.is_finite(), "non-finite String operand");
+        format!("{}{}", self, if *rhs == 0.0 { 0.0 } else { *rhs })
+    }
+}
+impl __AxAdd<String> for f64 {
+    type Output = String;
+    fn ax_add(&self, rhs: &String) -> String {
+        assert!(self.is_finite(), "non-finite String operand");
+        format!("{}{}", if *self == 0.0 { 0.0 } else { *self }, rhs)
+    }
+}
+macro_rules! __ax_float_add {
+    ($($ty:ty),*) => {$(
+        impl __AxAdd<f64> for $ty {
+            type Output = f64;
+            fn ax_add(&self, rhs: &f64) -> f64 { __ax_finite_add(*self as f64, *rhs) }
+        }
+        impl __AxAdd<$ty> for f64 {
+            type Output = f64;
+            fn ax_add(&self, rhs: &$ty) -> f64 { __ax_finite_add(*self, *rhs as f64) }
+        }
+    )*};
+}
+__ax_float_add!(i32, i64, u64);
+impl __AxAdd<i32> for i64 {
+    type Output = i64;
+    fn ax_add(&self, rhs: &i32) -> i64 { self.checked_add(i64::from(*rhs)).expect("integer addition overflow") }
+}
+impl __AxAdd<i64> for i32 {
+    type Output = i64;
+    fn ax_add(&self, rhs: &i64) -> i64 { i64::from(*self).checked_add(*rhs).expect("integer addition overflow") }
+}
+
+"#;
 
 fn split_codegen_binary_args(input: &str) -> Option<(&str, &str)> {
     let args = split_codegen_args(input);
@@ -2046,6 +2317,9 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
 fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     match fallback {
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
+            if let Some(fields) = render_invalid_call_fields(expr) {
+                return format!("        let __ax_error_value = json!({{\"fields\": {fields}}});\n        return Ok(AxActionOutput::new(__ax_action_error_payload(\"Invalid input.\".to_string(), __ax_error_value, 422, __ax_redirect)).with_cookies(__ax_cookies));\n");
+            }
             if let Some(message) = render_error_call_message(expr) {
                 format!(
                     "        let __ax_error_message = ({message}).to_string();\n        let __ax_error_value = json!(&__ax_error_message);\n        return Ok(AxActionOutput::new(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect)).with_cookies(__ax_cookies));\n"
@@ -2072,7 +2346,9 @@ fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
 fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     let response = match fallback {
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
-            if let Some(message) = render_error_call_message(expr) {
+            if let Some(fields) = render_invalid_call_fields(expr) {
+                format!("AxHttpResponse::json(422, &json!({{\"error\": \"invalid_input\", \"message\": \"Invalid input.\", \"fields\": {fields}}})).map_err(|error| AxRuntimeError::message(error.to_string()))?")
+            } else if let Some(message) = render_error_call_message(expr) {
                 format!(
                     "AxHttpResponse::json(401, &json!({{\"error\": {message}}})).map_err(|error| AxRuntimeError::message(error.to_string()))?"
                 )
@@ -2098,6 +2374,22 @@ fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     };
 
     format!("        return Ok(__ax_finalize_response({response}, __ax_headers, __ax_cookies));\n")
+}
+
+fn render_invalid_call_fields(expr: &AxRustExpr) -> Option<String> {
+    let inner = expr
+        .code
+        .trim()
+        .strip_prefix("invalid(")?
+        .strip_suffix(')')?;
+    let args = split_codegen_args(inner);
+    let [fields] = args.as_slice() else {
+        return None;
+    };
+    if fields.trim().is_empty() {
+        return None;
+    }
+    Some(render_borrowed_expr(&AxRustExpr::new(*fields)))
 }
 
 fn render_error_call_message(expr: &AxRustExpr) -> Option<String> {
@@ -2235,6 +2527,168 @@ mod tests {
     use crate::ax_backend_lowering::lower_backend_document;
 
     #[test]
+    fn record_input_contracts_reject_unsupported_carriers_and_optional_top_level() {
+        for ty in [
+            "Decimal",
+            "Set<String>",
+            "Result<String, String>",
+            "Json",
+            "Public<String>",
+        ] {
+            let source = format!("export type PostInput {{\n  title: String\n  bad: {ty}\n}}\naction Save(post: PostInput) {{\n  return input.post\n}}");
+            let error = compile_backend_ax_to_module(&source).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    AxBackendCompileError::Codegen(
+                        AxBackendCodegenError::UnsupportedRequestRecordInput { .. }
+                    )
+                ),
+                "{error}"
+            );
+            assert!(error.to_string().contains("PostInput.bad"));
+        }
+        let source = "export type PostInput {\n  title: String\n}\naction Save(post?: PostInput) {\n  return input.post\n}";
+        let error = compile_backend_ax_to_module(source).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AxBackendCompileError::Codegen(
+                    AxBackendCodegenError::UnsupportedRequestRecordInput { .. }
+                )
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("must be required"));
+    }
+
+    #[test]
+    fn record_action_and_api_inputs_use_shared_contract_decoder() {
+        let source = r#"
+export type PostInput {
+  title: String
+  tags: String[]
+}
+action Save(post: PostInput) {
+  return input.post
+}
+route POST "/api/posts" {
+  input:
+    post: PostInput
+  return json(input.post)
+}
+"#;
+        let module = compile_backend_ax_to_module(source).unwrap();
+        assert_eq!(module.matches("axonyx_runtime::input::decode_record(Some(request), None, \"post\", \"PostInput\", __ax_api_contract_context())?").count(), 2);
+        assert!(module.contains("serde_json::from_value::<PostInput>"));
+    }
+
+    #[test]
+    fn numeric_input_errors_are_typed_for_required_optional_and_default_fields() {
+        for rust_ty in ["i64", "u64", "f64"] {
+            for (optional, default) in [
+                (false, None),
+                (true, None),
+                (false, Some(AxRustExpr::new("7"))),
+            ] {
+                let field = AxFieldPlan {
+                    name: "count".to_string(),
+                    rust_ty: rust_ty.to_string(),
+                    optional,
+                    default,
+                };
+                let rendered = render_input_field(&field, "raw");
+                assert!(rendered.contains("AxRuntimeError::invalid_input(\"count\")"));
+                assert!(!rendered.contains("AxRuntimeError::message"));
+                assert!(!rendered.contains("received"));
+                if optional || field.default.is_some() {
+                    assert!(rendered.contains(".transpose()?.unwrap_or("));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn backend_addition_compiles_without_consuming_string_operands() {
+        let directory = std::env::temp_dir().join(format!(
+            "axonyx-addition-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        let source = directory.join("addition.rs");
+        let binary = directory.join(format!("addition{}", std::env::consts::EXE_SUFFIX));
+        std::fs::write(&source, format!("{BACKEND_ADDITION_HELPER}\n{}", r#"
+fn main() {
+    let email = "foundry@example.com".to_string();
+    let prefix = "register:".to_string();
+    assert_eq!(__ax_add(&prefix, &email), "register:foundry@example.com");
+    assert_eq!(__ax_add(&__ax_add(&prefix, &email), &"!".to_string()), "register:foundry@example.com!");
+    assert_eq!(__ax_add(&"".to_string(), &email), email);
+    assert_eq!(prefix, "register:");
+    assert_eq!(email, "foundry@example.com");
+    assert_eq!(__ax_add(&2, &3), 5);
+    assert_eq!(__ax_add(&2_i64, &3_i64), 5_i64);
+    assert_eq!(__ax_add(&2_u64, &3_u64), 5_u64);
+    assert_eq!(__ax_add(&2.5_f64, &3.0_f64), 5.5_f64);
+    assert_eq!(__ax_add(&"Count: ".to_string(), &42_i64), "Count: 42");
+    assert_eq!(__ax_add(&42_i64, &" items".to_string()), "42 items");
+    assert_eq!(__ax_add(&"enabled=".to_string(), &true), "enabled=true");
+    assert_eq!(__ax_add(&false, &"!".to_string()), "false!");
+    assert_eq!(__ax_add(&"ratio=".to_string(), &2.5_f64), "ratio=2.5");
+    assert_eq!(__ax_add(&"zero=".to_string(), &-0.0_f64), "zero=0");
+    assert_eq!(__ax_add(&2_i64, &0.5_f64), 2.5_f64);
+    assert_eq!(__ax_add(&0.5_f64, &2_i64), 2.5_f64);
+    assert_eq!(__ax_add(&2_i64, &3), 5_i64);
+}
+"#)).unwrap();
+        let compilation = std::process::Command::new("rustc")
+            .arg("--edition=2021")
+            .arg(&source)
+            .arg("-o")
+            .arg(&binary)
+            .output()
+            .unwrap();
+        let execution = compilation
+            .status
+            .success()
+            .then(|| std::process::Command::new(&binary).output().unwrap());
+        std::fs::remove_dir_all(&directory).unwrap();
+        assert!(
+            compilation.status.success(),
+            "{}",
+            String::from_utf8_lossy(&compilation.stderr)
+        );
+        assert!(execution.unwrap().status.success());
+    }
+
+    #[test]
+    fn lowers_addition_in_hooks_and_domain_helpers() {
+        let module = compile_backend_ax_to_module(
+            r#"
+export fn join(left: String, right: String) -> String {
+  return left + right
+}
+export fn sum(left: Int, right: Int) -> Int {
+  return left + right
+}
+route POST "/api/register" {
+  input:
+    email: String
+  before Login.throttle("register:" + input.email, 10, 60)
+  return json(input.email)
+}
+"#,
+        )
+        .expect("addition should compile");
+        assert!(module.contains("__ax_add(&(left), &(right))"));
+        assert!(module.contains("__ax_add(&(\"register:\".to_string()), &(input.email))"));
+    }
+
+    #[test]
     fn compiles_canonical_scalar_action_and_route_inputs() {
         let module = compile_backend_ax_to_module(
             r#"
@@ -2259,6 +2713,35 @@ route POST "/api/probe" {
             assert!(module.contains(field), "missing mapped input: {field}");
         }
         assert!(!module.contains("pub id: Int"));
+    }
+
+    #[test]
+    fn invalid_guard_emits_field_errors_without_changing_auth_status() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action Register(email: String) {
+  require Validate.email(input.email) else invalid({email: "Email is required."})
+  return ok()
+}
+route POST "/api/register" {
+  input:
+    email: String
+  require input.email != "" else invalid({email: "Email is required."})
+  return json("ok")
+}
+"#,
+        )
+        .expect("validation guards should compile");
+        assert!(module.contains("AxHttpResponse::json(422"));
+        assert!(module.contains("invalid_input"));
+        assert!(module.contains("Email is required."));
+        assert!(module.contains("axonyx_runtime::validation::email"));
+        assert!(!module.contains("Validate::"));
+        assert!(!module.contains("&invalid("));
+        let auth = render_require_fallback(Some(&AxReturnPlan::Expr(AxRustExpr::new(
+            "error(\"Unauthorized\")",
+        ))));
+        assert!(auth.contains("AxHttpResponse::json(401"));
     }
 
     #[test]
@@ -2521,6 +3004,38 @@ action publishPost(id: String, title: String) {
             "__ax_push_invalidation(&mut __ax_invalidations, \"posts\".to_string(), false)"
         ));
         assert!(module.contains("Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))"));
+    }
+
+    #[test]
+    fn loader_require_stops_before_database_access() {
+        let module = compile_backend_ax_to_module(
+            r#"
+query deniedPosts() {
+  require false else error("private policy detail")
+  data posts = db.posts.all()
+  return posts
+}
+"#,
+        )
+        .expect("guarded query should compile");
+        let denial = module
+            .find("return Err(AxRuntimeError::Unauthorized)")
+            .expect("loader must enforce guard");
+        let query = module
+            .find("runtime.load(&AxQueryRequest")
+            .expect("query should compile");
+        assert!(denial < query);
+        assert!(!module.contains("// require false"));
+        assert!(!module.contains("private policy detail"));
+        let forbidden = compile_backend_ax_to_module(
+            "query restricted() {\n  require false else forbidden()\n  return 1\n}",
+        )
+        .expect("forbidden query should compile");
+        assert!(forbidden.contains("return Err(AxRuntimeError::Forbidden)"));
+        let ordinary =
+            compile_backend_ax_to_module("query checked() {\n  require false\n  return 1\n}")
+                .expect("ordinary requirement should compile");
+        assert!(ordinary.contains("Backend requirement was not satisfied"));
     }
 
     #[test]
@@ -2924,15 +3439,24 @@ route GET "/api/account"
     }
 
     #[test]
+    fn loader_auth_uses_server_request_context() {
+        let module = compile_backend_ax_to_module("query privatePosts() {\n  require Auth.subject else error(\"private policy\")\n  return 1\n}").expect("request-bound loader should compile");
+        assert!(module.contains("let request = context.request()?;"));
+        assert!(module.contains("let context = context.with_request(request);"));
+        assert!(module.contains("runtime.load_session(request)?"));
+        assert!(!module.contains("private policy"));
+    }
+
+    #[test]
     fn rejects_auth_subject_outside_request_handlers() {
         let error = compile_backend_ax_to_module(
             r#"
-query loadAccount() {
+job loadAccount {
   return Auth.subject
 }
 "#,
         )
-        .expect_err("loader auth should be rejected");
+        .expect_err("job auth should be rejected");
 
         assert!(matches!(
             error,
@@ -3177,7 +3701,7 @@ route POST "/api/posts"
 
         assert!(module.contains("pub struct RoutePostApiPostsInput"));
         assert!(module.contains("__ax_request_input_field(request, \"title\")"));
-        assert!(module.contains("missing required input `title`"));
+        assert!(module.contains("AxRuntimeError::invalid_input(\"title\")"));
         assert!(module.contains("parse::<i64>()"));
         assert!(module.contains("let input = RoutePostApiPostsInput"));
         assert!(module.contains("AxHttpResponse::json(200, &json!(&input.title))"));
@@ -3269,6 +3793,62 @@ loader Login
                 AxBackendCodegenError::PasswordVerifyOutsideRequestHandler { .. }
             ))
         ));
+    }
+
+    #[test]
+    fn compiles_server_owned_uuid_and_rejects_invalid_calls() {
+        let source = "route POST \"/register\"\n  data id = Uuid.new()\n  return json(id)\n";
+        assert!(compile_backend_ax_to_module(source)
+            .unwrap()
+            .contains("json!(axonyx_runtime::new_uuid())"));
+        let session = compile_backend_ax_to_module(&source.replace(
+            "return json(id)",
+            "Session.create(id, {})\n  return json(\"ok\")",
+        ))
+        .unwrap();
+        assert!(session.contains("let __ax_session_subject = json!(&id)"));
+        assert!(session.contains("__ax_session_subject.as_str()"));
+        for invalid in [
+            source.replace("Uuid.new()", "Uuid.new(\"caller-id\")"),
+            "loader IDs\n  data id = Uuid.new()\n  return id\n".to_string(),
+            "fn makeId() -> String {\n  data id = Uuid.new()\n  return id\n}\n".to_string(),
+        ] {
+            assert!(matches!(
+                compile_backend_ax_to_module(&invalid),
+                Err(AxBackendCompileError::Codegen(
+                    AxBackendCodegenError::InvalidUuidNewCall
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn compiles_password_hash_and_rejects_invalid_handler_shapes() {
+        for source in [
+            "route POST \"/register\"\n  data hash = Password.hash(request.form.password)\n  return json(\"ok\")\n",
+            "action Register(password: String) {\n  data hash = Password.hash(input.password)\n  return json(\"ok\")\n}\n",
+        ] {
+            let module = compile_backend_ax_to_module(source).unwrap();
+            assert!(module.contains("axonyx_runtime::password::AxPassword::hash("));
+            assert!(module.contains("password hashing failed"));
+            assert!(!module.contains("json!(&Password::hash("));
+        }
+        for args in ["", "\"one\", \"two\""] {
+            let source = format!("route POST \"/register\"\n  data hash = Password.hash({args})\n  return json(\"ok\")\n");
+            assert!(matches!(
+                compile_backend_ax_to_module(&source),
+                Err(AxBackendCompileError::Codegen(
+                    AxBackendCodegenError::InvalidPasswordHashArguments
+                ))
+            ));
+        }
+        for source in [
+            "loader Register\n  data hash = Password.hash(\"secret\")\n  return hash\n",
+            "fn hashPassword(password: String) -> String {\n  data hash = Password.hash(password)\n  return hash\n}\n",
+        ] {
+            assert!(matches!(compile_backend_ax_to_module(source),
+                Err(AxBackendCompileError::Codegen(AxBackendCodegenError::PasswordHashOutsideRequestHandler { .. }))));
+        }
     }
 
     #[test]

@@ -63,6 +63,12 @@ impl AxActionOutput {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AxRuntimeError {
+    #[error("authentication required")]
+    Unauthorized,
+    #[error("access forbidden")]
+    Forbidden,
+    #[error("invalid request input `{field}`")]
+    InvalidInput { field: String },
     #[error("runtime operation failed: {message}")]
     Message { message: String },
     #[error("runtime database operation failed: {error}")]
@@ -70,6 +76,19 @@ pub enum AxRuntimeError {
 }
 
 impl AxRuntimeError {
+    pub fn access_denial_status(&self) -> Option<u16> {
+        match self {
+            Self::Unauthorized => Some(401),
+            Self::Forbidden => Some(403),
+            _ => None,
+        }
+    }
+    pub fn invalid_input(field: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            field: field.into(),
+        }
+    }
+
     pub fn message(message: impl Into<String>) -> Self {
         Self::Message {
             message: message.into(),
@@ -84,6 +103,14 @@ impl AxRuntimeError {
 
     pub fn public_error_payload(&self) -> Value {
         match self {
+            Self::Unauthorized => {
+                json!({"error": "unauthorized", "message": "Authentication required."})
+            }
+            Self::Forbidden => json!({"error": "forbidden", "message": "Access denied."}),
+            Self::InvalidInput { field } => {
+                let fields = BTreeMap::from([(field.clone(), "Missing or invalid input.")]);
+                json!({"error": "invalid_input", "message": "Invalid input.", "fields": fields})
+            }
             Self::Message { message } => json!({
                 "ok": false,
                 "code": "runtime.error",
@@ -489,11 +516,21 @@ pub struct AxSendRequest {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AxLoaderContext {
+    #[serde(skip)]
+    request: Option<AxHttpRequest>,
     pub params: BTreeMap<String, String>,
     pub query: BTreeMap<String, String>,
 }
 
 impl AxLoaderContext {
+    pub fn with_request(mut self, request: &AxHttpRequest) -> Self {
+        self.request = Some(request.clone());
+        self
+    }
+
+    pub fn request(&self) -> AxRuntimeResult<&AxHttpRequest> {
+        self.request.as_ref().ok_or(AxRuntimeError::Unauthorized)
+    }
     pub fn new() -> Self {
         Self::default()
     }
@@ -3459,11 +3496,31 @@ fn sqlite_row_to_json(row: &rusqlite::Row<'_>, column_names: &[String]) -> rusql
 }
 
 pub(crate) fn sqlite_runtime_error(resource: &str, error: rusqlite::Error) -> AxRuntimeError {
-    AxRuntimeError::database(AxDbError::from_driver_detail(
-        AxDatabaseDriver::Sqlite,
-        resource,
-        error.to_string(),
-    ))
+    let native_constraint = match &error {
+        rusqlite::Error::SqliteFailure(code, _)
+            if matches!(
+                code.extended_code,
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+                    | rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            ) =>
+        {
+            Some(AxDbErrorCode::UniqueViolation)
+        }
+        rusqlite::Error::SqliteFailure(code, _)
+            if code.code == rusqlite::ErrorCode::ConstraintViolation =>
+        {
+            Some(AxDbErrorCode::ConstraintViolation)
+        }
+        _ => None,
+    };
+    let mut translated =
+        AxDbError::from_driver_detail(AxDatabaseDriver::Sqlite, resource, error.to_string());
+    if let Some(code) = native_constraint {
+        translated.code = code.as_str().to_string();
+        translated.status = code.status();
+        translated.message = code.default_message().to_string();
+    }
+    AxRuntimeError::database(translated)
 }
 
 fn postgres_execute_query(
@@ -4109,6 +4166,13 @@ fn postgres_json_query(sql: &str) -> String {
 }
 
 pub(crate) fn postgres_runtime_error(resource: &str, error: postgres::Error) -> AxRuntimeError {
+    let native_constraint = error
+        .as_db_error()
+        .and_then(|error| match error.code().code() {
+            "23505" => Some(AxDbErrorCode::UniqueViolation),
+            "23502" | "23503" | "23514" | "23P01" => Some(AxDbErrorCode::ConstraintViolation),
+            _ => None,
+        });
     let detail = if let Some(db_error) = error.as_db_error() {
         format!("{}: {}", db_error.code().code(), db_error.message())
     } else {
@@ -4121,11 +4185,14 @@ pub(crate) fn postgres_runtime_error(resource: &str, error: postgres::Error) -> 
         }
         detail
     };
-    AxRuntimeError::database(AxDbError::from_driver_detail(
-        AxDatabaseDriver::Postgres,
-        resource,
-        detail,
-    ))
+    let mut translated =
+        AxDbError::from_driver_detail(AxDatabaseDriver::Postgres, resource, detail);
+    if let Some(code) = native_constraint {
+        translated.code = code.as_str().to_string();
+        translated.status = code.status();
+        translated.message = code.default_message().to_string();
+    }
+    AxRuntimeError::database(translated)
 }
 
 fn database_health_error(driver: AxDatabaseDriver, detail: impl Into<String>) -> AxRuntimeError {
@@ -4741,6 +4808,60 @@ mod tests {
     use super::*;
 
     #[test]
+    fn loader_request_identity_is_not_serialized_or_deserialized() {
+        let mut request = AxHttpRequest::new("GET", "/private");
+        request
+            .headers
+            .insert("Cookie".into(), "session=private-cookie".into());
+        let context = AxLoaderContext::new().with_request(&request);
+        assert_eq!(context.request().unwrap(), &request);
+        let serialized = serde_json::to_string(&context).unwrap();
+        assert!(!serialized.contains("private-cookie"));
+        assert!(!serialized.contains("request"));
+        let injected = json!({"params":{}, "query":{}, "request": request});
+        let decoded: AxLoaderContext = serde_json::from_value(injected).unwrap();
+        assert_eq!(decoded.request(), Err(AxRuntimeError::Unauthorized));
+    }
+
+    #[test]
+    fn access_denials_have_fixed_public_payloads_and_typed_statuses() {
+        assert_eq!(
+            AxRuntimeError::Unauthorized.access_denial_status(),
+            Some(401)
+        );
+        assert_eq!(AxRuntimeError::Forbidden.access_denial_status(), Some(403));
+        assert_eq!(
+            AxRuntimeError::Unauthorized.public_error_payload(),
+            json!({"error":"unauthorized", "message":"Authentication required."})
+        );
+        assert_eq!(
+            AxRuntimeError::Forbidden.public_error_payload(),
+            json!({"error":"forbidden", "message":"Access denied."})
+        );
+        assert_eq!(
+            AxRuntimeError::message("internal failure").access_denial_status(),
+            None
+        );
+        assert_eq!(
+            AxRuntimeError::invalid_input("email").access_denial_status(),
+            None
+        );
+    }
+
+    #[test]
+    fn input_error_payload_contains_only_field_and_fixed_message() {
+        let error = AxRuntimeError::invalid_input("password");
+        assert_eq!(
+            error.public_error_payload(),
+            json!({
+                "error": "invalid_input", "message": "Invalid input.",
+                "fields": {"password": "Missing or invalid input."}
+            })
+        );
+        assert_eq!(error.to_string(), "invalid request input `password`");
+    }
+
+    #[test]
     fn action_output_keeps_response_cookies_outside_the_public_payload() {
         let output = AxActionOutput::new(json!({ "ok": true }))
             .with_cookie(AxCookie::new("session", "signed-id").http_only());
@@ -4922,6 +5043,38 @@ mod tests {
     #[test]
     fn ok_payload_returns_framework_success_shape() {
         assert_eq!(ok_payload(), json!({ "ok": true }));
+    }
+
+    #[test]
+    fn sqlite_native_constraint_codes_override_message_classification() {
+        for (extended, expected) in [
+            (
+                rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE,
+                AxDbErrorCode::UniqueViolation,
+            ),
+            (
+                rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY,
+                AxDbErrorCode::UniqueViolation,
+            ),
+            (
+                rusqlite::ffi::SQLITE_CONSTRAINT_CHECK,
+                AxDbErrorCode::ConstraintViolation,
+            ),
+        ] {
+            let error = sqlite_runtime_error(
+                "credentials",
+                rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(extended),
+                    Some("localized opaque driver message".to_string()),
+                ),
+            );
+            let AxRuntimeError::Database { error } = error else {
+                panic!("expected typed database error");
+            };
+            assert_eq!(error.code, expected.as_str());
+            assert_eq!(error.status, 409);
+            assert_eq!(error.message, expected.default_message());
+        }
     }
 
     #[test]

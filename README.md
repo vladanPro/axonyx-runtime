@@ -18,7 +18,7 @@ For generated Axonyx apps, prefer the crates.io package:
 
 ```toml
 [dependencies]
-axonyx-runtime = "0.5.1"
+axonyx-runtime = "0.6.0"
 ```
 
 Use the Git dependency only when testing unreleased runtime work:

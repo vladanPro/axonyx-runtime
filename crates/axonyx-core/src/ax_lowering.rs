@@ -1386,23 +1386,7 @@ fn eval_binary_expr(
     right: AxValue,
 ) -> Result<AxValue, AxLowerError> {
     match op {
-        AxBinaryOp::Add => match (left, right) {
-            (AxValue::Number(left), AxValue::Number(right)) => Ok(AxValue::Number(left + right)),
-            (AxValue::Float(left), AxValue::Float(right)) => {
-                finite_float_value(left.get() + right.get(), "`+`")
-            }
-            (AxValue::Number(left), AxValue::Float(right)) => {
-                finite_float_value(left as f64 + right.get(), "`+`")
-            }
-            (AxValue::Float(left), AxValue::Number(right)) => {
-                finite_float_value(left.get() + right as f64, "`+`")
-            }
-            (left, right) => Ok(AxValue::String(format!(
-                "{}{}",
-                left.as_string(),
-                right.as_string()
-            ))),
-        },
+        AxBinaryOp::Add => add_values(left, right),
         AxBinaryOp::Sub => eval_numeric_binary(
             left,
             right,
@@ -1450,6 +1434,51 @@ fn eval_binary_expr(
         AxBinaryOp::And | AxBinaryOp::Or | AxBinaryOp::Fallback => {
             unreachable!("short-circuit operators are evaluated before this point")
         }
+    }
+}
+
+/// Adds numbers, or concatenates scalar values when one operand is a String.
+pub fn add_values(left: AxValue, right: AxValue) -> Result<AxValue, AxLowerError> {
+    match (left, right) {
+        (AxValue::Number(left), AxValue::Number(right)) => left
+            .checked_add(right)
+            .map(AxValue::Number)
+            .ok_or_else(|| AxLowerError::UnsupportedExpression {
+                message: "integer addition overflow".to_string(),
+            }),
+        (AxValue::Float(left), AxValue::Float(right)) => {
+            finite_float_value(left.get() + right.get(), "`+`")
+        }
+        (AxValue::Number(left), AxValue::Float(right)) => {
+            finite_float_value(left as f64 + right.get(), "`+`")
+        }
+        (AxValue::Float(left), AxValue::Number(right)) => {
+            finite_float_value(left.get() + right as f64, "`+`")
+        }
+        (left, right)
+            if matches!(&left, AxValue::String(_)) || matches!(&right, AxValue::String(_)) =>
+        {
+            let scalar = |value: &AxValue| match value {
+                AxValue::String(value) => Some(value.clone()),
+                AxValue::Number(value) => Some(value.to_string()),
+                AxValue::Float(value) => Some(if value.get() == 0.0 {
+                    "0".to_string()
+                } else {
+                    value.get().to_string()
+                }),
+                AxValue::Bool(value) => Some(value.to_string()),
+                _ => None,
+            };
+            match (scalar(&left), scalar(&right)) {
+                (Some(left), Some(right)) => Ok(AxValue::String(left + &right)),
+                _ => Err(AxLowerError::UnsupportedExpression {
+                    message: "`+` concatenation requires scalar operands".to_string(),
+                }),
+            }
+        }
+        _ => Err(AxLowerError::UnsupportedExpression {
+            message: "`+` requires two numbers or a String with a scalar operand".to_string(),
+        }),
     }
 }
 
@@ -2142,6 +2171,65 @@ pub mod prelude {
 mod tests {
     use super::*;
     use crate::ax_parser::parse_ax;
+
+    #[test]
+    fn addition_uses_numeric_or_scalar_string_semantics() {
+        let cases = [
+            (
+                AxValue::from("Count: "),
+                AxValue::from(42_i64),
+                AxValue::from("Count: 42"),
+            ),
+            (
+                AxValue::from(42_i64),
+                AxValue::from(" items"),
+                AxValue::from("42 items"),
+            ),
+            (
+                AxValue::from("ratio="),
+                AxValue::from(2.5),
+                AxValue::from("ratio=2.5"),
+            ),
+            (
+                AxValue::from("zero="),
+                AxValue::from(-0.0),
+                AxValue::from("zero=0"),
+            ),
+            (
+                AxValue::from("enabled="),
+                AxValue::from(true),
+                AxValue::from("enabled=true"),
+            ),
+            (
+                AxValue::from(false),
+                AxValue::from("!"),
+                AxValue::from("false!"),
+            ),
+            (AxValue::from(2_i64), AxValue::from(0.5), AxValue::from(2.5)),
+            (AxValue::from(0.5), AxValue::from(2_i64), AxValue::from(2.5)),
+        ];
+        for (left, right, expected) in cases {
+            assert_eq!(add_values(left, right).unwrap(), expected);
+        }
+        assert_eq!(
+            add_values(
+                add_values(AxValue::from("1"), AxValue::from(2_i64)).unwrap(),
+                AxValue::from(3_i64)
+            )
+            .unwrap(),
+            AxValue::from("123")
+        );
+        for invalid in [
+            AxValue::Null,
+            AxValue::list([]),
+            AxValue::record(Vec::<(String, AxValue)>::new()),
+        ] {
+            assert!(add_values(AxValue::from("x"), invalid.clone()).is_err());
+            assert!(add_values(invalid, AxValue::from("x")).is_err());
+        }
+        assert!(add_values(AxValue::from(true), AxValue::from(1_i64)).is_err());
+        assert!(add_values(AxValue::Number(i64::MAX), AxValue::from(1_i64)).is_err());
+    }
 
     #[test]
     fn lowers_indentation_first_page_into_ax_node() {

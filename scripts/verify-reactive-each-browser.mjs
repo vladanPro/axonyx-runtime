@@ -44,7 +44,19 @@ try {
   });
 
   await page.goto(origin, { waitUntil: "domcontentloaded" });
+  for (const [id, expected] of [["addition-label", "Count: 2"], ["addition-suffix", "2 items"], ["addition-total", "2.5"], ["addition-flag", "enabled=true"]]) {
+    if ((await page.locator(`#${id}`).textContent()) !== expected) {
+      throw new Error(`SSR addition mismatch for ${id}`);
+    }
+  }
   await page.waitForFunction(() => window.__axonyx?.state?.runtime() === "wasm");
+  captureRequests = true;
+  await page.locator("#increase-count").click();
+  await page.waitForFunction(() => document.querySelector("#addition-label")?.textContent === "Count: 3");
+  if ((await page.locator("#addition-suffix").textContent()) !== "3 items"
+    || (await page.locator("#addition-total").textContent()) !== "3.5") {
+    throw new Error("reactive WASM addition differs from SSR semantics");
+  }
   const list = page.locator('ax-state-each[data-ax-each-render-status="ready"]');
   const firstItem = list.locator('ax-each-item[data-ax-each-key="first"]');
   const firstHandle = await firstItem.elementHandle();

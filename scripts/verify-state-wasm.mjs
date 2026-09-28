@@ -121,6 +121,39 @@ const stringFrame = (value) => {
   const encoded = encoder.encode(value);
   return frame(1, u32(encoded.length), encoded);
 };
+const floatFrame = (value) => {
+  const payload = new Uint8Array(8);
+  new DataView(payload.buffer).setFloat64(0, value, true);
+  return frame(3, payload);
+};
+const evaluateAddition = (left, right) => {
+  const request = Uint8Array.from([
+    ...u32(expressionProgram.length), ...expressionProgram,
+    ...u32(2), ...left, ...right,
+  ]);
+  new Uint8Array(wasm.memory.buffer, valuePointer, request.length).set(request);
+  const length = wasm.ax_state_evaluate_expression(request.length) >>> 0;
+  return length === 0xffffffff ? null
+    : new Uint8Array(wasm.memory.buffer, valuePointer, length).slice();
+};
+for (const [left, right, expected] of [
+  [stringFrame("Count: "), intFrame(42), stringFrame("Count: 42")],
+  [intFrame(42), stringFrame(" items"), stringFrame("42 items")],
+  [stringFrame("ratio="), floatFrame(2.5), stringFrame("ratio=2.5")],
+  [stringFrame("zero="), floatFrame(-0), stringFrame("zero=0")],
+  [stringFrame("enabled="), frame(2, [1]), stringFrame("enabled=true")],
+  [frame(2, [0]), stringFrame("!"), stringFrame("false!")],
+  [intFrame(2), floatFrame(0.5), floatFrame(2.5)],
+  [floatFrame(0.5), intFrame(2), floatFrame(2.5)],
+]) {
+  const actual = evaluateAddition(left, right);
+  assert(actual && actual.length === expected.length
+    && actual.every((value, index) => value === expected[index]),
+  "WASM scalar addition differs from the backend/Pages contract");
+}
+assert(evaluateAddition(stringFrame("x"), nullFrame) === null, "String + null must be rejected");
+assert(evaluateAddition(stringFrame("x"), listFrame) === null, "String + list must be rejected");
+assert(evaluateAddition(frame(2, [1]), intFrame(1)) === null, "Bool + Int must be rejected");
 const stringListFrame = (values) => frame(6, u32(values.length), ...values.map(stringFrame));
 const reconcileObjectFrame = (oldKeys, nextKeys) => {
   const entries = [
