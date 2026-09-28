@@ -71,6 +71,12 @@ pub enum AxBackendCodegenError {
         "query function `{query}` can only be called from a route data binding; found in `{handler}`"
     )]
     QueryCallOutsideRequestHandler { query: String, handler: String },
+    #[error("request record input `{handler}.{field}` is not supported: {reason}")]
+    UnsupportedRequestRecordInput {
+        handler: String,
+        field: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -122,6 +128,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str(BACKEND_ADDITION_HELPER);
 
     validate_type_contracts(&plan.types, &plan.literal_unions)?;
+    validate_request_record_inputs(plan)?;
     for literal_union in &plan.literal_unions {
         out.push_str(&render_literal_union_type(literal_union)?);
         out.push('\n');
@@ -531,6 +538,86 @@ fn validate_type_contracts(
         validate_no_recursive_type(&record.name, &record.name, types, &mut path)?;
     }
     Ok(())
+}
+
+pub fn validate_request_record_inputs(plan: &AxBackendPlan) -> Result<(), AxBackendCodegenError> {
+    for handler in &plan.handlers {
+        let input = match &handler.kind {
+            AxHandlerKind::Action { input, .. } | AxHandlerKind::Route { input, .. } => input,
+            _ => continue,
+        };
+        for field in input {
+            let Some(record) = plan
+                .types
+                .iter()
+                .find(|record| record.name == field.rust_ty)
+            else {
+                continue;
+            };
+            let reason = if field.optional || field.default.is_some() {
+                Some("the record itself must be required and have no default".to_string())
+            } else {
+                unsupported_record_input_field(record, plan, 0)
+            };
+            if let Some(reason) = reason {
+                return Err(AxBackendCodegenError::UnsupportedRequestRecordInput {
+                    handler: handler.name.clone(),
+                    field: field.name.clone(),
+                    reason,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unsupported_record_input_field(
+    record: &AxRecordPlan,
+    plan: &AxBackendPlan,
+    depth: usize,
+) -> Option<String> {
+    if depth > 64 {
+        return Some("record nesting exceeds 64 levels".to_string());
+    }
+    for field in &record.fields {
+        if let Some(ty) = unsupported_record_input_type(&field.ty, plan, depth + 1) {
+            return Some(format!("`{}.{}` uses `{ty}`; use String, Bool, Int, Number, Float, date/UUID strings, optional fields, lists, maps or declared records", record.name, field.name));
+        }
+    }
+    None
+}
+
+fn unsupported_record_input_type(
+    ty: &AxType,
+    plan: &AxBackendPlan,
+    depth: usize,
+) -> Option<String> {
+    match ty {
+        AxType::String
+        | AxType::Bool
+        | AxType::Int
+        | AxType::Number
+        | AxType::Float
+        | AxType::DateTime
+        | AxType::Date
+        | AxType::Time
+        | AxType::Uuid => None,
+        AxType::Optional(inner) | AxType::List(inner) => {
+            unsupported_record_input_type(inner, plan, depth)
+        }
+        AxType::Map(key, value) => unsupported_record_input_type(key, plan, depth)
+            .or_else(|| unsupported_record_input_type(value, plan, depth)),
+        AxType::Record(name) if plan.literal_unions.iter().any(|union| union.name == *name) => None,
+        AxType::Record(name) => plan
+            .types
+            .iter()
+            .find(|record| record.name == *name)
+            .map_or_else(
+                || Some(ty.display_name()),
+                |record| unsupported_record_input_field(record, plan, depth),
+            ),
+        _ => Some(ty.display_name()),
+    }
 }
 
 fn render_literal_union_type(
@@ -2438,6 +2525,42 @@ mod tests {
     use crate::ax_ast::prelude::AxExpr;
     use crate::ax_backend_ast::prelude::*;
     use crate::ax_backend_lowering::lower_backend_document;
+
+    #[test]
+    fn record_input_contracts_reject_unsupported_carriers_and_optional_top_level() {
+        for ty in [
+            "Decimal",
+            "Set<String>",
+            "Result<String, String>",
+            "Json",
+            "Public<String>",
+        ] {
+            let source = format!("export type PostInput {{\n  title: String\n  bad: {ty}\n}}\naction Save(post: PostInput) {{\n  return input.post\n}}");
+            let error = compile_backend_ax_to_module(&source).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    AxBackendCompileError::Codegen(
+                        AxBackendCodegenError::UnsupportedRequestRecordInput { .. }
+                    )
+                ),
+                "{error}"
+            );
+            assert!(error.to_string().contains("PostInput.bad"));
+        }
+        let source = "export type PostInput {\n  title: String\n}\naction Save(post?: PostInput) {\n  return input.post\n}";
+        let error = compile_backend_ax_to_module(source).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                AxBackendCompileError::Codegen(
+                    AxBackendCodegenError::UnsupportedRequestRecordInput { .. }
+                )
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("must be required"));
+    }
 
     #[test]
     fn record_action_and_api_inputs_use_shared_contract_decoder() {
