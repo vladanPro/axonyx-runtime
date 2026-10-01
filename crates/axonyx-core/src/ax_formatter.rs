@@ -321,6 +321,17 @@ mod tests {
     }
 
     #[test]
+    fn formats_component_return_asx_and_remains_parseable() {
+        let source = "page Home() {\ncomponent Greeting(title = \"Hello\") {\nreturn ASX {\n<div>{title}<Slot /></div>\n}\n}\nreturn ASX { <Greeting /> }\n}\n";
+        let expected = "page Home() {\n  component Greeting(title = \"Hello\") {\n    return ASX {\n      <div>{title}<Slot /></div>\n    }\n  }\n  return ASX { <Greeting /> }\n}\n";
+
+        let formatted = format_ax_source(source);
+        assert_eq!(formatted, expected);
+        assert_eq!(format_ax_source(&formatted), expected);
+        parse_ax_v2(&formatted).expect("formatted component return should parse");
+    }
+
+    #[test]
     fn keeps_else_blocks_at_the_parent_depth() {
         let source =
             "fn label(value: Bool) {\nif value {\nreturn \"on\"\n} else {\nreturn \"off\"\n}\n}\n";

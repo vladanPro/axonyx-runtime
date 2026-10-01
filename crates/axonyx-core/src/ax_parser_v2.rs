@@ -854,6 +854,7 @@ impl<'a> Parser<'a> {
             || self.starts_with_keyword("client")
             || self.starts_with_keyword("style")
             || self.starts_with_keyword("render")
+            || self.starts_with_keyword("return")
     }
 
     fn parse_layered_component_decl(
@@ -897,6 +898,16 @@ impl<'a> Parser<'a> {
                     return Err(AxParseV2Error::InvalidComponent { line });
                 }
                 render = Some(self.parse_component_render_decl()?);
+                continue;
+            }
+
+            if self.starts_with_keyword("return") {
+                if render.is_some() {
+                    return Err(AxParseV2Error::InvalidComponent { line });
+                }
+                render = Some(AxComponentRenderDeclV2::asx(
+                    self.parse_return_asx_body(false)?,
+                ));
                 continue;
             }
 
@@ -2151,6 +2162,90 @@ component Greeting {
         assert_eq!(file.page.name, "ComponentModule");
         assert_eq!(file.components.len(), 1);
         assert_eq!(file.components[0].name, "Greeting");
+    }
+
+    #[test]
+    fn parses_component_return_asx_in_standalone_module() {
+        let file = parse_ax_component_module_v2(
+            r#"
+component AccordionItem(open = "", title = "") {
+  return ASX {
+    <div class="ax-accordion__item" data-open={open}>
+      <div class="ax-accordion__trigger">{title}</div>
+      <div class="ax-accordion__content"><Slot /></div>
+    </div>
+  }
+}
+"#,
+        )
+        .expect("component module should parse")
+        .expect("component declaration should be detected");
+
+        let component = &file.components[0];
+        assert_eq!(component.name, "AccordionItem");
+        assert_eq!(component.body.len(), 1);
+        assert_eq!(
+            component.render.as_ref().map(|render| render.body.len()),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn component_return_asx_matches_existing_render_forms() {
+        fn component_from_body(body: &str) -> AxComponentDeclV2 {
+            let source = format!(
+                "page Home\ncomponent Greeting(title = \"Hello\") {{\n{body}\n}}\n<Greeting />\n"
+            );
+            parse_ax_v2(&source)
+                .expect("component should parse")
+                .components
+                .remove(0)
+        }
+
+        let implicit = component_from_body("<div>{title}<Slot /></div>");
+        let layered = component_from_body("render ASX { <div>{title}<Slot /></div> }");
+        let returned = component_from_body("return ASX { <div>{title}<Slot /></div> }");
+
+        assert_eq!(implicit.body, layered.body);
+        assert_eq!(layered.body, returned.body);
+        assert_eq!(implicit.params, returned.params);
+    }
+
+    #[test]
+    fn component_return_asx_works_with_state_and_client_layers() {
+        let file = parse_ax_v2(
+            r#"
+page Home
+component ThemeSwitcher(label = "Theme") {
+  state selected: String = "silver"
+  client JS from "./theme.client.js"
+  return ASX { <button>{label}: {selected}</button> }
+}
+<ThemeSwitcher />
+"#,
+        )
+        .expect("layered component should parse");
+
+        let component = &file.components[0];
+        assert_eq!(component.states.len(), 1);
+        assert_eq!(component.clients.len(), 1);
+        assert_eq!(component.body.len(), 1);
+        assert!(component.render.is_some());
+    }
+
+    #[test]
+    fn component_rejects_duplicate_or_malformed_return_asx() {
+        for body in [
+            "return ASX { <Copy>First</Copy> }\nrender ASX { <Copy>Second</Copy> }",
+            "render ASX { <Copy>First</Copy> }\nreturn ASX { <Copy>Second</Copy> }",
+            "return ASX <Copy>Missing braces</Copy>",
+        ] {
+            let source = format!("page Home\ncomponent Greeting() {{\n{body}\n}}\n<Greeting />\n");
+            assert!(
+                parse_ax_v2(&source).is_err(),
+                "accepted invalid body: {body}"
+            );
+        }
     }
 
     #[test]
