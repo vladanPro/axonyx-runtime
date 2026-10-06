@@ -1674,7 +1674,8 @@ fn lower_local_component_nodes(
     let functions = context.sources.functions;
     let resolver = context.resolver;
     let props = eval_props(component, functions, scope, resolver)?;
-    let passthrough_attrs = component_passthrough_attrs(&props, component_def);
+    let mut passthrough_attrs = component_passthrough_attrs(&props, component_def);
+    passthrough_attrs.extend(style_attrs(&component.style, functions, scope, resolver)?);
     let mut component_scope = scope.clone();
     component_scope.insert(
         AX_COMPONENT_INSTANCE_PATH.to_string(),
@@ -1746,7 +1747,10 @@ fn component_passthrough_attrs(
                 .any(|param| param.name == **name)
                 && (name.starts_with("data-")
                     || name.starts_with("aria-")
-                    || matches!(name.as_str(), "id" | "role" | "title" | "tabindex"))
+                    || matches!(
+                        name.as_str(),
+                        "id" | "role" | "title" | "tabindex" | "style"
+                    ))
         })
         .map(|(name, value)| attr_boxed(name.clone(), value.as_string()))
         .collect()
@@ -1775,6 +1779,15 @@ fn apply_attrs_to_first_element(nodes: &mut [AxNode], incoming: Vec<Attribute>) 
         return;
     };
     for attr in incoming {
+        if matches!(attr.name, "class" | "style") {
+            if let Some(existing) = attrs.iter_mut().find(|existing| existing.name == attr.name) {
+                if !attr.value.trim().is_empty() {
+                    let separator = if attr.name == "style" { ";" } else { " " };
+                    existing.value = format!("{}{separator}{}", existing.value, attr.value);
+                }
+                continue;
+            }
+        }
         attrs.retain(|existing| existing.name != attr.name);
         attrs.push(attr);
     }
@@ -3750,6 +3763,67 @@ page Frame
                 )],
             )
         );
+    }
+
+    #[test]
+    fn merges_customization_into_local_and_imported_component_roots() {
+        let definition = r#"
+component PackageButton() {
+  return ASX {
+    <button class="ax-button" style="color: red" aria-label="Default"><Slot /></button>
+  }
+}
+"#;
+        for imported in [false, true] {
+            let prefix = if imported {
+                "import { PackageButton } from \"./button.asx\"".to_string()
+            } else {
+                String::new()
+            };
+            let local_definition = if imported { "" } else { definition };
+            let document = parse_ax_auto(&format!(
+                r#"{prefix}
+page Home() {{
+  {local_definition}
+  const customClass = "brand-button"
+  return ASX {{
+    <PackageButton className={{customClass}} style="color: blue; --ax-button-radius: 6px" id="save" aria-label="Save changes">Save</PackageButton>
+  }}
+}}
+"#
+            ))
+            .expect("customization should parse");
+            let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+            let imports = |source: &str| (source == "./button.asx").then(|| definition.to_string());
+            let node = lower_document_with_scope_and_imports(
+                &document,
+                BTreeMap::new(),
+                &resolver,
+                &imports,
+            )
+            .expect("customization should lower");
+            let AxNode::Element { children, .. } = node else {
+                panic!("page root")
+            };
+            let AxNode::Element {
+                attrs, children, ..
+            } = &children[0]
+            else {
+                panic!("component root")
+            };
+            for (name, value) in [
+                ("class", "ax-button brand-button"),
+                ("style", "color: red;color: blue; --ax-button-radius: 6px"),
+                ("id", "save"),
+                ("aria-label", "Save changes"),
+            ] {
+                assert_eq!(attrs.iter().filter(|attr| attr.name == name).count(), 1);
+                assert!(attrs
+                    .iter()
+                    .any(|attr| attr.name == name && attr.value == value));
+            }
+            assert_eq!(children, &vec![text("Save")]);
+        }
     }
 
     #[test]
