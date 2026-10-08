@@ -3199,6 +3199,38 @@ fn eval_preview_expr_with_functions(
 ) -> Result<AxValue, PreviewError> {
     let code = expr.code.trim();
 
+    // Lowering emits Rust grouping and operators, not authoring syntax.
+    if let Ok(parsed) = syn::parse_str::<syn::Expr>(code) {
+        match parsed {
+            syn::Expr::Paren(paren) => {
+                return eval_preview_expr_with_functions(
+                    &AxRustExpr::new(preview_rust_expr_source(&paren.expr)),
+                    scope,
+                    env,
+                    functions,
+                );
+            }
+            syn::Expr::Binary(binary) => {
+                return eval_preview_binary(&binary, scope, env, functions);
+            }
+            syn::Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Not(_)) => {
+                let value = eval_preview_expr_with_functions(
+                    &AxRustExpr::new(preview_rust_expr_source(&unary.expr)),
+                    scope,
+                    env,
+                    functions,
+                )?;
+                if let AxValue::Bool(value) = value {
+                    return Ok(AxValue::Bool(!value));
+                }
+                return Err(PreviewError::Runtime {
+                    message: "logical negation expects a Bool".to_string(),
+                });
+            }
+            _ => {}
+        }
+    }
+
     if let Some(value) = parse_preview_string(code) {
         return Ok(AxValue::String(value));
     }
@@ -3380,6 +3412,126 @@ fn eval_preview_expr_with_functions(
     })
 }
 
+fn preview_rust_expr_source(expr: &syn::Expr) -> String {
+    use quote::ToTokens;
+    use syn::parse::Parser;
+    match expr {
+        syn::Expr::Path(path) if path.qself.is_none() => path
+            .path
+            .segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect::<Vec<_>>()
+            .join("::"),
+        syn::Expr::Field(field) => format!(
+            "{}.{}",
+            preview_rust_expr_source(&field.base),
+            field.member.to_token_stream()
+        ),
+        syn::Expr::Call(call) => format!(
+            "{}({})",
+            preview_rust_expr_source(&call.func),
+            call.args
+                .iter()
+                .map(preview_rust_expr_source)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        syn::Expr::MethodCall(call) => format!(
+            "{}.{}{}({})",
+            preview_rust_expr_source(&call.receiver),
+            call.method,
+            call.turbofish
+                .as_ref()
+                .map(|args| args.to_token_stream().to_string())
+                .unwrap_or_default(),
+            call.args
+                .iter()
+                .map(preview_rust_expr_source)
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        syn::Expr::Try(expr) => format!("{}?", preview_rust_expr_source(&expr.expr)),
+        syn::Expr::Paren(paren) => format!("({})", preview_rust_expr_source(&paren.expr)),
+        syn::Expr::Reference(reference) => {
+            format!("&({})", preview_rust_expr_source(&reference.expr))
+        }
+        syn::Expr::Macro(mac) if mac.mac.path.is_ident("vec") => {
+            match syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated
+                .parse2(mac.mac.tokens.clone())
+            {
+                Ok(items) => format!(
+                    "vec![{}]",
+                    items
+                        .iter()
+                        .map(preview_rust_expr_source)
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+                Err(_) => expr.to_token_stream().to_string(),
+            }
+        }
+        _ => expr.to_token_stream().to_string(),
+    }
+}
+
+fn eval_preview_binary(
+    binary: &syn::ExprBinary,
+    scope: &BTreeMap<String, AxValue>,
+    env: &backend::AxEnv,
+    functions: &BTreeMap<String, AxFunctionPlan>,
+) -> Result<AxValue, PreviewError> {
+    let invalid = || PreviewError::Runtime {
+        message: "unsupported preview binary operator or operand types".to_string(),
+    };
+    let eval = |expr: &syn::Expr| {
+        eval_preview_expr_with_functions(
+            &AxRustExpr::new(preview_rust_expr_source(expr)),
+            scope,
+            env,
+            functions,
+        )
+    };
+    let left = eval(&binary.left)?;
+    if matches!(binary.op, syn::BinOp::And(_) | syn::BinOp::Or(_)) {
+        let AxValue::Bool(left) = left else {
+            return Err(invalid());
+        };
+        if (matches!(binary.op, syn::BinOp::And(_)) && !left)
+            || (matches!(binary.op, syn::BinOp::Or(_)) && left)
+        {
+            return Ok(AxValue::Bool(left));
+        }
+        let AxValue::Bool(right) = eval(&binary.right)? else {
+            return Err(invalid());
+        };
+        return Ok(AxValue::Bool(right));
+    }
+    let right = eval(&binary.right)?;
+    let result = match binary.op {
+        syn::BinOp::Eq(_) => left == right,
+        syn::BinOp::Ne(_) => left != right,
+        syn::BinOp::Lt(_) | syn::BinOp::Le(_) | syn::BinOp::Gt(_) | syn::BinOp::Ge(_) => {
+            let ordering = match (&left, &right) {
+                (AxValue::String(a), AxValue::String(b)) => Some(a.cmp(b)),
+                (AxValue::Number(a), AxValue::Number(b)) => Some(a.cmp(b)),
+                (AxValue::Float(a), AxValue::Float(b)) => a.get().partial_cmp(&b.get()),
+                _ => return Err(invalid()),
+            }
+            .ok_or_else(invalid)?;
+            match binary.op {
+                syn::BinOp::Lt(_) => ordering.is_lt(),
+                syn::BinOp::Le(_) => ordering.is_le(),
+                syn::BinOp::Gt(_) => ordering.is_gt(),
+                syn::BinOp::Ge(_) => ordering.is_ge(),
+                _ => unreachable!(),
+            }
+        }
+        _ => return Err(invalid()),
+    };
+    Ok(AxValue::Bool(result))
+}
+
 fn eval_preview_revalidation_target_with_functions(
     expr: &AxRustExpr,
     literal: bool,
@@ -3453,9 +3605,12 @@ fn parse_preview_string(code: &str) -> Option<String> {
         return parse_preview_string(value.trim());
     }
 
-    if (code.starts_with('"') && code.ends_with('"'))
-        || (code.starts_with('\'') && code.ends_with('\''))
-    {
+    if code.starts_with('"') {
+        return syn::parse_str::<syn::LitStr>(code)
+            .ok()
+            .map(|literal| literal.value());
+    }
+    if code.starts_with('\'') && code.ends_with('\'') && code.len() >= 2 {
         return Some(code[1..code.len() - 1].to_string());
     }
 
@@ -9582,6 +9737,87 @@ action SetTheme
         assert_eq!(error.status, 422);
         assert_eq!(error.message, "Theme is not supported.");
         assert!(result.patches.is_empty());
+    }
+
+    #[test]
+    fn preview_settings_action_validates_lowered_guards() {
+        let source = r#"
+action ValidateSettings(workspace: String, slug: String, email: String, theme: String) {
+  require input.workspace != "" else invalid({workspace: "Required"})
+  require input.slug != "admin" else invalid({slug: "Reserved"})
+  require Validate.email(input.email) else invalid({email: "Invalid email"})
+  require input.theme in ["silver", "bronze", "gold"] else invalid({theme: "Unsupported"})
+  return ok()
+}
+"#;
+        let valid = BTreeMap::from([
+            ("workspace".to_string(), "Public sample".to_string()),
+            ("slug".to_string(), "sample".to_string()),
+            ("email".to_string(), "builder@example.com".to_string()),
+            ("theme".to_string(), "gold".to_string()),
+        ]);
+        let result = execute_preview_action_sources(
+            &[source],
+            "ValidateSettings",
+            &valid,
+            &mut AxPreviewStore::default(),
+        )
+        .expect("valid preview action");
+        assert!(result.error.is_none());
+        for (field, value, message) in [
+            ("workspace", "", "Required"),
+            ("slug", "admin", "Reserved"),
+            ("email", "invalid", "Invalid email"),
+            ("theme", "blue", "Unsupported"),
+        ] {
+            let mut input = valid.clone();
+            input.insert(field.to_string(), value.to_string());
+            let result = execute_preview_action_sources(
+                &[source],
+                "ValidateSettings",
+                &input,
+                &mut AxPreviewStore::default(),
+            )
+            .expect("validation should not cause a runtime error");
+            let error = result.error.expect("invalid input must be rejected");
+            assert_eq!(error.status, 422);
+            let AxValue::Record(payload) = error.value else {
+                panic!("validation payload must be a record");
+            };
+            let Some(AxValue::Record(fields)) = payload.get("fields") else {
+                panic!("validation payload must contain field errors");
+            };
+            assert_eq!(fields.get(field), Some(&AxValue::from(message)));
+        }
+    }
+
+    #[test]
+    fn preview_lowered_comparisons_preserve_grouping_and_short_circuit() {
+        let scope = BTreeMap::from([(
+            "input".to_string(),
+            AxValue::record([("slug", AxValue::from("a\"b"))]),
+        )]);
+        for (expr, expected) in [
+            (r#"(input.slug == "a\"b".to_string())"#, true),
+            (
+                r#"((input.slug != "".to_string()) && Validate::email("bad".to_string()))"#,
+                false,
+            ),
+            ("(false && unknown())", false),
+            ("(true || unknown())", true),
+            (
+                r#"(true && contains(vec!["gold".to_string()], "gold".to_string()))"#,
+                true,
+            ),
+            ("(!(2 >= 3))", true),
+            ("(9007199254740993 > 9007199254740992)", true),
+        ] {
+            assert_eq!(
+                eval_preview_expr(&AxRustExpr::new(expr), &scope, &backend::AxEnv::default())
+                    .expect(expr),
+                AxValue::Bool(expected)
+            );
+        }
     }
 
     #[test]
