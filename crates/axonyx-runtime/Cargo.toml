@@ -42,6 +42,8 @@ hyper-util = { workspace = true, optional = true }
 futures-util = { workspace = true, optional = true }
 multer = { workspace = true, optional = true }
 encoding_rs.workspace = true
+syn.workspace = true
+quote.workspace = true
 cap-std = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["net", "rt-multi-thread"] }
 
