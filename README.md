@@ -242,6 +242,40 @@ Avoid promising "zero runtime". More accurate terms are:
 - no virtual DOM
 - no component rerender by default
 
+## Native Form Validation: Public Value Retention
+
+On a native form validation response (`422`), authors can explicitly retain
+public fields without JavaScript:
+
+```asx
+<form method="post" action={action SavePost}
+      data-ax-retain-fields="title,summary,palette,enabled">
+  <input name="title" />
+  <textarea name="summary"></textarea>
+  <select name="palette">
+    <option value="silver">Silver</option>
+    <option value="gold">Gold</option>
+  </select>
+  <input type="checkbox" name="enabled" />
+</form>
+```
+
+Replay is scoped to the matching action and route and uses escaped render-tree
+attributes/text. Values are excluded from form-result JSON and Debug output;
+mutation bodies are never forwarded to page loaders.
+
+- Only URL-encoded POST bodies are supported, not JSON or multipart uploads.
+- Limits are 32 submitted pairs, 4 KiB per decoded value and 64 KiB per body.
+  Repeated public field names or exceeded limits disable replay entirely.
+- Public input types, textarea, single select with explicit option values, and
+  checkbox/radio controls are supported. Missing checkbox/radio values clear
+  their checked state; unknown select values preserve the initial selection.
+- Disabled controls, hidden/file/password inputs, password/OTP autocomplete
+  controls, framework transport fields and known secret/token names never replay.
+- The allowlist is an author-controlled public-data boundary, not a complete
+  secret detector. Never opt in confidential fields under arbitrary names.
+  Multi-select and repeated checkbox groups are not supported in this version.
+
 ## Links
 
 - crates.io: https://crates.io/crates/axonyx-runtime
