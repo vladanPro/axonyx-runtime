@@ -68,7 +68,7 @@ pub enum AxBackendCodegenError {
     )]
     AuthSubjectOutsideRequestHandler { handler: String },
     #[error(
-        "query function `{query}` can only be called from a route data binding; found in `{handler}`"
+        "query function `{query}` can only be called from a route/action data binding; found in `{handler}`"
     )]
     QueryCallOutsideRequestHandler { query: String, handler: String },
     #[error("request record input `{handler}.{field}` is not supported: {reason}")]
@@ -1804,9 +1804,11 @@ fn render_value_plan(
             if let Some(query) = query {
                 let pattern = match &handler.kind {
                     AxHandlerKind::Route { path, .. } => format!("{path:?}"),
-                    AxHandlerKind::Action { .. }
-                    | AxHandlerKind::Loader { .. }
-                    | AxHandlerKind::Job => {
+                    // Action queries have transport request context, not caller-supplied page params.
+                    AxHandlerKind::Action { .. } => {
+                        "__ax_request_path(&request.target)".to_string()
+                    }
+                    AxHandlerKind::Loader { .. } | AxHandlerKind::Job => {
                         return Err(AxBackendCodegenError::QueryCallOutsideRequestHandler {
                             query: query.name.clone(),
                             handler: handler.name.clone(),
@@ -3595,6 +3597,30 @@ query currentUser(subject: String) {
                 AxBackendCodegenError::QueryCallOutsideRequestHandler { .. }
             )
         ));
+    }
+
+    #[test]
+    fn compiles_typed_optional_query_calls_in_actions_with_transport_context() {
+        let source = r#"
+type Credential {
+  password_hash: String
+}
+query loadCredential(email: String) -> Credential? {
+  return db.credentials.where({email: input.email}).first()
+}
+action SignIn(email: String, password: String) {
+  data credential = loadCredential(input.email)
+  data verified = Password.verifyOptional(input.password, credential?.password_hash)
+  require verified else forbidden()
+  require credential else forbidden()
+  return json(credential)
+}
+"#;
+        let module = compile_backend_ax_to_module(source).unwrap();
+        assert!(module.contains("let credential: Option<Credential> = serde_json::from_value"));
+        assert!(module.contains("dispatch_loader(runtime, \"loadCredential\", __ax_request_path(&request.target), request"));
+        assert!(module.contains("credential.as_ref().map(|record| record.password_hash.as_str())"));
+        assert!(module.contains("let credential = match credential"));
     }
 
     #[test]
