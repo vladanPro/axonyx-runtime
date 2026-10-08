@@ -2113,7 +2113,61 @@ fn execute_preview_action(
                     .with_max_age(0),
                 );
             }
-            AxStepPlan::Header { .. } | AxStepPlan::Hook { .. } | AxStepPlan::Send { .. } => {}
+            AxStepPlan::Hook { value: hook, .. } => {
+                if let Some(throttle) = axonyx_core::ax_backend_codegen::parse_login_throttle_hook(
+                    &hook.code,
+                )
+                .map_err(|_| PreviewError::Runtime {
+                    message: "invalid Login.throttle hook".into(),
+                })? {
+                    let AxValue::String(key) = eval_preview_expr(&throttle.key, &scope, env)?
+                    else {
+                        return Err(PreviewError::Runtime {
+                            message: "login throttle key must be String".into(),
+                        });
+                    };
+                    let identity = format!("action:{}:{}", action.name, hook.code);
+                    let limiter = store.throttles.entry(identity).or_insert_with(|| {
+                        AxPreviewThrottle(std::sync::Arc::new(
+                            login_throttle::AxLoginThrottle::new(
+                                throttle.attempts,
+                                std::time::Duration::from_secs(throttle.seconds),
+                                4096,
+                            )
+                            .expect("validated login throttle configuration"),
+                        ))
+                    });
+                    match limiter.0.try_acquire(&key) {
+                        Ok(()) => {}
+                        Err(login_throttle::AxLoginThrottleError::Limited { retry_after }) => {
+                            let seconds = (retry_after.as_secs()
+                                + u64::from(retry_after.subsec_nanos() != 0))
+                            .max(1);
+                            return Ok(AxPreviewActionResult {
+                                redirect_to: None,
+                                value,
+                                patches,
+                                invalidations,
+                                cookies,
+                                error: Some(AxPreviewActionError {
+                                    message: "Too many requests.".into(),
+                                    status: 429,
+                                    value: AxValue::record([(
+                                        "retryAfter",
+                                        AxValue::Number(seconds as i64),
+                                    )]),
+                                }),
+                            });
+                        }
+                        Err(_) => {
+                            return Err(PreviewError::Runtime {
+                                message: "login throttle unavailable".into(),
+                            })
+                        }
+                    }
+                }
+            }
+            AxStepPlan::Header { .. } | AxStepPlan::Send { .. } => {}
         }
     }
 
@@ -10616,6 +10670,50 @@ route POST "/login" {
                 .unwrap()
                 .status,
             200
+        );
+    }
+
+    #[test]
+    fn preview_action_throttle_runs_before_work_and_isolates_actions_and_keys() {
+        let source = r#"
+action SignIn(email: String) {
+  before Login.throttle(input.email, 1, 60)
+  require false else invalid({email: "Invalid credentials."})
+  return ok
+}
+action Install(email: String) {
+  before Login.throttle(input.email, 1, 60)
+  return ok
+}
+"#;
+        let mut store = AxPreviewStore::default();
+        let input = BTreeMap::from([("email".to_string(), "one".to_string())]);
+        let first =
+            execute_preview_action_sources(&[source], "SignIn", &input, &mut store).unwrap();
+        assert_eq!(first.error.unwrap().status, 422);
+        let blocked =
+            execute_preview_action_sources(&[source], "SignIn", &input, &mut store).unwrap();
+        let error = blocked.error.unwrap();
+        assert_eq!(error.status, 429);
+        assert!(matches!(error.value, AxValue::Record(ref fields)
+            if matches!(fields.get("retryAfter"), Some(AxValue::Number(1..=60)))));
+        assert!(blocked.patches.is_empty());
+        assert!(blocked.cookies.is_empty());
+        assert!(blocked.invalidations.is_empty());
+        assert!(
+            execute_preview_action_sources(&[source], "Install", &input, &mut store)
+                .unwrap()
+                .error
+                .is_none()
+        );
+        let other = BTreeMap::from([("email".to_string(), "two".to_string())]);
+        assert_eq!(
+            execute_preview_action_sources(&[source], "SignIn", &other, &mut store)
+                .unwrap()
+                .error
+                .unwrap()
+                .status,
+            422
         );
     }
 
