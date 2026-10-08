@@ -12,7 +12,7 @@ pub enum AxBackendCodegenError {
     InvalidPasswordHashArguments,
     #[error("Password.hash is only supported in action/route data bindings; found in `{handler}`")]
     PasswordHashOutsideRequestHandler { handler: String },
-    #[error("Login.throttle must be a route before hook with (String key, literal attempts 1..1000, literal seconds 1..86400)")]
+    #[error("Login.throttle must be a route/action before hook with (String key, literal attempts 1..1000, literal seconds 1..86400)")]
     InvalidLoginThrottleHook,
     #[error("Password.verify requires exactly two String arguments")]
     InvalidPasswordVerifyArguments,
@@ -1324,11 +1324,16 @@ fn render_step(
 ) -> Result<String, AxBackendCodegenError> {
     if let AxStepPlan::Hook { phase, value } = step {
         if let Some(throttle) = parse_login_throttle_hook(&value.code)? {
-            if !route_response || *phase != AxHookPhasePlan::Before {
+            if !(route_response || action_response) || *phase != AxHookPhasePlan::Before {
                 return Err(AxBackendCodegenError::InvalidLoginThrottleHook);
             }
+            let limited = if action_response {
+                "return Ok(AxActionOutput::new(__ax_action_error_payload(\"Too many requests.\".to_string(), json!({\"retryAfter\": seconds}), 429, __ax_redirect)).with_cookies(__ax_cookies));"
+            } else {
+                "let response = AxHttpResponse::json(429, &json!({\"error\":\"too many requests\"})).map_err(|_| AxRuntimeError::message(\"login throttle response failed\"))?.with_header(\"Retry-After\", seconds.to_string()).with_header(\"Cache-Control\", \"no-store\");\n                return Ok(__ax_finalize_response(response, __ax_headers, __ax_cookies));"
+            };
             return Ok(format!(
-                "    {{\n        static THROTTLE: std::sync::OnceLock<axonyx_runtime::login_throttle::AxLoginThrottle> = std::sync::OnceLock::new();\n        let throttle = THROTTLE.get_or_init(|| axonyx_runtime::login_throttle::AxLoginThrottle::new({}, std::time::Duration::from_secs({}), 4096).expect(\"validated login throttle configuration\"));\n        let key = json!({});\n        match throttle.try_acquire(key.as_str().ok_or_else(|| AxRuntimeError::message(\"login throttle key must be String\"))?) {{\n            Ok(()) => {{}},\n            Err(axonyx_runtime::login_throttle::AxLoginThrottleError::Limited {{ retry_after }}) => {{\n                let seconds = (retry_after.as_secs() + u64::from(retry_after.subsec_nanos() != 0)).max(1);\n                let response = AxHttpResponse::json(429, &json!({{\"error\":\"too many requests\"}})).map_err(|_| AxRuntimeError::message(\"login throttle response failed\"))?.with_header(\"Retry-After\", seconds.to_string()).with_header(\"Cache-Control\", \"no-store\");\n                return Ok(__ax_finalize_response(response, __ax_headers, __ax_cookies));\n            }},\n            Err(_) => return Err(AxRuntimeError::message(\"login throttle unavailable\")),\n        }}\n    }}\n",
+                "    {{\n        static THROTTLE: std::sync::OnceLock<axonyx_runtime::login_throttle::AxLoginThrottle> = std::sync::OnceLock::new();\n        let throttle = THROTTLE.get_or_init(|| axonyx_runtime::login_throttle::AxLoginThrottle::new({}, std::time::Duration::from_secs({}), 4096).expect(\"validated login throttle configuration\"));\n        let key = json!({});\n        match throttle.try_acquire(key.as_str().ok_or_else(|| AxRuntimeError::message(\"login throttle key must be String\"))?) {{\n            Ok(()) => {{}},\n            Err(axonyx_runtime::login_throttle::AxLoginThrottleError::Limited {{ retry_after }}) => {{\n                let seconds = (retry_after.as_secs() + u64::from(retry_after.subsec_nanos() != 0)).max(1);\n                {limited}\n            }},\n            Err(_) => return Err(AxRuntimeError::message(\"login throttle unavailable\")),\n        }}\n    }}\n",
                 throttle.attempts, throttle.seconds, render_borrowed_expr(&throttle.key)
             ));
         }
@@ -1539,7 +1544,10 @@ pub fn validate_login_throttle_hooks(handler: &AxHandlerPlan) -> Result<(), AxBa
         if let AxStepPlan::Hook { phase, value } = step {
             if parse_login_throttle_hook(&value.code)?.is_some()
                 && (*phase != AxHookPhasePlan::Before
-                    || !matches!(handler.kind, AxHandlerKind::Route { .. })
+                    || !matches!(
+                        handler.kind,
+                        AxHandlerKind::Route { .. } | AxHandlerKind::Action { .. }
+                    )
                     || !seen.insert(&value.code)
                     || handler.steps[..index].iter().any(|step| {
                         !matches!(
@@ -3853,6 +3861,19 @@ loader Login
 
     #[test]
     fn compiles_login_throttle_and_rejects_invalid_guard_shapes() {
+        let action = compile_backend_ax_to_module(
+            "action SignIn(email: String) {\n  before Login.throttle(input.email, 1, 60)\n  return ok\n}",
+        )
+        .unwrap();
+        assert!(action.contains("std::sync::OnceLock"));
+        assert!(action.contains("Too many requests."));
+        assert!(action.contains("retryAfter"));
+        for source in [
+            "query loadLogin() {\n  before Login.throttle(\"login\", 1, 60)\n  return \"ok\"\n}",
+            "fn checkLogin() -> String {\n  before Login.throttle(\"login\", 1, 60)\n  return \"ok\"\n}",
+        ] {
+            assert!(compile_backend_ax_to_module(source).is_err());
+        }
         let module = compile_backend_ax_to_module(
             r#"
 route POST "/login" {
@@ -3888,6 +3909,13 @@ route POST "/login" {
                 ),
                 "{hook}"
             );
+            let action = format!("action SignIn(email: String) {{\n  {hook}\n  return ok\n}}");
+            assert!(matches!(
+                compile_backend_ax_to_module(&action),
+                Err(AxBackendCompileError::Codegen(
+                    AxBackendCodegenError::InvalidLoginThrottleHook
+                ))
+            ), "action: {hook}");
         }
     }
 
