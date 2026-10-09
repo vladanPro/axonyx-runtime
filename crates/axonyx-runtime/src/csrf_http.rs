@@ -93,7 +93,9 @@ pub fn protect_form_response(
     request: &AxHttpRequest,
     mut response: AxHttpResponse,
 ) -> AxRuntimeResult<AxHttpResponse> {
-    if request.method != "GET" || !response.content_type.starts_with("text/html") {
+    let form_document =
+        request.method == "GET" || (request.method == "POST" && response.status == 422);
+    if !form_document || !response.content_type.starts_with("text/html") {
         return Ok(response);
     }
     let bytes = response.body.clone().into_bytes();
@@ -287,6 +289,55 @@ mod tests {
         )
         .unwrap()
         .is_some());
+    }
+
+    #[test]
+    fn validation_document_preserves_anonymous_form_proof() {
+        let runtime = runtime();
+        let get = AxHttpRequest::new("GET", "/setup").with_header("Host", "localhost");
+        let initial = token_response(&runtime, &get).unwrap();
+        let cookie = initial.set_cookies[0].split(';').next().unwrap();
+        let post = AxHttpRequest::new("POST", "/__axonyx/action")
+            .with_header("Host", "localhost")
+            .with_header("Cookie", cookie);
+        let response = protect_form_response(
+            &runtime,
+            &post,
+            AxHttpResponse::html(422, format!("<form>{FORM_MARKER}</form>")),
+        )
+        .unwrap();
+        assert!(response.set_cookies.is_empty());
+        assert_eq!(response.header_value("Cache-Control"), Some("no-store"));
+        assert_eq!(response.header_value("Vary"), Some("Cookie"));
+        let html = String::from_utf8(response.body.into_bytes()).unwrap();
+        let token = html
+            .split("value=\"")
+            .nth(1)
+            .unwrap()
+            .split('"')
+            .next()
+            .unwrap();
+        assert!(reject_mutation(
+            &runtime,
+            &post
+                .clone()
+                .with_body(format!("__ax_csrf={token}").into_bytes())
+        )
+        .unwrap()
+        .is_none());
+        assert!(reject_mutation(&runtime, &post).unwrap().is_some());
+    }
+
+    #[test]
+    fn rejected_post_does_not_issue_form_proof() {
+        let response = protect_form_response(
+            &runtime(),
+            &AxHttpRequest::new("POST", "/setup").with_header("Host", "localhost"),
+            AxHttpResponse::html(403, FORM_MARKER),
+        )
+        .unwrap();
+        assert!(response.set_cookies.is_empty());
+        assert_eq!(response.body.into_bytes(), FORM_MARKER.as_bytes());
     }
 
     #[test]
