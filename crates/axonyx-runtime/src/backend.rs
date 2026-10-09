@@ -63,6 +63,8 @@ impl AxActionOutput {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum AxRuntimeError {
+    #[error("resource not found")]
+    NotFound,
     #[error("authentication required")]
     Unauthorized,
     #[error("access forbidden")]
@@ -76,6 +78,13 @@ pub enum AxRuntimeError {
 }
 
 impl AxRuntimeError {
+    pub fn public_response_status(&self) -> Option<u16> {
+        match self {
+            Self::NotFound => Some(404),
+            _ => self.access_denial_status(),
+        }
+    }
+
     pub fn access_denial_status(&self) -> Option<u16> {
         match self {
             Self::Unauthorized => Some(401),
@@ -103,6 +112,7 @@ impl AxRuntimeError {
 
     pub fn public_error_payload(&self) -> Value {
         match self {
+            Self::NotFound => json!({"error": "not_found", "message": "Resource not found."}),
             Self::Unauthorized => {
                 json!({"error": "unauthorized", "message": "Authentication required."})
             }
@@ -4844,6 +4854,28 @@ mod tests {
         );
         assert_eq!(
             AxRuntimeError::invalid_input("email").access_denial_status(),
+            None
+        );
+    }
+
+    #[test]
+    fn not_found_has_a_fixed_public_response_without_reclassifying_internal_errors() {
+        assert_eq!(AxRuntimeError::NotFound.public_response_status(), Some(404));
+        assert_eq!(AxRuntimeError::NotFound.access_denial_status(), None);
+        assert_eq!(
+            AxRuntimeError::NotFound.public_error_payload(),
+            json!({"error":"not_found", "message":"Resource not found."})
+        );
+        assert_eq!(
+            AxRuntimeError::Forbidden.public_response_status(),
+            Some(403)
+        );
+        assert_eq!(
+            AxRuntimeError::Unauthorized.public_response_status(),
+            Some(401)
+        );
+        assert_eq!(
+            AxRuntimeError::message("not found in secret table").public_response_status(),
             None
         );
     }

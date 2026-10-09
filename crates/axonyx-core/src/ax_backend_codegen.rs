@@ -1511,6 +1511,7 @@ fn render_step(
         }
         AxStepPlan::Require { value, fallback } => {
             let error = match fallback.as_ref() {
+                Some(AxReturnPlan::NotFound) => "AxRuntimeError::NotFound",
                 Some(AxReturnPlan::Forbidden) => "AxRuntimeError::Forbidden",
                 Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
                     if render_error_call_message(expr).is_some() => "AxRuntimeError::Unauthorized",
@@ -2368,7 +2369,7 @@ fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
                 "        let __ax_error_message = {value};\n        let __ax_error_value = json!(&__ax_error_message);\n        return Ok(AxActionOutput::new(__ax_action_error_payload(__ax_error_message, __ax_error_value, 422, __ax_redirect)).with_cookies(__ax_cookies));\n"
             )
         }
-        Some(AxReturnPlan::NotFound) => "        return Ok(AxActionOutput::new(__ax_action_error_payload(\"not found\".to_string(), json!(\"not found\"), 422, __ax_redirect)).with_cookies(__ax_cookies));\n".to_string(),
+        Some(AxReturnPlan::NotFound) => "        return Err(AxRuntimeError::NotFound);\n".to_string(),
         Some(AxReturnPlan::Forbidden) => "        return Ok(AxActionOutput::new(__ax_action_error_payload(\"forbidden\".to_string(), json!({\"error\":\"forbidden\"}), 403, __ax_redirect)).with_cookies(__ax_cookies));\n".to_string(),
         Some(AxReturnPlan::Ok) | Some(AxReturnPlan::NoContent) | None => "        return Ok(AxActionOutput::new(__ax_action_error_payload(\"Action requirement failed.\".to_string(), json!(\"Action requirement failed.\"), 422, __ax_redirect)).with_cookies(__ax_cookies));\n".to_string(),
     }
@@ -3110,6 +3111,18 @@ loader PostsList
         ));
         assert!(module.contains("field: \"status\".to_string()"));
         assert!(module.contains("limit: Some(12)"));
+    }
+
+    #[test]
+    fn query_and_action_not_found_guards_emit_typed_rejections() {
+        for source in [
+            "query missing() {\n  require false else notFound()\n  return 1\n}",
+            "action missing() {\n  require false else notFound()\n  return ok()\n}",
+        ] {
+            let module = compile_backend_ax_to_module(source).expect("guard should compile");
+            assert!(module.contains("return Err(AxRuntimeError::NotFound)"));
+            assert!(!module.contains("Backend requirement was not satisfied"));
+        }
     }
 
     #[test]
