@@ -4761,34 +4761,7 @@ fn normalize_preview_method(method: &str) -> String {
 }
 
 fn url_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = String::with_capacity(value.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                out.push(' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                let hex = &value[index + 1..index + 3];
-                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
-                    out.push(decoded as char);
-                    index += 3;
-                } else {
-                    out.push('%');
-                    index += 1;
-                }
-            }
-            byte => {
-                out.push(byte as char);
-                index += 1;
-            }
-        }
-    }
-
-    out
+    server::url_decode(value)
 }
 
 fn url_encode(value: &str) -> String {
@@ -11378,6 +11351,19 @@ action Logout() {
         assert!(backend::AxSessionExecutor::load_session(&runtime, &request)
             .expect("session store should remain readable")
             .is_none());
+    }
+
+    #[test]
+    fn form_and_query_decoding_preserve_utf8_without_percent_slice_panics() {
+        let text = "\u{10c}\u{107} A\u{1f525}";
+        let encoded = "%C4%8C%C4%87+A%F0%9F%94%A5";
+        assert_eq!(url_decode(encoded), text);
+        assert_eq!(url_decode(text), text);
+        assert_eq!(url_decode("%\u{10c}"), "%\u{10c}");
+        assert_eq!(url_decode("%FF"), "\u{fffd}");
+        let request = server::AxHttpRequest::new("POST", "/")
+            .with_body(format!("name={encoded}").into_bytes());
+        assert_eq!(request.form_value("name").as_deref(), Some(text));
     }
 
     #[test]
