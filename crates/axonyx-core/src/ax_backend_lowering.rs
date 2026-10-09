@@ -1019,9 +1019,28 @@ fn render_expr(expr: &AxExpr) -> String {
                 .join(", ");
             format!("json!({{{fields}}})")
         }
+        AxExpr::Identifier(name) if name == "null" => "serde_json::Value::Null".to_string(),
         AxExpr::Identifier(name) => name.clone(),
         AxExpr::Unary { op, expr } => format!("({}{})", render_unary_op(*op), render_expr(expr)),
         AxExpr::Binary { op, left, right } => {
+            if matches!(op, AxBinaryOp::Eq | AxBinaryOp::Ne) {
+                let operand = if matches!(right.as_ref(), AxExpr::Identifier(name) if name == "null")
+                {
+                    Some(left.as_ref())
+                } else if matches!(left.as_ref(), AxExpr::Identifier(name) if name == "null") {
+                    Some(right.as_ref())
+                } else {
+                    None
+                };
+                if let Some(operand) = operand {
+                    let predicate = format!("__ax_is_null(&({}))?", render_expr(operand));
+                    return if *op == AxBinaryOp::Ne {
+                        format!("(!{predicate})")
+                    } else {
+                        predicate
+                    };
+                }
+            }
             if *op == AxBinaryOp::Add {
                 return format!(
                     "__ax_add(&({}), &({}))",
@@ -1048,6 +1067,9 @@ fn render_expr(expr: &AxExpr) -> String {
                 render_index_object_expr(object),
                 render_expr(index)
             )
+        }
+        AxExpr::Member { object, property } if property == "length" => {
+            format!("__ax_length(&({}))?", render_expr(object))
         }
         AxExpr::Member { object, property } => format!("{}.{}", render_expr(object), property),
         AxExpr::OptionalMember { object, property } => {

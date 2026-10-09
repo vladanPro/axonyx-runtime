@@ -1133,35 +1133,36 @@ fn parse_urlencoded_fields(body: &str) -> BTreeMap<String, String> {
     fields
 }
 
-fn url_decode(value: &str) -> String {
+pub(crate) fn url_decode(value: &str) -> String {
     let bytes = value.as_bytes();
-    let mut out = String::with_capacity(value.len());
+    let mut out = Vec::with_capacity(value.len());
     let mut index = 0;
 
     while index < bytes.len() {
         match bytes[index] {
             b'+' => {
-                out.push(' ');
+                out.push(b' ');
                 index += 1;
             }
             b'%' if index + 2 < bytes.len() => {
-                let hex = &value[index + 1..index + 3];
-                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
-                    out.push(decoded as char);
+                let high = (bytes[index + 1] as char).to_digit(16);
+                let low = (bytes[index + 2] as char).to_digit(16);
+                if let (Some(high), Some(low)) = (high, low) {
+                    out.push((high * 16 + low) as u8);
                     index += 3;
                 } else {
-                    out.push('%');
+                    out.push(b'%');
                     index += 1;
                 }
             }
             byte => {
-                out.push(byte as char);
+                out.push(byte);
                 index += 1;
             }
         }
     }
 
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

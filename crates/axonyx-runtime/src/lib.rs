@@ -774,6 +774,7 @@ struct PreviewBackendContext<'a> {
 }
 
 struct PreviewActionContext<'a> {
+    loaders: &'a BTreeMap<String, AxHandlerPlan>,
     type_context: &'a AxDataContext,
     env: &'a backend::AxEnv,
     runtime: Option<&'a dyn backend::AxBackendRuntime>,
@@ -1173,6 +1174,7 @@ pub fn execute_preview_action_sources(
         action_name,
         input_fields,
         PreviewActionContext {
+            loaders: &handlers.loaders,
             type_context: &handlers.type_context,
             env: &env,
             runtime: None,
@@ -1197,6 +1199,7 @@ pub fn execute_preview_action_sources_with_runtime(
         action_name,
         input_fields,
         PreviewActionContext {
+            loaders: &handlers.loaders,
             type_context: &handlers.type_context,
             env: runtime.env(),
             runtime: Some(runtime),
@@ -1222,6 +1225,7 @@ pub fn execute_preview_action_request_sources_with_storage(
         action_name,
         &BTreeMap::new(),
         PreviewActionContext {
+            loaders: &handlers.loaders,
             type_context: &handlers.type_context,
             env: &env,
             runtime: None,
@@ -1247,6 +1251,7 @@ pub fn execute_preview_action_request_sources_with_runtime_and_storage(
         action_name,
         &BTreeMap::new(),
         PreviewActionContext {
+            loaders: &handlers.loaders,
             type_context: &handlers.type_context,
             env: runtime.env(),
             runtime: Some(runtime),
@@ -1405,8 +1410,14 @@ fn collect_preview_handlers(
         collect_preview_functions(plan.functions, &mut functions);
 
         for handler in plan.handlers {
-            if matches!(handler.kind, AxHandlerKind::Action { .. }) {
-                actions.insert(handler.name.clone(), handler);
+            match handler.kind {
+                AxHandlerKind::Action { .. } => {
+                    actions.insert(handler.name.clone(), handler);
+                }
+                AxHandlerKind::Loader { .. } => {
+                    loaders.insert(handler.name.clone(), handler);
+                }
+                AxHandlerKind::Route { .. } | AxHandlerKind::Job => {}
             }
         }
     }
@@ -1835,6 +1846,7 @@ fn execute_preview_action(
     store: &mut AxPreviewStore,
 ) -> Result<AxPreviewActionResult, PreviewError> {
     let PreviewActionContext {
+        loaders,
         type_context,
         env,
         runtime,
@@ -1864,7 +1876,12 @@ fn execute_preview_action(
         build_preview_input_record(input, input_fields, request, type_context)?,
     );
     if let Some(request) = request {
-        let session = if action.steps.iter().any(ax_step_uses_auth_subject) {
+        let query_uses_auth = action.steps.iter().any(|step| {
+            matches!(step, AxStepPlan::Let { value: AxValuePlan::Call { path, .. }, .. }
+                if path.len() == 1 && loaders.get(&path[0]).is_some_and(|query|
+                    query.steps.iter().any(ax_step_uses_auth_subject)))
+        });
+        let session = if query_uses_auth || action.steps.iter().any(ax_step_uses_auth_subject) {
             runtime
                 .ok_or_else(|| PreviewError::Runtime {
                     message: "Auth.subject requires a configured backend runtime".to_string(),
@@ -1892,6 +1909,46 @@ fn execute_preview_action(
                 value: plan,
             } => {
                 let evaluated = match plan {
+                    AxValuePlan::Call { path, args }
+                        if path.len() == 1 && loaders.contains_key(&path[0]) =>
+                    {
+                        let request = request.ok_or_else(|| PreviewError::Runtime {
+                            message: "action query calls require an HTTP request".to_string(),
+                        })?;
+                        let args = args
+                            .iter()
+                            .map(|arg| {
+                                eval_preview_expr_with_functions(arg, &scope, env, functions)
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        // Do not expose action locals/input or manufacture page route parameters.
+                        let query_scope = BTreeMap::from([
+                            (
+                                "Auth".to_string(),
+                                scope.get("Auth").cloned().unwrap_or(AxValue::Null),
+                            ),
+                            ("params".to_string(), AxValue::Record(BTreeMap::new())),
+                            (
+                                "query".to_string(),
+                                AxValue::Record(
+                                    parse_preview_query_fields(&request.target)
+                                        .into_iter()
+                                        .map(|(key, value)| (key, AxValue::String(value)))
+                                        .collect(),
+                                ),
+                            ),
+                            ("request".to_string(), build_preview_request_record(request)),
+                        ]);
+                        execute_preview_loader(
+                            &loaders[&path[0]],
+                            &args,
+                            &query_scope,
+                            env,
+                            runtime,
+                            store,
+                            functions,
+                        )?
+                    }
                     AxValuePlan::StorageSave { capability, input } => {
                         let request = request.ok_or_else(|| PreviewError::Runtime {
                             message: "Storage.save requires an HTTP action request".to_string(),
@@ -3256,6 +3313,47 @@ fn eval_preview_expr_with_functions(
     // Lowering emits Rust grouping and operators, not authoring syntax.
     if let Ok(parsed) = syn::parse_str::<syn::Expr>(code) {
         match parsed {
+            syn::Expr::Try(expr) => {
+                if matches!(expr.expr.as_ref(), syn::Expr::Call(call)
+                    if matches!(call.func.as_ref(), syn::Expr::Path(path) if path.path.is_ident("__ax_length") || path.path.is_ident("__ax_is_null")))
+                {
+                    return eval_preview_expr_with_functions(
+                        &AxRustExpr::new(preview_rust_expr_source(&expr.expr)),
+                        scope,
+                        env,
+                        functions,
+                    );
+                }
+            }
+            syn::Expr::Index(expr) => {
+                let value = eval_preview_expr_with_functions(
+                    &AxRustExpr::new(preview_rust_expr_source(&expr.expr)),
+                    scope,
+                    env,
+                    functions,
+                )?;
+                let index = eval_preview_expr_with_functions(
+                    &AxRustExpr::new(preview_rust_expr_source(&expr.index)),
+                    scope,
+                    env,
+                    functions,
+                )?;
+                return match (value, index) {
+                    (AxValue::Record(fields), AxValue::String(key)) => {
+                        Ok(fields.get(&key).cloned().unwrap_or(AxValue::Null))
+                    }
+                    (AxValue::List(items), AxValue::Number(index)) if index >= 0 => {
+                        Ok(usize::try_from(index)
+                            .ok()
+                            .and_then(|index| items.get(index))
+                            .cloned()
+                            .unwrap_or(AxValue::Null))
+                    }
+                    _ => Err(PreviewError::Runtime {
+                        message: "index expects a record key or nonnegative list index".to_string(),
+                    }),
+                };
+            }
             syn::Expr::Paren(paren) => {
                 return eval_preview_expr_with_functions(
                     &AxRustExpr::new(preview_rust_expr_source(&paren.expr)),
@@ -3287,6 +3385,41 @@ fn eval_preview_expr_with_functions(
 
     if let Some(value) = parse_preview_string(code) {
         return Ok(AxValue::String(value));
+    }
+
+    if code == "serde_json::Value::Null" {
+        return Ok(AxValue::Null);
+    }
+    if let Some(args) = parse_preview_call_args(code, "__ax_is_null") {
+        let [arg] = args.as_slice() else {
+            return Err(PreviewError::Runtime {
+                message: "null predicate expects one value".to_string(),
+            });
+        };
+        let value = eval_preview_expr_with_functions(&AxRustExpr::new(arg), scope, env, functions)?;
+        return Ok(AxValue::Bool(matches!(value, AxValue::Null)));
+    }
+    if let Some(args) = parse_preview_call_args(code, "__ax_length") {
+        let [arg] = args.as_slice() else {
+            return Err(PreviewError::Runtime {
+                message: "length expects one value".to_string(),
+            });
+        };
+        let value = eval_preview_expr_with_functions(&AxRustExpr::new(arg), scope, env, functions)?;
+        let length = match value {
+            AxValue::String(value) => value.encode_utf16().count(),
+            AxValue::List(items) => items.len(),
+            _ => {
+                return Err(PreviewError::Runtime {
+                    message: "length expects String or List".to_string(),
+                })
+            }
+        };
+        return i64::try_from(length)
+            .map(AxValue::Number)
+            .map_err(|_| PreviewError::Runtime {
+                message: "length exceeds Int range".to_string(),
+            });
     }
 
     if let Some(inner) = code
@@ -4628,34 +4761,7 @@ fn normalize_preview_method(method: &str) -> String {
 }
 
 fn url_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = String::with_capacity(value.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                out.push(' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                let hex = &value[index + 1..index + 3];
-                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
-                    out.push(decoded as char);
-                    index += 3;
-                } else {
-                    out.push('%');
-                    index += 1;
-                }
-            }
-            byte => {
-                out.push(byte as char);
-                index += 1;
-            }
-        }
-    }
-
-    out
+    server::url_decode(value)
 }
 
 fn url_encode(value: &str) -> String {
@@ -11245,6 +11351,150 @@ action Logout() {
         assert!(backend::AxSessionExecutor::load_session(&runtime, &request)
             .expect("session store should remain readable")
             .is_none());
+    }
+
+    #[test]
+    fn form_and_query_decoding_preserve_utf8_without_percent_slice_panics() {
+        let text = "\u{10c}\u{107} A\u{1f525}";
+        let encoded = "%C4%8C%C4%87+A%F0%9F%94%A5";
+        assert_eq!(url_decode(encoded), text);
+        assert_eq!(url_decode(text), text);
+        assert_eq!(url_decode("%\u{10c}"), "%\u{10c}");
+        assert_eq!(url_decode("%FF"), "\u{fffd}");
+        let request = server::AxHttpRequest::new("POST", "/")
+            .with_body(format!("name={encoded}").into_bytes());
+        assert_eq!(request.form_value("name").as_deref(), Some(text));
+    }
+
+    #[test]
+    fn backend_null_length_and_record_index_have_explicit_semantics() {
+        let env = backend::AxEnv::new();
+        let scope = BTreeMap::from([
+            ("name".to_string(), AxValue::String("A\u{1f525}".into())),
+            (
+                "items".to_string(),
+                AxValue::List(vec![AxValue::Bool(true)]),
+            ),
+            (
+                "user".to_string(),
+                AxValue::record([("role", AxValue::String("admin".into()))]),
+            ),
+            ("missing".to_string(), AxValue::Null),
+        ]);
+        for (expression, expected) in [
+            ("__ax_length(&(name))?", AxValue::Number(3)),
+            ("__ax_length(&(items))?", AxValue::Number(1)),
+            ("__ax_is_null(&(missing))?", AxValue::Bool(true)),
+            ("!__ax_is_null(&(user))?", AxValue::Bool(true)),
+            (
+                "user[\"role\".to_string()]",
+                AxValue::String("admin".into()),
+            ),
+            ("user[\"unknown\".to_string()]", AxValue::Null),
+            ("missing == serde_json::Value::Null", AxValue::Bool(true)),
+            ("user != serde_json::Value::Null", AxValue::Bool(true)),
+        ] {
+            assert_eq!(
+                eval_preview_expr(&AxRustExpr::new(expression), &scope, &env).unwrap(),
+                expected,
+                "{expression}"
+            );
+        }
+        assert!(eval_preview_expr(&AxRustExpr::new("!missing"), &scope, &env).is_err());
+        assert!(
+            eval_preview_expr(&AxRustExpr::new("__ax_length(&(true))?"), &scope, &env).is_err()
+        );
+    }
+
+    #[test]
+    fn action_query_uses_explicit_arguments_not_forged_page_path() {
+        let source = r#"
+query findPost(slug: String) -> String {
+  return input.slug
+}
+action Find(slug: String) {
+  data post = findPost(input.slug)
+  return json(post)
+}
+"#;
+        let request = server::AxHttpRequest::new("POST", "/__axonyx/action?path=/posts/forged")
+            .with_body(b"slug=explicit".to_vec());
+        let result = execute_preview_action_request_sources_with_storage(
+            &[source],
+            "Find",
+            &request,
+            &server::AxUnavailableFileStorage,
+            &mut AxPreviewStore::default(),
+        )
+        .unwrap();
+        assert_eq!(result.value, AxValue::String("explicit".into()));
+        assert!(execute_preview_action_sources(
+            &[source],
+            "Find",
+            &BTreeMap::from([("slug".into(), "explicit".into())]),
+            &mut AxPreviewStore::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn action_query_loads_trusted_session_even_when_only_query_uses_auth() {
+        let runtime = backend::runtime_from_env(
+            backend::AxEnv::new()
+                .with_secret("db_driver", "memory")
+                .with_secret("session_key", "test-action-query-secret")
+                .with_secret("session_cookie_secure", "false"),
+        )
+        .unwrap();
+        let source = r#"
+query loadOwner() -> String {
+  require Auth.subject else forbidden()
+  return Auth.subject
+}
+action Login() {
+  Session.create("owner-42", {})
+  return ok()
+}
+action Read() {
+  data owner = loadOwner()
+  return json(owner)
+}
+"#;
+        let mut store = AxPreviewStore::default();
+        let login = execute_preview_action_sources_with_runtime(
+            &[source],
+            "Login",
+            &BTreeMap::new(),
+            &runtime,
+            &mut store,
+        )
+        .unwrap();
+        let request = server::AxHttpRequest::new("POST", "/__axonyx/action").with_header(
+            "Cookie",
+            format!("{}={}", login.cookies[0].name, login.cookies[0].value),
+        );
+        let value = execute_preview_action_request_sources_with_runtime_and_storage(
+            &[source],
+            "Read",
+            &request,
+            &runtime,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .unwrap();
+        assert_eq!(value.value, AxValue::String("owner-42".into()));
+        let forged = server::AxHttpRequest::new("POST", "/__axonyx/action?path=/admin")
+            .with_header("Cookie", "session=forged");
+        let error = execute_preview_action_request_sources_with_runtime_and_storage(
+            &[source],
+            "Read",
+            &forged,
+            &runtime,
+            &server::AxUnavailableFileStorage,
+            &mut store,
+        )
+        .unwrap_err();
+        assert!(matches!(error, PreviewError::AccessDenied { status: 403 }));
     }
 
     #[test]
