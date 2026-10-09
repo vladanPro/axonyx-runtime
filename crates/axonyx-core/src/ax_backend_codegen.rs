@@ -2323,10 +2323,13 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
             AxReturnPlan::Ok
             | AxReturnPlan::NoContent
             | AxReturnPlan::NotFound
-            | AxReturnPlan::Forbidden
-            | AxReturnPlan::Redirect { .. } => {
+            | AxReturnPlan::Forbidden => {
                 "    Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))\n".to_string()
             }
+            AxReturnPlan::Redirect { target, .. } => format!(
+                "    Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, Some({}))).with_cookies(__ax_cookies))\n",
+                render_string_expr(target)
+            ),
         };
     }
 
@@ -3032,6 +3035,29 @@ action publishPost(id: String, title: String) {
             "__ax_push_invalidation(&mut __ax_invalidations, \"posts\".to_string(), false)"
         ));
         assert!(module.contains("Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))"));
+    }
+
+    #[test]
+    fn action_return_redirect_preserves_explicit_target() {
+        let module = compile_backend_ax_to_module(
+            r#"action Complete() {
+  revalidate("/setup")
+  return redirect("/admin")
+}"#,
+        )
+        .expect("action redirect should compile");
+        assert!(module.contains("__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, Some((\"/admin\".to_string()).to_string()))"), "{module}");
+    }
+
+    #[test]
+    fn action_return_redirect_preserves_dynamic_target() {
+        let module = compile_backend_ax_to_module(
+            r#"action Complete(destination: String) {
+  return redirect(input.destination)
+}"#,
+        )
+        .expect("dynamic action redirect should compile");
+        assert!(module.contains("__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, Some((input.destination).to_string()))"), "{module}");
     }
 
     #[test]
