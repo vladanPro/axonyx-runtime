@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 
+// Bound the complete encoded request, not individual editor controls. Decoding
+// cannot expand a URL-encoded value beyond this request-wide byte budget.
+const MAX_REPLAY_BODY_BYTES: usize = 65536;
+
 /// Keep request identity/context, but never forward mutation payloads to reads.
 pub fn page_read_request(
     request: &crate::server::AxHttpRequest,
@@ -110,7 +114,7 @@ impl AxFormResult {
             .unwrap_or("")
             .trim();
         if !content_type.eq_ignore_ascii_case("application/x-www-form-urlencoded")
-            || request.body.len() > 65536
+            || request.body.len() > MAX_REPLAY_BODY_BYTES
             || request.multipart.is_some()
         {
             return self;
@@ -129,8 +133,8 @@ impl AxFormResult {
                 continue;
             }
             let value = crate::url_decode(value);
-            // Ambiguous repeated controls and oversized values disable replay.
-            if value.len() > 4096 || values.insert(name, value).is_some() {
+            // Ambiguous repeated controls disable replay for the whole form.
+            if values.insert(name, value).is_some() {
                 return self;
             }
         }
@@ -491,7 +495,7 @@ page Form() {
         for request in [
             replay_request("title=one&title=two"),
             replay_request("title=one&t%69tle=two"),
-            replay_request(&format!("title={}", "x".repeat(4097))),
+            replay_request(&format!("title={}", "x".repeat(MAX_REPLAY_BODY_BYTES))),
             replay_request(&vec!["x=y"; 33].join("&")),
             crate::server::AxHttpRequest::new("POST", "/__axonyx/action?name=Other&path=%2Fposts")
                 .with_header("content-type", "application/x-www-form-urlencoded")
@@ -511,6 +515,33 @@ page Form() {
                 .with_request_values(&request);
             assert!(result.submitted.is_none());
         }
+    }
+
+    #[test]
+    fn replay_preserves_long_editor_text_within_request_budget() {
+        let text = format!(
+            "{}\n</textarea><script>unsafe</script>",
+            "editor text ".repeat(1000)
+        );
+        let result = AxFormResult::validation("Save", "/posts", &serde_json::json!({}))
+            .unwrap()
+            .with_request_values(&replay_request(&format!("summary={text}&title=Retry")));
+        assert_eq!(
+            result.submitted.as_ref().unwrap().get("summary"),
+            Some(&text)
+        );
+        let html = replay_document(&result);
+        assert!(html.contains("&lt;/textarea&gt;&lt;script&gt;unsafe&lt;/script&gt;"));
+        assert!(!html.contains("<script>unsafe</script>"));
+        assert!(!serde_json::to_string(&result)
+            .unwrap()
+            .contains("editor text"));
+
+        let boundary = format!("title={}", "x".repeat(MAX_REPLAY_BODY_BYTES - 6));
+        let result = AxFormResult::validation("Save", "/posts", &serde_json::json!({}))
+            .unwrap()
+            .with_request_values(&replay_request(&boundary));
+        assert!(result.submitted.is_some());
     }
 
     #[test]
