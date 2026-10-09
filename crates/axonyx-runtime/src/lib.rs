@@ -291,12 +291,17 @@ pub enum PreviewError {
     Runtime { message: String },
     #[error("access denied")]
     AccessDenied { status: u16 },
+    #[error("resource not found")]
+    NotFound,
     #[error("invalid request input `{field}`")]
     InvalidInput { field: String },
 }
 
 impl From<backend::AxRuntimeError> for PreviewError {
     fn from(error: backend::AxRuntimeError) -> Self {
+        if matches!(error, backend::AxRuntimeError::NotFound) {
+            return Self::NotFound;
+        }
         if let backend::AxRuntimeError::InvalidInput { field } = error {
             return Self::InvalidInput { field };
         }
@@ -1693,6 +1698,7 @@ fn execute_preview_loader(
                     eval_preview_require_expr_with_functions(value, &scope, env, functions)?;
                 if !preview_require_passes(&requirement) {
                     return Err(match fallback {
+                        Some(AxReturnPlan::NotFound) => backend::AxRuntimeError::NotFound.into(),
                         Some(AxReturnPlan::Forbidden) => backend::AxRuntimeError::Forbidden.into(),
                         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
                             if expr.code.trim().starts_with("error(") =>
@@ -2775,6 +2781,13 @@ fn eval_preview_action_error_fallback_with_functions(
     env: &backend::AxEnv,
     functions: &BTreeMap<String, AxFunctionPlan>,
 ) -> Result<AxPreviewActionError, PreviewError> {
+    if matches!(fallback, Some(AxReturnPlan::NotFound)) {
+        return Ok(AxPreviewActionError {
+            message: "Resource not found.".to_string(),
+            value: AxValue::String("not_found".to_string()),
+            status: 404,
+        });
+    }
     if matches!(fallback, Some(AxReturnPlan::Forbidden)) {
         return Ok(AxPreviewActionError::forbidden());
     }
@@ -8927,6 +8940,25 @@ page DocsHome
         )
         .unwrap();
         assert!(html.contains("public data"));
+    }
+
+    #[test]
+    fn preview_not_found_guards_preserve_the_http_rejection() {
+        let error = preview_ax_route_with_loaders(
+            &[],
+            &["query loadMissing() {\n  require false else notFound()\n  return \"unreachable\"\n}"],
+            "page Missing() { data value = loadMissing()\n return ASX { <p>{value}</p> } }",
+        )
+        .unwrap_err();
+        assert!(matches!(error, PreviewError::NotFound));
+        let rejection = eval_preview_action_error_fallback_with_functions(
+            Some(&AxReturnPlan::NotFound),
+            &BTreeMap::new(),
+            &backend::AxEnv::default(),
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        assert_eq!(rejection.status, 404);
     }
 
     #[test]
