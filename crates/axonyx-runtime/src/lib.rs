@@ -3313,6 +3313,47 @@ fn eval_preview_expr_with_functions(
     // Lowering emits Rust grouping and operators, not authoring syntax.
     if let Ok(parsed) = syn::parse_str::<syn::Expr>(code) {
         match parsed {
+            syn::Expr::Try(expr) => {
+                if matches!(expr.expr.as_ref(), syn::Expr::Call(call)
+                    if matches!(call.func.as_ref(), syn::Expr::Path(path) if path.path.is_ident("__ax_length") || path.path.is_ident("__ax_is_null")))
+                {
+                    return eval_preview_expr_with_functions(
+                        &AxRustExpr::new(preview_rust_expr_source(&expr.expr)),
+                        scope,
+                        env,
+                        functions,
+                    );
+                }
+            }
+            syn::Expr::Index(expr) => {
+                let value = eval_preview_expr_with_functions(
+                    &AxRustExpr::new(preview_rust_expr_source(&expr.expr)),
+                    scope,
+                    env,
+                    functions,
+                )?;
+                let index = eval_preview_expr_with_functions(
+                    &AxRustExpr::new(preview_rust_expr_source(&expr.index)),
+                    scope,
+                    env,
+                    functions,
+                )?;
+                return match (value, index) {
+                    (AxValue::Record(fields), AxValue::String(key)) => {
+                        Ok(fields.get(&key).cloned().unwrap_or(AxValue::Null))
+                    }
+                    (AxValue::List(items), AxValue::Number(index)) if index >= 0 => {
+                        Ok(usize::try_from(index)
+                            .ok()
+                            .and_then(|index| items.get(index))
+                            .cloned()
+                            .unwrap_or(AxValue::Null))
+                    }
+                    _ => Err(PreviewError::Runtime {
+                        message: "index expects a record key or nonnegative list index".to_string(),
+                    }),
+                };
+            }
             syn::Expr::Paren(paren) => {
                 return eval_preview_expr_with_functions(
                     &AxRustExpr::new(preview_rust_expr_source(&paren.expr)),
@@ -3344,6 +3385,41 @@ fn eval_preview_expr_with_functions(
 
     if let Some(value) = parse_preview_string(code) {
         return Ok(AxValue::String(value));
+    }
+
+    if code == "serde_json::Value::Null" {
+        return Ok(AxValue::Null);
+    }
+    if let Some(args) = parse_preview_call_args(code, "__ax_is_null") {
+        let [arg] = args.as_slice() else {
+            return Err(PreviewError::Runtime {
+                message: "null predicate expects one value".to_string(),
+            });
+        };
+        let value = eval_preview_expr_with_functions(&AxRustExpr::new(arg), scope, env, functions)?;
+        return Ok(AxValue::Bool(matches!(value, AxValue::Null)));
+    }
+    if let Some(args) = parse_preview_call_args(code, "__ax_length") {
+        let [arg] = args.as_slice() else {
+            return Err(PreviewError::Runtime {
+                message: "length expects one value".to_string(),
+            });
+        };
+        let value = eval_preview_expr_with_functions(&AxRustExpr::new(arg), scope, env, functions)?;
+        let length = match value {
+            AxValue::String(value) => value.encode_utf16().count(),
+            AxValue::List(items) => items.len(),
+            _ => {
+                return Err(PreviewError::Runtime {
+                    message: "length expects String or List".to_string(),
+                })
+            }
+        };
+        return i64::try_from(length)
+            .map(AxValue::Number)
+            .map_err(|_| PreviewError::Runtime {
+                message: "length exceeds Int range".to_string(),
+            });
     }
 
     if let Some(inner) = code
@@ -4685,34 +4761,7 @@ fn normalize_preview_method(method: &str) -> String {
 }
 
 fn url_decode(value: &str) -> String {
-    let bytes = value.as_bytes();
-    let mut out = String::with_capacity(value.len());
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            b'+' => {
-                out.push(' ');
-                index += 1;
-            }
-            b'%' if index + 2 < bytes.len() => {
-                let hex = &value[index + 1..index + 3];
-                if let Ok(decoded) = u8::from_str_radix(hex, 16) {
-                    out.push(decoded as char);
-                    index += 3;
-                } else {
-                    out.push('%');
-                    index += 1;
-                }
-            }
-            byte => {
-                out.push(byte as char);
-                index += 1;
-            }
-        }
-    }
-
-    out
+    server::url_decode(value)
 }
 
 fn url_encode(value: &str) -> String {
@@ -11302,6 +11351,59 @@ action Logout() {
         assert!(backend::AxSessionExecutor::load_session(&runtime, &request)
             .expect("session store should remain readable")
             .is_none());
+    }
+
+    #[test]
+    fn form_and_query_decoding_preserve_utf8_without_percent_slice_panics() {
+        let text = "\u{10c}\u{107} A\u{1f525}";
+        let encoded = "%C4%8C%C4%87+A%F0%9F%94%A5";
+        assert_eq!(url_decode(encoded), text);
+        assert_eq!(url_decode(text), text);
+        assert_eq!(url_decode("%\u{10c}"), "%\u{10c}");
+        assert_eq!(url_decode("%FF"), "\u{fffd}");
+        let request = server::AxHttpRequest::new("POST", "/")
+            .with_body(format!("name={encoded}").into_bytes());
+        assert_eq!(request.form_value("name").as_deref(), Some(text));
+    }
+
+    #[test]
+    fn backend_null_length_and_record_index_have_explicit_semantics() {
+        let env = backend::AxEnv::new();
+        let scope = BTreeMap::from([
+            ("name".to_string(), AxValue::String("A\u{1f525}".into())),
+            (
+                "items".to_string(),
+                AxValue::List(vec![AxValue::Bool(true)]),
+            ),
+            (
+                "user".to_string(),
+                AxValue::record([("role", AxValue::String("admin".into()))]),
+            ),
+            ("missing".to_string(), AxValue::Null),
+        ]);
+        for (expression, expected) in [
+            ("__ax_length(&(name))?", AxValue::Number(3)),
+            ("__ax_length(&(items))?", AxValue::Number(1)),
+            ("__ax_is_null(&(missing))?", AxValue::Bool(true)),
+            ("!__ax_is_null(&(user))?", AxValue::Bool(true)),
+            (
+                "user[\"role\".to_string()]",
+                AxValue::String("admin".into()),
+            ),
+            ("user[\"unknown\".to_string()]", AxValue::Null),
+            ("missing == serde_json::Value::Null", AxValue::Bool(true)),
+            ("user != serde_json::Value::Null", AxValue::Bool(true)),
+        ] {
+            assert_eq!(
+                eval_preview_expr(&AxRustExpr::new(expression), &scope, &env).unwrap(),
+                expected,
+                "{expression}"
+            );
+        }
+        assert!(eval_preview_expr(&AxRustExpr::new("!missing"), &scope, &env).is_err());
+        assert!(
+            eval_preview_expr(&AxRustExpr::new("__ax_length(&(true))?"), &scope, &env).is_err()
+        );
     }
 
     #[test]

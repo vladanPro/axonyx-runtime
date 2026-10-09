@@ -126,6 +126,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("use axonyx_runtime::server_prelude::*;\n");
     out.push_str("use serde_json::{json, Value};\n\n");
     out.push_str(BACKEND_ADDITION_HELPER);
+    out.push_str(BACKEND_LENGTH_HELPER);
 
     validate_type_contracts(&plan.types, &plan.literal_unions)?;
     validate_request_record_inputs(plan)?;
@@ -2124,6 +2125,23 @@ fn render_codegen_expr(code: &str) -> String {
     )
 }
 
+const BACKEND_LENGTH_HELPER: &str = r#"
+fn __ax_is_null(value: &impl axonyx_runtime::serde::Serialize) -> Result<bool, AxRuntimeError> {
+    serde_json::to_value(value).map(|value| value.is_null())
+        .map_err(|_| AxRuntimeError::message("null predicate value cannot be serialized"))
+}
+fn __ax_length(value: &impl axonyx_runtime::serde::Serialize) -> Result<i64, AxRuntimeError> {
+    let value = serde_json::to_value(value)
+        .map_err(|_| AxRuntimeError::message("length value cannot be serialized"))?;
+    let length = match &value {
+        Value::String(value) => value.encode_utf16().count(),
+        Value::Array(value) => value.len(),
+        _ => return Err(AxRuntimeError::message("length expects String or List")),
+    };
+    i64::try_from(length).map_err(|_| AxRuntimeError::message("length exceeds Int range"))
+}
+"#;
+
 // Borrow operands so a concatenation does not consume reusable handler inputs.
 const BACKEND_ADDITION_HELPER: &str = r#"
 trait __AxAdd<Rhs> {
@@ -3597,6 +3615,28 @@ query currentUser(subject: String) {
                 AxBackendCodegenError::QueryCallOutsideRequestHandler { .. }
             )
         ));
+    }
+
+    #[test]
+    fn compiles_backend_null_length_and_explicit_record_index() {
+        let module = compile_backend_ax_to_module(
+            r#"
+action Inspect(name: String) {
+  data user = db.users.where({id: "missing"}).first()
+  require user == null else forbidden()
+  require input.name.length <= 120 else forbidden()
+  data users = db.users.all()
+  require users.length >= 0 else forbidden()
+  return json({ role: user["role"], length: input.name.length })
+}
+"#,
+        )
+        .unwrap();
+        assert!(module.contains("__ax_is_null(&(user))?"));
+        assert!(module.contains("__ax_length(&(input.name))?"));
+        assert!(module.contains("__ax_length(&(users))?"));
+        assert!(module.contains("user[\"role\".to_string()]"));
+        assert!(module.contains("value.encode_utf16().count()"));
     }
 
     #[test]
