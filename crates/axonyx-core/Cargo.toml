@@ -18,3 +18,6 @@ serde.workspace = true
 serde_json.workspace = true
 axonyx-macros = { version = "0.1.0", path = "../axonyx-macros" }
 proc-macro2 = { workspace = true, features = ["span-locations"] }
+
+[dev-dependencies]
+syn.workspace = true

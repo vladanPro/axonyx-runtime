@@ -1,6 +1,6 @@
 mod backend;
 
-use axonyx_runtime::backend::{AxDatabaseRuntime, AxEnv, MemoryAdapter};
+use axonyx_runtime::backend::{AxDatabaseRuntime, AxEnv, AxRuntimeEnvAccess, MemoryAdapter};
 use axonyx_runtime::native::{AxNativeLimits, AxNativeRegistry};
 use axonyx_runtime::server::{AxHttpRequest, AxUnavailableFileStorage};
 use axonyx_runtime::{
@@ -38,10 +38,12 @@ fn runtime(limits: AxNativeLimits) -> AxDatabaseRuntime<MemoryAdapter> {
     native
         .register("content.batch", |input: Batch| Ok::<_, ()>(input))
         .unwrap();
+    native.register("content.echo", |input: serde_json::Value| Ok::<_, ()>(input)).unwrap();
     AxDatabaseRuntime::new(AxEnv::default(), MemoryAdapter).with_native_functions(native)
 }
 
 fn main() {
+    private_binary_proof();
     let valid = backend::validatePost("t".repeat(160), "s".repeat(120), "b".repeat(20000), "published".into()).unwrap();
     assert!(valid.title && valid.slug && valid.body && valid.status);
     let copied = backend::copyValidation(&valid).unwrap();
@@ -60,6 +62,8 @@ fn main() {
     assert!(!bad_record.contains("private details"));
     let source = include_str!("native-backend.ax");
     let runtime = runtime(AxNativeLimits::default());
+    let empty=backend::dispatch_api_route(&runtime,&AxHttpRequest::new("GET","/empty-native"),true).unwrap().unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&empty.body.into_bytes()).unwrap(),serde_json::json!({"nested":{},"items":[]}));
     let request = AxHttpRequest::new("GET", "/prepare?t%65xt=%20hello%20");
     let compiled = backend::dispatch_api_route(&runtime, &request, false)
         .unwrap()
@@ -192,4 +196,41 @@ fn main() {
     let reused = backend::dispatch_action(&runtime, &AxUnavailableFileStorage, "ReuseHelper", &request).unwrap().unwrap();
     assert_eq!(reused.payload["value"], serde_json::json!({"first":"hello", "second":"hello", "original":"hello", "literal":"identityText(input.text)"}));
     println!("Native/Domain calls: generated Rust and preview parity passed");
+}
+
+fn private_binary_proof() {
+    use axonyx_runtime::native_response::{AxNativeBinaryResponse, AxNativeBinaryType};
+    use serde_json::{json, Value};
+    let mut registry = AxNativeRegistry::default();
+    registry.register_private_response("file.read", 100, |context, input: Value| {
+        assert_eq!(context.subject(), "owner");
+        assert_eq!(input, json!({"id":"image"}));
+        AxNativeBinaryResponse::new(AxNativeBinaryType::OctetStream, vec![0,255,128,42])
+    }).unwrap();
+    registry.register_private_response("file.empty", 100, |_, input: Value| {
+        assert_eq!(input, json!({}));
+        AxNativeBinaryResponse::new(AxNativeBinaryType::Png, vec![1,2,3])
+    }).unwrap();
+    let runtime = AxDatabaseRuntime::new(AxEnv::new().with_secret("db_driver","memory").with_secret("session_key","private-fixture-secret").with_secret("session_cookie_secure","false"), MemoryAdapter).with_native_functions(registry);
+    let (_,cookie)=runtime.runtime_create_session("owner",Default::default()).unwrap();
+    let request=AxHttpRequest::new("GET","/private/image").with_header("Cookie",format!("{}={}",cookie.name,cookie.value));
+    for validate in [false,true] {
+        let response=backend::dispatch_api_route(&runtime,&request,validate).unwrap().unwrap();
+        assert_eq!(response.status,200);
+        assert_eq!(response.body.into_bytes(),vec![0,255,128,42]);
+        let mut empty=request.clone();empty.target="/private-empty".into();
+        assert_eq!(backend::dispatch_api_route(&runtime,&empty,validate).unwrap().unwrap().body.into_bytes(),vec![1,2,3]);
+    }
+    let mut unknown=request.clone();unknown.target="/private-missing".into();
+    let error=backend::dispatch_api_route(&runtime,&unknown,true).unwrap().unwrap();
+    assert_eq!(error.status,500);
+    assert_eq!(error.header_value("Cache-Control"),Some("private, no-store"));
+    assert_eq!(error.body.into_bytes(),b"binary response unavailable");
+    let preview=execute_preview_route_request_sources_with_runtime(&[include_str!("native-backend.ax")],&request,&runtime,&mut AxPreviewStore::default());
+    assert!(preview.err().unwrap().to_string().contains("compiled server"));
+    runtime.runtime_destroy_session(&request).unwrap();
+    let denied=backend::dispatch_api_route(&runtime,&request,true).unwrap().unwrap();
+    assert_eq!(denied.status,403);
+    assert_eq!(denied.header_value("Cache-Control"),Some("private, no-store"));
+    assert_eq!(denied.body.into_bytes(),b"forbidden");
 }

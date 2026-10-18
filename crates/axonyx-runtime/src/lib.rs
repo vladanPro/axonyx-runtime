@@ -90,6 +90,8 @@ impl AxApiResponseValidationMode {
 
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum AxApiResponseValidationError {
+    #[error("successful Binary response requires status 200, an allowed binary MIME and 1..=8 MiB bytes")]
+    InvalidBinaryResponse,
     #[error("invalid API return contract `{contract}`: {message}")]
     InvalidContract { contract: String, message: String },
     #[error("successful API response for `{contract}` must use a JSON content type, found `{content_type}`")]
@@ -107,6 +109,57 @@ pub enum AxApiResponseValidationError {
     },
 }
 
+/// Safe route-boundary error, excluding native callback/configuration diagnostics.
+pub fn private_binary_failure() -> server::AxHttpResponse {
+    native_response::private_error(native_response::AxNativeResponseError::Unavailable)
+}
+
+/// Enforce private headers and closed failure bodies even on route guard exits.
+pub fn finalize_private_binary_response(
+    mut response: server::AxHttpResponse,
+) -> server::AxHttpResponse {
+    use native_response::{private_error, private_headers, AxNativeResponseError};
+    if response.status != 200 {
+        return private_error(match response.status {
+            403 => AxNativeResponseError::Forbidden,
+            404 => AxNativeResponseError::NotFound,
+            _ => AxNativeResponseError::Unavailable,
+        });
+    }
+    response.set_cookies.clear();
+    let response = private_headers(response);
+    if validate_private_binary_response(&response).is_err() {
+        return private_binary_failure();
+    }
+    response
+}
+
+/// Validate the binary contract without copying or JSON-encoding the body.
+pub fn validate_private_binary_response(
+    response: &server::AxHttpResponse,
+) -> Result<(), AxApiResponseValidationError> {
+    if !(200..300).contains(&response.status) {
+        return Ok(());
+    }
+    let size = response
+        .body
+        .chunks_iter()
+        .try_fold(0usize, |size, chunk| size.checked_add(chunk.len()));
+    if response.status != 200
+        || !matches!(size, Some(1..=native_response::MAX_NATIVE_BINARY_BYTES))
+        || !matches!(
+            response.content_type.as_str(),
+            "image/png" | "image/jpeg" | "application/octet-stream"
+        )
+        || response.header_value("Cache-Control") != Some("private, no-store")
+        || response.header_value("X-Content-Type-Options") != Some("nosniff")
+        || !response.set_cookies.is_empty()
+    {
+        return Err(AxApiResponseValidationError::InvalidBinaryResponse);
+    }
+    Ok(())
+}
+
 pub fn validate_api_response_bytes(
     status: u16,
     content_type: &str,
@@ -114,6 +167,22 @@ pub fn validate_api_response_bytes(
     contract: &str,
     context: &AxDataContext,
 ) -> Result<(), AxApiResponseValidationError> {
+    if contract.trim() == "Binary" {
+        if !(200..300).contains(&status) {
+            return Ok(());
+        }
+        if status != 200
+            || body.is_empty()
+            || body.len() > native_response::MAX_NATIVE_BINARY_BYTES
+            || !matches!(
+                content_type,
+                "image/png" | "image/jpeg" | "application/octet-stream"
+            )
+        {
+            return Err(AxApiResponseValidationError::InvalidBinaryResponse);
+        }
+        return Ok(());
+    }
     if !(200..300).contains(&status) || status == 204 {
         return Ok(());
     }
@@ -2284,6 +2353,12 @@ fn execute_preview_route(
     scope.insert("params".to_string(), AxValue::Record(route_match.params));
     scope.insert("query".to_string(), build_preview_query_record(query));
     scope.insert("request".to_string(), build_preview_request_record(request));
+    if matches!(&route_match.handler.kind, AxHandlerKind::Route { returns: Some(contract), .. } if contract == "Binary")
+    {
+        return Err(PreviewError::Runtime {
+            message: "private Binary routes require the compiled server".into(),
+        });
+    }
     let session = if route_match
         .handler
         .steps
@@ -2636,6 +2711,11 @@ fn render_preview_require_fallback(
     env: &backend::AxEnv,
 ) -> Result<AxPreviewHttpResponse, PreviewError> {
     let mut response = match fallback {
+        Some(AxReturnPlan::PrivateResponse { .. }) => {
+            return Err(PreviewError::Runtime {
+                message: "private Binary routes require the compiled server".into(),
+            })
+        }
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
             render_preview_json_response(&eval_preview_expr(expr, scope, env)?)?
         }
@@ -2795,6 +2875,11 @@ fn eval_preview_action_error_fallback_with_functions(
     }
 
     let value = match fallback {
+        Some(AxReturnPlan::PrivateResponse { .. }) => {
+            return Err(PreviewError::Runtime {
+                message: "private Binary routes require the compiled server".into(),
+            })
+        }
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
             eval_preview_expr_with_functions(expr, scope, env, functions)?
         }
@@ -2974,7 +3059,8 @@ fn eval_preview_return_with_functions(
     match value {
         AxReturnPlan::Expr(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
         AxReturnPlan::Json(expr) => eval_preview_expr_with_functions(expr, scope, env, functions),
-        AxReturnPlan::Redirect { .. }
+        AxReturnPlan::PrivateResponse { .. }
+        | AxReturnPlan::Redirect { .. }
         | AxReturnPlan::NoContent
         | AxReturnPlan::NotFound
         | AxReturnPlan::Forbidden => Err(PreviewError::Runtime {
@@ -2992,6 +3078,11 @@ fn render_preview_route_return(
     set_cookies: Vec<String>,
 ) -> Result<Option<AxPreviewHttpResponse>, PreviewError> {
     let response = match value {
+        AxReturnPlan::PrivateResponse { .. } => {
+            return Err(PreviewError::Runtime {
+                message: "private Binary routes require the compiled server".into(),
+            })
+        }
         AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => {
             render_preview_json_response(&eval_preview_expr(expr, scope, env)?)?
         }

@@ -231,6 +231,9 @@ pub struct AxAssignmentPlan {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxReturnPlan {
+    PrivateResponse {
+        args: Vec<AxRustExpr>,
+    },
     Expr(AxRustExpr),
     Json(AxRustExpr),
     Redirect {
@@ -873,6 +876,11 @@ fn lower_return_expr(expr: &AxExpr) -> AxReturnPlan {
     let AxExpr::Call { path, args } = expr else {
         return AxReturnPlan::Expr(lower_expr(expr));
     };
+    if path == &["Native", "privateResponse"] {
+        return AxReturnPlan::PrivateResponse {
+            args: args.iter().map(lower_expr).collect(),
+        };
+    }
 
     let Some(name) = path.last().map(String::as_str) else {
         return AxReturnPlan::Expr(lower_expr(expr));
@@ -1237,6 +1245,7 @@ fn ax_transaction_operation_uses_auth_subject(operation: &AxTransactionOperation
 
 fn ax_return_uses_auth_subject(value: &AxReturnPlan) -> bool {
     match value {
+        AxReturnPlan::PrivateResponse { .. } => true,
         AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => ax_expr_uses_auth_subject(expr),
         AxReturnPlan::Redirect { target, .. } => ax_expr_uses_auth_subject(target),
         AxReturnPlan::NoContent

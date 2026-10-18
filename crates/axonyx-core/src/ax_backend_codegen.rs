@@ -6,6 +6,8 @@ use crate::ax_types::prelude::AxType;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxBackendCodegenError {
+    #[error("Native.privateResponse requires a final return in a GET route declared -> Binary, a literal registered name and one payload; Binary routes cannot set headers/cookies, mutate sessions or use other returns")]
+    InvalidPrivateResponse,
     #[error("invalid declared Domain function call or argument count")]
     InvalidDomainFunctionCall,
     #[error("Native.call requires a literal registered function name and one payload in a backend data binding")]
@@ -134,6 +136,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
 
     validate_type_contracts(&plan.types, &plan.literal_unions)?;
     validate_request_record_inputs(plan)?;
+    validate_private_responses(plan)?;
     for literal_union in &plan.literal_unions {
         out.push_str(&render_literal_union_type(literal_union)?);
         out.push('\n');
@@ -294,6 +297,9 @@ fn render_function_value_plan(
     binding: &str,
 ) -> Result<String, AxBackendCodegenError> {
     match value {
+        AxValuePlan::Call { path, .. } if path == &["Native", "privateResponse"] => {
+            Err(AxBackendCodegenError::InvalidPrivateResponse)
+        }
         AxValuePlan::Expr(expr) => Ok(render_owned_expr(expr)),
         AxValuePlan::Call { path, .. } if path == &["Native", "call"] => {
             Err(AxBackendCodegenError::InvalidNativeCall)
@@ -323,12 +329,75 @@ fn render_function_value_plan(
     }
 }
 
+fn validate_private_responses(plan: &AxBackendPlan) -> Result<(), AxBackendCodegenError> {
+    let invalid = || AxBackendCodegenError::InvalidPrivateResponse;
+    let has_private = |step: &AxStepPlan| {
+        matches!(
+            step,
+            AxStepPlan::Return(AxReturnPlan::PrivateResponse { .. })
+                | AxStepPlan::Require {
+                    fallback: Some(AxReturnPlan::PrivateResponse { .. }),
+                    ..
+                }
+        )
+    };
+    if plan.types.iter().any(|ty| ty.name == "Binary")
+        || plan.literal_unions.iter().any(|ty| ty.name == "Binary")
+        || plan.globals.iter().any(has_private)
+        || plan
+            .functions
+            .iter()
+            .any(|function| function.steps.iter().any(has_private))
+    {
+        return Err(invalid());
+    }
+    for handler in &plan.handlers {
+        let binary = matches!(&handler.kind, AxHandlerKind::Route { method, returns: Some(contract), .. } if method == "GET" && contract == "Binary");
+        let declares_binary = matches!(&handler.kind, AxHandlerKind::Route { returns: Some(contract), .. } | AxHandlerKind::Loader { returns: Some(contract), .. } | AxHandlerKind::Action { returns: Some(contract), .. } if contract == "Binary");
+        if declares_binary && !binary {
+            return Err(invalid());
+        }
+        if handler.steps.iter().any(has_private) && !binary {
+            return Err(invalid());
+        }
+        if !binary {
+            continue;
+        }
+        if plan
+            .globals
+            .iter()
+            .any(|step| !matches!(step, AxStepPlan::Let { .. }))
+        {
+            return Err(invalid());
+        }
+        let Some(AxStepPlan::Return(AxReturnPlan::PrivateResponse { args })) = handler.steps.last()
+        else {
+            return Err(invalid());
+        };
+        crate::ax_native::native_call_name(args).ok_or_else(invalid)?;
+        render_native_payload(&args[1]).map_err(|_| invalid())?;
+        for step in &handler.steps[..handler.steps.len() - 1] {
+            if !matches!(step, AxStepPlan::Let { .. } | AxStepPlan::Require { .. })
+                || has_private(step)
+            {
+                return Err(invalid());
+            }
+            if matches!(step, AxStepPlan::Require { fallback, .. } if !matches!(fallback, Some(AxReturnPlan::Forbidden) | Some(AxReturnPlan::NotFound)))
+            {
+                return Err(invalid());
+            }
+        }
+    }
+    Ok(())
+}
+
 fn render_function_return(
     value: &AxReturnPlan,
     returns: &str,
     context: &AxBackendRenderContext<'_>,
 ) -> String {
     match value {
+        AxReturnPlan::PrivateResponse { .. } => "    return Err(AxRuntimeError::message(\"private binary return is not a Domain value\"));\n".into(),
         AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => {
             if context.record_names.contains(returns) {
                 format!("    return serde_json::from_value::<{returns}>(json!({})).map_err(|_| AxRuntimeError::message(\"domain helper return does not match declared record\"));\n", render_borrowed_expr(expr))
@@ -1084,12 +1153,25 @@ fn __ax_loader_context(pattern: &str, request: &AxHttpRequest) -> AxRuntimeResul
             continue;
         };
         let validation = returns.as_ref().map_or_else(String::new, |contract| {
+            if contract == "Binary" {
+                return " if validate_responses { axonyx_runtime::validate_private_binary_response(&response).map_err(|_| AxRuntimeError::message(\"API Binary response validation failed\"))?; }".into();
+            }
             format!(
                 " if validate_responses {{ let body = response.body.chunks_iter().flat_map(|chunk| chunk.iter().copied()).collect::<Vec<_>>(); validate_api_response_bytes(response.status, &response.content_type, &body, {contract:?}, __ax_api_contract_context()).map_err(|error| AxRuntimeError::message(format!(\"API response validation failed for {method} {path}: {{error}}\")))?; }}"
             )
         });
+        let binary_finalize = if returns.as_deref() == Some("Binary") {
+            " let response = axonyx_runtime::finalize_private_binary_response(response);"
+        } else {
+            ""
+        };
+        let handler_suffix = if returns.as_deref() == Some("Binary") {
+            ".unwrap_or_else(|_| axonyx_runtime::private_binary_failure())"
+        } else {
+            "?"
+        };
         out.push_str(&format!(
-            "    if request.method.eq_ignore_ascii_case({method:?}) && __ax_route_params({path:?}, &request.target).is_some() {{ let response = {}(runtime, request)?;{validation} return Ok(Some(response)); }}\n",
+            "    if request.method.eq_ignore_ascii_case({method:?}) && __ax_route_params({path:?}, &request.target).is_some() {{ let response = {}(runtime, request){handler_suffix};{binary_finalize}{validation} return Ok(Some(response)); }}\n",
             handler.rust_fn
         ));
     }
@@ -1377,6 +1459,12 @@ fn render_step(
     typed_bindings: &mut std::collections::BTreeMap<String, AxType>,
     context: &AxBackendRenderContext<'_>,
 ) -> Result<String, AxBackendCodegenError> {
+    if let AxStepPlan::Return(AxReturnPlan::PrivateResponse { args }) = step {
+        let name = crate::ax_native::native_call_name(args)
+            .ok_or(AxBackendCodegenError::InvalidPrivateResponse)?;
+        let payload = render_native_payload(&args[1])?;
+        return Ok(format!("    Ok(runtime.runtime_native_private_response(request, {name:?}, {payload}).unwrap_or_else(|_| axonyx_runtime::private_binary_failure()))\n"));
+    }
     if let AxStepPlan::Hook { phase, value } = step {
         if let Some(throttle) = parse_login_throttle_hook(&value.code)? {
             if !(route_response || action_response) || *phase != AxHookPhasePlan::Before {
@@ -1775,6 +1863,9 @@ fn render_value_plan(
     let output = match value {
         AxValuePlan::Expr(expr) => format!("json!({})", render_borrowed_expr(expr)),
         AxValuePlan::Call { path, args } => {
+            if path == &["Native", "privateResponse"] {
+                return Err(AxBackendCodegenError::InvalidPrivateResponse);
+            }
             if path == &["Native", "call"] {
                 let name = crate::ax_native::native_call_name(args)
                     .ok_or(AxBackendCodegenError::InvalidNativeCall)?;
@@ -2093,6 +2184,9 @@ fn render_native_payload(expr: &AxRustExpr) -> Result<String, AxBackendCodegenEr
         .strip_prefix("json!({")
         .and_then(|code| code.strip_suffix("})"))
     {
+        if fields.trim().is_empty() {
+            return Ok("json!({})".into());
+        }
         let fields = split_codegen_args(fields)
             .into_iter()
             .map(|field| {
@@ -2117,6 +2211,9 @@ fn render_native_payload(expr: &AxRustExpr) -> Result<String, AxBackendCodegenEr
         .strip_prefix("vec![")
         .and_then(|code| code.strip_suffix(']'))
     {
+        if items.trim().is_empty() {
+            return Ok("json!([])".into());
+        }
         let items = split_codegen_args(items)
             .into_iter()
             .map(|item| render_native_payload(&AxRustExpr::new(item)))
@@ -2362,6 +2459,7 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
                     render_owned_expr(target)
                 ),
             },
+            AxReturnPlan::PrivateResponse { .. } => "    Err(AxRuntimeError::message(\"invalid private binary return location\"))\n".into(),
             AxReturnPlan::NoContent => {
                 "    Ok(__ax_finalize_response(AxHttpResponse::no_content(), __ax_headers, __ax_cookies))\n".to_string()
             }
@@ -2383,6 +2481,7 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
                 "    Ok(AxActionOutput::new(__ax_action_payload(json!({}), __ax_patches, __ax_invalidations, __ax_redirect)).with_cookies(__ax_cookies))\n",
                 render_borrowed_expr(expr)
             ),
+            AxReturnPlan::PrivateResponse { .. } => "    Err(AxRuntimeError::message(\"invalid private binary return location\"))\n".into(),
             AxReturnPlan::Ok
             | AxReturnPlan::NoContent
             | AxReturnPlan::NotFound
@@ -2397,6 +2496,9 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
     }
 
     match value {
+        AxReturnPlan::PrivateResponse { .. } => {
+            "    Err(AxRuntimeError::message(\"invalid private binary return location\"))\n".into()
+        }
         AxReturnPlan::Expr(expr) | AxReturnPlan::Json(expr) => {
             format!("    Ok(json!({}))\n", render_borrowed_expr(expr))
         }
@@ -2410,6 +2512,7 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
 
 fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     match fallback {
+        Some(AxReturnPlan::PrivateResponse { .. }) => "        return Err(AxRuntimeError::message(\"invalid private binary fallback\"));\n".into(),
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
             if let Some(fields) = render_invalid_call_fields(expr) {
                 return format!("        let __ax_error_value = json!({{\"fields\": {fields}}});\n        return Ok(AxActionOutput::new(__ax_action_error_payload(\"Invalid input.\".to_string(), __ax_error_value, 422, __ax_redirect)).with_cookies(__ax_cookies));\n");
@@ -2439,6 +2542,7 @@ fn render_action_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
 
 fn render_require_fallback(fallback: Option<&AxReturnPlan>) -> String {
     let response = match fallback {
+        Some(AxReturnPlan::PrivateResponse { .. }) => "axonyx_runtime::private_binary_failure()".into(),
         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr)) => {
             if let Some(fields) = render_invalid_call_fields(expr) {
                 format!("AxHttpResponse::json(422, &json!({{\"error\": \"invalid_input\", \"message\": \"Invalid input.\", \"fields\": {fields}}})).map_err(|error| AxRuntimeError::message(error.to_string()))?")

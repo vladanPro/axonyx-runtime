@@ -99,3 +99,21 @@ action ReuseHelper(text: String) {
   require identityText(input.text) != "" else invalid({text: "Required"})
   return { first: first, second: second, original: input.text, literal: "identityText(input.text)" }
 }
+
+route GET "/private/:id" -> Binary {
+  require Auth.subject else forbidden()
+  return Native.privateResponse("file.read", { id: params.id })
+}
+
+route GET "/private-empty" -> Binary {
+  return Native.privateResponse("file.empty", {})
+}
+
+route GET "/private-missing" -> Binary {
+  return Native.privateResponse("file.unknown", null)
+}
+
+route GET "/empty-native" {
+  data value = Native.call("content.echo", { nested: {}, items: [] })
+  return json(value)
+}
