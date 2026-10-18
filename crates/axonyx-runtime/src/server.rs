@@ -680,11 +680,18 @@ pub fn axum_router_from_table(table: AxRouteTable) -> axum::Router {
 pub type AxCompiledHandler =
     std::sync::Arc<dyn Fn(AxHttpRequest) -> AxHttpResponse + Send + Sync + 'static>;
 
+/// Trusted, inexpensive request-head policy. None retains the default limit.
+/// The compiler must resolve allowed route/action identities; this is not auth.
+#[cfg(feature = "axum")]
+pub type AxBodyLimitResolver =
+    std::sync::Arc<dyn Fn(&str, &str) -> Option<usize> + Send + Sync + 'static>;
+
 #[cfg(feature = "axum")]
 #[derive(Clone)]
 struct AxCompiledHandlerState {
     handler: AxCompiledHandler,
     body_limit: usize,
+    body_limit_resolver: Option<AxBodyLimitResolver>,
 }
 
 #[cfg(feature = "axum")]
@@ -697,6 +704,25 @@ pub fn axum_router_from_compiled_handler(
         .with_state(AxCompiledHandlerState {
             handler,
             body_limit,
+            body_limit_resolver: None,
+        })
+}
+
+/// Selects a body budget before parsing/collecting the request. Unlike the
+/// legacy constructor, size failures return safe 413 responses, malformed
+/// requests return safe 400 responses, and neither reaches the app handler.
+#[cfg(feature = "axum")]
+pub fn axum_router_from_compiled_handler_with_body_limits(
+    handler: AxCompiledHandler,
+    default_body_limit: usize,
+    resolver: AxBodyLimitResolver,
+) -> axum::Router {
+    axum::Router::new()
+        .fallback(axum::routing::any(axum_compiled_handler))
+        .with_state(AxCompiledHandlerState {
+            handler,
+            body_limit: default_body_limit,
+            body_limit_resolver: Some(resolver),
         })
 }
 
@@ -708,6 +734,26 @@ pub fn serve_compiled_axum(
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     let bind_addr = bind_addr.into();
     let router = axum_router_from_compiled_handler(handler, body_limit);
+    serve_compiled_axum_router(bind_addr, router)
+}
+
+#[cfg(feature = "axum")]
+pub fn serve_compiled_axum_with_body_limits(
+    bind_addr: impl Into<String>,
+    default_body_limit: usize,
+    handler: AxCompiledHandler,
+    resolver: AxBodyLimitResolver,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let router =
+        axum_router_from_compiled_handler_with_body_limits(handler, default_body_limit, resolver);
+    serve_compiled_axum_router(bind_addr.into(), router)
+}
+
+#[cfg(feature = "axum")]
+fn serve_compiled_axum_router(
+    bind_addr: String,
+    router: axum::Router,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_io()
         .build()?;
@@ -724,7 +770,40 @@ async fn axum_compiled_handler(
     axum::extract::State(state): axum::extract::State<AxCompiledHandlerState>,
     request: axum::http::Request<axum::body::Body>,
 ) -> axum::response::Response {
-    match axum_request_to_axonyx_with_limit(request, state.body_limit).await {
+    let body_limit = state
+        .body_limit_resolver
+        .as_ref()
+        .and_then(|resolver| {
+            let target = request
+                .uri()
+                .path_and_query()
+                .map(|value| value.as_str())
+                .unwrap_or_else(|| request.uri().path());
+            resolver(request.method().as_str(), target)
+        })
+        .unwrap_or(state.body_limit);
+    if state.body_limit_resolver.is_some()
+        && request
+            .headers()
+            .get(axum::http::header::CONTENT_LENGTH)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<u64>().ok())
+            .is_some_and(|length| length > u64::try_from(body_limit).unwrap_or(u64::MAX))
+    {
+        return axonyx_response_to_axum(AxHttpResponse::text(413, "Payload Too Large"));
+    }
+    let request = if state.body_limit_resolver.is_some() {
+        // Bound the entire body, including multipart epilogues that a form
+        // parser can otherwise stop reading after its final boundary.
+        let (parts, body) = request.into_parts();
+        match axum::body::to_bytes(body, body_limit).await {
+            Ok(bytes) => axum::http::Request::from_parts(parts, axum::body::Body::from(bytes)),
+            Err(error) => return axonyx_response_to_axum(scoped_body_error_response(&error)),
+        }
+    } else {
+        request
+    };
+    match axum_request_to_axonyx_with_limit(request, body_limit).await {
         Ok(request) => {
             let handler = state.handler.clone();
             match tokio::task::spawn_blocking(move || handler(request)).await {
@@ -735,8 +814,40 @@ async fn axum_compiled_handler(
                 }
             }
         }
+        Err(error) if state.body_limit_resolver.is_some() => {
+            axonyx_response_to_axum(scoped_body_error_response(error.as_ref()))
+        }
         Err(error) => axonyx_response_to_axum(AxHttpResponse::text(400, error.to_string())),
     }
+}
+
+#[cfg(feature = "axum")]
+fn scoped_body_error_response(error: &(dyn Error + 'static)) -> AxHttpResponse {
+    if is_axum_body_limit_error(error) {
+        AxHttpResponse::text(413, "Payload Too Large")
+    } else {
+        AxHttpResponse::text(400, "Bad Request")
+    }
+}
+
+#[cfg(feature = "axum")]
+fn is_axum_body_limit_error(error: &(dyn Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.is::<http_body_util::LengthLimitError>()
+            || matches!(
+                error.downcast_ref::<multer::Error>(),
+                Some(
+                    multer::Error::StreamSizeExceeded { .. }
+                        | multer::Error::FieldSizeExceeded { .. }
+                )
+            )
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
 }
 
 #[cfg(feature = "axum")]
@@ -1629,8 +1740,10 @@ pub mod prelude {
     pub use super::{
         ax_body_to_axum_body, axonyx_response_to_axum, axum_request_to_axonyx,
         axum_request_to_axonyx_with_limit, axum_router_from_compiled_handler,
-        axum_router_from_table, axum_router_from_table_with_limit, serve_compiled_axum,
-        AxAxumRouter, AxAxumServerAdapter, AxCompiledHandler,
+        axum_router_from_compiled_handler_with_body_limits, axum_router_from_table,
+        axum_router_from_table_with_limit, serve_compiled_axum,
+        serve_compiled_axum_with_body_limits, AxAxumRouter, AxAxumServerAdapter,
+        AxBodyLimitResolver, AxCompiledHandler,
     };
 }
 
@@ -2264,6 +2377,287 @@ mod tests {
     }
 
     #[cfg(feature = "axum")]
+    fn scoped_body_limit_state() -> (
+        AxCompiledHandlerState,
+        std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let handler: AxCompiledHandler = Arc::new(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            AxHttpResponse::text(200, "ok")
+        });
+        // Only a transport fixture. Canonical compiler action resolution is a
+        // separate integration gate, not implemented by this exact-match policy.
+        let resolver: AxBodyLimitResolver = Arc::new(|method, target| {
+            (method == "POST" && target == "/__axonyx/action?path=%2Fmedia&name=Upload")
+                .then_some(1024)
+        });
+        let _router = axum_router_from_compiled_handler_with_body_limits(
+            handler.clone(),
+            128,
+            resolver.clone(),
+        );
+        (
+            AxCompiledHandlerState {
+                handler,
+                body_limit: 128,
+                body_limit_resolver: Some(resolver),
+            },
+            calls,
+        )
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn scoped_body_limits_preserve_defaults_and_ignore_client_budget_headers() {
+        use std::sync::atomic::Ordering;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (state, calls) = scoped_body_limit_state();
+            for (method, target, length, status) in [
+                ("POST", "/login", 128, 200),
+                ("POST", "/login", 129, 413),
+                (
+                    "POST",
+                    "/__axonyx/action?path=%2Fmedia&name=Upload",
+                    512,
+                    200,
+                ),
+                (
+                    "GET",
+                    "/__axonyx/action?path=%2Fmedia&name=Upload",
+                    512,
+                    413,
+                ),
+                (
+                    "POST",
+                    "/__axonyx/action?path=%2Fmedia&name=Unknown",
+                    512,
+                    413,
+                ),
+                (
+                    "POST",
+                    "/__axonyx/action?path=%2Fmedia&name=Upload&name=Other",
+                    512,
+                    413,
+                ),
+                ("POST", "/__axonyx/action?path=%ZZ&name=Upload", 512, 413),
+            ] {
+                let before = calls.load(Ordering::SeqCst);
+                let request = axum::http::Request::builder()
+                    .method(method)
+                    .uri(target)
+                    .header("x-max-body-bytes", "9999999")
+                    .body(axum::body::Body::from(vec![b'x'; length]))
+                    .unwrap();
+                let response =
+                    axum_compiled_handler(axum::extract::State(state.clone()), request).await;
+                assert_eq!(response.status().as_u16(), status, "{method} {target}");
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    before + usize::from(status == 200)
+                );
+            }
+            // Existing callers retain their old status/error mapping.
+            let mut legacy = state;
+            legacy.body_limit_resolver = None;
+            let request = axum::http::Request::builder()
+                .uri("/login")
+                .body(axum::body::Body::from(vec![0; 129]))
+                .unwrap();
+            assert_eq!(
+                axum_compiled_handler(axum::extract::State(legacy), request)
+                    .await
+                    .status(),
+                400
+            );
+        });
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn scoped_body_limits_enforce_streamed_bytes_without_trusting_content_length() {
+        use std::sync::atomic::Ordering;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (state, calls) = scoped_body_limit_state();
+            for (target, declared_length, status) in [
+                ("/login", None, 413),
+                ("/login", Some("1"), 413),
+                ("/__axonyx/action?path=%2Fmedia&name=Upload", None, 200),
+            ] {
+                let chunks =
+                    futures_util::stream::iter((0..3).map(|_| {
+                        Ok::<_, std::io::Error>(axum::body::Bytes::from(vec![b'x'; 100]))
+                    }));
+                let mut request = axum::http::Request::builder().method("POST").uri(target);
+                if let Some(length) = declared_length {
+                    request = request.header("content-length", length);
+                }
+                let request = request.body(axum::body::Body::from_stream(chunks)).unwrap();
+                let before = calls.load(Ordering::SeqCst);
+                let response =
+                    axum_compiled_handler(axum::extract::State(state.clone()), request).await;
+                assert_eq!(response.status().as_u16(), status);
+                assert_eq!(
+                    calls.load(Ordering::SeqCst),
+                    before + usize::from(status == 200)
+                );
+            }
+            let polled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = polled.clone();
+            let body = axum::body::Body::from_stream(futures_util::stream::once(async move {
+                observed.store(true, Ordering::SeqCst);
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"x"))
+            }));
+            let request = axum::http::Request::builder()
+                .uri("/login")
+                .header("content-length", "129")
+                .body(body)
+                .unwrap();
+            let before = calls.load(Ordering::SeqCst);
+            assert_eq!(
+                axum_compiled_handler(axum::extract::State(state), request)
+                    .await
+                    .status(),
+                413
+            );
+            assert!(!polled.load(Ordering::SeqCst));
+            assert_eq!(calls.load(Ordering::SeqCst), before);
+        });
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn scoped_body_limits_bound_multipart_and_keep_malformed_errors_private() {
+        use std::sync::atomic::Ordering;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (state, calls) = scoped_body_limit_state();
+            for (target, payload_length, status) in [
+                ("/login", 512, 413),
+                ("/__axonyx/action?path=%2Fmedia&name=Upload", 512, 200),
+                ("/__axonyx/action?path=%2Fmedia&name=Upload", 2048, 413),
+            ] {
+                let body = format!("--AX\r\nContent-Disposition: form-data; name=\"image\"; filename=\"image.png\"\r\n\r\n{}\r\n--AX--\r\n", "x".repeat(payload_length));
+                let chunks = body.as_bytes().chunks(64).map(|bytes| {
+                    Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(bytes))
+                }).collect::<Vec<_>>();
+                let request = axum::http::Request::builder().method("POST").uri(target)
+                    .header("content-type", "multipart/form-data; boundary=AX")
+                    .body(axum::body::Body::from_stream(futures_util::stream::iter(chunks))).unwrap();
+                let before = calls.load(Ordering::SeqCst);
+                let response = axum_compiled_handler(axum::extract::State(state.clone()), request).await;
+                assert_eq!(response.status().as_u16(), status);
+                assert_eq!(calls.load(Ordering::SeqCst), before + usize::from(status == 200));
+            }
+            let request = axum::http::Request::builder().method("POST")
+                .uri("/__axonyx/action?path=%2Fmedia&name=Upload")
+                .header("content-type", "multipart/form-data")
+                .body(axum::body::Body::from("private-parser-details")).unwrap();
+            let before = calls.load(Ordering::SeqCst);
+            let response = axum_compiled_handler(axum::extract::State(state), request).await;
+            assert_eq!(response.status(), 400);
+            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            assert_eq!(&body[..], b"Bad Request");
+            assert_eq!(calls.load(Ordering::SeqCst), before);
+        });
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn scoped_body_limits_reject_oversized_multipart_epilogues_and_safe_stream_errors() {
+        use std::sync::atomic::Ordering;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (state, calls) = scoped_body_limit_state();
+            let form = b"--AX\r\nContent-Disposition: form-data; name=\"image\"; filename=\"a.png\"\r\n\r\nx\r\n--AX--\r\n";
+            let chunks = vec![
+                Ok::<_, std::io::Error>(axum::body::Bytes::copy_from_slice(form)),
+                Ok(axum::body::Bytes::from(vec![b'x'; 2048])),
+            ];
+            let request = axum::http::Request::builder().method("POST")
+                .uri("/__axonyx/action?path=%2Fmedia&name=Upload")
+                .header("content-type", "multipart/form-data; boundary=AX")
+                .body(axum::body::Body::from_stream(futures_util::stream::iter(chunks))).unwrap();
+            let response = axum_compiled_handler(axum::extract::State(state.clone()), request).await;
+            assert_eq!(response.status(), 413);
+            let chunks = futures_util::stream::iter(vec![Err::<axum::body::Bytes, _>(
+                std::io::Error::other("private transport error"),
+            )]);
+            let request = axum::http::Request::builder().uri("/login")
+                .body(axum::body::Body::from_stream(chunks)).unwrap();
+            let response = axum_compiled_handler(axum::extract::State(state), request).await;
+            assert_eq!(response.status(), 400);
+            assert_eq!(&axum::body::to_bytes(response.into_body(), 1024).await.unwrap()[..], b"Bad Request");
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        });
+    }
+
+    #[cfg(feature = "axum")]
+    #[test]
+    fn scoped_body_limit_router_enforces_chunked_uploads_over_real_http() {
+        use std::fmt::Write as _;
+        use std::sync::atomic::Ordering;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_io()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (state, calls) = scoped_body_limit_state();
+            let router = axum_router_from_compiled_handler_with_body_limits(
+                state.handler, state.body_limit, state.body_limit_resolver.unwrap(),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move { axum::serve(listener, router).await.unwrap(); });
+            for (target, status) in [
+                ("/login", 413),
+                ("/__axonyx/action?path=%2Fmedia&name=Upload", 200),
+                ("/__axonyx/action?path=%2Fmedia&name=Upload&name=Other", 413),
+            ] {
+                let body = format!("--AX\r\nContent-Disposition: form-data; name=\"image\"; filename=\"image.png\"\r\n\r\n{}\r\n--AX--\r\n", "x".repeat(512));
+                let mut chunks = String::new();
+                for chunk in body.as_bytes().chunks(75) {
+                    write!(chunks, "{:x}\r\n{}\r\n", chunk.len(), std::str::from_utf8(chunk).unwrap()).unwrap();
+                }
+                let request = format!("POST {target} HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary=AX\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{chunks}0\r\n\r\n");
+                let before = calls.load(Ordering::SeqCst);
+                let response = tokio::task::spawn_blocking(move || {
+                    use std::io::{Read, Write};
+                    let mut stream = std::net::TcpStream::connect(address).unwrap();
+                    stream.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+                    stream.write_all(request.as_bytes()).unwrap();
+                    let mut response = String::new();
+                    stream.read_to_string(&mut response).unwrap();
+                    response
+                }).await.unwrap();
+                assert!(response.starts_with(&format!("HTTP/1.1 {status}")), "{response}");
+                assert_eq!(calls.load(Ordering::SeqCst), before + usize::from(status == 200));
+            }
+            server.abort();
+            let _ = server.await;
+        });
+    }
+
+    #[cfg(feature = "axum")]
     #[test]
     fn axum_compiled_handler_isolates_sync_work_from_async_worker() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2278,6 +2672,7 @@ mod tests {
         let state = AxCompiledHandlerState {
             handler,
             body_limit: 4096,
+            body_limit_resolver: None,
         };
         let request = axum::http::Request::builder()
             .uri("/")
