@@ -30,7 +30,7 @@ use thiserror::Error;
 use tokio_postgres_rustls::MakeRustlsConnect;
 use uuid::Uuid;
 
-use crate::server::{AxCookie, AxHttpRequest};
+use crate::server::{AxCookie, AxHttpRequest, AxHttpResponse};
 use crate::session::{
     AxMemorySessionStore, AxPostgresSessionStore, AxSameSite, AxSession, AxSessionCookiePolicy,
     AxSessionManager, AxSessionStore, AxSqliteSessionStore,
@@ -1101,6 +1101,18 @@ pub trait AxRuntimeEnvAccess {
         ))
     }
 
+    /// Private binary callbacks require real session verification by this runtime.
+    fn runtime_native_private_response(
+        &self,
+        _request: &AxHttpRequest,
+        _name: &str,
+        _input: Value,
+    ) -> AxRuntimeResult<AxHttpResponse> {
+        Err(AxRuntimeError::message(
+            "private native responses are unavailable for this backend runtime",
+        ))
+    }
+
     fn runtime_create_session(
         &self,
         _subject: &str,
@@ -1392,6 +1404,38 @@ impl<A> AxRuntimeEnvAccess for AxDatabaseRuntime<A> {
         })?;
         registry
             .call(name, input)
+            .map_err(|error| AxRuntimeError::message(error.to_string()))
+    }
+
+    fn runtime_native_private_response(
+        &self,
+        request: &AxHttpRequest,
+        name: &str,
+        input: Value,
+    ) -> AxRuntimeResult<AxHttpResponse> {
+        use crate::native_response::{
+            private_error, private_headers, AxNativeResponseContext, AxNativeResponseError,
+        };
+        if request.method != "GET" {
+            return Ok(
+                private_headers(AxHttpResponse::text(405, "method not allowed"))
+                    .with_header("Allow", "GET"),
+            );
+        }
+        let Some(session) = self.runtime_load_session(request)? else {
+            return Ok(private_error(AxNativeResponseError::Forbidden));
+        };
+        if session.subject.is_empty() {
+            return Ok(private_error(AxNativeResponseError::Forbidden));
+        }
+        let registry = self.native.as_ref().ok_or_else(|| {
+            AxRuntimeError::message(
+                "private native responses are unavailable for this backend runtime",
+            )
+        })?;
+        let context = AxNativeResponseContext::verified(session.subject);
+        registry
+            .private_response(&context, name, input)
             .map_err(|error| AxRuntimeError::message(error.to_string()))
     }
 
