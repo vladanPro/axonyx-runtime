@@ -204,6 +204,11 @@ fn render_function_fn(
     function: &AxFunctionPlan,
     context: &AxBackendRenderContext<'_>,
 ) -> Result<String, AxBackendCodegenError> {
+    if ax_steps_use_auth_subject(function.steps.iter()) {
+        return Err(AxBackendCodegenError::AuthSubjectOutsideRequestHandler {
+            handler: function.name.clone(),
+        });
+    }
     for field in &function.input {
         if field.optional || field.default.is_some() {
             return Err(AxBackendCodegenError::UnsupportedFunctionDefaultInput {
@@ -2242,6 +2247,11 @@ fn render_owned_expr(expr: &AxRustExpr) -> String {
 }
 
 fn render_codegen_expr(code: &str) -> String {
+    let code = render_context_members(code);
+    render_codegen_intrinsics(&code)
+}
+
+fn render_codegen_intrinsics(code: &str) -> String {
     let code = code.trim();
     for (name, predicate) in [
         ("Validate.email", "email"),
@@ -2281,7 +2291,7 @@ fn render_codegen_expr(code: &str) -> String {
         None => format!("serde_json::json!({items})"),
     };
     format!(
-        "({options}).as_array().is_some_and(|__ax_items| __ax_items.contains(&serde_json::json!({})))",
+        "match ({options}).as_array() {{ Some(__ax_items) => __ax_items.contains(&serde_json::json!({})), None => false }}",
         render_codegen_expr(value)
     )
 }
@@ -2605,6 +2615,15 @@ fn render_error_call_message(expr: &AxRustExpr) -> Option<String> {
 }
 
 fn render_context_lookup(code: &str) -> Option<String> {
+    if !code.split('.').all(|part| {
+        let mut chars = part.chars();
+        chars
+            .next()
+            .is_some_and(|ch| ch == '_' || ch.is_alphabetic())
+            && chars.all(|ch| ch == '_' || ch.is_alphanumeric())
+    }) {
+        return None;
+    }
     let (source, field) = code.split_once('.')?;
     match source {
         "params" => Some(format!("&context.param({field:?})?")),
@@ -2613,6 +2632,69 @@ fn render_context_lookup(code: &str) -> Option<String> {
         "Auth" => render_auth_lookup(field),
         _ => None,
     }
+}
+
+// Rewrite token spans, not substrings: literals and same-named record fields
+// must survive unchanged, including inside nested groups and JSON macros.
+fn render_context_members(code: &str) -> String {
+    use proc_macro2::{TokenStream, TokenTree};
+    fn collect(tokens: TokenStream, edits: &mut Vec<(usize, usize, String)>) {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        for (index, token) in tokens.iter().enumerate() {
+            if let TokenTree::Group(group) = token {
+                collect(group.stream(), edits);
+            }
+            if (index > 0
+                && matches!(&tokens[index - 1], TokenTree::Punct(p) if p.as_char() == '.'))
+                || (index > 1
+                    && matches!(&tokens[index - 1], TokenTree::Punct(p) if p.as_char() == ':')
+                    && matches!(&tokens[index - 2], TokenTree::Punct(p) if p.as_char() == ':'))
+            {
+                continue;
+            }
+            let TokenTree::Ident(root) = token else {
+                continue;
+            };
+            let mut path = root.to_string();
+            if !matches!(path.as_str(), "query" | "params" | "request" | "Auth") {
+                continue;
+            }
+            let mut end = index;
+            while let (Some(TokenTree::Punct(dot)), Some(TokenTree::Ident(field))) =
+                (tokens.get(end + 1), tokens.get(end + 2))
+            {
+                if dot.as_char() != '.' {
+                    break;
+                }
+                path.push('.');
+                path.push_str(&field.to_string());
+                end += 2;
+                if let Some(value) = render_context_lookup(&path) {
+                    edits.push((
+                        root.span().byte_range().start,
+                        tokens[end].span().byte_range().end,
+                        format!("({}).to_owned()", value.trim_start_matches('&')),
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+    let Ok(tokens) = code.parse::<TokenStream>() else {
+        return code.to_string();
+    };
+    let mut edits = Vec::new();
+    collect(tokens, &mut edits);
+    edits.sort_by_key(|(start, _, _)| *start);
+    let mut output = String::new();
+    let mut cursor = 0;
+    for (start, end, value) in edits {
+        output.push_str(&code[cursor..start]);
+        output.push_str(&value);
+        cursor = end;
+    }
+    output.push_str(&code[cursor..]);
+    output
 }
 
 fn render_auth_lookup(field: &str) -> Option<String> {
@@ -2724,6 +2806,54 @@ mod tests {
     use crate::ax_ast::prelude::AxExpr;
     use crate::ax_backend_ast::prelude::*;
     use crate::ax_backend_lowering::lower_backend_document;
+
+    #[test]
+    fn request_members_are_lowered_inside_composite_expressions_only() {
+        let source = r#"route POST "/guard/:id" {
+  require query.key == "fixture-only" && params.id == "allowed" else forbidden()
+  require request.method == "POST" && request.headers.x_fixture == "yes" else forbidden()
+  require query.mode in ["preview", "compiled"] else forbidden()
+  return json({ key: query.key, literal: "query.key params.id request.method", size: query.key.length })
+}"#;
+        let module = compile_backend_ax_to_module(source).unwrap();
+        assert!(module.contains("context.query(\"key\")?"));
+        assert!(module.contains("context.param(\"id\")?"));
+        assert!(module.contains("request.header_value(\"x-fixture\")"));
+        assert!(module.contains("\"query.key params.id request.method\".to_string()"));
+        syn::parse_file(&module).unwrap();
+        for source in [
+            "record.query.key",
+            "module::query.key",
+            r#""🙂 query.key""#,
+            "record.request.headers.x_fixture",
+        ] {
+            assert_eq!(render_context_members(source), source);
+        }
+        assert!(render_context_lookup("query.key == other").is_none());
+        assert!(render_context_lookup("query.key.to_string()").is_none());
+        assert_eq!(
+            render_context_members(r#"json!({"🙂": query.key})"#),
+            r#"json!({"🙂": (context.query("key")?).to_owned()})"#
+        );
+        let source = "route GET \"/account\" {\n  require Auth.subject != \"\" else forbidden()\n  return json({ subject: Auth.subject })\n}";
+        let module = compile_backend_ax_to_module(source).unwrap();
+        assert!(module.contains("let __ax_session = runtime.load_session(request)?"));
+        let source = "route GET \"/account\" {\n  return json({ subject: Auth.subject })\n}";
+        assert!(compile_backend_ax_to_module(source)
+            .unwrap()
+            .contains("let __ax_session = runtime.load_session(request)?"));
+        let source = "fn helper() -> Bool {\n  return Auth.subject != \"\"\n}";
+        assert!(matches!(
+            compile_backend_ax_to_module(source),
+            Err(AxBackendCompileError::Codegen(
+                AxBackendCodegenError::AuthSubjectOutsideRequestHandler { .. }
+            ))
+        ));
+        let source = "route GET \"/literal\" {\n  return json(\"Auth.subject\")\n}";
+        assert!(!compile_backend_ax_to_module(source)
+            .unwrap()
+            .contains("runtime.load_session(request)?"));
+    }
 
     #[test]
     fn record_input_contracts_reject_unsupported_carriers_and_optional_top_level() {
@@ -2980,7 +3110,7 @@ route POST "/api/theme" {
 "#,
         )
         .expect("global membership and comma messages should compile");
-        assert!(module.contains("serde_json::json!(themes)).as_array().is_some_and"));
+        assert!(module.contains("match (serde_json::json!(themes)).as_array()"));
         assert!(!module.contains("json!(&error("));
         assert!(module.contains("Choose silver, bronze, or gold."));
     }

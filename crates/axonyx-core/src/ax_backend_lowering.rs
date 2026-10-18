@@ -1256,7 +1256,27 @@ fn ax_return_uses_auth_subject(value: &AxReturnPlan) -> bool {
 }
 
 fn ax_expr_uses_auth_subject(expr: &AxRustExpr) -> bool {
-    expr.code.trim() == "Auth.subject"
+    use proc_macro2::{TokenStream, TokenTree};
+    fn contains_subject(tokens: TokenStream) -> bool {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        tokens.iter().enumerate().any(|(index, token)| {
+            if let TokenTree::Group(group) = token {
+                return contains_subject(group.stream());
+            }
+            if (index > 0
+                && matches!(&tokens[index - 1], TokenTree::Punct(p) if p.as_char() == '.'))
+                || (index > 1
+                    && matches!(&tokens[index - 1], TokenTree::Punct(p) if p.as_char() == ':')
+                    && matches!(&tokens[index - 2], TokenTree::Punct(p) if p.as_char() == ':'))
+            {
+                return false;
+            }
+            matches!(token, TokenTree::Ident(name) if name == "Auth")
+                && matches!(tokens.get(index + 1), Some(TokenTree::Punct(dot)) if dot.as_char() == '.')
+                && matches!(tokens.get(index + 2), Some(TokenTree::Ident(name)) if name == "subject")
+        })
+    }
+    expr.code.parse::<TokenStream>().is_ok_and(contains_subject)
 }
 
 fn try_render_runtime_env(expr: &AxExpr) -> Option<String> {

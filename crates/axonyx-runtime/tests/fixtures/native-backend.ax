@@ -117,3 +117,25 @@ route GET "/empty-native" {
   data value = Native.call("content.echo", { nested: {}, items: [] })
   return json(value)
 }
+
+route POST "/guard/:id" {
+  require query.key == "fixture-only" && params.id == "allowed" else forbidden()
+  require request.method == "POST" && request.headers.x_fixture == "yes" else forbidden()
+  require query.mode in ["preview", "compiled"] else forbidden()
+  return json({ key: query.key, literal: "query.key params.id request.method", size: query.key.length })
+}
+
+route GET "/short-guard" {
+  require query.public == "yes" || query.key == "fixture-only" else forbidden()
+  return json({ ok: true })
+}
+
+route GET "/account-guard" {
+  require Auth.subject != "" else forbidden()
+  return json({ subject: Auth.subject })
+}
+
+route GET "/and-guard" {
+  require query.public == "yes" && query.key == "fixture-only" else forbidden()
+  return json({ ok: true })
+}

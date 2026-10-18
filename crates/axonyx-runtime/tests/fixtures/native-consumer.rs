@@ -62,6 +62,29 @@ fn main() {
     assert!(!bad_record.contains("private details"));
     let source = include_str!("native-backend.ax");
     let runtime = runtime(AxNativeLimits::default());
+    for (target, header, status) in [
+        ("/guard/allowed?key=fixture-only&mode=compiled", "yes", 200),
+        ("/guard/allowed?key=fixture-only&mode=preview", "yes", 200),
+        ("/guard/allowed?key=wrong&mode=compiled", "yes", 403),
+        ("/guard/denied?key=fixture-only&mode=compiled", "yes", 403),
+        ("/guard/allowed?key=fixture-only&mode=compiled", "no", 403),
+        ("/guard/allowed?key=fixture-only&mode=unknown", "yes", 403),
+        ("/short-guard?public=yes", "", 200),
+        ("/short-guard?public=no&key=fixture-only", "", 200),
+        ("/short-guard?public=no&key=wrong", "", 403),
+        ("/and-guard?public=no", "", 403),
+        ("/and-guard?public=yes&key=fixture-only", "", 200),
+    ] {
+        let method = if target.starts_with("/guard/") { "POST" } else { "GET" };
+        let request = AxHttpRequest::new(method, target).with_header("x-fixture", header);
+        let compiled = backend::dispatch_api_route(&runtime, &request, true).unwrap().unwrap();
+        let preview = execute_preview_route_request_sources_with_runtime(
+            &[source], &request, &runtime, &mut AxPreviewStore::default(),
+        ).unwrap().unwrap();
+        assert_eq!(compiled.status, status, "compiled: {target}");
+        assert_eq!(preview.status, status, "preview: {target}");
+        assert_eq!(compiled.body.into_bytes(), preview.body, "{target}");
+    }
     let empty=backend::dispatch_api_route(&runtime,&AxHttpRequest::new("GET","/empty-native"),true).unwrap().unwrap();
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&empty.body.into_bytes()).unwrap(),serde_json::json!({"nested":{},"items":[]}));
     let request = AxHttpRequest::new("GET", "/prepare?t%65xt=%20hello%20");
@@ -214,6 +237,16 @@ fn private_binary_proof() {
     let runtime = AxDatabaseRuntime::new(AxEnv::new().with_secret("db_driver","memory").with_secret("session_key","private-fixture-secret").with_secret("session_cookie_secure","false"), MemoryAdapter).with_native_functions(registry);
     let (_,cookie)=runtime.runtime_create_session("owner",Default::default()).unwrap();
     let request=AxHttpRequest::new("GET","/private/image").with_header("Cookie",format!("{}={}",cookie.name,cookie.value));
+    for (cookie_header, status) in [(String::new(), 403), (format!("{}={}", cookie.name, cookie.value), 200)] {
+        let account = AxHttpRequest::new("GET", "/account-guard").with_header("Cookie", cookie_header);
+        let compiled = backend::dispatch_api_route(&runtime, &account, true).unwrap().unwrap();
+        let preview = execute_preview_route_request_sources_with_runtime(
+            &[include_str!("native-backend.ax")], &account, &runtime, &mut AxPreviewStore::default(),
+        ).unwrap().unwrap();
+        assert_eq!(compiled.status, status);
+        assert_eq!(preview.status, status);
+        assert_eq!(compiled.body.into_bytes(), preview.body);
+    }
     for validate in [false,true] {
         let response=backend::dispatch_api_route(&runtime,&request,validate).unwrap().unwrap();
         assert_eq!(response.status,200);
