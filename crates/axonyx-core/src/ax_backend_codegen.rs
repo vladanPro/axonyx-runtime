@@ -329,7 +329,8 @@ fn render_function_value_plan(
     }
 }
 
-fn validate_private_responses(plan: &AxBackendPlan) -> Result<(), AxBackendCodegenError> {
+/// Validate the private HTTP return boundary independently of Rust emission.
+pub fn validate_private_responses(plan: &AxBackendPlan) -> Result<(), AxBackendCodegenError> {
     let invalid = || AxBackendCodegenError::InvalidPrivateResponse;
     let has_private = |step: &AxStepPlan| {
         matches!(
