@@ -33,6 +33,10 @@ jobs:
         shell: pwsh
         run: ./scripts/smoke-native-calls.ps1
 
+      - name: Verify fresh default and Axum consumers on the declared MSRV
+        shell: pwsh
+        run: ./scripts/check-runtime-msrv.ps1
+
       - name: Run strict Clippy lint gate
         run: cargo clippy --workspace --all-features --all-targets -- -D warnings
 
