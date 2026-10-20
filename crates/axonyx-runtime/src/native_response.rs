@@ -1,4 +1,4 @@
-//! Private, bounded binary callback results. Never serialized through Native.call.
+//! Bounded binary callbacks, isolated from Native.call and from one another.
 use crate::server::AxHttpResponse;
 
 pub const MAX_NATIVE_BINARY_BYTES: usize = 8 * 1024 * 1024;
@@ -78,6 +78,12 @@ pub(crate) fn private_error(error: AxNativeResponseError) -> AxHttpResponse {
         AxNativeResponseError::Unavailable => (500, "binary response unavailable"),
     };
     private_headers(AxHttpResponse::text(status, message))
+}
+
+/// Anonymous admission never includes callback names, inputs or configuration
+/// details in failure bodies. Public access does not imply public caching.
+pub(crate) fn public_binary_failure() -> AxHttpResponse {
+    private_error(AxNativeResponseError::Unavailable)
 }
 
 #[cfg(test)]

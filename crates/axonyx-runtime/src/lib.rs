@@ -7,6 +7,8 @@ pub mod mutation_security;
 pub mod native;
 pub mod native_response;
 pub mod password;
+#[cfg(test)]
+mod public_native_response_tests;
 pub mod server;
 pub mod session;
 #[cfg(feature = "storage")]

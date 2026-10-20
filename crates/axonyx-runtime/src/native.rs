@@ -53,6 +53,7 @@ pub enum AxNativeError {
 type Callback = dyn Fn(Value, AxNativeLimits) -> Result<Value, AxNativeError> + Send + Sync;
 type ResponseCallback =
     dyn Fn(&AxNativeResponseContext, Value) -> Result<AxHttpResponse, AxNativeError> + Send + Sync;
+type PublicResponseCallback = dyn Fn(Value) -> Result<AxHttpResponse, AxNativeError> + Send + Sync;
 
 /// Register during startup; then share the immutable registry through `Arc`.
 #[derive(Default)]
@@ -60,6 +61,7 @@ pub struct AxNativeRegistry {
     limits: AxNativeLimits,
     functions: BTreeMap<String, Box<Callback>>,
     private_responses: BTreeMap<String, Box<ResponseCallback>>,
+    public_responses: BTreeMap<String, Box<PublicResponseCallback>>,
 }
 
 impl AxNativeRegistry {
@@ -68,6 +70,7 @@ impl AxNativeRegistry {
             limits,
             functions: BTreeMap::new(),
             private_responses: BTreeMap::new(),
+            public_responses: BTreeMap::new(),
         }
     }
 
@@ -80,7 +83,7 @@ impl AxNativeRegistry {
         if !valid_name(name) {
             return Err(AxNativeError::InvalidRegistration);
         }
-        if self.functions.contains_key(name) || self.private_responses.contains_key(name) {
+        if self.contains_name(name) {
             return Err(AxNativeError::DuplicateRegistration);
         }
         self.functions.insert(
@@ -119,7 +122,7 @@ impl AxNativeRegistry {
         if !valid_name(name) || max_bytes == 0 || max_bytes > MAX_NATIVE_BINARY_BYTES {
             return Err(AxNativeError::InvalidRegistration);
         }
-        if self.functions.contains_key(name) || self.private_responses.contains_key(name) {
+        if self.contains_name(name) {
             return Err(AxNativeError::DuplicateRegistration);
         }
         self.private_responses.insert(
@@ -149,6 +152,60 @@ impl AxNativeRegistry {
         check_shape(&input, self.limits)?;
         encode(&input, self.limits.input_bytes, AxNativeError::InvalidInput)?;
         callback(context, input)
+    }
+
+    /// Explicit anonymous admission, NOT a product authorization grant. The
+    /// trusted callback must check current publication/ownership before reading
+    /// bytes. It receives no invented session subject and is separate from both
+    /// the private response and Native.call channels.
+    pub fn register_public_response<I, F>(
+        &mut self,
+        name: &str,
+        max_bytes: usize,
+        function: F,
+    ) -> Result<(), AxNativeError>
+    where
+        I: DeserializeOwned,
+        F: Fn(I) -> Result<AxNativeBinaryResponse, AxNativeResponseError> + Send + Sync + 'static,
+    {
+        if !valid_name(name) || max_bytes == 0 || max_bytes > MAX_NATIVE_BINARY_BYTES {
+            return Err(AxNativeError::InvalidRegistration);
+        }
+        if self.contains_name(name) {
+            return Err(AxNativeError::DuplicateRegistration);
+        }
+        self.public_responses.insert(
+            name.to_owned(),
+            Box::new(move |value| {
+                let input =
+                    serde_json::from_value::<I>(value).map_err(|_| AxNativeError::InvalidInput)?;
+                Ok(match function(input) {
+                    Ok(response) => response.into_response(max_bytes),
+                    Err(error) => private_error(error),
+                })
+            }),
+        );
+        Ok(())
+    }
+
+    pub(crate) fn public_response(
+        &self,
+        name: &str,
+        input: Value,
+    ) -> Result<AxHttpResponse, AxNativeError> {
+        let callback = self
+            .public_responses
+            .get(name)
+            .ok_or(AxNativeError::UnknownFunction)?;
+        check_shape(&input, self.limits)?;
+        encode(&input, self.limits.input_bytes, AxNativeError::InvalidInput)?;
+        callback(input)
+    }
+
+    fn contains_name(&self, name: &str) -> bool {
+        self.functions.contains_key(name)
+            || self.private_responses.contains_key(name)
+            || self.public_responses.contains_key(name)
     }
 
     pub fn call(&self, name: &str, input: Value) -> Result<Value, AxNativeError> {

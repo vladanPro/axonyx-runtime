@@ -1113,6 +1113,19 @@ pub trait AxRuntimeEnvAccess {
         ))
     }
 
+    /// Explicit anonymous binary capability. Product callbacks still establish
+    /// their own current read grants; no session subject is manufactured.
+    fn runtime_native_public_response(
+        &self,
+        _request: &AxHttpRequest,
+        _name: &str,
+        _input: Value,
+    ) -> AxRuntimeResult<AxHttpResponse> {
+        Err(AxRuntimeError::message(
+            "public native responses are unavailable for this backend runtime",
+        ))
+    }
+
     fn runtime_create_session(
         &self,
         _subject: &str,
@@ -1437,6 +1450,29 @@ impl<A> AxRuntimeEnvAccess for AxDatabaseRuntime<A> {
         registry
             .private_response(&context, name, input)
             .map_err(|error| AxRuntimeError::message(error.to_string()))
+    }
+
+    fn runtime_native_public_response(
+        &self,
+        request: &AxHttpRequest,
+        name: &str,
+        input: Value,
+    ) -> AxRuntimeResult<AxHttpResponse> {
+        use crate::native_response::{private_headers, public_binary_failure};
+        if request.method != "GET" {
+            return Ok(
+                private_headers(AxHttpResponse::text(405, "method not allowed"))
+                    .with_header("Allow", "GET"),
+            );
+        }
+        // Do not load a session or initialize its secret configuration here.
+        // Public and private callback maps cannot dispatch into one another.
+        Ok(match &self.native {
+            Some(registry) => registry
+                .public_response(name, input)
+                .unwrap_or_else(|_| public_binary_failure()),
+            None => public_binary_failure(),
+        })
     }
 
     fn runtime_create_session(
