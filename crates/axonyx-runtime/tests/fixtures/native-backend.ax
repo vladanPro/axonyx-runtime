@@ -118,6 +118,19 @@ route GET "/empty-native" {
   return json(value)
 }
 
+route GET "/public/:id" -> Binary {
+  return Native.publicResponse("post.image", { id: params.id })
+}
+
+route GET "/public-private-channel" -> Binary {
+  return Native.publicResponse("private.only", null)
+}
+
+route GET "/public-guard" -> Binary {
+  require false else forbidden()
+  return Native.publicResponse("post.image", { id: "image" })
+}
+
 route POST "/guard/:id" {
   require query.key == "fixture-only" && params.id == "allowed" else forbidden()
   require request.method == "POST" && request.headers.x_fixture == "yes" else forbidden()

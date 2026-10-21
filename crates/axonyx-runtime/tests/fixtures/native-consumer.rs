@@ -44,6 +44,7 @@ fn runtime(limits: AxNativeLimits) -> AxDatabaseRuntime<MemoryAdapter> {
 
 fn main() {
     private_binary_proof();
+    public_binary_proof();
     let valid = backend::validatePost("t".repeat(160), "s".repeat(120), "b".repeat(20000), "published".into()).unwrap();
     assert!(valid.title && valid.slug && valid.body && valid.status);
     let copied = backend::copyValidation(&valid).unwrap();
@@ -266,4 +267,37 @@ fn private_binary_proof() {
     assert_eq!(denied.status,403);
     assert_eq!(denied.header_value("Cache-Control"),Some("private, no-store"));
     assert_eq!(denied.body.into_bytes(),b"forbidden");
+}
+
+fn public_binary_proof() {
+    use axonyx_runtime::native_response::{AxNativeBinaryResponse, AxNativeBinaryType, AxNativeResponseError};
+    use serde_json::Value;
+    let mut registry = AxNativeRegistry::default();
+    registry.register_public_response("post.image", 100, |input: Value| {
+        if input["id"] != "image" {
+            return Err(AxNativeResponseError::NotFound);
+        }
+        AxNativeBinaryResponse::new(AxNativeBinaryType::Png, vec![0,255,128,42])
+    }).unwrap();
+    registry.register_private_response("private.only", 100, |_, _: ()| panic!("public route exposed private callback")).unwrap();
+    let runtime = AxDatabaseRuntime::new(AxEnv::new(), MemoryAdapter).with_native_functions(registry);
+    for validate in [false, true] {
+        for (target, status, bytes) in [
+            ("/public/image", 200, vec![0,255,128,42]),
+            ("/public/missing", 404, b"not found".to_vec()),
+            ("/public-private-channel", 500, b"binary response unavailable".to_vec()),
+            ("/public-guard", 403, b"forbidden".to_vec()),
+        ] {
+            let request = AxHttpRequest::new("GET", target).with_header("If-None-Match", "*");
+            let response = backend::dispatch_api_route(&runtime, &request, validate).unwrap().unwrap();
+            assert_eq!(response.status, status);
+            assert_eq!(response.header_value("Cache-Control"), Some("private, no-store"));
+            assert_eq!(response.header_value("X-Content-Type-Options"), Some("nosniff"));
+            assert!(response.set_cookies.is_empty());
+            assert_eq!(response.body.into_bytes(), bytes);
+        }
+    }
+    let request = AxHttpRequest::new("GET", "/public/image");
+    let preview = execute_preview_route_request_sources_with_runtime(&[include_str!("native-backend.ax")], &request, &runtime, &mut AxPreviewStore::default());
+    assert!(preview.err().unwrap().to_string().contains("compiled server"));
 }
