@@ -2267,11 +2267,16 @@ fn split_top_level_signature_params(input: &str) -> Vec<&str> {
 fn split_top_level_once<'a>(input: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> {
     let mut depth = 0usize;
     let mut in_string: Option<char> = None;
+    let mut escaped = false;
 
     for (index, ch) in input.char_indices() {
         match in_string {
             Some(quote) => {
-                if ch == quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
                     in_string = None;
                 }
             }
@@ -4349,6 +4354,12 @@ route GET "/guard" {
                 )
             );
         }
+
+        let escaped = r#"route GET "/guard" {
+  require (query.allowed ?? "say \" else \" now") == "yes" else forbidden()
+  return json({ ok: true })
+}"#;
+        parse_backend_ax(escaped).expect("escaped quotes should not expose an else delimiter");
     }
 
     #[test]
