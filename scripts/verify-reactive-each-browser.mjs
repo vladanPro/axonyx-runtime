@@ -50,6 +50,9 @@ try {
     }
   }
   await page.waitForFunction(() => window.__axonyx?.state?.runtime() === "wasm");
+  // The bootstrap snapshot may finish after WASM becomes available. Exclude it
+  // from the requests attributed to subsequent local reconciliation.
+  await page.waitForLoadState("networkidle");
   captureRequests = true;
   await page.locator("#increase-count").click();
   await page.waitForFunction(() => document.querySelector("#addition-label")?.textContent === "Count: 3");
