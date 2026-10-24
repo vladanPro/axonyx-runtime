@@ -1163,6 +1163,116 @@ pub fn ax_steps_use_auth_subject<'a>(steps: impl IntoIterator<Item = &'a AxStepP
     steps.into_iter().any(ax_step_uses_auth_subject)
 }
 
+pub fn ax_steps_use_context_member<'a>(
+    steps: impl IntoIterator<Item = &'a AxStepPlan>,
+    scope: &str,
+) -> bool {
+    steps
+        .into_iter()
+        .any(|step| ax_step_uses_context_member(step, scope))
+}
+
+fn ax_step_uses_context_member(step: &AxStepPlan, scope: &str) -> bool {
+    let expr = |value: &AxRustExpr| ax_expr_uses_context_member(value, scope);
+    let fields = |values: &[AxAssignmentPlan]| values.iter().any(|field| expr(&field.value));
+    let filters = |values: &[AxQueryFilterPlan]| values.iter().any(|filter| expr(&filter.value));
+    match step {
+        AxStepPlan::Let { value, .. } => match value {
+            AxValuePlan::Expr(value) => expr(value),
+            AxValuePlan::Call { args, .. } => args.iter().any(expr),
+            AxValuePlan::Query(query) => {
+                matches!(&query.source, AxQuerySourcePlan::RawSql { params, .. } if params.iter().any(expr))
+                    || filters(&query.filters)
+            }
+            AxValuePlan::StorageSave { .. } => false,
+        },
+        AxStepPlan::Transaction { operations } => {
+            operations.iter().any(|operation| match operation {
+                AxTransactionOperationPlan::Insert { fields: values, .. } => fields(values),
+                AxTransactionOperationPlan::Update {
+                    fields: values,
+                    filters: conditions,
+                    ..
+                } => fields(values) || filters(conditions),
+                AxTransactionOperationPlan::Delete {
+                    filters: conditions,
+                    ..
+                } => filters(conditions),
+            })
+        }
+        AxStepPlan::Insert { fields: values, .. } => fields(values),
+        AxStepPlan::Update {
+            fields: values,
+            filters: conditions,
+            ..
+        } => fields(values) || filters(conditions),
+        AxStepPlan::Delete {
+            filters: conditions,
+            ..
+        } => filters(conditions),
+        AxStepPlan::Revalidate { target, .. } => expr(target),
+        AxStepPlan::Patch { signal, value } => expr(signal) || expr(value),
+        AxStepPlan::Hook { value, .. } => expr(value),
+        AxStepPlan::Header { name, value } | AxStepPlan::Cookie { name, value } => {
+            expr(name) || expr(value)
+        }
+        AxStepPlan::ClearCookie { name } => expr(name),
+        AxStepPlan::SessionCreate { subject, data } => expr(subject) || expr(data),
+        AxStepPlan::SessionDestroy | AxStepPlan::SessionRefresh => false,
+        AxStepPlan::Require { value, fallback } => {
+            expr(value)
+                || fallback
+                    .as_ref()
+                    .is_some_and(|value| ax_return_uses_context_member(value, scope))
+        }
+        AxStepPlan::Return(value) => ax_return_uses_context_member(value, scope),
+        AxStepPlan::Send { payload, .. } => expr(payload),
+    }
+}
+
+fn ax_return_uses_context_member(value: &AxReturnPlan, scope: &str) -> bool {
+    match value {
+        AxReturnPlan::PublicResponse { args } | AxReturnPlan::PrivateResponse { args } => args
+            .iter()
+            .any(|value| ax_expr_uses_context_member(value, scope)),
+        AxReturnPlan::Expr(value) | AxReturnPlan::Json(value) => {
+            ax_expr_uses_context_member(value, scope)
+        }
+        AxReturnPlan::Redirect { target, .. } => ax_expr_uses_context_member(target, scope),
+        AxReturnPlan::NoContent
+        | AxReturnPlan::NotFound
+        | AxReturnPlan::Forbidden
+        | AxReturnPlan::Ok => false,
+    }
+}
+
+pub fn ax_expr_uses_context_member(expr: &AxRustExpr, scope: &str) -> bool {
+    use proc_macro2::{TokenStream, TokenTree};
+    fn contains_member(tokens: TokenStream, scope: &str) -> bool {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        tokens.iter().enumerate().any(|(index, token)| {
+            if let TokenTree::Group(group) = token {
+                return contains_member(group.stream(), scope);
+            }
+            if index > 0 && matches!(&tokens[index - 1], TokenTree::Punct(p) if p.as_char() == '.') {
+                return false;
+            }
+            if index > 1
+                && matches!(&tokens[index - 1], TokenTree::Punct(p) if p.as_char() == ':')
+                && matches!(&tokens[index - 2], TokenTree::Punct(p) if p.as_char() == ':')
+            {
+                return false;
+            }
+            matches!(token, TokenTree::Ident(name) if name == scope)
+                && matches!(tokens.get(index + 1), Some(TokenTree::Punct(dot)) if dot.as_char() == '.')
+                && matches!(tokens.get(index + 2), Some(TokenTree::Ident(_)))
+        })
+    }
+    expr.code
+        .parse::<TokenStream>()
+        .is_ok_and(|tokens| contains_member(tokens, scope))
+}
+
 pub fn ax_step_uses_auth_subject(step: &AxStepPlan) -> bool {
     match step {
         AxStepPlan::Let { value, .. } => ax_value_uses_auth_subject(value),
@@ -1375,8 +1485,10 @@ fn route_method_ident(method: &str) -> String {
 }
 
 pub mod prelude {
+    pub use super::ax_expr_uses_context_member;
     pub use super::ax_step_uses_auth_subject;
     pub use super::ax_steps_use_auth_subject;
+    pub use super::ax_steps_use_context_member;
     pub use super::lower_backend_document;
     pub use super::AxAssignmentPlan;
     pub use super::AxBackendLowerError;

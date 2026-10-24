@@ -83,6 +83,8 @@ pub enum AxBackendCodegenError {
         field: String,
         reason: String,
     },
+    #[error("action `{handler}` cannot use `{scope}.*`: the action transport has no page route context; declare an action input and authorize the resource on the server")]
+    ActionContextUnavailable { handler: String, scope: String },
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -137,6 +139,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     validate_type_contracts(&plan.types, &plan.literal_unions)?;
     validate_request_record_inputs(plan)?;
     validate_private_responses(plan)?;
+    validate_action_context(plan)?;
     for literal_union in &plan.literal_unions {
         out.push_str(&render_literal_union_type(literal_union)?);
         out.push('\n');
@@ -198,6 +201,31 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str(&render_compiled_dispatchers(plan));
 
     Ok(out)
+}
+
+pub fn validate_action_context(plan: &AxBackendPlan) -> Result<(), AxBackendCodegenError> {
+    for handler in &plan.handlers {
+        let AxHandlerKind::Action { input, .. } = &handler.kind else {
+            continue;
+        };
+        for scope in ["params", "query"] {
+            if input
+                .iter()
+                .filter_map(|field| field.default.as_ref())
+                .any(|value| ax_expr_uses_context_member(value, scope))
+                || ax_steps_use_context_member(
+                    plan.globals.iter().chain(handler.steps.iter()),
+                    scope,
+                )
+            {
+                return Err(AxBackendCodegenError::ActionContextUnavailable {
+                    handler: handler.name.clone(),
+                    scope: scope.to_string(),
+                });
+            }
+        }
+    }
+    Ok(())
 }
 
 fn render_function_fn(
@@ -2937,6 +2965,7 @@ pub mod prelude {
     pub use super::compile_backend_ax_to_module;
     pub use super::compile_backend_sources_to_module;
     pub use super::generate_backend_module;
+    pub use super::validate_action_context;
     pub use super::AxBackendBundleError;
     pub use super::AxBackendCodegenError;
     pub use super::AxBackendCompileError;
@@ -2948,6 +2977,27 @@ mod tests {
     use crate::ax_ast::prelude::AxExpr;
     use crate::ax_backend_ast::prelude::*;
     use crate::ax_backend_lowering::lower_backend_document;
+
+    #[test]
+    fn action_page_context_is_rejected_before_generating_invalid_rust() {
+        for (scope, member) in [("params", "id"), ("query", "mode")] {
+            let source = format!(
+                "action Save(id: String) {{\n  require input.id == {scope}.{member} else notFound()\n  return redirect(\"/admin/posts\")\n}}"
+            );
+            assert!(matches!(
+                compile_backend_ax_to_module(&source),
+                Err(AxBackendCompileError::Codegen(
+                    AxBackendCodegenError::ActionContextUnavailable { scope: found, .. }
+                )) if found == scope
+            ));
+        }
+        let source = r#"action Save(id: String) {
+  data payload = { literal: "params.id", nested: { note: "query.mode" } }
+  require input.id != "" else notFound()
+  return redirect("/admin/posts")
+}"#;
+        assert!(compile_backend_ax_to_module(source).is_ok());
+    }
 
     #[test]
     fn request_members_are_lowered_inside_composite_expressions_only() {
