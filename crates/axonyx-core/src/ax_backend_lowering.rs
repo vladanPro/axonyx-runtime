@@ -1089,7 +1089,10 @@ fn render_expr(expr: &AxExpr) -> String {
         }
         AxExpr::Member { object, property } => format!("{}.{}", render_expr(object), property),
         AxExpr::OptionalMember { object, property } => {
-            format!("{}.{}", render_expr(object), property)
+            format!(
+                "__ax_optional_member({}, {property:?})",
+                render_expr(object)
+            )
         }
         AxExpr::Call { path, args } => {
             if path.as_slice() == ["list"] {
