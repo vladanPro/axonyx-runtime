@@ -135,6 +135,7 @@ pub fn generate_backend_module(plan: &AxBackendPlan) -> Result<String, AxBackend
     out.push_str("use serde_json::{json, Value};\n\n");
     out.push_str(BACKEND_ADDITION_HELPER);
     out.push_str(BACKEND_LENGTH_HELPER);
+    out.push_str(BACKEND_OPTIONAL_JSON_HELPER);
 
     validate_type_contracts(&plan.types, &plan.literal_unions)?;
     validate_request_record_inputs(plan)?;
@@ -273,6 +274,7 @@ fn render_function_fn(
     );
     for step in &function.steps {
         let step = render_function_step(step, &returns, &function.name, context)?;
+        let step = rewrite_optional_json_members(&step, &std::collections::BTreeSet::new());
         out.push_str(
             &crate::ax_domain_codegen::rewrite_calls(
                 &step,
@@ -1210,6 +1212,7 @@ fn render_handler_fn(
     }
     let mut typed_bindings = std::collections::BTreeMap::new();
     let mut native_bindings = std::collections::BTreeSet::new();
+    let mut json_bindings = std::collections::BTreeSet::new();
     for step in globals.iter().chain(handler.steps.iter()) {
         let rendered = render_step(
             step,
@@ -1219,6 +1222,7 @@ fn render_handler_fn(
             &mut typed_bindings,
             context,
         )?;
+        let rendered = rewrite_optional_json_members(&rendered, &json_bindings);
         let rendered = crate::ax_domain_codegen::rewrite_calls(
             &rendered,
             context.functions,
@@ -1230,6 +1234,12 @@ fn render_handler_fn(
                 .map_err(|_| AxBackendCodegenError::InvalidNativeCall)?,
         );
         if let AxStepPlan::Let { binding, value } = step {
+            let json_binding = matches!(value, AxValuePlan::Query(_))
+                || matches!(value, AxValuePlan::Expr(expr) if json_bindings.contains(expr.code.trim()));
+            json_bindings.remove(binding);
+            if json_binding {
+                json_bindings.insert(binding.clone());
+            }
             let native = match value {
                 AxValuePlan::Call { path, .. } => {
                     path == &["Native", "call"]
@@ -2466,6 +2476,27 @@ fn render_codegen_intrinsics(code: &str) -> String {
     )
 }
 
+const BACKEND_OPTIONAL_JSON_HELPER: &str = r#"
+struct __AxJsonOptional(Option<Value>);
+
+impl __AxJsonOptional {
+    fn unwrap_or<T: axonyx_runtime::serde::Serialize>(self, fallback: T) -> Value {
+        self.0.unwrap_or_else(|| json!(fallback))
+    }
+}
+
+impl axonyx_runtime::serde::Serialize for __AxJsonOptional {
+    fn serialize<S: axonyx_runtime::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.serialize(serializer)
+    }
+}
+
+fn __ax_json_optional_member(value: &Value, field: &str) -> __AxJsonOptional {
+    __AxJsonOptional(value.get(field).filter(|field| !field.is_null()).cloned())
+}
+
+"#;
+
 const BACKEND_LENGTH_HELPER: &str = r#"
 fn __ax_is_null(value: &impl axonyx_runtime::serde::Serialize) -> Result<bool, AxRuntimeError> {
     serde_json::to_value(value).map(|value| value.is_null())
@@ -2867,6 +2898,70 @@ fn render_context_members(code: &str) -> String {
     output
 }
 
+// Lowering preserves optional access until the handler knows whether a binding
+// came from an untyped JSON query or from a typed Rust value.
+fn rewrite_optional_json_members(
+    code: &str,
+    json_bindings: &std::collections::BTreeSet<String>,
+) -> String {
+    use proc_macro2::{Delimiter, TokenStream, TokenTree};
+
+    fn collect(
+        tokens: TokenStream,
+        json_bindings: &std::collections::BTreeSet<String>,
+        edits: &mut Vec<(usize, usize, String)>,
+    ) {
+        let tokens: Vec<_> = tokens.into_iter().collect();
+        let mut index = 0;
+        while index < tokens.len() {
+            if matches!(&tokens[index], TokenTree::Ident(name) if name == "__ax_optional_member") {
+                if let Some(TokenTree::Group(group)) = tokens.get(index + 1) {
+                    if group.delimiter() == Delimiter::Parenthesis {
+                        let args = group.stream().to_string();
+                        if let Some((object, property)) = split_codegen_binary_args(&args) {
+                            if let Ok(property) = serde_json::from_str::<String>(property) {
+                                let object = object.trim();
+                                let replacement = if json_bindings.contains(object) {
+                                    format!("__ax_json_optional_member(&{object}, {property:?})")
+                                } else {
+                                    format!("{object}.{property}")
+                                };
+                                edits.push((
+                                    tokens[index].span().byte_range().start,
+                                    group.span().byte_range().end,
+                                    replacement,
+                                ));
+                                index += 2;
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+            if let TokenTree::Group(group) = &tokens[index] {
+                collect(group.stream(), json_bindings, edits);
+            }
+            index += 1;
+        }
+    }
+
+    let Ok(tokens) = code.parse::<TokenStream>() else {
+        return code.to_string();
+    };
+    let mut edits = Vec::new();
+    collect(tokens, json_bindings, &mut edits);
+    edits.sort_by_key(|(start, _, _)| *start);
+    let mut output = String::new();
+    let mut cursor = 0;
+    for (start, end, replacement) in edits {
+        output.push_str(&code[cursor..start]);
+        output.push_str(&replacement);
+        cursor = end;
+    }
+    output.push_str(&code[cursor..]);
+    output
+}
+
 fn render_auth_lookup(field: &str) -> Option<String> {
     match field {
         "bearer" => Some("&AxAuth::bearer(request).unwrap_or_default()".to_string()),
@@ -2977,6 +3072,35 @@ mod tests {
     use crate::ax_ast::prelude::AxExpr;
     use crate::ax_backend_ast::prelude::*;
     use crate::ax_backend_lowering::lower_backend_document;
+
+    #[test]
+    fn optional_members_of_raw_query_records_use_null_safe_json_lookup() {
+        let source = r#"action Probe() {
+  data missing = db.users.where({ id: "missing" }).first()
+  data user = db.users.where({ id: "known" }).first()
+  return json({ existing: user?.role ?? "none", absent: missing?.role ?? "none", literal: "user?.role" })
+}"#;
+        let module = compile_backend_ax_to_module(source).unwrap();
+        assert!(module.contains("__ax_json_optional_member(&user, \"role\")"));
+        assert!(module.contains("__ax_json_optional_member(&missing, \"role\")"));
+        assert!(module.contains("\"user?.role\".to_string()"));
+        assert!(!module.contains("(user.role).unwrap_or"));
+        syn::parse_file(&module).unwrap();
+
+        let typed = compile_backend_ax_to_module(
+            "type User {\n  role: String\n}\nquery loadUser() -> User {\n  return db.users.first()\n}\nroute GET \"/typed\" {\n  data user = loadUser()\n  return json(user?.role)\n}",
+        )
+        .unwrap();
+        assert!(typed.contains("json!(&user.role)"));
+        assert!(!typed.contains("__ax_json_optional_member(&user"));
+
+        let helper = compile_backend_ax_to_module(
+            "type User {\n  role: String\n}\nexport fn userRole(user: User) -> String {\n  return user?.role\n}",
+        )
+        .unwrap();
+        assert!(helper.contains("user.role"));
+        assert!(!helper.contains("__ax_optional_member("));
+    }
 
     #[test]
     fn action_page_context_is_rejected_before_generating_invalid_rust() {
