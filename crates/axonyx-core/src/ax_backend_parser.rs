@@ -906,7 +906,7 @@ impl Parser {
         }
 
         if let Some(value) = text.strip_prefix("require ") {
-            let (value, fallback) = match value.split_once(" else ") {
+            let (value, fallback) = match split_top_level_once(value, " else ") {
                 Some((value, fallback)) => (value.trim(), Some(fallback.trim())),
                 None => (value.trim(), None),
             };
@@ -1775,6 +1775,13 @@ fn parse_function_call_stmt(
         return Ok(None);
     }
 
+    if !matches!(
+        method,
+        "revalidate" | "invalidate" | "before" | "after" | "clearCookie"
+    ) {
+        return Ok(None);
+    }
+
     let args = split_call_args(&input[open_index + 1..input.len() - 1], line)?;
     match method {
         "revalidate" if args.len() == 1 => Ok(Some(AxBackendStmt::revalidate(args[0].clone()))),
@@ -2260,11 +2267,16 @@ fn split_top_level_signature_params(input: &str) -> Vec<&str> {
 fn split_top_level_once<'a>(input: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> {
     let mut depth = 0usize;
     let mut in_string: Option<char> = None;
+    let mut escaped = false;
 
     for (index, ch) in input.char_indices() {
         match in_string {
             Some(quote) => {
-                if ch == quote {
+                if escaped {
+                    escaped = false;
+                } else if ch == '\\' {
+                    escaped = true;
+                } else if ch == quote {
                     in_string = None;
                 }
             }
@@ -4277,6 +4289,77 @@ route GET "/api/admin"
                 AxExpr::call(["redirect"], [AxExpr::string("/login")])
             )
         );
+    }
+
+    #[test]
+    fn parses_grouped_coalescing_comparison_in_require_guard() {
+        parse_expr(r#"(query.allowed ?? "") == "yes""#, 1)
+            .expect("shared expression parser should accept the grouped comparison");
+        parse_requirement_expr(r#"(query.allowed ?? "") == "yes""#, 1)
+            .expect("require expression should accept the grouped comparison");
+        let input = r#"
+route GET "/guard" {
+  require (query.allowed ?? "") == "yes" else forbidden()
+  return json({ ok: true })
+}
+"#;
+
+        let document = parse_backend_ax(input).expect("grouped guard should parse");
+        let AxBackendBlock::Route(route) = &document.blocks[0] else {
+            panic!("expected route block");
+        };
+        assert_eq!(
+            route.body[0],
+            AxBackendStmt::require_with_fallback(
+                AxExpr::binary(
+                    crate::ax_ast::AxBinaryOp::Eq,
+                    AxExpr::binary(
+                        crate::ax_ast::AxBinaryOp::Fallback,
+                        AxExpr::ident("query").member("allowed"),
+                        AxExpr::string(""),
+                    ),
+                    AxExpr::string("yes"),
+                ),
+                AxExpr::call(["forbidden"], []),
+            )
+        );
+    }
+
+    #[test]
+    fn require_guard_ignores_else_and_in_inside_quoted_defaults() {
+        for (default, expected) in [
+            ("", "yes"),
+            ("not in list else maybe", "not in list else maybe"),
+        ] {
+            let input = format!(
+                "route GET \"/guard\" {{\n  require (query.allowed ?? \"{default}\") == \"{expected}\" else forbidden()\n  return json({{ ok: true }})\n}}"
+            );
+            let document = parse_backend_ax(&input).expect("quoted defaults should parse");
+            let AxBackendBlock::Route(route) = &document.blocks[0] else {
+                panic!("expected route block");
+            };
+            assert_eq!(
+                route.body[0],
+                AxBackendStmt::require_with_fallback(
+                    AxExpr::binary(
+                        crate::ax_ast::AxBinaryOp::Eq,
+                        AxExpr::binary(
+                            crate::ax_ast::AxBinaryOp::Fallback,
+                            AxExpr::ident("query").member("allowed"),
+                            AxExpr::string(default),
+                        ),
+                        AxExpr::string(expected),
+                    ),
+                    AxExpr::call(["forbidden"], []),
+                )
+            );
+        }
+
+        let escaped = r#"route GET "/guard" {
+  require (query.allowed ?? "say \" else \" now") == "yes" else forbidden()
+  return json({ ok: true })
+}"#;
+        parse_backend_ax(escaped).expect("escaped quotes should not expose an else delimiter");
     }
 
     #[test]
