@@ -366,12 +366,17 @@ pub enum PreviewError {
     AccessDenied { status: u16 },
     #[error("resource not found")]
     NotFound,
+    #[error("page query redirect")]
+    PageRedirect { location: String, status: u16 },
     #[error("invalid request input `{field}`")]
     InvalidInput { field: String },
 }
 
 impl From<backend::AxRuntimeError> for PreviewError {
     fn from(error: backend::AxRuntimeError) -> Self {
+        if let backend::AxRuntimeError::PageRedirect { location, status } = error {
+            return Self::PageRedirect { location, status };
+        }
         if matches!(error, backend::AxRuntimeError::NotFound) {
             return Self::NotFound;
         }
@@ -1771,6 +1776,13 @@ fn execute_preview_loader(
                     eval_preview_require_expr_with_functions(value, &scope, env, functions)?;
                 if !preview_require_passes(&requirement) {
                     return Err(match fallback {
+                        Some(AxReturnPlan::Redirect { target, status }) => {
+                            let location =
+                                eval_preview_expr_with_functions(target, &scope, env, functions)?
+                                    .as_string();
+                            backend::AxRuntimeError::page_redirect(location, status.unwrap_or(302))
+                                .into()
+                        }
                         Some(AxReturnPlan::NotFound) => backend::AxRuntimeError::NotFound.into(),
                         Some(AxReturnPlan::Forbidden) => backend::AxRuntimeError::Forbidden.into(),
                         Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
@@ -9087,6 +9099,19 @@ page DocsHome
         )
         .unwrap();
         assert!(html.contains("public data"));
+    }
+
+    #[test]
+    fn preview_loader_redirect_guard_has_typed_local_target() {
+        let error = preview_ax_route_with_loaders(
+            &[],
+            &["query loadPrivate() {\n  require Auth.subject else redirect(\"/login\")\n  return \"private data\"\n}"],
+            "page Private() { data secret = loadPrivate()\n return ASX { <p>{secret}</p> } }",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(error, PreviewError::PageRedirect { location, status } if location == "/login" && status == 302)
+        );
     }
 
     #[test]
