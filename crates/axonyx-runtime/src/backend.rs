@@ -69,6 +69,8 @@ pub enum AxRuntimeError {
     Unauthorized,
     #[error("access forbidden")]
     Forbidden,
+    #[error("page query redirect")]
+    PageRedirect { location: String, status: u16 },
     #[error("invalid request input `{field}`")]
     InvalidInput { field: String },
     #[error("runtime operation failed: {message}")]
@@ -78,6 +80,18 @@ pub enum AxRuntimeError {
 }
 
 impl AxRuntimeError {
+    pub fn page_redirect(location: impl Into<String>, status: u16) -> Self {
+        let location = location.into();
+        if !matches!(status, 302 | 303 | 307 | 308)
+            || !location.starts_with('/')
+            || location.starts_with("//")
+            || location.chars().any(|ch| ch.is_control() || ch == '\\')
+        {
+            return Self::message("invalid page redirect target or status");
+        }
+        Self::PageRedirect { location, status }
+    }
+
     pub fn public_response_status(&self) -> Option<u16> {
         match self {
             Self::NotFound => Some(404),
@@ -117,6 +131,7 @@ impl AxRuntimeError {
                 json!({"error": "unauthorized", "message": "Authentication required."})
             }
             Self::Forbidden => json!({"error": "forbidden", "message": "Access denied."}),
+            Self::PageRedirect { .. } => json!({"error": "internal_server_error"}),
             Self::InvalidInput { field } => {
                 let fields = BTreeMap::from([(field.clone(), "Missing or invalid input.")]);
                 json!({"error": "invalid_input", "message": "Invalid input.", "fields": fields})
@@ -4920,6 +4935,36 @@ pub mod prelude {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn page_redirect_accepts_only_local_paths_and_redirect_statuses() {
+        assert_eq!(
+            AxRuntimeError::page_redirect("/login?next=%2Fadmin", 302),
+            AxRuntimeError::PageRedirect {
+                location: "/login?next=%2Fadmin".into(),
+                status: 302,
+            }
+        );
+        for location in [
+            "https://example.com",
+            "//example.com",
+            "/\\example.com",
+            "/login\r\nX: y",
+        ] {
+            assert!(matches!(
+                AxRuntimeError::page_redirect(location, 302),
+                AxRuntimeError::Message { .. }
+            ));
+        }
+        assert!(matches!(
+            AxRuntimeError::page_redirect("/login", 301),
+            AxRuntimeError::Message { .. }
+        ));
+        assert_eq!(
+            AxRuntimeError::page_redirect("/login", 302).public_response_status(),
+            None
+        );
+    }
 
     #[test]
     fn loader_request_identity_is_not_serialized_or_deserialized() {
