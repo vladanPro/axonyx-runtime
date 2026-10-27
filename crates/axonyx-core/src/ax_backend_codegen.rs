@@ -1836,11 +1836,16 @@ fn render_step(
         }
         AxStepPlan::Require { value, fallback } => {
             let error = match fallback.as_ref() {
-                Some(AxReturnPlan::NotFound) => "AxRuntimeError::NotFound",
-                Some(AxReturnPlan::Forbidden) => "AxRuntimeError::Forbidden",
+                Some(AxReturnPlan::Redirect { target, status }) => format!(
+                    "AxRuntimeError::page_redirect({}, {})",
+                    render_owned_expr(target),
+                    status.unwrap_or(302)
+                ),
+                Some(AxReturnPlan::NotFound) => "AxRuntimeError::NotFound".to_string(),
+                Some(AxReturnPlan::Forbidden) => "AxRuntimeError::Forbidden".to_string(),
                 Some(AxReturnPlan::Expr(expr)) | Some(AxReturnPlan::Json(expr))
-                    if render_error_call_message(expr).is_some() => "AxRuntimeError::Unauthorized",
-                _ => "AxRuntimeError::message(\"Backend requirement was not satisfied\")",
+                    if render_error_call_message(expr).is_some() => "AxRuntimeError::Unauthorized".to_string(),
+                _ => "AxRuntimeError::message(\"Backend requirement was not satisfied\")".to_string(),
             };
             let mut rendered = format!(
                 "    if !__ax_truthy(&json!({})) {{\n        return Err({error});\n    }}\n",
@@ -3704,6 +3709,15 @@ query deniedPosts() {
             compile_backend_ax_to_module("query checked() {\n  require false\n  return 1\n}")
                 .expect("ordinary requirement should compile");
         assert!(ordinary.contains("Backend requirement was not satisfied"));
+    }
+
+    #[test]
+    fn query_redirect_guard_lowers_to_typed_runtime_signal() {
+        let module = compile_backend_ax_to_module(
+            "query privatePage() {\n  require Auth.subject else redirect(\"/login\")\n  return 1\n}",
+        )
+        .expect("query redirect should compile");
+        assert!(module.contains("AxRuntimeError::page_redirect(\"/login\".to_string(), 302)"));
     }
 
     #[test]
