@@ -9,6 +9,15 @@ use thiserror::Error;
 
 const MAX_KEY_BYTES: usize = 1024;
 
+/// Match SQLite NOCASE account lookup without retaining the submitted email in
+/// throttle buckets. This deliberately folds ASCII only, as SQLite does.
+pub fn account_key(email: &str) -> String {
+    format!(
+        "account:{:x}",
+        Sha256::digest(email.to_ascii_lowercase().as_bytes())
+    )
+}
+
 /// One HTTP boundary for native forms and the action bridge. No submitted data.
 pub fn action_response(
     request: &crate::server::AxHttpRequest,
@@ -126,6 +135,19 @@ impl AxLoginThrottle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn account_keys_match_case_insensitive_sqlite_lookup() {
+        assert_eq!(
+            account_key("Owner@Example.test"),
+            account_key("owner@example.TEST")
+        );
+        assert_ne!(
+            account_key("owner@example.test"),
+            account_key("other@example.test")
+        );
+        assert_eq!(account_key("").len(), "account:".len() + 64);
+    }
 
     #[test]
     fn action_response_negotiates_html_and_json_without_caching() {

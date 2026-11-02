@@ -28,7 +28,8 @@ tokio = ["axonyx-runtime/tokio"]
         $target = ($metadata | ConvertFrom-Json).target_directory
     } finally { Pop-Location }
     $manifest = Join-Path $fixture 'Cargo.toml'
-    & cargo generate-lockfile --manifest-path $manifest
+    Copy-Item -LiteralPath (Join-Path $root 'Cargo.lock') -Destination (Join-Path $fixture 'Cargo.lock')
+    & cargo check --manifest-path $manifest --offline --target-dir $target
     if ($LASTEXITCODE -ne 0) { throw 'Fresh consumer resolution failed' }
     $lock = Get-Content -LiteralPath (Join-Path $fixture 'Cargo.lock') -Raw
     if ($lock -notmatch '(?m)^name = "tokio"\r?\nversion = "([^"]+)"') {
