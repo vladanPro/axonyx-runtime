@@ -26,8 +26,11 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Resolve dependencies for the declared MSRV
+        run: cargo generate-lockfile
+
       - name: Run workspace tests
-        run: cargo test --workspace --all-features
+        run: cargo test --workspace --all-features --locked
 
       - name: Verify generated native and Domain calls against preview
         shell: pwsh
@@ -38,7 +41,7 @@ jobs:
         run: ./scripts/check-runtime-msrv.ps1
 
       - name: Run strict Clippy lint gate
-        run: cargo clippy --workspace --all-features --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings
 
       - name: Verify bundled state WASM ABI
         run: node scripts/verify-state-wasm.mjs
@@ -111,7 +114,10 @@ jobs:
       - name: Cache Rust artifacts
         uses: Swatinem/rust-cache@v2
 
+      - name: Resolve dependencies for the declared MSRV
+        run: cargo generate-lockfile
+
       - name: Verify Postgres runtime, pool, transactions, health, and migrations
         run: |
-          cargo test -p axonyx-runtime backend::tests::postgres_live_query_runs_when_test_url_is_configured -- --exact
-          cargo test -p axonyx-runtime session::postgres::tests::postgres_live_session_lifecycle_runs_when_test_url_is_configured -- --exact
+          cargo test -p axonyx-runtime backend::tests::postgres_live_query_runs_when_test_url_is_configured --locked -- --exact
+          cargo test -p axonyx-runtime session::postgres::tests::postgres_live_session_lifecycle_runs_when_test_url_is_configured --locked -- --exact
