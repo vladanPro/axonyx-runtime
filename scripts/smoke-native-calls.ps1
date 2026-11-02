@@ -28,7 +28,10 @@ serde_json = "1.0.145"
 "@ | Set-Content -LiteralPath (Join-Path $fixture 'Cargo.toml') -Encoding utf8
     Copy-Item -LiteralPath (Join-Path $root 'crates/axonyx-runtime/tests/fixtures/native-consumer.rs') -Destination (Join-Path $fixture 'src/main.rs')
     Copy-Item -LiteralPath (Join-Path $root 'crates/axonyx-runtime/tests/fixtures/native-backend.ax') -Destination (Join-Path $fixture 'src/native-backend.ax')
-    & cargo run --manifest-path (Join-Path $fixture 'Cargo.toml') --target-dir $target --quiet
+    Copy-Item -LiteralPath (Join-Path $root 'Cargo.lock') -Destination (Join-Path $fixture 'Cargo.lock')
+    & cargo check --manifest-path (Join-Path $fixture 'Cargo.toml') --target-dir $target --offline --quiet
+    if ($LASTEXITCODE -ne 0) { throw 'Native fixture dependency resolution failed' }
+    & cargo run --manifest-path (Join-Path $fixture 'Cargo.toml') --target-dir $target --locked --quiet
     if ($LASTEXITCODE -ne 0) { throw 'Compiled native/preview parity failed' }
 } finally {
     if (-not $Keep) {
