@@ -2438,6 +2438,20 @@ fn render_codegen_expr(code: &str) -> String {
 
 fn render_codegen_intrinsics(code: &str) -> String {
     let code = code.trim();
+    for name in ["Login.accountKey", "Login::accountKey"] {
+        if let Some(inner) = code
+            .strip_prefix(&format!("{name}("))
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let args = split_codegen_args(inner);
+            if let [email] = args.as_slice() {
+                return format!(
+                    "axonyx_runtime::login_throttle::account_key(&({}))",
+                    render_codegen_expr(email)
+                );
+            }
+        }
+    }
     for (name, predicate) in [
         ("Validate.email", "email"),
         ("Validate.password", "password"),
@@ -4604,6 +4618,14 @@ loader Login
         assert!(action.contains("std::sync::OnceLock"));
         assert!(action.contains("Too many requests."));
         assert!(action.contains("retryAfter"));
+        let account_action = compile_backend_ax_to_module(
+            "action SignIn(email: String) {\n  before Login.throttle(Login.accountKey(input.email), 5, 60)\n  before Login.throttle(\"login:global\", 60, 60)\n  return ok\n}",
+        )
+        .unwrap();
+        assert!(
+            account_action.contains("axonyx_runtime::login_throttle::account_key(&(input.email))")
+        );
+        assert_eq!(account_action.matches("static THROTTLE:").count(), 2);
         for source in [
             "query loadLogin() {\n  before Login.throttle(\"login\", 1, 60)\n  return \"ok\"\n}",
             "fn checkLogin() -> String {\n  before Login.throttle(\"login\", 1, 60)\n  return \"ok\"\n}",
