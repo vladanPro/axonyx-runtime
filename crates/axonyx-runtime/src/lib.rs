@@ -3682,6 +3682,24 @@ fn eval_preview_expr_with_functions(
         return Ok(AxValue::Bool(items.iter().any(|item| item == &needle)));
     }
 
+    for name in ["Login.accountKey", "Login::accountKey"] {
+        if let Some(args) = parse_preview_call_args(code, name) {
+            let [email] = args.as_slice() else {
+                return Err(PreviewError::Runtime {
+                    message: "Login.accountKey expects one String argument".to_string(),
+                });
+            };
+            let value =
+                eval_preview_expr_with_functions(&AxRustExpr::new(email), scope, env, functions)?;
+            let AxValue::String(email) = value else {
+                return Err(PreviewError::Runtime {
+                    message: "Login.accountKey expects one String argument".to_string(),
+                });
+            };
+            return Ok(AxValue::String(login_throttle::account_key(&email)));
+        }
+    }
+
     for (name, predicate) in [
         ("Validate.email", validation::email as fn(&str) -> bool),
         ("Validate::email", validation::email as fn(&str) -> bool),
@@ -11024,6 +11042,52 @@ action Install(email: String) {
                 .unwrap()
                 .status,
             422
+        );
+    }
+
+    #[test]
+    fn preview_account_throttle_shares_case_variants_but_not_other_accounts() {
+        let source = r#"
+action SignIn(email: String) {
+  before Login.throttle(Login.accountKey(input.email), 2, 60)
+  before Login.throttle("login:global", 3, 60)
+  return ok
+}
+"#;
+        let mut store = AxPreviewStore::default();
+        for email in ["Owner@Example.test", "owner@example.TEST"] {
+            let input = BTreeMap::from([("email".to_string(), email.to_string())]);
+            assert!(
+                execute_preview_action_sources(&[source], "SignIn", &input, &mut store)
+                    .unwrap()
+                    .error
+                    .is_none()
+            );
+        }
+        let owner = BTreeMap::from([("email".to_string(), "owner@example.test".to_string())]);
+        assert_eq!(
+            execute_preview_action_sources(&[source], "SignIn", &owner, &mut store)
+                .unwrap()
+                .error
+                .unwrap()
+                .status,
+            429
+        );
+        let other = BTreeMap::from([("email".to_string(), "other@example.test".to_string())]);
+        assert!(
+            execute_preview_action_sources(&[source], "SignIn", &other, &mut store)
+                .unwrap()
+                .error
+                .is_none()
+        );
+        let third = BTreeMap::from([("email".to_string(), "third@example.test".to_string())]);
+        assert_eq!(
+            execute_preview_action_sources(&[source], "SignIn", &third, &mut store)
+                .unwrap()
+                .error
+                .unwrap()
+                .status,
+            429
         );
     }
 
