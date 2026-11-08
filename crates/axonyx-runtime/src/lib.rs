@@ -560,8 +560,10 @@ fn translate_page_call(
     translator: translation::AxTranslator<'_>,
     args: &[AxValue],
 ) -> Option<AxValue> {
-    let [AxValue::String(key)] = args else {
-        return None;
+    let (key, translator) = match args {
+        [AxValue::String(key)] => (key, translator),
+        [AxValue::String(key), AxValue::String(locale)] => (key, translator.for_locale(locale)),
+        _ => return None,
     };
     translator
         .translate(key)

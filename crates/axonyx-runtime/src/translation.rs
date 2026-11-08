@@ -114,18 +114,27 @@ impl AxTranslationCatalog {
             .locales
             .get(&locale.to_ascii_lowercase())
             .unwrap_or(fallback);
-        AxTranslator { selected, fallback }
+        AxTranslator {
+            catalog: self,
+            selected,
+            fallback,
+        }
     }
 }
 
 /// A view of the shared catalogs bound to a single effective locale.
 #[derive(Debug, Clone, Copy)]
 pub struct AxTranslator<'a> {
+    catalog: &'a AxTranslationCatalog,
     selected: &'a LocaleCatalog,
     fallback: &'a LocaleCatalog,
 }
 
 impl<'a> AxTranslator<'a> {
+    pub(crate) fn for_locale(self, locale: &str) -> Self {
+        self.catalog.translator(locale)
+    }
+
     pub fn locale(&self) -> &'a str {
         &self.selected.tag
     }
@@ -289,8 +298,13 @@ mod tests {
     fn preview_and_compiled_render_translate_and_escape_with_the_same_locale() {
         let source = r#"
 page Home() {
+  const adminLanguage = "sr-Latn"
   return ASX {
-    <button title={t("pages.save")}>{t("pages.save")} {t("pages.cancel")}</button>
+    <>
+      <button title={t("pages.save")}>{t("pages.save")} {t("pages.cancel")}</button>
+      <span lang={adminLanguage}>{t("pages.save", adminLanguage) + " / " + t("pages.cancel", adminLanguage)}</span>
+      <span lang="en">{t("pages.save", "unsupported") + " / " + t("pages.save", "en")}</span>
+    </>
   }
 }
 "#;
@@ -340,6 +354,14 @@ page Home() {
             assert!(fragment.contains(&format!(r#"title="{expected}""#)));
             assert!(fragment.contains(expected));
             assert!(fragment.contains("Cancel"));
+            assert!(
+                fragment.contains(r#"<span lang="sr-Latn">&lt;Save&gt; / Cancel</span>"#),
+                "{fragment}"
+            );
+            assert!(
+                fragment.contains(r#"<span lang="en">Save / Save</span>"#),
+                "{fragment}"
+            );
             assert!(!fragment.contains("<Save>"));
             assert!(!fragment.contains("<html"));
         }
