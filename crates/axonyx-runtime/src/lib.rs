@@ -417,15 +417,15 @@ pub fn render_compiled_page_document(
     loader_values: &BTreeMap<String, serde_json::Value>,
     form_result: Option<&form_result::AxFormResult>,
 ) -> Result<String, PreviewError> {
-    render_compiled_document(
+    AxCompiledPageRender {
         document_json,
         import_sources,
         request_target,
         route_params,
         loader_values,
         form_result,
-        true,
-    )
+    }
+    .render_document(None)
 }
 
 pub fn render_compiled_page_fragment(
@@ -453,26 +453,56 @@ pub fn render_compiled_page_fragment_with_form(
     loader_values: &BTreeMap<String, serde_json::Value>,
     form_result: Option<&form_result::AxFormResult>,
 ) -> Result<String, PreviewError> {
-    render_compiled_document(
+    AxCompiledPageRender {
         document_json,
         import_sources,
         request_target,
         route_params,
         loader_values,
         form_result,
-        false,
-    )
+    }
+    .render_fragment(None)
+}
+
+/// Inputs for one compiled SSR render. The optional translator is request-local.
+pub struct AxCompiledPageRender<'a> {
+    pub document_json: &'a str,
+    pub import_sources: &'a [(&'a str, &'a str)],
+    pub request_target: &'a str,
+    pub route_params: &'a BTreeMap<String, String>,
+    pub loader_values: &'a BTreeMap<String, serde_json::Value>,
+    pub form_result: Option<&'a form_result::AxFormResult>,
+}
+
+impl AxCompiledPageRender<'_> {
+    pub fn render_document(
+        self,
+        translator: Option<translation::AxTranslator<'_>>,
+    ) -> Result<String, PreviewError> {
+        render_compiled_document(self, translator, true)
+    }
+
+    pub fn render_fragment(
+        self,
+        translator: Option<translation::AxTranslator<'_>>,
+    ) -> Result<String, PreviewError> {
+        render_compiled_document(self, translator, false)
+    }
 }
 
 fn render_compiled_document(
-    document_json: &str,
-    import_sources: &[(&str, &str)],
-    request_target: &str,
-    route_params: &BTreeMap<String, String>,
-    loader_values: &BTreeMap<String, serde_json::Value>,
-    form_result: Option<&form_result::AxFormResult>,
+    inputs: AxCompiledPageRender<'_>,
+    translator: Option<translation::AxTranslator<'_>>,
     full_document: bool,
 ) -> Result<String, PreviewError> {
+    let AxCompiledPageRender {
+        document_json,
+        import_sources,
+        request_target,
+        route_params,
+        loader_values,
+        form_result,
+    } = inputs;
     let document = serde_json::from_str::<AxDocument>(document_json).map_err(|error| {
         PreviewError::Runtime {
             message: format!("failed to decode compiled page AST: {error}"),
@@ -484,6 +514,9 @@ fn render_compiled_document(
         &parse_preview_query_fields(request_target),
     );
     let resolver = |path: &[String], args: &[AxValue]| {
+        if let Some(translator) = translator.filter(|_| path == ["t"]) {
+            return translate_page_call(translator, args);
+        }
         if path == ["action"] {
             if let [AxValue::String(name)] = args {
                 let route = request_target.split('?').next().unwrap_or("/");
@@ -512,11 +545,27 @@ fn render_compiled_document(
         result.apply_to_node(&mut node);
     }
     if full_document {
-        return Ok(render_preview_document(&document, &node));
+        return Ok(render_document_with_locale(
+            &document,
+            &node,
+            translator.map(|t| t.locale()),
+        ));
     }
     let mut html = String::new();
     render_node(&node, &mut html);
     Ok(html)
+}
+
+fn translate_page_call(
+    translator: translation::AxTranslator<'_>,
+    args: &[AxValue],
+) -> Option<AxValue> {
+    let [AxValue::String(key)] = args else {
+        return None;
+    };
+    translator
+        .translate(key)
+        .map(|text| AxValue::String(text.into()))
 }
 
 pub fn compiled_loader_call_key(name: &str, args: &[serde_json::Value]) -> String {
@@ -1154,6 +1203,55 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
     store: &AxPreviewStore,
     import_resolver: &impl AxImportResolver,
 ) -> Result<String, PreviewError> {
+    render_preview_route(
+        AxPreviewRouteRender {
+            layout_sources,
+            loader_sources,
+            action_sources,
+            page_source,
+            request_target,
+            route_params,
+            runtime,
+            request,
+            form,
+        },
+        store,
+        import_resolver,
+        None,
+    )
+}
+
+/// Inputs for one source-backed preview render, including optional server context.
+pub struct AxPreviewRouteRender<'a> {
+    pub layout_sources: &'a [&'a str],
+    pub loader_sources: &'a [&'a str],
+    pub action_sources: &'a [&'a str],
+    pub page_source: &'a str,
+    pub request_target: &'a str,
+    pub route_params: &'a BTreeMap<String, String>,
+    pub runtime: Option<&'a dyn backend::AxBackendRuntime>,
+    pub request: Option<&'a server::AxHttpRequest>,
+    pub form: Option<&'a form_result::AxFormResult>,
+}
+
+/// Render a preview with an optional translator selected for this request.
+pub fn render_preview_route(
+    inputs: AxPreviewRouteRender<'_>,
+    store: &AxPreviewStore,
+    import_resolver: &impl AxImportResolver,
+    translator: Option<translation::AxTranslator<'_>>,
+) -> Result<String, PreviewError> {
+    let AxPreviewRouteRender {
+        layout_sources,
+        loader_sources,
+        action_sources,
+        page_source,
+        request_target,
+        route_params,
+        runtime,
+        request,
+        form,
+    } = inputs;
     let page_document = parse_ax_auto(page_source)?;
     let mut document = page_document;
 
@@ -1207,6 +1305,9 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
     };
     let resolver_error = RefCell::new(None);
     let resolver = |path: &[String], args: &[AxValue]| -> Option<AxValue> {
+        if let Some(translator) = translator.filter(|_| path == ["t"]) {
+            return translate_page_call(translator, args);
+        }
         match preview_resolve_call(&resolve_context, path, args) {
             Ok(value) => value,
             Err(error) => {
@@ -1241,7 +1342,11 @@ fn preview_ax_route_with_request_context_runtime_and_imports(
     if let Some(form) = form {
         form.apply_to_node(&mut node);
     }
-    Ok(render_preview_document(&document, &node))
+    Ok(render_document_with_locale(
+        &document,
+        &node,
+        translator.map(|t| t.locale()),
+    ))
 }
 
 pub fn execute_preview_action_sources(
@@ -5057,8 +5162,12 @@ fn is_slot_component(component: &AxComponent) -> bool {
     component.name == "Slot"
 }
 
-fn render_preview_document(document: &AxDocument, root: &AxNode) -> String {
-    String::from_utf8(render_preview_document_chunks(document, root).concat())
+fn render_document_with_locale(
+    document: &AxDocument,
+    root: &AxNode,
+    locale: Option<&str>,
+) -> String {
+    String::from_utf8(render_preview_document_chunks(document, root, locale).concat())
         .expect("preview renderer only emits UTF-8 HTML")
 }
 
@@ -5066,14 +5175,18 @@ fn render_preview_document_response(
     document: &AxDocument,
     root: &AxNode,
 ) -> server::AxHttpResponse {
-    server::AxHttpResponse::html_stream(200, render_preview_document_chunks(document, root))
+    server::AxHttpResponse::html_stream(200, render_preview_document_chunks(document, root, None))
 }
 
-fn render_preview_document_chunks(document: &AxDocument, root: &AxNode) -> Vec<Vec<u8>> {
+fn render_preview_document_chunks(
+    document: &AxDocument,
+    root: &AxNode,
+    locale: Option<&str>,
+) -> Vec<Vec<u8>> {
     let mut body = String::new();
     render_node(root, &mut body);
     let head = render_head_html(&document.head);
-    let html_attrs = render_html_attrs(&document.head);
+    let html_attrs = render_html_attrs(&document.head, locale);
     let behavior_script = if body.contains("data-ax-behavior=") {
         ax_behavior_script()
     } else {
@@ -7640,8 +7753,8 @@ fn ax_state_bridge_script() -> &'static str {
 </script>"##
 }
 
-fn render_html_attrs(head: &AxHead) -> String {
-    let mut attrs = String::from(" lang=\"en\"");
+fn render_html_attrs(head: &AxHead, locale: Option<&str>) -> String {
+    let mut attrs = format!(" lang=\"{}\"", escape_html(locale.unwrap_or("en")));
     if let Some(theme) = &head.theme {
         attrs.push_str(" data-theme=\"");
         attrs.push_str(&escape_html(&head_expr_to_string(theme)));
