@@ -203,6 +203,10 @@ fn parse_messages(json: &str) -> Result<BTreeMap<String, String>, serde_json::Er
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        compose_compiled_page_document, render_preview_route, AxCompiledPageRender,
+        AxPreviewRouteRender, AxPreviewStore,
+    };
     use std::sync::Barrier;
 
     const EN: &str = r#"{"pages.save":"Save","pages.cancel":"Cancel"}"#;
@@ -279,5 +283,66 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn preview_and_compiled_render_translate_and_escape_with_the_same_locale() {
+        let source = r#"
+page Home() {
+  return ASX {
+    <button title={t("pages.save")}>{t("pages.save")} {t("pages.cancel")}</button>
+  }
+}
+"#;
+        let document =
+            serde_json::to_string(&compose_compiled_page_document(&[], source).unwrap()).unwrap();
+        let catalog = AxTranslationCatalog::from_json(
+            "en",
+            [("en", EN), ("sr-Latn", r#"{"pages.save":"<Save>"}"#)],
+        )
+        .unwrap();
+        let params = BTreeMap::new();
+        let store = AxPreviewStore::default();
+        let imports = |_: &str| None;
+        let loader_values = BTreeMap::new();
+        let inputs = || AxCompiledPageRender {
+            document_json: &document,
+            import_sources: &[],
+            request_target: "/",
+            route_params: &params,
+            loader_values: &loader_values,
+            form_result: None,
+        };
+
+        for (language, expected) in [("en", "Save"), ("sr-Latn", "&lt;Save&gt;")] {
+            let translator = Some(catalog.translator(language));
+            let preview = render_preview_route(
+                AxPreviewRouteRender {
+                    layout_sources: &[],
+                    loader_sources: &[],
+                    action_sources: &[],
+                    page_source: source,
+                    request_target: "/",
+                    route_params: &params,
+                    runtime: None,
+                    request: None,
+                    form: None,
+                },
+                &store,
+                &imports,
+                translator,
+            )
+            .unwrap();
+            let compiled = inputs().render_document(translator).unwrap();
+            assert_eq!(preview, compiled);
+            assert!(compiled.contains(&format!(r#"<html lang="{language}""#)));
+            let fragment = inputs().render_fragment(translator).unwrap();
+            assert!(fragment.contains(&format!(r#"title="{expected}""#)));
+            assert!(fragment.contains(expected));
+            assert!(fragment.contains("Cancel"));
+            assert!(!fragment.contains("<Save>"));
+            assert!(!fragment.contains("<html"));
+        }
+        assert!(inputs().render_document(None).is_err());
     }
 }
