@@ -6,6 +6,11 @@ use std::collections::{btree_map::Entry, BTreeMap};
 use std::fmt;
 use thiserror::Error;
 
+mod binding;
+pub use binding::{
+    bound_translator_initializer, lower_bound_translators, AxTranslationBindingError,
+};
+
 #[derive(Debug, Error)]
 pub enum AxCatalogError {
     #[error("invalid catalog locale: {0:?}")]
@@ -366,5 +371,75 @@ page Home() {
             assert!(!fragment.contains("<html"));
         }
         assert!(inputs().render_document(None).is_err());
+    }
+
+    #[test]
+    fn bound_translators_keep_page_and_layout_locales_separate() {
+        let layout = r#"
+page Layout() {
+  const translate = I18n.withLocale("en")
+  return ASX {
+    <>
+      <Slot />
+      <p id="layout">{translate("pages.save")}</p>
+    </>
+  }
+}
+"#;
+        let page = r#"
+page Home() {
+  const translate = I18n.withLocale(query.language)
+  return ASX { <p id="page">{translate("pages.save")}</p> }
+}
+"#;
+        let catalog = AxTranslationCatalog::from_json(
+            "en",
+            [("en", EN), ("sr-Latn", r#"{"pages.save":"Sacuvaj"}"#)],
+        )
+        .unwrap();
+        let layouts = [layout];
+        let translator = Some(catalog.translator("en"));
+        let document =
+            serde_json::to_string(&crate::compose_localized_page_document(&layouts, page).unwrap())
+                .unwrap();
+        let params = BTreeMap::new();
+        let target = "/?language=sr-Latn";
+        let preview = render_preview_route(
+            AxPreviewRouteRender {
+                layout_sources: &layouts,
+                loader_sources: &[],
+                action_sources: &[],
+                page_source: page,
+                request_target: target,
+                route_params: &params,
+                runtime: None,
+                request: None,
+                form: None,
+            },
+            &AxPreviewStore::default(),
+            &|_: &str| None,
+            translator,
+        )
+        .unwrap();
+        let loader_values = BTreeMap::new();
+        let compiled = || AxCompiledPageRender {
+            document_json: &document,
+            import_sources: &[],
+            request_target: target,
+            route_params: &params,
+            loader_values: &loader_values,
+            form_result: None,
+        };
+        assert_eq!(preview, compiled().render_document(translator).unwrap());
+        assert!(preview.contains(r#"<html lang="en""#));
+        let fragment = compiled().render_fragment(translator).unwrap();
+        assert!(
+            fragment.contains(r#"<p id="page">Sacuvaj</p>"#),
+            "{fragment}"
+        );
+        assert!(
+            fragment.contains(r#"<p id="layout">Save</p>"#),
+            "{fragment}"
+        );
     }
 }
