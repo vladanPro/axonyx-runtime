@@ -13,6 +13,7 @@ pub mod server;
 pub mod session;
 #[cfg(feature = "storage")]
 pub mod storage;
+pub mod translation;
 pub mod validation;
 
 /// Generates a server-owned identifier, not a session or authentication token.
