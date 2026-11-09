@@ -165,7 +165,11 @@ pub fn classify_ax_source(path: &str, source: &str) -> AxSourceKind {
         return AxSourceKind::Page;
     }
 
-    let lines = source.lines().map(str::trim_start).collect::<Vec<_>>();
+    let lines = source
+        .lines()
+        .map(crate::ax_backend_parser::backend_code_before_comment)
+        .map(str::trim)
+        .collect::<Vec<_>>();
     if lines.iter().any(|line| {
         let line = line.strip_prefix("export ").unwrap_or(line);
         line.starts_with("page ") || line.starts_with("layout ") || line.starts_with("component ")

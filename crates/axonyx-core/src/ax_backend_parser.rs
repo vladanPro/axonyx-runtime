@@ -154,7 +154,7 @@ pub fn parse_backend_ax_with_span(input: &str) -> Result<AxBackendDocument, AxBa
 
 fn backend_failure_span(input: &str, error: &AxBackendParseError) -> AxBackendSourceSpan {
     let line = error.line().max(1);
-    let source = input.lines().nth(line - 1).unwrap_or_default();
+    let source = backend_code_before_comment(input.lines().nth(line - 1).unwrap_or_default());
 
     if let AxBackendParseError::InvalidExpression { message, .. } = error {
         let expression_error = AxParseError::InvalidExpression {
@@ -1374,6 +1374,7 @@ fn preprocess(input: &str) -> Result<Vec<BackendLine>, AxBackendParseError> {
 
     for (index, raw) in input.lines().enumerate() {
         let line_no = index + 1;
+        let raw = backend_code_before_comment(raw);
         if raw.trim().is_empty() {
             continue;
         }
@@ -1395,6 +1396,25 @@ fn preprocess(input: &str) -> Result<Vec<BackendLine>, AxBackendParseError> {
     }
 
     Ok(lines)
+}
+
+pub(crate) fn backend_code_before_comment(line: &str) -> &str {
+    let mut chars = line.char_indices().peekable();
+    let mut quote = None;
+    while let Some((index, ch)) = chars.next() {
+        if let Some(delimiter) = quote {
+            if ch == '\\' {
+                chars.next();
+            } else if ch == delimiter {
+                quote = None;
+            }
+        } else if matches!(ch, '"' | '\'') {
+            quote = Some(ch);
+        } else if ch == '/' && chars.peek().is_some_and(|(_, next)| *next == '/') {
+            return &line[..index];
+        }
+    }
+    line
 }
 
 fn is_query_clause(text: &str) -> bool {
@@ -3006,8 +3026,30 @@ export fn normalizeStatus(status?: String) -> String {
     }
 
     #[test]
+    fn ignores_backend_line_comments_without_changing_quoted_content() {
+        let documented = r#"/// Returns a URL with a quoted path segment.
+export fn endpoint() -> String { // Not part of the signature.
+   // Comment indentation is not syntax.
+  return "https://example.test/\"//path" // Keep the URL.
+}
+"#;
+        let plain = r#"export fn endpoint() -> String {
+  return "https://example.test/\"//path"
+}
+"#;
+        assert_eq!(
+            parse_backend_ax(documented).unwrap(),
+            parse_backend_ax(plain).unwrap()
+        );
+        assert_eq!(
+            backend_code_before_comment("return 'https://example.test' // note"),
+            "return 'https://example.test' "
+        );
+    }
+
+    #[test]
     fn reports_the_backend_expression_operator_span() {
-        let input = "fn normalize(status: String) -> String {\n  return status ??\n}";
+        let input = "/// Describes normalization.\nfn normalize(status: String) -> String {\n  return status ?? // Missing operand.\n}";
 
         let failure = parse_backend_ax_with_span(input).expect_err("missing operand should fail");
 
@@ -3018,9 +3060,9 @@ export fn normalizeStatus(status?: String) -> String {
         assert_eq!(
             failure.span,
             AxBackendSourceSpan {
-                line: 2,
+                line: 3,
                 column: 17,
-                end_line: 2,
+                end_line: 3,
                 end_column: 19,
             }
         );
