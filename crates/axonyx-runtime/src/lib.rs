@@ -402,9 +402,35 @@ pub fn compose_compiled_page_document(
     layout_sources: &[&str],
     page_source: &str,
 ) -> Result<AxDocument, PreviewError> {
-    let mut document = parse_ax_auto(page_source)?;
-    for source in layout_sources.iter().rev() {
-        document = compose_layout_with_page(parse_ax_auto(source)?, document);
+    compose_page_document(layout_sources, page_source, false)
+}
+
+pub fn compose_localized_page_document(
+    layout_sources: &[&str],
+    page_source: &str,
+) -> Result<AxDocument, PreviewError> {
+    compose_page_document(layout_sources, page_source, true)
+}
+
+fn compose_page_document(
+    layout_sources: &[&str],
+    page_source: &str,
+    i18n: bool,
+) -> Result<AxDocument, PreviewError> {
+    let parse = |source, index| {
+        let mut document = parse_ax_auto(source)?;
+        if i18n {
+            translation::lower_bound_translators(&mut document, index).map_err(|error| {
+                PreviewError::Runtime {
+                    message: error.to_string(),
+                }
+            })?;
+        }
+        Ok::<_, PreviewError>(document)
+    };
+    let mut document = parse(page_source, 0)?;
+    for (index, source) in layout_sources.iter().enumerate().rev() {
+        document = compose_layout_with_page(parse(source, index + 1)?, document);
     }
     Ok(document)
 }
@@ -1254,13 +1280,7 @@ pub fn render_preview_route(
         request,
         form,
     } = inputs;
-    let page_document = parse_ax_auto(page_source)?;
-    let mut document = page_document;
-
-    for layout_source in layout_sources.iter().rev() {
-        let layout_document = parse_ax_auto(layout_source)?;
-        document = compose_layout_with_page(layout_document, document);
-    }
+    let document = compose_page_document(layout_sources, page_source, translator.is_some())?;
 
     let handlers = collect_preview_handlers(loader_sources, action_sources, &[])?;
     let cache = RefCell::new(BTreeMap::new());
