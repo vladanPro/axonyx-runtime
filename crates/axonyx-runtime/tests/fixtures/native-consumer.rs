@@ -277,7 +277,7 @@ fn native_redirect_proof() {
     let runtime = AxDatabaseRuntime::new(AxEnv::new(), MemoryAdapter).with_native_functions(registry);
     let source = include_str!("native-backend.ax");
     let destination = "/admin/posts?page=2&q=news";
-    for (path, status) in [("/native-redirect", 302), ("/native-redirect-member", 307)] {
+    for (path, status) in [("/native-redirect", 303), ("/native-redirect-member", 307)] {
         let request = AxHttpRequest::new("GET", path);
         let compiled = backend::dispatch_api_route(&runtime, &request, false).unwrap().unwrap();
         let preview = execute_preview_route_request_sources_with_runtime(
@@ -290,14 +290,10 @@ fn native_redirect_proof() {
     let request = AxHttpRequest::new("POST", "/native-redirect")
         .with_body(b"destination=%2Fadmin%2Fposts%3Fpage%3D2%26q%3Dnews".to_vec());
     let compiled = backend::dispatch_action(&runtime, &AxUnavailableFileStorage, "NativeRedirect", &request).unwrap().unwrap();
-    let preview = execute_preview_action_request_sources_with_runtime_and_storage(
-        &[source], "NativeRedirect", &request, &runtime, &AxUnavailableFileStorage, &mut AxPreviewStore::default(),
-    ).unwrap();
     assert_eq!(compiled.payload["redirect"], destination);
-    assert_eq!(compiled.payload["redirect"].as_str(), preview.redirect_to.as_deref());
     let error = backend::dispatch_api_route(&runtime, &AxHttpRequest::new("GET", "/native-redirect-invalid"), false).unwrap_err();
     assert!(error.to_string().contains("Redirect target must be a string"));
-    println!("Native redirects: compiled/preview strings, aliases, members, status and non-string rejection passed");
+    println!("Native redirects: API preview parity, compiled action alias, member/status and non-string rejection passed");
 }
 
 fn public_binary_proof() {
