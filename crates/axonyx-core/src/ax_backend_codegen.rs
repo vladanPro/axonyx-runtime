@@ -2673,6 +2673,14 @@ fn render_string_expr(expr: &AxRustExpr) -> String {
     format!("({}).to_string()", render_owned_expr(expr))
 }
 
+fn render_redirect_target(expr: &AxRustExpr) -> String {
+    // Native bindings hold JSON Values; Value::to_string would quote a URL.
+    format!(
+        "json!({}).as_str().ok_or_else(|| AxRuntimeError::message(\"Redirect target must be a string\"))?.to_owned()",
+        render_borrowed_expr(expr)
+    )
+}
+
 fn render_return_step(value: &AxReturnPlan, route_response: bool, action_response: bool) -> String {
     if route_response {
         return match value {
@@ -2683,11 +2691,11 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
             AxReturnPlan::Redirect { target, status } => match status {
                 Some(status) => format!(
                     "    Ok(__ax_finalize_response(AxHttpResponse::redirect_with_status({status}, {}), __ax_headers, __ax_cookies))\n",
-                    render_owned_expr(target)
+                    render_redirect_target(target)
                 ),
                 None => format!(
                     "    Ok(__ax_finalize_response(AxHttpResponse::redirect({}), __ax_headers, __ax_cookies))\n",
-                    render_owned_expr(target)
+                    render_redirect_target(target)
                 ),
             },
             AxReturnPlan::PrivateResponse { .. } | AxReturnPlan::PublicResponse { .. } => "    Err(AxRuntimeError::message(\"invalid binary return location\"))\n".into(),
@@ -2721,7 +2729,7 @@ fn render_return_step(value: &AxReturnPlan, route_response: bool, action_respons
             }
             AxReturnPlan::Redirect { target, .. } => format!(
                 "    Ok(AxActionOutput::new(__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, Some({}))).with_cookies(__ax_cookies))\n",
-                render_string_expr(target)
+                render_redirect_target(target)
             ),
         };
     }
@@ -3679,7 +3687,10 @@ action publishPost(id: String, title: String) {
 }"#,
         )
         .expect("action redirect should compile");
-        assert!(module.contains("__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, Some((\"/admin\".to_string()).to_string()))"), "{module}");
+        assert!(
+            module.contains("Some(json!(&\"/admin\".to_string()).as_str()"),
+            "{module}"
+        );
     }
 
     #[test]
@@ -3690,7 +3701,57 @@ action publishPost(id: String, title: String) {
 }"#,
         )
         .expect("dynamic action redirect should compile");
-        assert!(module.contains("__ax_action_payload(ok_payload(), __ax_patches, __ax_invalidations, Some((input.destination).to_string()))"), "{module}");
+        assert!(
+            module.contains("Some(json!(&input.destination).as_str()"),
+            "{module}"
+        );
+    }
+
+    #[test]
+    fn redirects_extract_native_json_string_values_instead_of_serializing_them() {
+        for target in ["destination", "alias", "response.url"] {
+            let module = compile_backend_ax_to_module(&format!(
+                r#"
+action Complete() {{
+  data destination = Native.call("sample.destination", null)
+  data alias = destination
+  data response = Native.call("sample.response", null)
+  return redirect({target})
+}}
+"#
+            ))
+            .expect("native redirect should compile");
+            let expression = if target == "response.url" {
+                "&response[\"url\"]"
+            } else if target == "alias" {
+                "&alias"
+            } else {
+                "&destination"
+            };
+            assert!(
+                module.contains(&format!("Some(json!({expression}).as_str()")),
+                "{module}"
+            );
+            assert!(module.contains("Redirect target must be a string"));
+            syn::parse_file(&module).expect("generated redirect must be valid Rust");
+        }
+    }
+
+    #[test]
+    fn api_redirects_extract_native_strings_with_optional_status() {
+        for expression in ["redirect(destination)", "redirect(307, destination)"] {
+            let module = compile_backend_ax_to_module(&format!(
+                r#"
+route GET "/go" {{
+  data destination = Native.call("sample.destination", null)
+  return {expression}
+}}
+"#
+            ))
+            .expect("native API redirect should compile");
+            assert!(module.contains("json!(&destination).as_str()"), "{module}");
+            syn::parse_file(&module).expect("generated API redirect must be valid Rust");
+        }
     }
 
     #[test]
@@ -4073,7 +4134,7 @@ route GET "/admin"
 
         assert!(module.contains("AxRuntimeResult<AxHttpResponse>"));
         assert!(module.contains("AxHttpResponse::json(200, &json!(&posts))"));
-        assert!(module.contains(r#"AxHttpResponse::redirect("/next".to_string())"#));
+        assert!(module.contains(r#"AxHttpResponse::redirect(json!(&"/next".to_string()).as_str()"#));
         assert!(module.contains("AxHttpResponse::no_content()"));
         assert!(module.contains("AxHttpResponse::text(404, \"not found\")"));
         assert!(module.contains("AxHttpResponse::json(403, &json!({\"error\":\"forbidden\"}))"));

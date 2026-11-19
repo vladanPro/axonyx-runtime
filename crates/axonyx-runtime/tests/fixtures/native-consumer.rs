@@ -43,6 +43,7 @@ fn runtime(limits: AxNativeLimits) -> AxDatabaseRuntime<MemoryAdapter> {
 }
 
 fn main() {
+    native_redirect_proof();
     private_binary_proof();
     public_binary_proof();
     let valid = backend::validatePost("t".repeat(160), "s".repeat(120), "b".repeat(20000), "published".into()).unwrap();
@@ -267,6 +268,36 @@ fn private_binary_proof() {
     assert_eq!(denied.status,403);
     assert_eq!(denied.header_value("Cache-Control"),Some("private, no-store"));
     assert_eq!(denied.body.into_bytes(),b"forbidden");
+}
+
+fn native_redirect_proof() {
+    use serde_json::Value;
+    let mut registry = AxNativeRegistry::default();
+    registry.register("redirect.value", |value: Value| Ok::<_, ()>(value)).unwrap();
+    let runtime = AxDatabaseRuntime::new(AxEnv::new(), MemoryAdapter).with_native_functions(registry);
+    let source = include_str!("native-backend.ax");
+    let destination = "/admin/posts?page=2&q=news";
+    for (path, status) in [("/native-redirect", 302), ("/native-redirect-member", 307)] {
+        let request = AxHttpRequest::new("GET", path);
+        let compiled = backend::dispatch_api_route(&runtime, &request, false).unwrap().unwrap();
+        let preview = execute_preview_route_request_sources_with_runtime(
+            &[source], &request, &runtime, &mut AxPreviewStore::default(),
+        ).unwrap().unwrap();
+        assert_eq!(compiled.status, status);
+        assert_eq!(compiled.header_value("Location"), Some(destination));
+        assert_eq!(compiled.header_value("Location"), preview.headers.iter().find(|(name, _)| name.eq_ignore_ascii_case("Location")).map(|(_, value)| value.as_str()));
+    }
+    let request = AxHttpRequest::new("POST", "/native-redirect")
+        .with_body(b"destination=%2Fadmin%2Fposts%3Fpage%3D2%26q%3Dnews".to_vec());
+    let compiled = backend::dispatch_action(&runtime, &AxUnavailableFileStorage, "NativeRedirect", &request).unwrap().unwrap();
+    let preview = execute_preview_action_request_sources_with_runtime_and_storage(
+        &[source], "NativeRedirect", &request, &runtime, &AxUnavailableFileStorage, &mut AxPreviewStore::default(),
+    ).unwrap();
+    assert_eq!(compiled.payload["redirect"], destination);
+    assert_eq!(compiled.payload["redirect"].as_str(), preview.redirect_to.as_deref());
+    let error = backend::dispatch_api_route(&runtime, &AxHttpRequest::new("GET", "/native-redirect-invalid"), false).unwrap_err();
+    assert!(error.to_string().contains("Redirect target must be a string"));
+    println!("Native redirects: compiled/preview strings, aliases, members, status and non-string rejection passed");
 }
 
 fn public_binary_proof() {
