@@ -3,6 +3,27 @@ route GET "/prepare" {
   return json(prepared)
 }
 
+action NativeRedirect(destination: String) {
+  data value = Native.call("redirect.value", input.destination)
+  data alias = value
+  return redirect(alias)
+}
+
+route GET "/native-redirect" {
+  data destination = Native.call("redirect.value", "/admin/posts?page=2&q=news")
+  return redirect(destination)
+}
+
+route GET "/native-redirect-member" {
+  data result = Native.call("redirect.value", { url: "/admin/posts?page=2&q=news" })
+  return redirect(307, result.url)
+}
+
+route GET "/native-redirect-invalid" {
+  data destination = Native.call("redirect.value", 42)
+  return redirect(destination)
+}
+
 route GET "/invalid" {
   data prepared = Native.call("content.prepare", {text: 42})
   return json(prepared)
