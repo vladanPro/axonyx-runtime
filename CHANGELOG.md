@@ -6,6 +6,17 @@ The format is intentionally simple while the project is still early-stage.
 
 ## Unreleased
 
+## axonyx-core 0.8.4
+
+- Preserve native JSON string redirect targets in compiled actions and API
+  responses instead of serializing additional URL quote characters. Non-string
+  targets fail with a fixed error. Generated consumer coverage checks native
+  aliases, API members/status, exact action payloads and API preview parity.
+- Accept and preserve line comments in backend `.ax` parsing/formatting and
+  language-service diagnostics, already merged in development before this patch.
+- Only core is versioned for this patch. Runtime remains 0.8.4. Preview action
+  `return redirect(...)` parity is tracked separately in issue #298.
+
 ## 0.3.0 - 2026-09-06
 
 ### Added

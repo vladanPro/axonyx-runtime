@@ -116,6 +116,7 @@ fn is_raw_block_start(line: &str) -> bool {
 }
 
 fn is_indentation_sensitive_line(line: &str) -> bool {
+    let line = crate::ax_backend_parser::backend_code_before_comment(line);
     let text = line.trim_start();
     if ["where", "order", "limit", "offset"].iter().any(|keyword| {
         text.strip_prefix(keyword)
@@ -802,6 +803,25 @@ mod tests {
         parse_ax_v2(&format_ax_source(frontend)).expect("formatted ASX should parse");
         parse_backend_ax(&format_ax_source(backend))
             .expect("formatted backend source should parse");
+    }
+
+    #[test]
+    fn preserves_backend_doc_comments_and_ignores_braces_in_legacy_comments() {
+        let source = "/// Returns the endpoint.\nexport fn endpoint() -> String {\n// Keep // and } inside comments.\nreturn \"https://example.test\" // URL\n}\n";
+        let formatted = format_ax_source(source);
+        assert_eq!(formatted, "/// Returns the endpoint.\nexport fn endpoint() -> String {\n  // Keep // and } inside comments.\n  return \"https://example.test\" // URL\n}\n");
+        assert_eq!(format_ax_source(&formatted), formatted);
+        assert_eq!(
+            parse_backend_ax(&formatted).unwrap(),
+            parse_backend_ax(
+                "export fn endpoint() -> String {\n  return \"https://example.test\"\n}\n"
+            )
+            .unwrap()
+        );
+
+        let legacy = "/// Legacy loader.\nloader Posts // { not a body delimiter\n  data posts = db.posts.all()\n  return posts\n";
+        assert_eq!(format_ax_source(legacy), legacy);
+        parse_backend_ax(legacy).unwrap();
     }
 
     #[test]
