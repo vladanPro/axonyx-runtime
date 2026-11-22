@@ -37,7 +37,7 @@ use axonyx_core::ax_backend_lowering_prelude::{
 };
 use axonyx_core::ax_backend_parser::AxBackendParseError;
 use axonyx_core::ax_backend_parser_prelude::parse_backend_ax;
-use axonyx_core::ax_lowering::AxLowerError;
+use axonyx_core::ax_lowering::{take_scoped_head, AxLowerError};
 use axonyx_core::ax_lowering_prelude::{
     lower_document_with_head, lower_document_with_scope_and_imports, AxImportResolver, AxValue,
 };
@@ -430,7 +430,7 @@ fn compose_page_document(
     };
     let mut document = parse(page_source, 0)?;
     for (index, source) in layout_sources.iter().enumerate().rev() {
-        document = compose_layout_with_page(parse(source, index + 1)?, document);
+        document = compose_layout_with_page(parse(source, index + 1)?, document, index + 1);
     }
     Ok(document)
 }
@@ -1026,9 +1026,9 @@ pub fn preview_ax_route_stream_response_with_backend_and_imports(
     let page_document = parse_ax_auto(page_source)?;
     let mut document = page_document;
 
-    for layout_source in layout_sources.iter().rev() {
+    for (index, layout_source) in layout_sources.iter().enumerate().rev() {
         let layout_document = parse_ax_auto(layout_source)?;
-        document = compose_layout_with_page(layout_document, document);
+        document = compose_layout_with_page(layout_document, document, index + 1);
     }
 
     let handlers = collect_preview_handlers(loader_sources, action_sources, &[])?;
@@ -5099,11 +5099,20 @@ fn url_encode(value: &str) -> String {
     out
 }
 
-fn compose_layout_with_page(mut layout: AxDocument, page: AxDocument) -> AxDocument {
+fn compose_layout_with_page(
+    mut layout: AxDocument,
+    mut page: AxDocument,
+    depth: usize,
+) -> AxDocument {
     let page_name = page.page.name;
-    let page_head = page.head;
     let page_imports = page.imports;
-    let page_body = page.page.body;
+    let mut page_body = page.page.body;
+    if head_uses_bindings(&layout.head) || head_uses_bindings(&page.head) {
+        page_body.extend(take_scoped_head(&mut page.head, depth as i64));
+        page_body = vec![AxStatement::Component(
+            AxComponent::new("Fragment").block(page_body),
+        )];
+    }
 
     if !inject_slot_statements(&mut layout.page.body, &page_body) {
         layout.page.body.extend(page_body);
@@ -5111,8 +5120,25 @@ fn compose_layout_with_page(mut layout: AxDocument, page: AxDocument) -> AxDocum
 
     layout.page.name = page_name;
     layout.imports.extend(page_imports);
-    layout.head.merge(page_head);
+    layout.head.merge(page.head);
     layout
+}
+
+fn head_uses_bindings(head: &AxHead) -> bool {
+    head.title
+        .iter()
+        .chain(
+            head.metas
+                .iter()
+                .chain(&head.links)
+                .flat_map(|tag| tag.attrs.iter().map(|attr| &attr.value)),
+        )
+        .any(|expr| {
+            !matches!(
+                expr,
+                AxExpr::String(_) | AxExpr::Number(_) | AxExpr::Float(_) | AxExpr::Bool(_)
+            )
+        })
 }
 
 fn inject_slot_statements(statements: &mut Vec<AxStatement>, page_body: &[AxStatement]) -> bool {
@@ -8286,13 +8312,31 @@ return ASX {
 
     #[test]
     fn renders_compiled_head_metadata_from_page_bindings() {
-        let layout = r#"page Layout() {
+        let layout = r#"import { Shell } from "./Shell"
+page Layout() {
+  const title = "Outer layout"
   return ASX {
     <Head>
-      <Title>Legura</Title>
+      <Title>{title}</Title>
+      <Meta name="outer" content={title} />
       <Link rel="stylesheet" href="/site.css" />
     </Head>
-    <Slot />
+    <Shell><main><Slot /></main></Shell>
+  }
+}"#;
+        let inner_layout = r#"page Inner() {
+  const title = "Inner layout"
+  return ASX {
+    <Head>
+      <Title>{title}</Title>
+      <Meta name="inner" content={title} />
+    </Head>
+    <section><Slot /></section>
+  }
+}"#;
+        let shell = r#"component Shell() {
+  return ASX {
+    <div class="shell"><Slot /></div>
   }
 }"#;
         let page = r#"page Story() {
@@ -8307,7 +8351,7 @@ return ASX {
     <article>{story.title}</article>
   }
 }"#;
-        let document = compose_compiled_page_document(&[layout], page).unwrap();
+        let document = compose_compiled_page_document(&[layout, inner_layout], page).unwrap();
         let document_json = serde_json::to_string(&document).unwrap();
         for canonical in [json!("https://example.test/posts/story"), json!(null)] {
             let values = BTreeMap::from([(
@@ -8316,7 +8360,7 @@ return ASX {
             )]);
             let html = render_compiled_page_document(
                 &document_json,
-                &[],
+                &[("./Shell", shell)],
                 "/posts/story",
                 &BTreeMap::new(),
                 &values,
@@ -8327,12 +8371,22 @@ return ASX {
             assert!(head.contains("<title>Fish &amp; Chips | Legura</title>"));
             assert_eq!(head.matches("<title>").count(), 1);
             assert!(head.contains("content=\"A &quot;quoted&quot; &lt;story&gt;\""));
+            let outer = head
+                .find("<meta name=\"outer\" content=\"Outer layout\">")
+                .unwrap();
+            let inner = head
+                .find("<meta name=\"inner\" content=\"Inner layout\">")
+                .unwrap();
+            let description = head.find("<meta name=\"description\"").unwrap();
+            assert!(outer < inner && inner < description);
             assert!(head.contains("href=\"/site.css\""));
             assert_eq!(head.contains("rel=\"canonical\""), !canonical.is_null());
             if let Some(canonical) = canonical.as_str() {
                 assert!(head.contains(&format!("href=\"{canonical}\"")));
             }
             assert!(!body.contains("rel=\"canonical\""));
+            assert!(body.contains("<article>Fish &amp; Chips</article>"));
+            assert!(!body.contains("ax-scoped-head"));
         }
     }
 
@@ -8611,6 +8665,36 @@ page Home
         assert!(!html.contains("name=\"description\""));
         assert!(!html.contains("rel=\"canonical\""));
         assert!(html.contains("<article>Preview &amp; details</article>"));
+    }
+
+    #[test]
+    fn preview_nested_layout_resolves_metadata_from_the_page_scope() {
+        let html = preview_ax_route_stream_response_with_backend_and_imports(
+            &[r#"page Layout() {
+  const title = "Layout"
+  return ASX {
+    <Head><Title>{title}</Title></Head>
+    <section><Slot /></section>
+  }
+}"#],
+            &[],
+            &[],
+            r#"page Story() {
+  const title = "Story & notes"
+  return ASX {
+    <Head><Title>{title}</Title></Head>
+    <article>{title}</article>
+  }
+}"#,
+            "/story",
+            &AxPreviewStore::default(),
+            &|_: &str| None,
+        )
+        .unwrap();
+        let body = String::from_utf8(html.body.into_bytes()).unwrap();
+        assert!(body.contains("<title>Story &amp; notes</title>"));
+        assert!(!body.contains("<title>Layout</title>"));
+        assert!(body.contains("<section><article>Story &amp; notes</article></section>"));
     }
 
     #[test]
