@@ -39,7 +39,7 @@ use axonyx_core::ax_backend_parser::AxBackendParseError;
 use axonyx_core::ax_backend_parser_prelude::parse_backend_ax;
 use axonyx_core::ax_lowering::AxLowerError;
 use axonyx_core::ax_lowering_prelude::{
-    lower_document_with_scope_and_imports, AxImportResolver, AxValue,
+    lower_document_with_head, lower_document_with_scope_and_imports, AxImportResolver, AxValue,
 };
 use axonyx_core::ax_parser_auto::AxAutoParseError;
 use axonyx_core::ax_parser_auto_prelude::parse_ax_auto;
@@ -565,14 +565,20 @@ fn render_compiled_document(
             .iter()
             .find_map(|(name, contents)| (*name == source).then(|| (*contents).to_string()))
     };
-    let mut node =
-        lower_document_with_scope_and_imports(&document, scope, &resolver, &import_resolver)?;
+    let (mut node, head) = if full_document {
+        let (node, head) = lower_document_with_head(&document, scope, &resolver, &import_resolver)?;
+        (node, Some(head))
+    } else {
+        let node =
+            lower_document_with_scope_and_imports(&document, scope, &resolver, &import_resolver)?;
+        (node, None)
+    };
     if let Some(result) = form_result {
         result.apply_to_node(&mut node);
     }
-    if full_document {
+    if let Some(head) = head {
         return Ok(render_document_with_locale(
-            &document,
+            &head,
             &node,
             translator.map(|t| t.locale()),
         ));
@@ -607,14 +613,10 @@ pub fn preview_ax_page_stream_response(
     let document = parse_ax_auto(ax_source)?;
     let resolver = |_: &[String], _: &[AxValue]| None;
     let import_resolver = |_: &str| None;
-    let node = lower_document_with_scope_and_imports(
-        &document,
-        BTreeMap::new(),
-        &resolver,
-        &import_resolver,
-    )?;
+    let (node, head) =
+        lower_document_with_head(&document, BTreeMap::new(), &resolver, &import_resolver)?;
 
-    Ok(render_preview_document_response(&document, &node))
+    Ok(render_preview_document_response(&head, &node))
 }
 
 pub fn ax_page_route_definition(
@@ -1060,7 +1062,7 @@ pub fn preview_ax_route_stream_response_with_backend_and_imports(
         }
     };
 
-    let node = match lower_document_with_scope_and_imports(
+    let (node, head) = match lower_document_with_head(
         &document,
         route_scope.clone(),
         &resolver,
@@ -1079,7 +1081,7 @@ pub fn preview_ax_route_stream_response_with_backend_and_imports(
         return Err(runtime_error);
     }
 
-    Ok(render_preview_document_response(&document, &node))
+    Ok(render_preview_document_response(&head, &node))
 }
 
 pub fn preview_ax_route_with_request_context(
@@ -1342,7 +1344,7 @@ pub fn render_preview_route(
         }
     };
 
-    let mut node = match lower_document_with_scope_and_imports(
+    let (mut node, head) = match lower_document_with_head(
         &document,
         route_scope.clone(),
         &resolver,
@@ -1365,7 +1367,7 @@ pub fn render_preview_route(
         form.apply_to_node(&mut node);
     }
     Ok(render_document_with_locale(
-        &document,
+        &head,
         &node,
         translator.map(|t| t.locale()),
     ))
@@ -5184,31 +5186,24 @@ fn is_slot_component(component: &AxComponent) -> bool {
     component.name == "Slot"
 }
 
-fn render_document_with_locale(
-    document: &AxDocument,
-    root: &AxNode,
-    locale: Option<&str>,
-) -> String {
-    String::from_utf8(render_preview_document_chunks(document, root, locale).concat())
+fn render_document_with_locale(head: &AxHead, root: &AxNode, locale: Option<&str>) -> String {
+    String::from_utf8(render_preview_document_chunks(head, root, locale).concat())
         .expect("preview renderer only emits UTF-8 HTML")
 }
 
-fn render_preview_document_response(
-    document: &AxDocument,
-    root: &AxNode,
-) -> server::AxHttpResponse {
-    server::AxHttpResponse::html_stream(200, render_preview_document_chunks(document, root, None))
+fn render_preview_document_response(head: &AxHead, root: &AxNode) -> server::AxHttpResponse {
+    server::AxHttpResponse::html_stream(200, render_preview_document_chunks(head, root, None))
 }
 
 fn render_preview_document_chunks(
-    document: &AxDocument,
+    head: &AxHead,
     root: &AxNode,
     locale: Option<&str>,
 ) -> Vec<Vec<u8>> {
     let mut body = String::new();
     render_node(root, &mut body);
-    let head = render_head_html(&document.head);
-    let html_attrs = render_html_attrs(&document.head, locale);
+    let html_attrs = render_html_attrs(head, locale);
+    let head = render_head_html(head);
     let behavior_script = if body.contains("data-ax-behavior=") {
         ax_behavior_script()
     } else {
@@ -8290,6 +8285,58 @@ return ASX {
     }
 
     #[test]
+    fn renders_compiled_head_metadata_from_page_bindings() {
+        let layout = r#"page Layout() {
+  return ASX {
+    <Head>
+      <Title>Legura</Title>
+      <Link rel="stylesheet" href="/site.css" />
+    </Head>
+    <Slot />
+  }
+}"#;
+        let page = r#"page Story() {
+  data story = loadStory()
+  const title = story.title + " | Legura"
+  return ASX {
+    <Head>
+      <Title>{title}</Title>
+      <Meta name="description" content={story.description} />
+      <Link rel="canonical" href={story.canonical} />
+    </Head>
+    <article>{story.title}</article>
+  }
+}"#;
+        let document = compose_compiled_page_document(&[layout], page).unwrap();
+        let document_json = serde_json::to_string(&document).unwrap();
+        for canonical in [json!("https://example.test/posts/story"), json!(null)] {
+            let values = BTreeMap::from([(
+                compiled_loader_call_key("loadStory", &[]),
+                json!({ "title": "Fish & Chips", "description": "A \"quoted\" <story>", "canonical": canonical }),
+            )]);
+            let html = render_compiled_page_document(
+                &document_json,
+                &[],
+                "/posts/story",
+                &BTreeMap::new(),
+                &values,
+                None,
+            )
+            .unwrap();
+            let (head, body) = html.split_once("</head>").unwrap();
+            assert!(head.contains("<title>Fish &amp; Chips | Legura</title>"));
+            assert_eq!(head.matches("<title>").count(), 1);
+            assert!(head.contains("content=\"A &quot;quoted&quot; &lt;story&gt;\""));
+            assert!(head.contains("href=\"/site.css\""));
+            assert_eq!(head.contains("rel=\"canonical\""), !canonical.is_null());
+            if let Some(canonical) = canonical.as_str() {
+                assert!(head.contains(&format!("href=\"{canonical}\"")));
+            }
+            assert!(!body.contains("rel=\"canonical\""));
+        }
+    }
+
+    #[test]
     fn renders_compiled_page_ast_with_distinct_parameterized_loader_calls() {
         let document = parse_ax_auto(
             r#"page Posts() {
@@ -8542,6 +8589,28 @@ page Home
         assert!(html.contains("<meta name=\"description\" content=\"Docs without bloat\">"));
         assert!(html.contains("Runtime V2"));
         assert!(html.contains("Body from JSX-like .ax"));
+    }
+
+    #[test]
+    fn preview_stream_resolves_head_without_emitting_null_tags() {
+        let html = preview_ax_page(
+            r#"page Preview() {
+  const title = "Preview & details"
+  return ASX {
+    <Head>
+      <Title>{title}</Title>
+      <Meta name="description" content={null} />
+      <Link rel="canonical" href={null} />
+    </Head>
+    <article>{title}</article>
+  }
+}"#,
+        )
+        .unwrap();
+        assert!(html.contains("<title>Preview &amp; details</title>"));
+        assert!(!html.contains("name=\"description\""));
+        assert!(!html.contains("rel=\"canonical\""));
+        assert!(html.contains("<article>Preview &amp; details</article>"));
     }
 
     #[test]

@@ -158,13 +158,56 @@ pub fn lower_document_with_scope_and_imports(
     import_resolver: &impl AxImportResolver,
 ) -> Result<AxNode, AxLowerError> {
     let mut scope = initial_scope;
+    lower_document_body(document, &mut scope, resolver, import_resolver)
+}
+
+/// Resolve document metadata against the top-level page scope produced by body lowering.
+/// Fragment-only rendering should continue to use `lower_document_with_scope_and_imports`.
+pub fn lower_document_with_head(
+    document: &AxDocument,
+    mut scope: BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+    import_resolver: &impl AxImportResolver,
+) -> Result<(AxNode, AxHead), AxLowerError> {
+    let root = lower_document_body(document, &mut scope, resolver, import_resolver)?;
+    let evaluate = |expr: &AxExpr| eval_expr(expr, &document.functions, &scope, resolver);
+    let mut head = document.head.clone();
+    if let Some(title) = &mut head.title {
+        *title = AxExpr::String(evaluate(title)?.as_string());
+    }
+    lower_head_tags(&mut head.metas, "content", &evaluate)?;
+    lower_head_tags(&mut head.links, "href", &evaluate)?;
+    Ok((root, head))
+}
+
+fn lower_head_tags(
+    tags: &mut Vec<AxHeadTag>,
+    required_value: &str,
+    evaluate: &impl Fn(&AxExpr) -> Result<AxValue, AxLowerError>,
+) -> Result<(), AxLowerError> {
+    let mut resolved = Vec::with_capacity(tags.len());
+    'tag: for mut tag in std::mem::take(tags) {
+        for attr in &mut tag.attrs {
+            let value = evaluate(&attr.value)?;
+            if attr.name == required_value && value == AxValue::Null {
+                continue 'tag;
+            }
+            attr.value = AxExpr::String(value.as_string());
+        }
+        resolved.push(tag);
+    }
+    *tags = resolved;
+    Ok(())
+}
+
+fn lower_document_body(
+    document: &AxDocument,
+    scope: &mut BTreeMap<String, AxValue>,
+    resolver: &impl AxDataResolver,
+    import_resolver: &impl AxImportResolver,
+) -> Result<AxNode, AxLowerError> {
     scope.insert(AX_RENDER_PATH.to_string(), AxValue::String("0".to_string()));
-    apply_params_to_scope(
-        &document.page.params,
-        &mut scope,
-        &document.functions,
-        resolver,
-    )?;
+    apply_params_to_scope(&document.page.params, scope, &document.functions, resolver)?;
     let context = LoweringContext {
         sources: LoweringSources {
             functions: &document.functions,
@@ -174,7 +217,7 @@ pub fn lower_document_with_scope_and_imports(
         resolver,
         import_resolver,
     };
-    let children = lower_statements(&document.page.body, &context, &mut scope, None)?;
+    let children = lower_statements(&document.page.body, &context, scope, None)?;
 
     Ok(element_with_attrs(
         "main",
@@ -2172,6 +2215,7 @@ fn leak_tag(tag: String) -> &'static str {
 
 pub mod prelude {
     pub use super::lower_document;
+    pub use super::lower_document_with_head;
     pub use super::lower_document_with_scope;
     pub use super::lower_document_with_scope_and_imports;
     pub use super::AxDataResolver;
