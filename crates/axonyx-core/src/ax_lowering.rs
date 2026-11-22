@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
@@ -11,6 +12,34 @@ const AX_COMPONENT_INSTANCE_PATH: &str = "__ax_component_instance_path";
 const AX_EACH_RENDER_BINDING: &str = "__ax_each_render_binding";
 const AX_EACH_RENDER_PARAM_PREFIX: &str = "__ax_each_render_param:";
 const AX_EACH_RENDER_UNSUPPORTED: &str = "__ax_each_render_unsupported";
+// The NUL prefix cannot be authored as an ASX tag. Keep compiled AST compatibility.
+const AX_SCOPED_HEAD: &str = "\0ax-scoped-head";
+
+/// Move page metadata into an internal, non-rendering node for layout composition.
+/// Script and theme settings remain on the document with their existing semantics.
+pub fn take_scoped_head(head: &mut AxHead, depth: i64) -> Option<AxStatement> {
+    let mut entries = Vec::new();
+    if let Some(title) = head.title.take() {
+        entries.push(AxStatement::Component(
+            AxComponent::new("Title").inline(title),
+        ));
+    }
+    for (kind, tags) in [("Meta", &mut head.metas), ("Link", &mut head.links)] {
+        for tag in std::mem::take(tags) {
+            let mut entry = AxComponent::new(kind);
+            entry.props = tag.attrs;
+            entries.push(AxStatement::Component(entry));
+        }
+    }
+    if entries.is_empty() {
+        return None;
+    }
+    Some(AxStatement::Component(
+        AxComponent::new(AX_SCOPED_HEAD)
+            .prop("depth", depth)
+            .block(entries),
+    ))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AxValue {
@@ -158,10 +187,10 @@ pub fn lower_document_with_scope_and_imports(
     import_resolver: &impl AxImportResolver,
 ) -> Result<AxNode, AxLowerError> {
     let mut scope = initial_scope;
-    lower_document_body(document, &mut scope, resolver, import_resolver)
+    lower_document_body(document, &mut scope, resolver, import_resolver, None)
 }
 
-/// Resolve document metadata against the top-level page scope produced by body lowering.
+/// Resolve document metadata using the scopes established by body lowering.
 /// Fragment-only rendering should continue to use `lower_document_with_scope_and_imports`.
 pub fn lower_document_with_head(
     document: &AxDocument,
@@ -169,15 +198,34 @@ pub fn lower_document_with_head(
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
 ) -> Result<(AxNode, AxHead), AxLowerError> {
-    let root = lower_document_body(document, &mut scope, resolver, import_resolver)?;
-    let evaluate = |expr: &AxExpr| eval_expr(expr, &document.functions, &scope, resolver);
-    let mut head = document.head.clone();
+    let scoped_heads = RefCell::new(BTreeMap::new());
+    let root = lower_document_body(
+        document,
+        &mut scope,
+        resolver,
+        import_resolver,
+        Some(&scoped_heads),
+    )?;
+    let mut head = resolve_head(document.head.clone(), &document.functions, &scope, resolver)?;
+    for (_, scoped_head) in scoped_heads.into_inner() {
+        head.merge(scoped_head);
+    }
+    Ok((root, head))
+}
+
+fn resolve_head(
+    mut head: AxHead,
+    functions: &[AxFunctionDef],
+    scope: &BTreeMap<String, AxValue>,
+    resolver: &dyn AxDataResolver,
+) -> Result<AxHead, AxLowerError> {
+    let evaluate = |expr: &AxExpr| eval_expr(expr, functions, scope, resolver);
     if let Some(title) = &mut head.title {
         *title = AxExpr::String(evaluate(title)?.as_string());
     }
     lower_head_tags(&mut head.metas, "content", &evaluate)?;
     lower_head_tags(&mut head.links, "href", &evaluate)?;
-    Ok((root, head))
+    Ok(head)
 }
 
 fn lower_head_tags(
@@ -205,6 +253,7 @@ fn lower_document_body(
     scope: &mut BTreeMap<String, AxValue>,
     resolver: &impl AxDataResolver,
     import_resolver: &impl AxImportResolver,
+    scoped_heads: Option<&RefCell<BTreeMap<i64, AxHead>>>,
 ) -> Result<AxNode, AxLowerError> {
     scope.insert(AX_RENDER_PATH.to_string(), AxValue::String("0".to_string()));
     apply_params_to_scope(&document.page.params, scope, &document.functions, resolver)?;
@@ -216,6 +265,7 @@ fn lower_document_body(
         },
         resolver,
         import_resolver,
+        scoped_heads,
     };
     let children = lower_statements(&document.page.body, &context, scope, None)?;
 
@@ -240,6 +290,43 @@ struct LoweringContext<'a> {
     sources: LoweringSources<'a>,
     resolver: &'a dyn AxDataResolver,
     import_resolver: &'a dyn AxImportResolver,
+    scoped_heads: Option<&'a RefCell<BTreeMap<i64, AxHead>>>,
+}
+
+fn lower_scoped_head(
+    component: &AxComponent,
+    context: &LoweringContext<'_>,
+    scope: &BTreeMap<String, AxValue>,
+) -> Result<(), AxLowerError> {
+    let Some(heads) = context.scoped_heads else {
+        return Ok(());
+    };
+    let invalid = || AxLowerError::UnsupportedExpression {
+        message: "invalid composed head metadata".to_string(),
+    };
+    let (Some(AxExpr::Number(depth)), AxBody::Block(entries)) =
+        (component_prop_expr(component, &["depth"]), &component.body)
+    else {
+        return Err(invalid());
+    };
+    if heads.borrow().contains_key(depth) {
+        return Ok(());
+    }
+    let mut head = AxHead::default();
+    for entry in entries {
+        let AxStatement::Component(entry) = entry else {
+            return Err(invalid());
+        };
+        match (entry.name.as_str(), &entry.body) {
+            ("Title", AxBody::Inline(title)) => head.title = Some(title.clone()),
+            ("Meta", AxBody::Empty) => head.metas.push(AxHeadTag::new(entry.props.clone())),
+            ("Link", AxBody::Empty) => head.links.push(AxHeadTag::new(entry.props.clone())),
+            _ => return Err(invalid()),
+        }
+    }
+    let head = resolve_head(head, context.sources.functions, scope, context.resolver)?;
+    heads.borrow_mut().insert(*depth, head);
+    Ok(())
 }
 
 struct SlotContext<'a> {
@@ -511,6 +598,10 @@ fn lower_component_nodes(
         ..
     } = context.sources;
     let resolver = context.resolver;
+    if component.name == AX_SCOPED_HEAD {
+        lower_scoped_head(component, context, scope)?;
+        return Ok(Vec::new());
+    }
     if component.name == "Slot" {
         let Some(slot_context) = slot_context else {
             return Ok(Vec::new());
@@ -529,6 +620,7 @@ fn lower_component_nodes(
             sources: slot_context.sources,
             resolver: context.resolver,
             import_resolver: context.import_resolver,
+            scoped_heads: context.scoped_heads,
         };
         return lower_statements(
             &selected_body,
@@ -1878,6 +1970,7 @@ fn lower_imported_component_nodes(
             },
             resolver: context.resolver,
             import_resolver: context.import_resolver,
+            scoped_heads: context.scoped_heads,
         };
         return lower_local_component_nodes(
             component,
@@ -1929,6 +2022,7 @@ fn lower_imported_component_nodes(
         },
         resolver: context.resolver,
         import_resolver: context.import_resolver,
+        scoped_heads: context.scoped_heads,
     };
     lower_statements(
         &document.page.body,
@@ -1964,6 +2058,7 @@ fn lower_imported_component_only_nodes(
         },
         resolver: context.resolver,
         import_resolver: context.import_resolver,
+        scoped_heads: context.scoped_heads,
     };
     lower_local_component_nodes(
         component,
