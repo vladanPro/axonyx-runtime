@@ -6,6 +6,16 @@ The format is intentionally simple while the project is still early-stage.
 
 ## Unreleased
 
+## axonyx-core / axonyx-runtime 0.8.5
+
+- Resolve `Title`, `Meta`, and `Link` from top-level page bindings in
+  server-rendered documents. Preserve layout assets and escape rendered values.
+- Omit `Meta` with null content and `Link` with null href. Fragment rendering
+  and script/theme preflight behavior are unchanged.
+- Runtime 0.8.5 requires Core 0.8.5. Publish Core first and verify it is
+  resolvable from crates.io before publishing Runtime. See
+  [server-rendered metadata](docs/server-rendered-head.md) for scope and syntax.
+
 ## axonyx-core 0.8.4
 
 - Preserve native JSON string redirect targets in compiled actions and API
