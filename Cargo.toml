@@ -46,7 +46,8 @@ tokio-util = "=0.7.19"
 tokio-postgres-rustls = "=0.12.0"
 rustls = { version = "=0.23.35", default-features = false, features = ["ring", "std", "tls12"] }
 rustls-pemfile = "=2.2.0"
-webpki-roots = "=0.26.8"
+# Use the patched root store directly (RUSTSEC-2026-0381).
+webpki-roots = "=1.0.12"
 # Keep the TLS stack on Axonyx's Rust 1.82 MSRV.
 base64ct = "=1.7.3"
 zeroize = "=1.8.1"

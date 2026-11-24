@@ -75,7 +75,7 @@ dependencies = [
 
 [[package]]
 name = "axonyx-runtime"
-version = "0.8.6"
+version = "0.8.7"
 dependencies = [
  "argon2",
  "axonyx-core",
@@ -1697,9 +1697,9 @@ dependencies = [
 
 [[package]]
 name = "webpki-roots"
-version = "0.26.8"
+version = "1.0.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2210b291f7ea53617fbafcc4939f10914214ec15aace5ba62293a668f322c5c9"
+checksum = "7265c9301c16a8711c992c2d8da90ee77ef54b1ed51482d6dfeb00dc756b1297"
 dependencies = [
  "rustls-pki-types",
 ]
