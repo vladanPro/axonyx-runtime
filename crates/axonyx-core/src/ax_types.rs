@@ -926,6 +926,18 @@ impl AxDataContext {
                     Err(error) => Err(error),
                 }
             }
+            AxExpr::Call { path, args } if path.as_slice() == ["List", "length"] => {
+                let [value] = args.as_slice() else {
+                    return Err(AxTypeError::InvalidListLengthArity { actual: args.len() });
+                };
+                let ty = self.resolve_expr_type(value)?;
+                if !matches!(ty, AxType::List(_) | AxType::Unknown) {
+                    return Err(AxTypeError::InvalidListLengthType {
+                        found: ty.display_name(),
+                    });
+                }
+                Ok(AxType::Int)
+            }
             AxExpr::Call { .. } => Ok(AxType::Unknown),
         }
     }
@@ -1277,6 +1289,10 @@ fn is_type_identifier(input: &str) -> bool {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxTypeError {
+    #[error("List.length expects one argument, got {actual}")]
+    InvalidListLengthArity { actual: usize },
+    #[error("List.length expects List<T>, found {found}")]
+    InvalidListLengthType { found: String },
     #[error(
         "`+` requires two numbers or a String with a scalar operand; found {left} and {right}"
     )]
@@ -1777,6 +1793,29 @@ mod tests {
 
         assert_eq!(error.path, "$.title");
         assert_eq!(error.actual, "missing");
+    }
+
+    #[test]
+    fn resolves_list_length_as_int_and_rejects_wrong_arguments() {
+        let context = AxDataContext::new()
+            .with_binding("posts", AxType::list(AxType::record("Post")))
+            .with_binding("title", AxType::String);
+        let call = |args: Vec<AxExpr>| AxExpr::call(["List", "length"], args);
+
+        assert_eq!(
+            context.resolve_expr_type(&call(vec![AxExpr::ident("posts")])),
+            Ok(AxType::Int)
+        );
+        assert_eq!(
+            context.resolve_expr_type(&call(vec![AxExpr::ident("title")])),
+            Err(AxTypeError::InvalidListLengthType {
+                found: "String".to_string(),
+            })
+        );
+        assert_eq!(
+            context.resolve_expr_type(&call(vec![])),
+            Err(AxTypeError::InvalidListLengthArity { actual: 0 })
+        );
     }
 
     #[test]

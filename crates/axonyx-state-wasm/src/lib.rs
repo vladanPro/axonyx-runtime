@@ -22,6 +22,7 @@ const AX_EACH_RECONCILE_MAX_KEYS: usize = 4096;
 const AX_EACH_RENDER_MAX_PATHS: usize = 256;
 const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
 const AX_EXPRESSION_STACK_MAX_VALUES: usize = 4096;
+const AX_EXPRESSION_LIST_LENGTH: u8 = 52;
 
 static mut STRING_BUFFER: [u8; AX_STATE_STRING_CAPACITY] = [0; AX_STATE_STRING_CAPACITY];
 static mut VALUE_BUFFER: [u8; AX_STATE_VALUE_CAPACITY] = [0; AX_STATE_VALUE_CAPACITY];
@@ -439,6 +440,12 @@ fn evaluate_expression_program(program: &[u8], dependencies: &[ExprValue]) -> Op
                 }
                 let values = pop_expression_values(&mut stack, count)?;
                 stack.push(ExprValue::Object(keys.into_iter().zip(values).collect()));
+            }
+            AX_EXPRESSION_LIST_LENGTH => {
+                let ExprValue::List(items) = stack.pop()? else {
+                    return None;
+                };
+                stack.push(ExprValue::Int(i64::try_from(items.len()).ok()?));
             }
             _ => return None,
         }
@@ -1020,6 +1027,18 @@ mod tests {
             decode_expr_value(result, 0),
             Some((ExprValue::Bool(true), 5))
         );
+    }
+
+    #[test]
+    fn counts_items_in_a_reactive_list() {
+        let program = b"AXE\x01\x00\x00\x00\x34";
+        let count = |value| evaluate_expression_program(program, &[value]);
+        assert_eq!(
+            count(ExprValue::List(vec![ExprValue::Null, ExprValue::Null])),
+            Some(ExprValue::Int(2))
+        );
+        assert_eq!(count(ExprValue::List(vec![])), Some(ExprValue::Int(0)));
+        assert_eq!(count(ExprValue::String("not a list".to_string())), None);
     }
 
     #[test]

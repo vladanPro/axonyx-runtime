@@ -1062,6 +1062,7 @@ const AX_EXPR_MEMBER: u8 = 41;
 const AX_EXPR_OPTIONAL_MEMBER: u8 = 42;
 const AX_EXPR_BUILD_LIST: u8 = 50;
 const AX_EXPR_BUILD_OBJECT: u8 = 51;
+const AX_EXPR_LIST_LENGTH: u8 = 52;
 const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
 
 fn is_reactive_boolean_attr(name: &str) -> bool {
@@ -1255,6 +1256,21 @@ fn expand_pure_reactive_expression(
             )?),
             property: property.clone(),
         },
+        AxExpr::Call { path, args } if path.as_slice() == ["List", "length"] => {
+            let [value] = args.as_slice() else {
+                return Err("List.length expects one argument".to_string());
+            };
+            AxExpr::Call {
+                path: path.clone(),
+                args: vec![expand_pure_reactive_expression(
+                    value,
+                    bindings,
+                    locals,
+                    local_stack,
+                    call_stack,
+                )?],
+            }
+        }
         AxExpr::Call { path, args } => {
             let [name] = path.as_slice() else {
                 return Err(format!("`{}` is not a local pure function", path.join(".")));
@@ -1461,6 +1477,13 @@ fn compile_reactive_expression_node(
                 AX_EXPR_OPTIONAL_MEMBER
             });
             push_program_string(program, property)?;
+        }
+        AxExpr::Call { path, args } if path.as_slice() == ["List", "length"] => {
+            let [value] = args.as_slice() else {
+                return Err("List.length expects one argument".to_string());
+            };
+            compile_reactive_expression_node(value, bindings, dependencies, program)?;
+            program.push(AX_EXPR_LIST_LENGTH);
         }
         AxExpr::Call { path, .. } => {
             return Err(format!(

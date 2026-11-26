@@ -44,6 +44,9 @@ try {
   });
 
   await page.goto(origin, { waitUntil: "domcontentloaded" });
+  if ((await page.locator("#post-count").textContent()) !== "2") {
+    throw new Error("server-rendered List.length did not count initial rows");
+  }
   for (const [id, expected] of [["addition-label", "Count: 2"], ["addition-suffix", "2 items"], ["addition-total", "2.5"], ["addition-flag", "enabled=true"]]) {
     if ((await page.locator(`#${id}`).textContent()) !== expected) {
       throw new Error(`SSR addition mismatch for ${id}`);
@@ -79,6 +82,7 @@ try {
   await page.locator("#insert").click();
   const inserted = list.locator('ax-each-item[data-ax-each-key="third"]');
   await inserted.waitFor();
+  await page.waitForFunction(() => document.querySelector("#post-count")?.textContent === "3");
   if ((await inserted.locator("strong").count()) !== 0) throw new Error("inserted text was interpreted as HTML");
   if ((await inserted.locator("span").textContent()) !== "<strong>Literal</strong>") {
     throw new Error("inserted text was not preserved literally");
@@ -92,6 +96,7 @@ try {
   }
 
   await page.locator("#remove").click();
+  await page.waitForFunction(() => document.querySelector("#post-count")?.textContent === "2");
   if ((await list.locator('ax-each-item[data-ax-each-key="second"]').count()) !== 0) {
     throw new Error("removed keyed boundary remained in the DOM");
   }
