@@ -6850,6 +6850,16 @@ fn ax_state_bridge_script() -> &'static str {
   const updateExpression = (entry) => {
     const value = evaluateWasmExpression(entry);
     if (value === undefined) return false;
+    if (entry.each) {
+      if (!Array.isArray(value)) {
+        rejectExpression(entry.node, entry.index, "each-target-type-mismatch");
+        return false;
+      }
+      if (!stateValuesEqual(entry.each.items, value, "Unknown")
+        && !reconcileEach(entry.each, value)) return false;
+      executorStats.expressionEvaluations += 1;
+      return true;
+    }
     if (entry.target.startsWith("boolean:") && typeof value !== "boolean") {
       rejectExpression(entry.node, entry.index, "boolean-target-type-mismatch");
       return false;
@@ -6898,7 +6908,9 @@ fn ax_state_bridge_script() -> &'static str {
         rejectExpression(node, index, "invalid-dependencies");
         continue;
       }
-      const validTarget = target === "text"
+      const eachTarget = target === "each" && count === 1
+        && node.matches('ax-state-each[data-ax-each-protocol="ax-each/1"]:not([data-ax-each-signal])');
+      const validTarget = eachTarget || target === "text"
         || target?.startsWith("boolean:")
           && expressionBooleanTargets.has(target.slice("boolean:".length));
       if (!validTarget) {
@@ -6912,7 +6924,9 @@ fn ax_state_bridge_script() -> &'static str {
         if (!state.has(signal)) state.set(signal, castValue(initials[dependencyIndex], type));
       });
       const expressionId = `expression:${index}:${signals.join("|")}`;
-      const capability = registerDomCapability(
+      const each = eachTarget ? prepareEach(node, expressionId, "Unknown") : undefined;
+      if (eachTarget && !each) continue;
+      const capability = eachTarget ? undefined : registerDomCapability(
         node,
         expressionId,
         target,
@@ -6920,7 +6934,7 @@ fn ax_state_bridge_script() -> &'static str {
         "expression",
         true,
       );
-      if (!capability) {
+      if (!each && !capability) {
         rejectExpression(node, index, "capability-rejected");
         continue;
       }
@@ -6932,6 +6946,7 @@ fn ax_state_bridge_script() -> &'static str {
         types: dependencyTypes,
         target,
         capability,
+        each,
       };
       expressionEntries.push(entry);
       indexExpressionEntry(entry);
@@ -7224,7 +7239,10 @@ fn ax_state_bridge_script() -> &'static str {
         anchor = node;
       }
     });
-    if (entry.emptyNode) entry.emptyNode.hidden = nextKeys.length !== 0;
+    if (entry.emptyNode) {
+      entry.emptyNode.hidden = nextKeys.length !== 0;
+      entry.emptyNode.style.display = nextKeys.length === 0 ? "contents" : "none";
+    }
     entry.items = nextValue;
     entry.itemsNodes = Array.from(entry.node.children)
       .filter((node) => node.matches("ax-each-item[data-ax-each-key-id]"));
@@ -7236,12 +7254,7 @@ fn ax_state_bridge_script() -> &'static str {
     return true;
   };
 
-  const registerEach = (node) => {
-    if (node.getAttribute("data-ax-each-protocol") !== "ax-each/1") return;
-    const rawSignal = node.getAttribute("data-ax-each-signal");
-    if (!rawSignal) return;
-    const signal = canonicalSignal(rawSignal);
-    const type = node.getAttribute("data-ax-each-type") || "Unknown";
+  const prepareEach = (node, signal, type) => {
     const items = castValue(node.getAttribute("data-ax-each-initial") || "[]", type);
     const itemsNodes = Array.from(node.children)
       .filter((child) => child.matches("ax-each-item[data-ax-each-key-id]"));
@@ -7261,11 +7274,22 @@ fn ax_state_bridge_script() -> &'static str {
     };
     const domKeys = itemsNodes.map((child) => child.getAttribute("data-ax-each-key-id"));
     const initialKeys = eachKeys(entry.items, entry.keyPath, entry.keyKind);
-    if (!initialKeys || domKeys.length !== initialKeys.length
+    if (!Array.isArray(items) || !initialKeys || domKeys.length !== initialKeys.length
       || domKeys.some((key, index) => key !== initialKeys[index])) {
       rejectEach(entry, "initial-dom-key-mismatch", entry.items);
       return;
     }
+    return entry;
+  };
+
+  const registerEach = (node) => {
+    if (node.getAttribute("data-ax-each-protocol") !== "ax-each/1") return;
+    const rawSignal = node.getAttribute("data-ax-each-signal");
+    if (!rawSignal) return;
+    const signal = canonicalSignal(rawSignal);
+    const type = node.getAttribute("data-ax-each-type") || "Unknown";
+    const entry = prepareEach(node, signal, type);
+    if (!entry) return;
     if (!types.has(signal)) types.set(signal, type);
     if (!state.has(signal)) state.set(signal, entry.items);
     if (!eachBindings.has(signal)) eachBindings.set(signal, []);

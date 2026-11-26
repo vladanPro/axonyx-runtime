@@ -63,7 +63,7 @@ try {
     || (await page.locator("#addition-total").textContent()) !== "3.5") {
     throw new Error("reactive WASM addition differs from SSR semantics");
   }
-  const list = page.locator('ax-state-each[data-ax-each-render-status="ready"]');
+  const list = page.locator('ax-state-each[data-ax-each-render-status="ready"][data-ax-each-signal]');
   const firstItem = list.locator('ax-each-item[data-ax-each-key="first"]');
   const firstHandle = await firstItem.elementHandle();
   await firstItem.locator("input").focus();
@@ -127,6 +127,30 @@ try {
   if (diagnostics.eachRefreshesRequired !== 1) {
     throw new Error(`expected one refresh fallback, got ${diagnostics.eachRefreshesRequired}`);
   }
+
+  const derived = page.locator('ax-state-each[data-ax-expression-0-target="each"]');
+  const derivedRows = derived.locator(":scope > ax-each-item");
+  const empty = derived.getByText("No rows", { exact: true });
+  const keys = () => derivedRows.evaluateAll((nodes) => nodes.map((node) => node.dataset.axEachKey).join(","));
+  if ((await keys()) !== "a,b" || await empty.isVisible()) {
+    throw new Error("server-rendered derived list or its empty state is incorrect");
+  }
+  const existing = derived.locator('ax-each-item[data-ax-each-key="a"]');
+  const existingHandle = await existing.elementHandle();
+  await page.locator("#derived-reorder").click();
+  await page.waitForFunction(() => document.querySelector(
+    'ax-state-each[data-ax-expression-0-target="each"] > ax-each-item',
+  )?.dataset.axEachKey === "b");
+  if ((await keys()) !== "b,a"
+    || !(await existing.evaluate((node, original) => node === original, existingHandle))) {
+    throw new Error("derived reorder did not retain the keyed DOM boundary");
+  }
+  await page.locator("#derived-clear").click();
+  await empty.waitFor();
+  if (await derivedRows.count()) throw new Error("derived empty list retained rows");
+  await page.locator("#derived-reset").click();
+  await empty.waitFor({ state: "hidden" });
+  if ((await keys()) !== "a,b") throw new Error("derived list did not restore rows after clearing");
   if (localRequests.length !== 0) throw new Error(`local reconciliation made requests: ${localRequests.join(", ")}`);
   if (consoleErrors.length !== 0) throw new Error(`browser console errors: ${consoleErrors.join(" | ")}`);
 

@@ -9,6 +9,12 @@ page ReactiveEachProbe() {
   state enabled: Bool = true
   state posts = [{ id: "first", title: "Alpha", disabled: false }, { id: "second", title: "Beta", disabled: true }]
   state fallbackPosts = [{ id: "fallback", title: "Stable", visible: true }]
+  type Row {
+    id: String
+    title: String
+  }
+  state rowSets: List<List<Row>> = [[{ id: "a", title: "Alpha" }, { id: "b", title: "Beta" }], [{ id: "b", title: "Beta" }, { id: "a", title: "Alpha" }], []]
+  state selectedRows: Int = 0
 
   return ASX {
     <>
@@ -34,6 +40,13 @@ page ReactiveEachProbe() {
 
       <Each items={fallbackPosts} as="post" key={post.id}>
         <If when={post.visible}><span>{post.title}</span></If>
+      </Each>
+      <button id="derived-reorder" on:click={selectedRows = 1}>Change order</button>
+      <button id="derived-clear" on:click={selectedRows = 2}>Clear rows</button>
+      <button id="derived-reset" on:click={selectedRows = 0}>Reset rows</button>
+      <Each items={rowSets[selectedRows]} as="row" key={row.id}>
+        <article>{row.title}</article>
+        <Empty><p>No rows</p></Empty>
       </Each>
     </>
   }
