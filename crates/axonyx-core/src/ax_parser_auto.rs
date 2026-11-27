@@ -1079,6 +1079,31 @@ const AX_EXPR_BUILD_LIST: u8 = 50;
 const AX_EXPR_BUILD_OBJECT: u8 = 51;
 const AX_EXPR_LIST_LENGTH: u8 = 52;
 const AX_EXPR_LIST_FILTER_EQ: u8 = 53;
+const AX_EXPR_LIST_SORT_BY: u8 = 54;
+
+fn list_field_opcode(path: &[String]) -> Option<u8> {
+    match path {
+        [namespace, name] if namespace == "List" => match name.as_str() {
+            "filterEq" => Some(AX_EXPR_LIST_FILTER_EQ),
+            "sortBy" => Some(AX_EXPR_LIST_SORT_BY),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn list_field_arguments<'a>(
+    path: &[String],
+    args: &'a [AxExpr],
+) -> Result<(&'a AxExpr, &'a String, &'a AxExpr), String> {
+    match args {
+        [list, AxExpr::String(field), value] if !field.is_empty() => Ok((list, field, value)),
+        _ => Err(format!(
+            "{} expects a list, nonempty literal field name, and text value",
+            path.join(".")
+        )),
+    }
+}
 const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
 
 fn is_reactive_boolean_attr(name: &str) -> bool {
@@ -1287,15 +1312,8 @@ fn expand_pure_reactive_expression(
                 )?],
             }
         }
-        AxExpr::Call { path, args } if path.as_slice() == ["List", "filterEq"] => {
-            let [list, AxExpr::String(field), value] = args.as_slice() else {
-                return Err(
-                    "List.filterEq expects a list, literal field name, and text value".to_string(),
-                );
-            };
-            if field.is_empty() {
-                return Err("List.filterEq expects a nonempty field name".to_string());
-            }
+        AxExpr::Call { path, args } if list_field_opcode(path).is_some() => {
+            let (list, field, value) = list_field_arguments(path, args)?;
             AxExpr::Call {
                 path: path.clone(),
                 args: vec![
@@ -1531,22 +1549,18 @@ fn compile_reactive_expression_node(
             compile_reactive_expression_node(value, bindings, dependencies, program)?;
             program.push(AX_EXPR_LIST_LENGTH);
         }
-        AxExpr::Call { path, args } if path.as_slice() == ["List", "filterEq"] => {
-            let [list, AxExpr::String(field), value] = args.as_slice() else {
-                return Err(
-                    "List.filterEq expects a list, literal field name, and text value".to_string(),
-                );
+        AxExpr::Call { path, args } => {
+            let Some(opcode) = list_field_opcode(path) else {
+                return Err(format!(
+                    "pure function `{}` could not be fully inlined",
+                    path.join(".")
+                ));
             };
+            let (list, field, value) = list_field_arguments(path, args)?;
             compile_reactive_expression_node(list, bindings, dependencies, program)?;
             compile_reactive_expression_node(value, bindings, dependencies, program)?;
-            program.push(AX_EXPR_LIST_FILTER_EQ);
+            program.push(opcode);
             push_program_string(program, field)?;
-        }
-        AxExpr::Call { path, .. } => {
-            return Err(format!(
-                "pure function `{}` could not be fully inlined",
-                path.join(".")
-            ));
         }
         AxExpr::List(items) => {
             let count = reactive_collection_count(items.len(), "list")?;

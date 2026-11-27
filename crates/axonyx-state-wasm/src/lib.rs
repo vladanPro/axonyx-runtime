@@ -24,6 +24,7 @@ const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
 const AX_EXPRESSION_STACK_MAX_VALUES: usize = 4096;
 const AX_EXPRESSION_LIST_LENGTH: u8 = 52;
 const AX_EXPRESSION_LIST_FILTER_EQ: u8 = 53;
+const AX_EXPRESSION_LIST_SORT_BY: u8 = 54;
 
 static mut STRING_BUFFER: [u8; AX_STATE_STRING_CAPACITY] = [0; AX_STATE_STRING_CAPACITY];
 static mut VALUE_BUFFER: [u8; AX_STATE_VALUE_CAPACITY] = [0; AX_STATE_VALUE_CAPACITY];
@@ -448,7 +449,7 @@ fn evaluate_expression_program(program: &[u8], dependencies: &[ExprValue]) -> Op
                 };
                 stack.push(ExprValue::Int(i64::try_from(items.len()).ok()?));
             }
-            AX_EXPRESSION_LIST_FILTER_EQ => {
+            AX_EXPRESSION_LIST_FILTER_EQ | AX_EXPRESSION_LIST_SORT_BY => {
                 let field = read_program_string(program, &mut cursor)?;
                 let ExprValue::String(expected) = stack.pop()? else {
                     return None;
@@ -456,11 +457,27 @@ fn evaluate_expression_program(program: &[u8], dependencies: &[ExprValue]) -> Op
                 let ExprValue::List(mut items) = stack.pop()? else {
                     return None;
                 };
-                items.retain(|item| {
-                    matches!(item, ExprValue::Object(fields)
-                    if fields.iter().any(|(name, value)| name == &field
-                        && matches!(value, ExprValue::String(text) if text == &expected)))
-                });
+                if opcode == AX_EXPRESSION_LIST_FILTER_EQ {
+                    items.retain(|item| expr_text_field(item, &field) == Some(expected.as_str()));
+                } else {
+                    let descending = match expected.as_str() {
+                        "asc" => false,
+                        "desc" => true,
+                        _ => return None,
+                    };
+                    items.sort_by(|left, right| {
+                        match (
+                            expr_text_field(left, &field),
+                            expr_text_field(right, &field),
+                        ) {
+                            (Some(left), Some(right)) if descending => right.cmp(left),
+                            (Some(left), Some(right)) => left.cmp(right),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    });
+                }
                 stack.push(ExprValue::List(items));
             }
             _ => return None,
@@ -470,6 +487,16 @@ fn evaluate_expression_program(program: &[u8], dependencies: &[ExprValue]) -> Op
         }
     }
     (stack.len() == 1).then(|| stack.pop()).flatten()
+}
+
+fn expr_text_field<'a>(item: &'a ExprValue, field: &str) -> Option<&'a str> {
+    let ExprValue::Object(fields) = item else {
+        return None;
+    };
+    fields.iter().find_map(|(name, value)| match value {
+        ExprValue::String(text) if name == field => Some(text.as_str()),
+        _ => None,
+    })
 }
 
 fn read_program_u16(program: &[u8], cursor: &mut usize) -> Option<usize> {
@@ -1043,6 +1070,47 @@ mod tests {
             decode_expr_value(result, 0),
             Some((ExprValue::Bool(true), 5))
         );
+    }
+
+    #[test]
+    fn sorts_text_stably_with_missing_fields_last() {
+        let program = b"AXE\x01\x00\x00\x00\x00\x01\x00\x36\x05\x00\x00\x00title";
+        let row = |id: &str, title: &str| {
+            ExprValue::Object(vec![
+                ("id".to_string(), ExprValue::String(id.to_string())),
+                ("title".to_string(), ExprValue::String(title.to_string())),
+            ])
+        };
+        let one = row("one", "Alpha");
+        let two = row("two", "Alpha");
+        let three = row("three", "Zulu");
+        let missing = ExprValue::Object(vec![]);
+        let items = ExprValue::List(vec![
+            missing.clone(),
+            one.clone(),
+            three.clone(),
+            two.clone(),
+        ]);
+        let sort = |direction: &str| {
+            evaluate_expression_program(
+                program,
+                &[items.clone(), ExprValue::String(direction.to_string())],
+            )
+        };
+        assert_eq!(
+            sort("asc"),
+            Some(ExprValue::List(vec![
+                one.clone(),
+                two.clone(),
+                three.clone(),
+                missing.clone()
+            ]))
+        );
+        assert_eq!(
+            sort("desc"),
+            Some(ExprValue::List(vec![three, one, two, missing]))
+        );
+        assert_eq!(sort("up"), None);
     }
 
     #[test]

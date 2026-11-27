@@ -188,6 +188,17 @@ try {
     || !(await nativeFilteredRows.first().evaluate((node) => node.classList.contains("ax-table__row")))) {
     throw new Error("native table did not render first matches as styled tr children");
   }
+  const firstDraft = nativeFilter.locator(':scope > tr[data-ax-each-key="draft-a"]');
+  const firstDraftHandle = await firstDraft.elementHandle();
+  await page.locator("#sort-desc").click();
+  if (JSON.stringify(await nativeFilteredRows.allTextContents()) !== JSON.stringify([...expectedDrafts].reverse())
+    || !(await firstDraft.evaluate((node, original) => node === original, firstDraftHandle))) {
+    throw new Error("descending title sort replaced rows or changed filter results");
+  }
+  await page.locator("#sort-asc").click();
+  if (JSON.stringify(await nativeFilteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)) {
+    throw new Error("ascending title sort did not restore the order");
+  }
   await page.locator("#filter-published").click();
   await filtered.getByText("Published post", { exact: true }).waitFor();
   if (await filteredRows.count() !== 1) throw new Error("published filter kept other rows");

@@ -21,6 +21,8 @@ The format is intentionally simple while the project is still early-stage.
   nonempty state list, without running server data callbacks for the sample.
 - Reconcile a keyed `Each` directly in native `tbody`, preserving `tr`
   identity, Foundry row attributes, and optional empty rows.
+- Add stable text `List.sortBy(rows, "title", direction)` for Pages and WASM.
+  It composes with filters and does not mutate the original list.
 
 ## axonyx-core / axonyx-runtime 0.8.5
 
