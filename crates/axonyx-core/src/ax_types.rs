@@ -938,18 +938,32 @@ impl AxDataContext {
                 }
                 Ok(AxType::Int)
             }
-            AxExpr::Call { path, args } if path.as_slice() == ["List", "filterEq"] => {
+            AxExpr::Call { path, args }
+                if matches!(path.as_slice(), [base, name]
+                if base == "List" && matches!(name.as_str(), "filterEq" | "sortBy")) =>
+            {
+                let operation = if path[1] == "sortBy" {
+                    "sortBy"
+                } else {
+                    "filterEq"
+                };
                 let [list, AxExpr::String(field), expected] = args.as_slice() else {
-                    return Err(AxTypeError::InvalidListFilterArguments);
+                    return Err(AxTypeError::InvalidListFieldArguments { operation });
                 };
                 if field.is_empty() {
-                    return Err(AxTypeError::InvalidListFilterArguments);
+                    return Err(AxTypeError::InvalidListFieldArguments { operation });
+                }
+                if operation == "sortBy"
+                    && matches!(expected, AxExpr::String(direction) if !matches!(direction.as_str(), "asc" | "desc"))
+                {
+                    return Err(AxTypeError::InvalidListSortDirection);
                 }
                 let item = match self.resolve_expr_type(list)? {
                     AxType::List(item) => item,
                     AxType::Unknown => Box::new(AxType::Unknown),
                     other => {
-                        return Err(AxTypeError::InvalidListFilterSource {
+                        return Err(AxTypeError::InvalidListFieldSource {
+                            operation,
                             found: other.display_name(),
                         })
                     }
@@ -960,8 +974,9 @@ impl AxDataContext {
                     other => other,
                 };
                 for ty in [field_type, &self.resolve_expr_type(expected)?] {
-                    if !self.is_filter_text_type(ty) {
-                        return Err(AxTypeError::InvalidListFilterTextType {
+                    if !self.is_list_text_type(ty) {
+                        return Err(AxTypeError::InvalidListFieldTextType {
+                            operation,
                             found: ty.display_name(),
                         });
                     }
@@ -1029,7 +1044,7 @@ impl AxDataContext {
         }
     }
 
-    fn is_filter_text_type(&self, ty: &AxType) -> bool {
+    fn is_list_text_type(&self, ty: &AxType) -> bool {
         match ty {
             AxType::String | AxType::Unknown => true,
             AxType::Record(name) => self.literal_union(name).is_some(),
@@ -1327,12 +1342,20 @@ fn is_type_identifier(input: &str) -> bool {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxTypeError {
-    #[error("List.filterEq expects a list, a nonempty literal field name, and a text value")]
-    InvalidListFilterArguments,
-    #[error("List.filterEq expects List<T>, found {found}")]
-    InvalidListFilterSource { found: String },
-    #[error("List.filterEq expects a text field and value, found {found}")]
-    InvalidListFilterTextType { found: String },
+    #[error("List.{operation} expects a list, a nonempty literal field name, and a text value")]
+    InvalidListFieldArguments { operation: &'static str },
+    #[error("List.{operation} expects List<T>, found {found}")]
+    InvalidListFieldSource {
+        operation: &'static str,
+        found: String,
+    },
+    #[error("List.{operation} expects a text field and value, found {found}")]
+    InvalidListFieldTextType {
+        operation: &'static str,
+        found: String,
+    },
+    #[error("List.sortBy expects direction `asc` or `desc`")]
+    InvalidListSortDirection,
     #[error("List.length expects one argument, got {actual}")]
     InvalidListLengthArity { actual: usize },
     #[error("List.length expects List<T>, found {found}")]
@@ -1840,6 +1863,29 @@ mod tests {
     }
 
     #[test]
+    fn sorts_text_lists_without_losing_their_item_type() {
+        let posts = AxType::list(AxType::record("Post"));
+        let context = AxDataContext::new()
+            .with_record(AxRecordType::new("Post").field("title", AxType::String))
+            .with_binding("posts", posts.clone());
+        let sort = |direction| {
+            AxExpr::call(
+                ["List", "sortBy"],
+                [
+                    AxExpr::ident("posts"),
+                    AxExpr::string("title"),
+                    AxExpr::string(direction),
+                ],
+            )
+        };
+        assert_eq!(context.resolve_expr_type(&sort("asc")), Ok(posts));
+        assert_eq!(
+            context.resolve_expr_type(&sort("up")),
+            Err(AxTypeError::InvalidListSortDirection)
+        );
+    }
+
+    #[test]
     fn filters_a_typed_list_without_losing_its_record_contract() {
         let posts = AxType::list(AxType::record("Post"));
         let context = AxDataContext::new()
@@ -1867,11 +1913,17 @@ mod tests {
         ));
         assert!(matches!(
             context.resolve_expr_type(&filter("views", AxExpr::string("10"))),
-            Err(AxTypeError::InvalidListFilterTextType { .. })
+            Err(AxTypeError::InvalidListFieldTextType {
+                operation: "filterEq",
+                ..
+            })
         ));
         assert!(matches!(
             context.resolve_expr_type(&filter("status", AxExpr::Bool(true))),
-            Err(AxTypeError::InvalidListFilterTextType { .. })
+            Err(AxTypeError::InvalidListFieldTextType {
+                operation: "filterEq",
+                ..
+            })
         ));
     }
 

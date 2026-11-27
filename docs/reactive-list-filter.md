@@ -39,6 +39,23 @@ optional; when provided it also renders a single row.
 </TableBody>
 ```
 
+## Sort loaded rows
+
+`List.sortBy(posts, "title", direction)` returns a new list and accepts
+`"asc"` or `"desc"` for direction. Text is compared case-sensitively,
+without locale rules. Equal values keep their input order; missing or
+non-text values go last in both directions.
+
+```ax
+<Each
+  items={List.sortBy(List.filterEq(posts, "status", selectedStatus), "title", direction)}
+  as="post"
+  key={post.id}
+>
+  <TableRow><TableCell>{post.title}</TableCell></TableRow>
+</Each>
+```
+
 The browser reconciles native rows directly. Keep static or independently
 updated rows in separate table bodies. This does not change the Foundry
 `DataTable` search or paging behavior.

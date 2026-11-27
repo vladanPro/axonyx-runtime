@@ -1307,13 +1307,23 @@ fn empty_filtered_each_template(
     slot_context: Option<&SlotContext<'_>>,
 ) -> Option<(String, Vec<AxNode>)> {
     block.expression_binding.as_ref()?;
-    let AxExpr::Call { path, args } = &block.source else {
+    let mut source = &block.source;
+    let mut filtered = false;
+    while let AxExpr::Call { path, args } = source {
+        if path.as_slice() == ["List", "filterEq"] {
+            filtered = true;
+        } else if path.as_slice() != ["List", "sortBy"] {
+            return None;
+        }
+        let [list, _, _] = args.as_slice() else {
+            return None;
+        };
+        source = list;
+    }
+    let AxExpr::Identifier(source) = source else {
         return None;
     };
-    let [AxExpr::Identifier(source), _, _] = args.as_slice() else {
-        return None;
-    };
-    if path.as_slice() != ["List", "filterEq"] {
+    if !filtered {
         return None;
     }
     let AxValue::List(items) = scope.get(source)? else {
@@ -1704,16 +1714,20 @@ fn eval_expr(
             }
         }
         AxExpr::Call { path, args } => {
-            if path.as_slice() == ["List", "filterEq"] {
+            if matches!(path.as_slice(), [base, name]
+                if base == "List" && matches!(name.as_str(), "filterEq" | "sortBy"))
+            {
+                let operation = path.join(".");
                 let [list, AxExpr::String(field), expected] = args.as_slice() else {
                     return Err(AxLowerError::UnsupportedExpression {
-                        message: "List.filterEq expects a list, literal field name, and text value"
-                            .to_string(),
+                        message: format!(
+                            "{operation} expects a list, literal field name, and text value"
+                        ),
                     });
                 };
                 if field.is_empty() {
                     return Err(AxLowerError::UnsupportedExpression {
-                        message: "List.filterEq expects a nonempty field name".to_string(),
+                        message: format!("{operation} expects a nonempty field name"),
                     });
                 }
                 let items = eval_expr(list, functions, scope, resolver)?;
@@ -1721,13 +1735,32 @@ fn eval_expr(
                 let (AxValue::List(mut items), AxValue::String(expected)) = (items, expected)
                 else {
                     return Err(AxLowerError::UnsupportedExpression {
-                        message: "List.filterEq expects a list and a text value".to_string(),
+                        message: format!("{operation} expects a list and a text value"),
                     });
                 };
-                items.retain(|item| {
-                    matches!(item, AxValue::Record(fields)
-                        if matches!(fields.get(field), Some(AxValue::String(text)) if text == &expected))
-                });
+                if path[1] == "filterEq" {
+                    items.retain(|item| list_text_field(item, field) == Some(expected.as_str()));
+                } else {
+                    let descending = match expected.as_str() {
+                        "asc" => false,
+                        "desc" => true,
+                        _ => {
+                            return Err(AxLowerError::UnsupportedExpression {
+                                message: "List.sortBy expects direction `asc` or `desc`"
+                                    .to_string(),
+                            })
+                        }
+                    };
+                    items.sort_by(|left, right| {
+                        match (list_text_field(left, field), list_text_field(right, field)) {
+                            (Some(left), Some(right)) if descending => right.cmp(left),
+                            (Some(left), Some(right)) => left.cmp(right),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    });
+                }
                 return Ok(AxValue::List(items));
             }
             let args = args
@@ -1756,6 +1789,16 @@ fn eval_expr(
                     path: path.join("."),
                 })
         }
+    }
+}
+
+fn list_text_field<'a>(item: &'a AxValue, field: &str) -> Option<&'a str> {
+    let AxValue::Record(fields) = item else {
+        return None;
+    };
+    match fields.get(field)? {
+        AxValue::String(value) => Some(value),
+        _ => None,
     }
 }
 
@@ -3174,6 +3217,32 @@ component ThemePicker() {
         };
 
         assert_eq!(children, vec![text("Custom")]);
+    }
+
+    #[test]
+    fn sorts_server_rendered_rows_stably_without_mutating_state() {
+        let source = r#"
+page Posts() {
+  state posts = [{ id: "missing" }, { id: "first", title: "Alpha" }, { id: "last", title: "Zulu" }, { id: "second", title: "Alpha" }]
+  return ASX {
+    <Each items={List.sortBy(posts, "title", "desc")} as="post" key={post.id}>
+      <article>{post.id}</article>
+    </Each>
+    <Each items={posts} as="post" key={post.id}>
+      <article>{post.id}</article>
+    </Each>
+  }
+}
+"#;
+        let document = parse_ax_auto(source).expect("sorted reactive list should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let node = lower_document(&document, &resolver).expect("sorted list should render");
+        let mut keys = Vec::new();
+        collect_attr_values(&node, "data-ax-each-key", &mut keys);
+        assert_eq!(
+            keys,
+            ["last", "first", "second", "missing", "missing", "first", "last", "second"]
+        );
     }
 
     #[test]

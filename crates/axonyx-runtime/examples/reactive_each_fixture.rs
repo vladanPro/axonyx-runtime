@@ -57,6 +57,7 @@ page ReactiveEachProbe() {
   }
   state filterPosts: List<FilterPost> = [{ id: "draft-a", title: "First draft", status: "draft" }, { id: "published-b", title: "Published post", status: "published" }, { id: "draft-c", title: "Second draft", status: "draft" }]
   state selectedStatus: String = "archived"
+  state sortDirection: String = "asc"
 
   return ASX {
     <>
@@ -102,13 +103,16 @@ page ReactiveEachProbe() {
         </Each>
       </section>
       <table id="native-filter">
+        <caption>Posts by status</caption>
         <TableBody>
-          <Each items={List.filterEq(filterPosts, "status", selectedStatus)} as="post" key={post.id}>
+          <Each items={List.sortBy(List.filterEq(filterPosts, "status", selectedStatus), "title", sortDirection)} as="post" key={post.id}>
             <TableRow><TableCell>{post.title}</TableCell></TableRow>
             <Empty><tr><td>No matching table rows</td></tr></Empty>
           </Each>
         </TableBody>
       </table>
+      <button id="sort-asc" on:click={sortDirection = "asc"}>Title ascending</button>
+      <button id="sort-desc" on:click={sortDirection = "desc"}>Title descending</button>
       <table id="native-order">
         <tbody>
           <Each items={rowSets[selectedRows]} as="row" key={row.id}>
