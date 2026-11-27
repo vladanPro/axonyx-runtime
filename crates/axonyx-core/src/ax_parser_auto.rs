@@ -621,7 +621,22 @@ fn convert_each_statement(
                 plan.ty.clone(),
                 plan.initial.clone(),
             ));
+            return Ok(AxStatement::Each(each));
         }
+    }
+    if let Some(plan) = compile_reactive_expression(&source, bindings)? {
+        if each.key.is_none() {
+            return Err(AxConvertV2Error::ReactiveEachRequiresKey {
+                state: format_expr(&source),
+            });
+        }
+        each.source = plan.expression;
+        each.expression_binding = Some(AxEachExpressionBinding {
+            program: encode_hex(&plan.program),
+            signals: plan.signals,
+            types: plan.types,
+            initials: plan.initials,
+        });
     }
     Ok(AxStatement::Each(each))
 }
@@ -3281,6 +3296,27 @@ page Posts() {
             .expect("state each should keep bridge metadata");
         assert_eq!(state.signal, "root:posts:1");
         assert!(state.ty.starts_with("List<"));
+    }
+
+    #[test]
+    fn rejects_derived_state_each_without_key() {
+        let error = parse_ax_auto(
+            r#"
+page Results() {
+  state selected: Int = 0
+  state rows: List<List<String>> = [["first"]]
+  return ASX {
+    <Each items={rows[selected]} as="row"><p>{row}</p></Each>
+  }
+}
+"#,
+        )
+        .expect_err("a reactive expression may not bypass keyed reconciliation");
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::ReactiveEachRequiresKey { state })
+                if state == "rows[selected]"
+        ));
     }
 
     #[test]

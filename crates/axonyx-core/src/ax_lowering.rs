@@ -376,11 +376,18 @@ fn lower_statements(
                 };
 
                 if let Some(key_expr) = &block.key {
+                    let expression = block.expression_binding.as_ref();
+                    let expression_initial = expression.map(|_| {
+                        serde_json::Value::Array(items.iter().map(each_value_to_json).collect())
+                            .to_string()
+                    });
+                    let initially_empty = items.is_empty();
                     let mut each_children = Vec::new();
                     let mut render_template = None;
+                    let mut empty_node = None;
                     let mut keys = BTreeSet::new();
                     let mut key_kind = None;
-                    if items.is_empty() {
+                    if expression.is_some() || initially_empty {
                         let mut nested = scope.clone();
                         let empty = lower_statements(
                             &block.empty_body,
@@ -388,14 +395,17 @@ fn lower_statements(
                             &mut nested,
                             slot_context,
                         )?;
-                        if !empty.is_empty() {
-                            each_children.push(element_with_attrs(
-                                "ax-each-empty",
-                                vec![attr("style", "display: contents")],
-                                empty,
-                            ));
+                        if expression.is_some() || !empty.is_empty() {
+                            let empty_attrs = if initially_empty {
+                                vec![attr("style", "display: contents")]
+                            } else {
+                                vec![attr("hidden", "")]
+                            };
+                            empty_node =
+                                Some(element_with_attrs("ax-each-empty", empty_attrs, empty));
                         }
-                    } else {
+                    }
+                    if !initially_empty {
                         for item in items {
                             let mut nested = scope.clone();
                             nested.insert(block.binding.clone(), item);
@@ -445,6 +455,9 @@ fn lower_statements(
                             ));
                         }
                     }
+                    if let Some(empty_node) = empty_node {
+                        each_children.push(empty_node);
+                    }
                     if let Some(template_children) = render_template {
                         each_children.push(element_with_attrs(
                             "template",
@@ -477,6 +490,27 @@ fn lower_statements(
                             attr("data-ax-each-signal", binding.signal.clone()),
                             attr("data-ax-each-type", binding.ty.clone()),
                             attr("data-ax-each-initial", binding.initial.clone()),
+                        ]);
+                    }
+                    if let (Some(binding), Some(initial)) = (expression, expression_initial) {
+                        attrs.extend([
+                            attr("data-ax-each-initial", initial),
+                            attr("data-ax-expression-protocol", "ax-expression/1"),
+                            attr("data-ax-expression-count", "1"),
+                            attr("data-ax-expression-0-target", "each"),
+                            attr("data-ax-expression-0-program", binding.program.clone()),
+                            attr(
+                                "data-ax-expression-0-signals",
+                                serde_json::json!(binding.signals).to_string(),
+                            ),
+                            attr(
+                                "data-ax-expression-0-types",
+                                serde_json::json!(binding.types).to_string(),
+                            ),
+                            attr(
+                                "data-ax-expression-0-initials",
+                                serde_json::json!(binding.initials).to_string(),
+                            ),
                         ]);
                     }
                     nodes.push(element_with_attrs("ax-state-each", attrs, each_children));
@@ -1135,6 +1169,25 @@ fn eval_props(
         );
     }
     Ok(props)
+}
+
+fn each_value_to_json(value: &AxValue) -> serde_json::Value {
+    use serde_json::Value;
+
+    match value {
+        AxValue::Null => Value::Null,
+        AxValue::String(value) => Value::String(value.clone()),
+        AxValue::Bool(value) => Value::Bool(*value),
+        AxValue::Number(value) => Value::from(*value),
+        AxValue::Float(value) => Value::from(value.get()),
+        AxValue::List(items) => Value::Array(items.iter().map(each_value_to_json).collect()),
+        AxValue::Record(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), each_value_to_json(value)))
+                .collect(),
+        ),
+    }
 }
 
 fn each_key_identity(value: &AxValue) -> Result<(String, String), AxLowerError> {

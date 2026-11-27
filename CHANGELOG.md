@@ -9,6 +9,10 @@ The format is intentionally simple while the project is still early-stage.
 - Support `List.length(items)` in Pages. It returns an `Int` for a list in
   the first server render and for supported reactive expressions in WASM.
   Counting does not mutate the list or make a server request.
+- Support keyed `<Each>` over a derived reactive list, such as
+  `items={rowSets[selected]}`. WASM evaluates the source and the browser
+  reconciles supported rows by key. Lists with no initial row template retain
+  the existing refresh-required fallback when insertion needs that template.
 
 ## axonyx-core / axonyx-runtime 0.8.5
 

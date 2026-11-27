@@ -398,6 +398,8 @@ pub struct AxEachBlock {
     pub key: Option<AxExpr>,
     #[serde(default)]
     pub state_binding: Option<AxEachStateBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expression_binding: Option<AxEachExpressionBinding>,
     pub body: Vec<AxStatement>,
     pub empty_body: Vec<AxStatement>,
 }
@@ -407,6 +409,14 @@ pub struct AxEachStateBinding {
     pub signal: String,
     pub ty: String,
     pub initial: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AxEachExpressionBinding {
+    pub program: String,
+    pub signals: Vec<String>,
+    pub types: Vec<String>,
+    pub initials: Vec<String>,
 }
 
 impl AxEachStateBinding {
@@ -434,6 +444,7 @@ impl AxEachBlock {
             source,
             key: None,
             state_binding: None,
+            expression_binding: None,
             body: body.into_iter().collect(),
             empty_body: Vec::new(),
         }
@@ -859,6 +870,7 @@ pub mod prelude {
     pub use super::AxDataBinding;
     pub use super::AxDocument;
     pub use super::AxEachBlock;
+    pub use super::AxEachExpressionBinding;
     pub use super::AxEachStage;
     pub use super::AxEachStateBinding;
     pub use super::AxExpr;
