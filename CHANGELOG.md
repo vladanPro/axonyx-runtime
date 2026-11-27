@@ -6,6 +6,13 @@ The format is intentionally simple while the project is still early-stage.
 
 ## Unreleased
 
+## axonyx-core / axonyx-runtime 0.9.0
+
+- Rust callers constructing `AxEachBlock` with a struct literal must supply
+  the new `expression_binding` field. `AxEachBlock::new` supplies `None`.
+  Serde still accepts older documents without the field. Review exhaustive
+  Rust matches on the Core error enums for the new list and table diagnostics.
+
 - Support `List.length(items)` in Pages. It returns an `Int` for a list in
   the first server render and for supported reactive expressions in WASM.
   Counting does not mutate the list or make a server request.
