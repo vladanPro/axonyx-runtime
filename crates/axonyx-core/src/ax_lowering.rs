@@ -12,6 +12,7 @@ const AX_COMPONENT_INSTANCE_PATH: &str = "__ax_component_instance_path";
 const AX_EACH_RENDER_BINDING: &str = "__ax_each_render_binding";
 const AX_EACH_RENDER_PARAM_PREFIX: &str = "__ax_each_render_param:";
 const AX_EACH_RENDER_UNSUPPORTED: &str = "__ax_each_render_unsupported";
+const AX_EACH_TEMPLATE_PROBE: &str = "\0ax-each-template-probe";
 // The NUL prefix cannot be authored as an ASX tag. Keep compiled AST compatibility.
 const AX_SCOPED_HEAD: &str = "\0ax-scoped-head";
 
@@ -150,6 +151,8 @@ pub enum AxLowerError {
     InvalidEachKey,
     #[error("duplicate `each` key `{key}`")]
     DuplicateEachKey { key: String },
+    #[error("invalid keyed Each in <tbody>: {message}")]
+    InvalidTableEach { message: &'static str },
     #[error("failed to parse imported component from `{import_path}`: {message}")]
     ImportedComponentParse {
         import_path: String,
@@ -376,11 +379,21 @@ fn lower_statements(
                 };
 
                 if let Some(key_expr) = &block.key {
+                    let expression = block.expression_binding.as_ref();
+                    let expression_initial = expression.map(|_| {
+                        serde_json::Value::Array(items.iter().map(each_value_to_json).collect())
+                            .to_string()
+                    });
+                    let initially_empty = items.is_empty();
                     let mut each_children = Vec::new();
                     let mut render_template = None;
+                    let mut empty_node = None;
                     let mut keys = BTreeSet::new();
                     let mut key_kind = None;
-                    if items.is_empty() {
+                    if expression.is_some()
+                        || initially_empty
+                        || (block.state_binding.is_some() && !block.empty_body.is_empty())
+                    {
                         let mut nested = scope.clone();
                         let empty = lower_statements(
                             &block.empty_body,
@@ -388,14 +401,17 @@ fn lower_statements(
                             &mut nested,
                             slot_context,
                         )?;
-                        if !empty.is_empty() {
-                            each_children.push(element_with_attrs(
-                                "ax-each-empty",
-                                vec![attr("style", "display: contents")],
-                                empty,
-                            ));
+                        if expression.is_some() || !empty.is_empty() {
+                            let empty_attrs = if initially_empty {
+                                vec![attr("style", "display: contents")]
+                            } else {
+                                vec![attr("hidden", "")]
+                            };
+                            empty_node =
+                                Some(element_with_attrs("ax-each-empty", empty_attrs, empty));
                         }
-                    } else {
+                    }
+                    if !initially_empty {
                         for item in items {
                             let mut nested = scope.clone();
                             nested.insert(block.binding.clone(), item);
@@ -445,6 +461,21 @@ fn lower_statements(
                             ));
                         }
                     }
+                    if initially_empty {
+                        if let Some((kind, template)) = empty_filtered_each_template(
+                            block,
+                            key_expr,
+                            context,
+                            scope,
+                            slot_context,
+                        ) {
+                            key_kind = Some(kind);
+                            render_template = Some(template);
+                        }
+                    }
+                    if let Some(empty_node) = empty_node {
+                        each_children.push(empty_node);
+                    }
                     if let Some(template_children) = render_template {
                         each_children.push(element_with_attrs(
                             "template",
@@ -477,6 +508,27 @@ fn lower_statements(
                             attr("data-ax-each-signal", binding.signal.clone()),
                             attr("data-ax-each-type", binding.ty.clone()),
                             attr("data-ax-each-initial", binding.initial.clone()),
+                        ]);
+                    }
+                    if let (Some(binding), Some(initial)) = (expression, expression_initial) {
+                        attrs.extend([
+                            attr("data-ax-each-initial", initial),
+                            attr("data-ax-expression-protocol", "ax-expression/1"),
+                            attr("data-ax-expression-count", "1"),
+                            attr("data-ax-expression-0-target", "each"),
+                            attr("data-ax-expression-0-program", binding.program.clone()),
+                            attr(
+                                "data-ax-expression-0-signals",
+                                serde_json::json!(binding.signals).to_string(),
+                            ),
+                            attr(
+                                "data-ax-expression-0-types",
+                                serde_json::json!(binding.types).to_string(),
+                            ),
+                            attr(
+                                "data-ax-expression-0-initials",
+                                serde_json::json!(binding.initials).to_string(),
+                            ),
                         ]);
                     }
                     nodes.push(element_with_attrs("ax-state-each", attrs, each_children));
@@ -920,7 +972,11 @@ fn lower_component_node(
         tag if is_native_html_tag(tag) => {
             push_behavior_props(&mut attrs, &mut props);
             push_native_props(&mut attrs, props);
-            element_with_attrs(leak_tag(tag.to_string()), attrs, children)
+            if tag == "tbody" {
+                lower_table_body(attrs, children)?
+            } else {
+                element_with_attrs(leak_tag(tag.to_string()), attrs, children)
+            }
         }
         other => {
             attrs.insert(0, attr("data-component", other.to_string()));
@@ -932,6 +988,112 @@ fn lower_component_node(
 
     attach_each_render_attributes(&mut node, component, scope);
     Ok(node)
+}
+
+fn lower_table_body(
+    mut attrs: Vec<Attribute>,
+    mut children: Vec<AxNode>,
+) -> Result<AxNode, AxLowerError> {
+    let Some(index) = children
+        .iter()
+        .position(|node| node_has_tag(node, "ax-state-each"))
+    else {
+        return Ok(element_with_attrs("tbody", attrs, children));
+    };
+    let each = children.remove(index);
+    if children.iter().any(|node| !node_is_blank(node)) {
+        return Err(AxLowerError::InvalidTableEach {
+            message: "use a separate <tbody> for the keyed Each and other rows",
+        });
+    }
+    let AxNode::Element {
+        attrs: mut each_attrs,
+        children: rows,
+        ..
+    } = each
+    else {
+        unreachable!("the keyed Each was found by its tag");
+    };
+    each_attrs.retain(|attribute| attribute.name != "style");
+    each_attrs.push(attr("data-ax-each-row-mode", "tr"));
+    attrs.retain(|attribute| !each_attrs.iter().any(|owned| owned.name == attribute.name));
+    attrs.extend(each_attrs);
+
+    let mut native_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let AxNode::Element {
+            tag,
+            mut attrs,
+            children,
+        } = row
+        else {
+            return Err(AxLowerError::InvalidTableEach {
+                message: "expected a row",
+            });
+        };
+        let row = match tag {
+            "ax-each-item" => {
+                attrs.retain(|attribute| {
+                    matches!(attribute.name, "data-ax-each-key" | "data-ax-each-key-id")
+                });
+                native_each_row(children, attrs, false)?
+            }
+            "ax-each-empty" => {
+                attrs.retain(|attribute| attribute.name == "hidden");
+                attrs.push(attr("data-ax-each-empty", ""));
+                native_each_row(children, attrs, true)?
+            }
+            "template" => {
+                let row = native_each_row(children, Vec::new(), false)?
+                    .expect("nonempty row is required");
+                Some(element_with_attrs("template", attrs, vec![row]))
+            }
+            _ => {
+                return Err(AxLowerError::InvalidTableEach {
+                    message: "expected a row",
+                })
+            }
+        };
+        native_rows.extend(row);
+    }
+    Ok(element_with_attrs("tbody", attrs, native_rows))
+}
+
+fn native_each_row(
+    children: Vec<AxNode>,
+    ownership: Vec<Attribute>,
+    optional: bool,
+) -> Result<Option<AxNode>, AxLowerError> {
+    let mut nodes = children
+        .into_iter()
+        .filter(|node| !node_is_blank(node) && !node_has_tag(node, "ax-each-render-unsupported"));
+    let node = nodes.next();
+    if node.is_none() && optional {
+        return Ok(None);
+    }
+    if let Some(AxNode::Element {
+        tag: "tr",
+        mut attrs,
+        children,
+    }) = node
+    {
+        if nodes.next().is_none() {
+            attrs.retain(|attribute| !ownership.iter().any(|owned| owned.name == attribute.name));
+            attrs.extend(ownership);
+            return Ok(Some(element_with_attrs("tr", attrs, children)));
+        }
+    }
+    Err(AxLowerError::InvalidTableEach {
+        message: "render exactly one <tr> per item and in <Empty> when provided",
+    })
+}
+
+fn node_has_tag(node: &AxNode, expected: &str) -> bool {
+    matches!(node, AxNode::Element { tag, .. } if *tag == expected)
+}
+
+fn node_is_blank(node: &AxNode) -> bool {
+    matches!(node, AxNode::Text(text) if text.trim().is_empty())
 }
 
 fn lower_component_children(
@@ -1135,6 +1297,86 @@ fn eval_props(
         );
     }
     Ok(props)
+}
+
+fn empty_filtered_each_template(
+    block: &AxEachBlock,
+    key_expr: &AxExpr,
+    context: &LoweringContext<'_>,
+    scope: &BTreeMap<String, AxValue>,
+    slot_context: Option<&SlotContext<'_>>,
+) -> Option<(String, Vec<AxNode>)> {
+    block.expression_binding.as_ref()?;
+    let mut source = &block.source;
+    let mut filtered = false;
+    while let AxExpr::Call { path, args } = source {
+        if path.as_slice() == ["List", "filterEq"] {
+            filtered = true;
+        } else if path.as_slice() != ["List", "sortBy"] {
+            return None;
+        }
+        let [list, _, _] = args.as_slice() else {
+            return None;
+        };
+        source = list;
+    }
+    let AxExpr::Identifier(source) = source else {
+        return None;
+    };
+    if !filtered {
+        return None;
+    }
+    let AxValue::List(items) = scope.get(source)? else {
+        return None;
+    };
+    // An excluded row is only a template seed, not permission to render page data.
+    let mut nested = BTreeMap::from([
+        (block.binding.clone(), items.first()?.clone()),
+        (AX_EACH_TEMPLATE_PROBE.to_string(), AxValue::Bool(true)),
+        (
+            AX_EACH_RENDER_BINDING.to_string(),
+            AxValue::String(block.binding.clone()),
+        ),
+    ]);
+    let no_data_resolver = |_: &[String], _: &[AxValue]| None;
+    let template_context = LoweringContext {
+        sources: context.sources,
+        resolver: &no_data_resolver,
+        import_resolver: context.import_resolver,
+        scoped_heads: None,
+    };
+    let key = eval_expr(
+        key_expr,
+        template_context.sources.functions,
+        &nested,
+        template_context.resolver,
+    )
+    .ok()?;
+    let (identity, _) = each_key_identity(&key).ok()?;
+    let (kind, _) = identity.split_once(':')?;
+    let template =
+        lower_statements(&block.body, &template_context, &mut nested, slot_context).ok()?;
+    (each_render_scope_is_supported(&nested) && each_render_template_is_safe(&template))
+        .then(|| (kind.to_string(), template))
+}
+
+fn each_value_to_json(value: &AxValue) -> serde_json::Value {
+    use serde_json::Value;
+
+    match value {
+        AxValue::Null => Value::Null,
+        AxValue::String(value) => Value::String(value.clone()),
+        AxValue::Bool(value) => Value::Bool(*value),
+        AxValue::Number(value) => Value::from(*value),
+        AxValue::Float(value) => Value::from(value.get()),
+        AxValue::List(items) => Value::Array(items.iter().map(each_value_to_json).collect()),
+        AxValue::Record(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(name, value)| (name.clone(), each_value_to_json(value)))
+                .collect(),
+        ),
+    }
 }
 
 fn each_key_identity(value: &AxValue) -> Result<(String, String), AxLowerError> {
@@ -1454,6 +1696,11 @@ fn eval_expr(
         AxExpr::OptionalMember { object, property } => {
             let value = match eval_expr(object, functions, scope, resolver) {
                 Ok(value) => value,
+                Err(error @ AxLowerError::UnknownIdentifier { .. })
+                    if scope.contains_key(AX_EACH_TEMPLATE_PROBE) =>
+                {
+                    return Err(error);
+                }
                 Err(AxLowerError::UnknownIdentifier { .. })
                 | Err(AxLowerError::UnknownMember { .. }) => return Ok(AxValue::Null),
                 Err(error) => return Err(error),
@@ -1467,10 +1714,72 @@ fn eval_expr(
             }
         }
         AxExpr::Call { path, args } => {
+            if matches!(path.as_slice(), [base, name]
+                if base == "List" && matches!(name.as_str(), "filterEq" | "sortBy"))
+            {
+                let operation = path.join(".");
+                let [list, AxExpr::String(field), expected] = args.as_slice() else {
+                    return Err(AxLowerError::UnsupportedExpression {
+                        message: format!(
+                            "{operation} expects a list, literal field name, and text value"
+                        ),
+                    });
+                };
+                if field.is_empty() {
+                    return Err(AxLowerError::UnsupportedExpression {
+                        message: format!("{operation} expects a nonempty field name"),
+                    });
+                }
+                let items = eval_expr(list, functions, scope, resolver)?;
+                let expected = eval_expr(expected, functions, scope, resolver)?;
+                let (AxValue::List(mut items), AxValue::String(expected)) = (items, expected)
+                else {
+                    return Err(AxLowerError::UnsupportedExpression {
+                        message: format!("{operation} expects a list and a text value"),
+                    });
+                };
+                if path[1] == "filterEq" {
+                    items.retain(|item| list_text_field(item, field) == Some(expected.as_str()));
+                } else {
+                    let descending = match expected.as_str() {
+                        "asc" => false,
+                        "desc" => true,
+                        _ => {
+                            return Err(AxLowerError::UnsupportedExpression {
+                                message: "List.sortBy expects direction `asc` or `desc`"
+                                    .to_string(),
+                            })
+                        }
+                    };
+                    items.sort_by(|left, right| {
+                        match (list_text_field(left, field), list_text_field(right, field)) {
+                            (Some(left), Some(right)) if descending => right.cmp(left),
+                            (Some(left), Some(right)) => left.cmp(right),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    });
+                }
+                return Ok(AxValue::List(items));
+            }
             let args = args
                 .iter()
                 .map(|arg| eval_expr(arg, functions, scope, resolver))
                 .collect::<Result<Vec<_>, _>>()?;
+            if path.as_slice() == ["List", "length"] {
+                let [AxValue::List(items)] = args.as_slice() else {
+                    return Err(AxLowerError::UnsupportedExpression {
+                        message: "List.length expects one List<T> argument".to_string(),
+                    });
+                };
+                let length = i64::try_from(items.len()).map_err(|_| {
+                    AxLowerError::UnsupportedExpression {
+                        message: "List.length exceeds the Int range".to_string(),
+                    }
+                })?;
+                return Ok(AxValue::Number(length));
+            }
             if let Some(function) = resolve_function(functions, path) {
                 return eval_function_call(function, &args, functions, scope, resolver);
             }
@@ -1480,6 +1789,16 @@ fn eval_expr(
                     path: path.join("."),
                 })
         }
+    }
+}
+
+fn list_text_field<'a>(item: &'a AxValue, field: &str) -> Option<&'a str> {
+    let AxValue::Record(fields) = item else {
+        return None;
+    };
+    match fields.get(field)? {
+        AxValue::String(value) => Some(value),
+        _ => None,
     }
 }
 
@@ -2898,6 +3217,98 @@ component ThemePicker() {
         };
 
         assert_eq!(children, vec![text("Custom")]);
+    }
+
+    #[test]
+    fn sorts_server_rendered_rows_stably_without_mutating_state() {
+        let source = r#"
+page Posts() {
+  state posts = [{ id: "missing" }, { id: "first", title: "Alpha" }, { id: "last", title: "Zulu" }, { id: "second", title: "Alpha" }]
+  return ASX {
+    <Each items={List.sortBy(posts, "title", "desc")} as="post" key={post.id}>
+      <article>{post.id}</article>
+    </Each>
+    <Each items={posts} as="post" key={post.id}>
+      <article>{post.id}</article>
+    </Each>
+  }
+}
+"#;
+        let document = parse_ax_auto(source).expect("sorted reactive list should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        let node = lower_document(&document, &resolver).expect("sorted list should render");
+        let mut keys = Vec::new();
+        collect_attr_values(&node, "data-ax-each-key", &mut keys);
+        assert_eq!(
+            keys,
+            ["last", "first", "second", "missing", "missing", "first", "last", "second"]
+        );
+    }
+
+    #[test]
+    fn keyed_table_each_rejects_non_rows_and_mixed_ownership() {
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        for (before, row) in [
+            ("<tr><td>Static</td></tr>", "<tr><td>{post.id}</td></tr>"),
+            ("", "<div>{post.id}</div>"),
+        ] {
+            let source = format!(
+                r#"
+page TableProbe() {{
+  state posts = [{{ id: "first" }}]
+  return ASX {{
+    <table><tbody>
+      {before}
+      <Each items={{posts}} as="post" key={{post.id}}>{row}</Each>
+    </tbody></table>
+  }}
+}}
+"#
+            );
+            let document = parse_ax_auto(&source).expect("table probe should parse");
+            assert!(matches!(
+                lower_document(&document, &resolver),
+                Err(AxLowerError::InvalidTableEach { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn empty_filtered_each_does_not_resolve_server_data_for_sample_rows() {
+        let source = r#"
+page Filtered() {
+  state posts = [{ id: "one", status: "draft" }]
+  state selected: String = "published"
+  return ASX {
+    <Each items={List.filterEq(posts, "status", selected)} as="post" key={post.id}>
+      <article>{Server.detail(post.id)}</article>
+      <Empty><p>Nothing published</p></Empty>
+    </Each>
+  }
+}
+"#;
+        let document = parse_ax_auto(source).expect("reactive filter should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> {
+            panic!("an excluded row must not resolve server data");
+        };
+        let html = lower_document(&document, &resolver).expect("empty filter should render");
+        let mut statuses = Vec::new();
+        collect_attr_values(&html, "data-ax-each-render-status", &mut statuses);
+        assert_eq!(statuses, ["fallback"]);
+
+        for reference in ["privateLabel", "privateLabel?.text"] {
+            let document = parse_ax_auto(&source.replace("Server.detail(post.id)", reference))
+                .expect("reactive filter should parse");
+            let scope = BTreeMap::from([(
+                "privateLabel".to_string(),
+                AxValue::record([("text", AxValue::from("page-only server data"))]),
+            )]);
+            let html = lower_document_with_scope(&document, scope, &resolver)
+                .expect("an empty list must not depend on surrounding page data");
+            statuses.clear();
+            collect_attr_values(&html, "data-ax-each-render-status", &mut statuses);
+            assert_eq!(statuses, ["fallback"]);
+        }
     }
 
     #[test]

@@ -621,7 +621,22 @@ fn convert_each_statement(
                 plan.ty.clone(),
                 plan.initial.clone(),
             ));
+            return Ok(AxStatement::Each(each));
         }
+    }
+    if let Some(plan) = compile_reactive_expression(&source, bindings)? {
+        if each.key.is_none() {
+            return Err(AxConvertV2Error::ReactiveEachRequiresKey {
+                state: format_expr(&source),
+            });
+        }
+        each.source = plan.expression;
+        each.expression_binding = Some(AxEachExpressionBinding {
+            program: encode_hex(&plan.program),
+            signals: plan.signals,
+            types: plan.types,
+            initials: plan.initials,
+        });
     }
     Ok(AxStatement::Each(each))
 }
@@ -1062,6 +1077,33 @@ const AX_EXPR_MEMBER: u8 = 41;
 const AX_EXPR_OPTIONAL_MEMBER: u8 = 42;
 const AX_EXPR_BUILD_LIST: u8 = 50;
 const AX_EXPR_BUILD_OBJECT: u8 = 51;
+const AX_EXPR_LIST_LENGTH: u8 = 52;
+const AX_EXPR_LIST_FILTER_EQ: u8 = 53;
+const AX_EXPR_LIST_SORT_BY: u8 = 54;
+
+fn list_field_opcode(path: &[String]) -> Option<u8> {
+    match path {
+        [namespace, name] if namespace == "List" => match name.as_str() {
+            "filterEq" => Some(AX_EXPR_LIST_FILTER_EQ),
+            "sortBy" => Some(AX_EXPR_LIST_SORT_BY),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn list_field_arguments<'a>(
+    path: &[String],
+    args: &'a [AxExpr],
+) -> Result<(&'a AxExpr, &'a String, &'a AxExpr), String> {
+    match args {
+        [list, AxExpr::String(field), value] if !field.is_empty() => Ok((list, field, value)),
+        _ => Err(format!(
+            "{} expects a list, nonempty literal field name, and text value",
+            path.join(".")
+        )),
+    }
+}
 const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
 
 fn is_reactive_boolean_attr(name: &str) -> bool {
@@ -1255,6 +1297,44 @@ fn expand_pure_reactive_expression(
             )?),
             property: property.clone(),
         },
+        AxExpr::Call { path, args } if path.as_slice() == ["List", "length"] => {
+            let [value] = args.as_slice() else {
+                return Err("List.length expects one argument".to_string());
+            };
+            AxExpr::Call {
+                path: path.clone(),
+                args: vec![expand_pure_reactive_expression(
+                    value,
+                    bindings,
+                    locals,
+                    local_stack,
+                    call_stack,
+                )?],
+            }
+        }
+        AxExpr::Call { path, args } if list_field_opcode(path).is_some() => {
+            let (list, field, value) = list_field_arguments(path, args)?;
+            AxExpr::Call {
+                path: path.clone(),
+                args: vec![
+                    expand_pure_reactive_expression(
+                        list,
+                        bindings,
+                        locals,
+                        local_stack,
+                        call_stack,
+                    )?,
+                    AxExpr::String(field.clone()),
+                    expand_pure_reactive_expression(
+                        value,
+                        bindings,
+                        locals,
+                        local_stack,
+                        call_stack,
+                    )?,
+                ],
+            }
+        }
         AxExpr::Call { path, args } => {
             let [name] = path.as_slice() else {
                 return Err(format!("`{}` is not a local pure function", path.join(".")));
@@ -1462,11 +1542,25 @@ fn compile_reactive_expression_node(
             });
             push_program_string(program, property)?;
         }
-        AxExpr::Call { path, .. } => {
-            return Err(format!(
-                "pure function `{}` could not be fully inlined",
-                path.join(".")
-            ));
+        AxExpr::Call { path, args } if path.as_slice() == ["List", "length"] => {
+            let [value] = args.as_slice() else {
+                return Err("List.length expects one argument".to_string());
+            };
+            compile_reactive_expression_node(value, bindings, dependencies, program)?;
+            program.push(AX_EXPR_LIST_LENGTH);
+        }
+        AxExpr::Call { path, args } => {
+            let Some(opcode) = list_field_opcode(path) else {
+                return Err(format!(
+                    "pure function `{}` could not be fully inlined",
+                    path.join(".")
+                ));
+            };
+            let (list, field, value) = list_field_arguments(path, args)?;
+            compile_reactive_expression_node(list, bindings, dependencies, program)?;
+            compile_reactive_expression_node(value, bindings, dependencies, program)?;
+            program.push(opcode);
+            push_program_string(program, field)?;
         }
         AxExpr::List(items) => {
             let count = reactive_collection_count(items.len(), "list")?;
@@ -3258,6 +3352,27 @@ page Posts() {
             .expect("state each should keep bridge metadata");
         assert_eq!(state.signal, "root:posts:1");
         assert!(state.ty.starts_with("List<"));
+    }
+
+    #[test]
+    fn rejects_derived_state_each_without_key() {
+        let error = parse_ax_auto(
+            r#"
+page Results() {
+  state selected: Int = 0
+  state rows: List<List<String>> = [["first"]]
+  return ASX {
+    <Each items={rows[selected]} as="row"><p>{row}</p></Each>
+  }
+}
+"#,
+        )
+        .expect_err("a reactive expression may not bypass keyed reconciliation");
+        assert!(matches!(
+            error,
+            AxAutoParseError::Convert(AxConvertV2Error::ReactiveEachRequiresKey { state })
+                if state == "rows[selected]"
+        ));
     }
 
     #[test]

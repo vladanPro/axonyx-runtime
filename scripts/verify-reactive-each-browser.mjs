@@ -44,6 +44,9 @@ try {
   });
 
   await page.goto(origin, { waitUntil: "domcontentloaded" });
+  if ((await page.locator("#post-count").textContent()) !== "2") {
+    throw new Error("server-rendered List.length did not count initial rows");
+  }
   for (const [id, expected] of [["addition-label", "Count: 2"], ["addition-suffix", "2 items"], ["addition-total", "2.5"], ["addition-flag", "enabled=true"]]) {
     if ((await page.locator(`#${id}`).textContent()) !== expected) {
       throw new Error(`SSR addition mismatch for ${id}`);
@@ -60,7 +63,7 @@ try {
     || (await page.locator("#addition-total").textContent()) !== "3.5") {
     throw new Error("reactive WASM addition differs from SSR semantics");
   }
-  const list = page.locator('ax-state-each[data-ax-each-render-status="ready"]');
+  const list = page.locator('ax-state-each[data-ax-each-render-status="ready"][data-ax-each-signal]');
   const firstItem = list.locator('ax-each-item[data-ax-each-key="first"]');
   const firstHandle = await firstItem.elementHandle();
   await firstItem.locator("input").focus();
@@ -79,6 +82,7 @@ try {
   await page.locator("#insert").click();
   const inserted = list.locator('ax-each-item[data-ax-each-key="third"]');
   await inserted.waitFor();
+  await page.waitForFunction(() => document.querySelector("#post-count")?.textContent === "3");
   if ((await inserted.locator("strong").count()) !== 0) throw new Error("inserted text was interpreted as HTML");
   if ((await inserted.locator("span").textContent()) !== "<strong>Literal</strong>") {
     throw new Error("inserted text was not preserved literally");
@@ -92,6 +96,7 @@ try {
   }
 
   await page.locator("#remove").click();
+  await page.waitForFunction(() => document.querySelector("#post-count")?.textContent === "2");
   if ((await list.locator('ax-each-item[data-ax-each-key="second"]').count()) !== 0) {
     throw new Error("removed keyed boundary remained in the DOM");
   }
@@ -121,6 +126,92 @@ try {
   }
   if (diagnostics.eachRefreshesRequired !== 1) {
     throw new Error(`expected one refresh fallback, got ${diagnostics.eachRefreshesRequired}`);
+  }
+
+  const derived = page.locator('#derived-row-set ax-state-each[data-ax-expression-0-target="each"]');
+  const derivedRows = derived.locator(":scope > ax-each-item");
+  const empty = derived.getByText("No rows", { exact: true });
+  const keys = () => derivedRows.evaluateAll((nodes) => nodes.map((node) => node.dataset.axEachKey).join(","));
+  if ((await keys()) !== "a,b" || await empty.isVisible()) {
+    throw new Error("server-rendered derived list or its empty state is incorrect");
+  }
+  const existing = derived.locator('ax-each-item[data-ax-each-key="a"]');
+  const existingHandle = await existing.elementHandle();
+  const nativeOrder = page.locator("#native-order tbody");
+  const nativeRows = nativeOrder.locator(":scope > tr[data-ax-each-key-id]");
+  const nativeKeys = () => nativeRows.evaluateAll((nodes) => nodes.map((node) => node.dataset.axEachKey).join(","));
+  if ((await nativeKeys()) !== "a,b") throw new Error("native table SSR did not keep rows in tbody");
+  const nativeExisting = nativeOrder.locator(':scope > tr[data-ax-each-key="a"]');
+  const nativeHandle = await nativeExisting.elementHandle();
+  await page.locator("#derived-reorder").click();
+  await page.waitForFunction(() => document.querySelector(
+    '#derived-row-set ax-state-each[data-ax-expression-0-target="each"] > ax-each-item',
+  )?.dataset.axEachKey === "b");
+  if ((await keys()) !== "b,a"
+    || !(await existing.evaluate((node, original) => node === original, existingHandle))) {
+    throw new Error("derived reorder did not retain the keyed DOM boundary");
+  }
+  if ((await nativeKeys()) !== "b,a"
+    || !(await nativeExisting.evaluate((node, original) => node === original, nativeHandle))) {
+    throw new Error("native table reorder replaced an existing tr");
+  }
+  await page.locator("#derived-clear").click();
+  await empty.waitFor();
+  if (await derivedRows.count()) throw new Error("derived empty list retained rows");
+  if (await nativeRows.count()) throw new Error("native empty list retained rows");
+  await page.locator("#derived-reset").click();
+  await empty.waitFor({ state: "hidden" });
+  if ((await keys()) !== "a,b") throw new Error("derived list did not restore rows after clearing");
+  if ((await nativeKeys()) !== "a,b") throw new Error("native table did not restore rows after clearing");
+
+  const filtered = page.locator("#status-filter ax-state-each");
+  const filteredRows = filtered.locator(":scope > ax-each-item");
+  const expectedDrafts = ["First draft", "Second draft"];
+  const nativeFilter = page.locator("#native-filter tbody.ax-table__body");
+  const nativeFilteredRows = nativeFilter.locator(":scope > tr[data-ax-each-key-id]");
+  const nativeEmpty = nativeFilter.getByText("No matching table rows", { exact: true });
+  if (!(await nativeEmpty.isVisible()) || await nativeFilteredRows.count()) {
+    throw new Error("native table did not SSR its empty row correctly");
+  }
+  if (await filteredRows.count()
+    || !(await filtered.getByText("No matching posts", { exact: true }).isVisible())
+    || (await filtered.getAttribute("data-ax-each-render-status")) !== "ready") {
+    throw new Error("initial no-match filter did not prepare a row template");
+  }
+  await page.locator("#filter-drafts").click();
+  await filtered.getByText("Second draft", { exact: true }).waitFor();
+  if (JSON.stringify(await filteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)) {
+    throw new Error("initially empty filter did not insert drafts in source order");
+  }
+  if (JSON.stringify(await nativeFilteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)
+    || await nativeEmpty.isVisible()
+    || !(await nativeFilteredRows.first().evaluate((node) => node.classList.contains("ax-table__row")))) {
+    throw new Error("native table did not render first matches as styled tr children");
+  }
+  const firstDraft = nativeFilter.locator(':scope > tr[data-ax-each-key="draft-a"]');
+  const firstDraftHandle = await firstDraft.elementHandle();
+  await page.locator("#sort-desc").click();
+  if (JSON.stringify(await nativeFilteredRows.allTextContents()) !== JSON.stringify([...expectedDrafts].reverse())
+    || !(await firstDraft.evaluate((node, original) => node === original, firstDraftHandle))) {
+    throw new Error("descending title sort replaced rows or changed filter results");
+  }
+  await page.locator("#sort-asc").click();
+  if (JSON.stringify(await nativeFilteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)) {
+    throw new Error("ascending title sort did not restore the order");
+  }
+  await page.locator("#filter-published").click();
+  await filtered.getByText("Published post", { exact: true }).waitFor();
+  if (await filteredRows.count() !== 1) throw new Error("published filter kept other rows");
+  await page.locator("#filter-archived").click();
+  await filtered.getByText("No matching posts", { exact: true }).waitFor();
+  if (await filteredRows.count() !== 0) throw new Error("no-match filter kept rows");
+  if (await nativeFilteredRows.count() !== 0 || !(await nativeEmpty.isVisible())) {
+    throw new Error("native table did not restore its empty row");
+  }
+  await page.locator("#filter-drafts").click();
+  await filtered.getByText("Second draft", { exact: true }).waitFor();
+  if (JSON.stringify(await filteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)) {
+    throw new Error("restoring the drafts filter lost rows or ordering");
   }
   if (localRequests.length !== 0) throw new Error(`local reconciliation made requests: ${localRequests.join(", ")}`);
   if (consoleErrors.length !== 0) throw new Error(`browser console errors: ${consoleErrors.join(" | ")}`);

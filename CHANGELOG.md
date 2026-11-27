@@ -6,6 +6,31 @@ The format is intentionally simple while the project is still early-stage.
 
 ## Unreleased
 
+## axonyx-core / axonyx-runtime 0.9.0
+
+- Rust callers constructing `AxEachBlock` with a struct literal must supply
+  the new `expression_binding` field. `AxEachBlock::new` supplies `None`.
+  Serde still accepts older documents without the field. Review exhaustive
+  Rust matches on the Core error enums for the new list and table diagnostics.
+
+- Support `List.length(items)` in Pages. It returns an `Int` for a list in
+  the first server render and for supported reactive expressions in WASM.
+  Counting does not mutate the list or make a server request.
+- Support keyed `<Each>` over a derived reactive list, such as
+  `items={rowSets[selected]}`. WASM evaluates the source and the browser
+  reconciles supported rows by key. When no row template is available,
+  insertion retains the existing refresh-required fallback.
+- Add `List.filterEq(posts, "status", selectedStatus)` for exact,
+  case-sensitive text matching in Pages and client WASM. It returns a
+  new list in the original order and skips missing or non-text fields. See
+  [reactive list filtering](docs/reactive-list-filter.md).
+- Prepare a keyed row template for an initially unmatched filter over a
+  nonempty state list, without running server data callbacks for the sample.
+- Reconcile a keyed `Each` directly in native `tbody`, preserving `tr`
+  identity, Foundry row attributes, and optional empty rows.
+- Add stable text `List.sortBy(rows, "title", direction)` for Pages and WASM.
+  It composes with filters and does not mutate the original list.
+
 ## axonyx-core / axonyx-runtime 0.8.5
 
 - Resolve `Title`, `Meta`, and `Link` from top-level page bindings in

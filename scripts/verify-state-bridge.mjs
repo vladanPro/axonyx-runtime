@@ -32,6 +32,10 @@ class FakeElement {
   setAttribute(name, value) { this.attrs.set(name, String(value)); }
   removeAttribute(name) { this.attrs.delete(name); }
   matches(selector) {
+    if (selector === 'ax-state-each[data-ax-each-protocol="ax-each/1"]') {
+      return this.tag === "ax-state-each"
+        && this.getAttribute("data-ax-each-protocol") === "ax-each/1";
+    }
     if (selector === "ax-each-empty") return this.tag === "ax-each-empty";
     if (selector === "ax-each-item[data-ax-each-key-id]") {
       return this.tag === "ax-each-item" && this.attrs.has("data-ax-each-key-id");
@@ -159,11 +163,9 @@ globalThis.CustomEvent = class CustomEvent {
 };
 globalThis.document = {
   readyState: "complete",
-  querySelectorAll: (selector) => (
-    selector === "ax-state-each[data-ax-each-protocol]"
-      ? [eachRoot, fallbackEachRoot]
-      : []
-  ),
+  querySelectorAll: (selector) => [eachRoot, fallbackEachRoot].filter((root) => (
+    selector.split(",").some((part) => root.matches(part.trim()))
+  )),
   addEventListener: () => {},
   createElement: (tag) => new FakeElement(tag),
 };

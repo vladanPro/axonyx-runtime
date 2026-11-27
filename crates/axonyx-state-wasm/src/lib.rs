@@ -22,6 +22,9 @@ const AX_EACH_RECONCILE_MAX_KEYS: usize = 4096;
 const AX_EACH_RENDER_MAX_PATHS: usize = 256;
 const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
 const AX_EXPRESSION_STACK_MAX_VALUES: usize = 4096;
+const AX_EXPRESSION_LIST_LENGTH: u8 = 52;
+const AX_EXPRESSION_LIST_FILTER_EQ: u8 = 53;
+const AX_EXPRESSION_LIST_SORT_BY: u8 = 54;
 
 static mut STRING_BUFFER: [u8; AX_STATE_STRING_CAPACITY] = [0; AX_STATE_STRING_CAPACITY];
 static mut VALUE_BUFFER: [u8; AX_STATE_VALUE_CAPACITY] = [0; AX_STATE_VALUE_CAPACITY];
@@ -440,6 +443,43 @@ fn evaluate_expression_program(program: &[u8], dependencies: &[ExprValue]) -> Op
                 let values = pop_expression_values(&mut stack, count)?;
                 stack.push(ExprValue::Object(keys.into_iter().zip(values).collect()));
             }
+            AX_EXPRESSION_LIST_LENGTH => {
+                let ExprValue::List(items) = stack.pop()? else {
+                    return None;
+                };
+                stack.push(ExprValue::Int(i64::try_from(items.len()).ok()?));
+            }
+            AX_EXPRESSION_LIST_FILTER_EQ | AX_EXPRESSION_LIST_SORT_BY => {
+                let field = read_program_string(program, &mut cursor)?;
+                let ExprValue::String(expected) = stack.pop()? else {
+                    return None;
+                };
+                let ExprValue::List(mut items) = stack.pop()? else {
+                    return None;
+                };
+                if opcode == AX_EXPRESSION_LIST_FILTER_EQ {
+                    items.retain(|item| expr_text_field(item, &field) == Some(expected.as_str()));
+                } else {
+                    let descending = match expected.as_str() {
+                        "asc" => false,
+                        "desc" => true,
+                        _ => return None,
+                    };
+                    items.sort_by(|left, right| {
+                        match (
+                            expr_text_field(left, &field),
+                            expr_text_field(right, &field),
+                        ) {
+                            (Some(left), Some(right)) if descending => right.cmp(left),
+                            (Some(left), Some(right)) => left.cmp(right),
+                            (Some(_), None) => std::cmp::Ordering::Less,
+                            (None, Some(_)) => std::cmp::Ordering::Greater,
+                            (None, None) => std::cmp::Ordering::Equal,
+                        }
+                    });
+                }
+                stack.push(ExprValue::List(items));
+            }
             _ => return None,
         }
         if stack.len() > AX_EXPRESSION_STACK_MAX_VALUES {
@@ -447,6 +487,16 @@ fn evaluate_expression_program(program: &[u8], dependencies: &[ExprValue]) -> Op
         }
     }
     (stack.len() == 1).then(|| stack.pop()).flatten()
+}
+
+fn expr_text_field<'a>(item: &'a ExprValue, field: &str) -> Option<&'a str> {
+    let ExprValue::Object(fields) = item else {
+        return None;
+    };
+    fields.iter().find_map(|(name, value)| match value {
+        ExprValue::String(text) if name == field => Some(text.as_str()),
+        _ => None,
+    })
 }
 
 fn read_program_u16(program: &[u8], cursor: &mut usize) -> Option<usize> {
@@ -1020,6 +1070,89 @@ mod tests {
             decode_expr_value(result, 0),
             Some((ExprValue::Bool(true), 5))
         );
+    }
+
+    #[test]
+    fn sorts_text_stably_with_missing_fields_last() {
+        let program = b"AXE\x01\x00\x00\x00\x00\x01\x00\x36\x05\x00\x00\x00title";
+        let row = |id: &str, title: &str| {
+            ExprValue::Object(vec![
+                ("id".to_string(), ExprValue::String(id.to_string())),
+                ("title".to_string(), ExprValue::String(title.to_string())),
+            ])
+        };
+        let one = row("one", "Alpha");
+        let two = row("two", "Alpha");
+        let three = row("three", "Zulu");
+        let missing = ExprValue::Object(vec![]);
+        let items = ExprValue::List(vec![
+            missing.clone(),
+            one.clone(),
+            three.clone(),
+            two.clone(),
+        ]);
+        let sort = |direction: &str| {
+            evaluate_expression_program(
+                program,
+                &[items.clone(), ExprValue::String(direction.to_string())],
+            )
+        };
+        assert_eq!(
+            sort("asc"),
+            Some(ExprValue::List(vec![
+                one.clone(),
+                two.clone(),
+                three.clone(),
+                missing.clone()
+            ]))
+        );
+        assert_eq!(
+            sort("desc"),
+            Some(ExprValue::List(vec![three, one, two, missing]))
+        );
+        assert_eq!(sort("up"), None);
+    }
+
+    #[test]
+    fn filters_record_lists_by_exact_text_in_source_order() {
+        let program = b"AXE\x01\x00\x00\x00\x00\x01\x00\x35\x06\x00\x00\x00status";
+        let row = |id: &str, status: &str| {
+            ExprValue::Object(vec![
+                ("id".to_string(), ExprValue::String(id.to_string())),
+                ("status".to_string(), ExprValue::String(status.to_string())),
+            ])
+        };
+        let first = row("first", "draft");
+        let last = row("last", "draft");
+        let input = ExprValue::List(vec![
+            first.clone(),
+            row("middle", "Draft"),
+            ExprValue::Object(vec![]),
+            last.clone(),
+        ]);
+        assert_eq!(
+            evaluate_expression_program(
+                program,
+                &[input.clone(), ExprValue::String("draft".to_string())]
+            ),
+            Some(ExprValue::List(vec![first, last]))
+        );
+        assert_eq!(
+            evaluate_expression_program(program, &[input, ExprValue::Bool(true)]),
+            None
+        );
+    }
+
+    #[test]
+    fn counts_items_in_a_reactive_list() {
+        let program = b"AXE\x01\x00\x00\x00\x34";
+        let count = |value| evaluate_expression_program(program, &[value]);
+        assert_eq!(
+            count(ExprValue::List(vec![ExprValue::Null, ExprValue::Null])),
+            Some(ExprValue::Int(2))
+        );
+        assert_eq!(count(ExprValue::List(vec![])), Some(ExprValue::Int(0)));
+        assert_eq!(count(ExprValue::String("not a list".to_string())), None);
     }
 
     #[test]
