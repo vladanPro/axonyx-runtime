@@ -1,8 +1,42 @@
 use std::{env, fs, path::PathBuf};
 
-use axonyx_runtime::preview_ax_page;
+use axonyx_runtime::preview_ax_page_with_imports;
+
+const TABLE_BODY: &str = r#"
+component TableBody {
+  return ASX {
+    <tbody class="ax-table__body">
+      <Slot />
+    </tbody>
+  }
+}
+"#;
+
+const TABLE_ROW: &str = r#"
+component TableRow {
+  return ASX {
+    <tr class="ax-table__row">
+      <Slot />
+    </tr>
+  }
+}
+"#;
+
+const TABLE_CELL: &str = r#"
+component TableCell(align = "") {
+  return ASX {
+    <td class="ax-table__cell" data-align={align}>
+      <Slot />
+    </td>
+  }
+}
+"#;
 
 const SOURCE: &str = r#"
+import { TableBody } from "@axonyx/ui/foundry/TableBody"
+import { TableRow } from "@axonyx/ui/foundry/TableRow"
+import { TableCell } from "@axonyx/ui/foundry/TableCell"
+
 page ReactiveEachProbe() {
   state count: Int = 2
   state ratio: Float = 0.5
@@ -67,6 +101,21 @@ page ReactiveEachProbe() {
           <Empty><p>No matching posts</p></Empty>
         </Each>
       </section>
+      <table id="native-filter">
+        <TableBody>
+          <Each items={List.filterEq(filterPosts, "status", selectedStatus)} as="post" key={post.id}>
+            <TableRow><TableCell>{post.title}</TableCell></TableRow>
+            <Empty><tr><td>No matching table rows</td></tr></Empty>
+          </Each>
+        </TableBody>
+      </table>
+      <table id="native-order">
+        <tbody>
+          <Each items={rowSets[selectedRows]} as="row" key={row.id}>
+            <tr><td>{row.title}</td></tr>
+          </Each>
+        </tbody>
+      </table>
     </>
   }
 }
@@ -79,7 +128,17 @@ fn main() {
     let runtime_dir = output.join("_ax").join("runtime");
     fs::create_dir_all(&runtime_dir).expect("fixture output directory should be created");
 
-    let html = preview_ax_page(SOURCE).expect("reactive Each fixture should compile");
+    let resolver = |path: &str| {
+        match path {
+            "@axonyx/ui/foundry/TableBody" => Some(TABLE_BODY),
+            "@axonyx/ui/foundry/TableRow" => Some(TABLE_ROW),
+            "@axonyx/ui/foundry/TableCell" => Some(TABLE_CELL),
+            _ => None,
+        }
+        .map(str::to_string)
+    };
+    let html = preview_ax_page_with_imports(SOURCE, &resolver)
+        .expect("reactive Each fixture should compile");
     fs::write(output.join("index.html"), html).expect("fixture HTML should be written");
     fs::write(
         runtime_dir.join("axonyx-state-v2.wasm"),

@@ -22,5 +22,23 @@ When the first render has no matches, a filter over a named state list can
 use its first loaded item to prepare an inert row template. The sample cannot
 read surrounding page data or run server data callbacks. If the input itself
 is empty or the row body cannot be safely cloned, reconciliation still reports
-that a refresh is required. This feature does not change native table-row
-rendering.
+that a refresh is required.
+
+## Native table rows
+
+Put one keyed `Each` inside a `tbody` or Foundry `TableBody`. Render a single
+native `tr` per item, directly or through `TableRow`. An `Empty` block is
+optional; when provided it also renders a single row.
+
+```ax
+<TableBody>
+  <Each items={List.filterEq(posts, "status", selectedStatus)} as="post" key={post.id}>
+    <TableRow><TableCell>{post.title}</TableCell></TableRow>
+    <Empty><tr><td>No matching posts</td></tr></Empty>
+  </Each>
+</TableBody>
+```
+
+The browser reconciles native rows directly. Keep static or independently
+updated rows in separate table bodies. This does not change the Foundry
+`DataTable` search or paging behavior.

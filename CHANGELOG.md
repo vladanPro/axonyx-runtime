@@ -19,6 +19,8 @@ The format is intentionally simple while the project is still early-stage.
   [reactive list filtering](docs/reactive-list-filter.md).
 - Prepare a keyed row template for an initially unmatched filter over a
   nonempty state list, without running server data callbacks for the sample.
+- Reconcile a keyed `Each` directly in native `tbody`, preserving `tr`
+  identity, Foundry row attributes, and optional empty rows.
 
 ## axonyx-core / axonyx-runtime 0.8.5
 

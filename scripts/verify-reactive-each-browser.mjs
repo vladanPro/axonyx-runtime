@@ -137,6 +137,12 @@ try {
   }
   const existing = derived.locator('ax-each-item[data-ax-each-key="a"]');
   const existingHandle = await existing.elementHandle();
+  const nativeOrder = page.locator("#native-order tbody");
+  const nativeRows = nativeOrder.locator(":scope > tr[data-ax-each-key-id]");
+  const nativeKeys = () => nativeRows.evaluateAll((nodes) => nodes.map((node) => node.dataset.axEachKey).join(","));
+  if ((await nativeKeys()) !== "a,b") throw new Error("native table SSR did not keep rows in tbody");
+  const nativeExisting = nativeOrder.locator(':scope > tr[data-ax-each-key="a"]');
+  const nativeHandle = await nativeExisting.elementHandle();
   await page.locator("#derived-reorder").click();
   await page.waitForFunction(() => document.querySelector(
     '#derived-row-set ax-state-each[data-ax-expression-0-target="each"] > ax-each-item',
@@ -145,16 +151,28 @@ try {
     || !(await existing.evaluate((node, original) => node === original, existingHandle))) {
     throw new Error("derived reorder did not retain the keyed DOM boundary");
   }
+  if ((await nativeKeys()) !== "b,a"
+    || !(await nativeExisting.evaluate((node, original) => node === original, nativeHandle))) {
+    throw new Error("native table reorder replaced an existing tr");
+  }
   await page.locator("#derived-clear").click();
   await empty.waitFor();
   if (await derivedRows.count()) throw new Error("derived empty list retained rows");
+  if (await nativeRows.count()) throw new Error("native empty list retained rows");
   await page.locator("#derived-reset").click();
   await empty.waitFor({ state: "hidden" });
   if ((await keys()) !== "a,b") throw new Error("derived list did not restore rows after clearing");
+  if ((await nativeKeys()) !== "a,b") throw new Error("native table did not restore rows after clearing");
 
   const filtered = page.locator("#status-filter ax-state-each");
   const filteredRows = filtered.locator(":scope > ax-each-item");
   const expectedDrafts = ["First draft", "Second draft"];
+  const nativeFilter = page.locator("#native-filter tbody.ax-table__body");
+  const nativeFilteredRows = nativeFilter.locator(":scope > tr[data-ax-each-key-id]");
+  const nativeEmpty = nativeFilter.getByText("No matching table rows", { exact: true });
+  if (!(await nativeEmpty.isVisible()) || await nativeFilteredRows.count()) {
+    throw new Error("native table did not SSR its empty row correctly");
+  }
   if (await filteredRows.count()
     || !(await filtered.getByText("No matching posts", { exact: true }).isVisible())
     || (await filtered.getAttribute("data-ax-each-render-status")) !== "ready") {
@@ -165,12 +183,20 @@ try {
   if (JSON.stringify(await filteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)) {
     throw new Error("initially empty filter did not insert drafts in source order");
   }
+  if (JSON.stringify(await nativeFilteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)
+    || await nativeEmpty.isVisible()
+    || !(await nativeFilteredRows.first().evaluate((node) => node.classList.contains("ax-table__row")))) {
+    throw new Error("native table did not render first matches as styled tr children");
+  }
   await page.locator("#filter-published").click();
   await filtered.getByText("Published post", { exact: true }).waitFor();
   if (await filteredRows.count() !== 1) throw new Error("published filter kept other rows");
   await page.locator("#filter-archived").click();
   await filtered.getByText("No matching posts", { exact: true }).waitFor();
   if (await filteredRows.count() !== 0) throw new Error("no-match filter kept rows");
+  if (await nativeFilteredRows.count() !== 0 || !(await nativeEmpty.isVisible())) {
+    throw new Error("native table did not restore its empty row");
+  }
   await page.locator("#filter-drafts").click();
   await filtered.getByText("Second draft", { exact: true }).waitFor();
   if (JSON.stringify(await filteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)) {

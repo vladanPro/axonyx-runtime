@@ -151,6 +151,8 @@ pub enum AxLowerError {
     InvalidEachKey,
     #[error("duplicate `each` key `{key}`")]
     DuplicateEachKey { key: String },
+    #[error("invalid keyed Each in <tbody>: {message}")]
+    InvalidTableEach { message: &'static str },
     #[error("failed to parse imported component from `{import_path}`: {message}")]
     ImportedComponentParse {
         import_path: String,
@@ -388,7 +390,10 @@ fn lower_statements(
                     let mut empty_node = None;
                     let mut keys = BTreeSet::new();
                     let mut key_kind = None;
-                    if expression.is_some() || initially_empty {
+                    if expression.is_some()
+                        || initially_empty
+                        || (block.state_binding.is_some() && !block.empty_body.is_empty())
+                    {
                         let mut nested = scope.clone();
                         let empty = lower_statements(
                             &block.empty_body,
@@ -967,7 +972,11 @@ fn lower_component_node(
         tag if is_native_html_tag(tag) => {
             push_behavior_props(&mut attrs, &mut props);
             push_native_props(&mut attrs, props);
-            element_with_attrs(leak_tag(tag.to_string()), attrs, children)
+            if tag == "tbody" {
+                lower_table_body(attrs, children)?
+            } else {
+                element_with_attrs(leak_tag(tag.to_string()), attrs, children)
+            }
         }
         other => {
             attrs.insert(0, attr("data-component", other.to_string()));
@@ -979,6 +988,112 @@ fn lower_component_node(
 
     attach_each_render_attributes(&mut node, component, scope);
     Ok(node)
+}
+
+fn lower_table_body(
+    mut attrs: Vec<Attribute>,
+    mut children: Vec<AxNode>,
+) -> Result<AxNode, AxLowerError> {
+    let Some(index) = children
+        .iter()
+        .position(|node| node_has_tag(node, "ax-state-each"))
+    else {
+        return Ok(element_with_attrs("tbody", attrs, children));
+    };
+    let each = children.remove(index);
+    if children.iter().any(|node| !node_is_blank(node)) {
+        return Err(AxLowerError::InvalidTableEach {
+            message: "use a separate <tbody> for the keyed Each and other rows",
+        });
+    }
+    let AxNode::Element {
+        attrs: mut each_attrs,
+        children: rows,
+        ..
+    } = each
+    else {
+        unreachable!("the keyed Each was found by its tag");
+    };
+    each_attrs.retain(|attribute| attribute.name != "style");
+    each_attrs.push(attr("data-ax-each-row-mode", "tr"));
+    attrs.retain(|attribute| !each_attrs.iter().any(|owned| owned.name == attribute.name));
+    attrs.extend(each_attrs);
+
+    let mut native_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let AxNode::Element {
+            tag,
+            mut attrs,
+            children,
+        } = row
+        else {
+            return Err(AxLowerError::InvalidTableEach {
+                message: "expected a row",
+            });
+        };
+        let row = match tag {
+            "ax-each-item" => {
+                attrs.retain(|attribute| {
+                    matches!(attribute.name, "data-ax-each-key" | "data-ax-each-key-id")
+                });
+                native_each_row(children, attrs, false)?
+            }
+            "ax-each-empty" => {
+                attrs.retain(|attribute| attribute.name == "hidden");
+                attrs.push(attr("data-ax-each-empty", ""));
+                native_each_row(children, attrs, true)?
+            }
+            "template" => {
+                let row = native_each_row(children, Vec::new(), false)?
+                    .expect("nonempty row is required");
+                Some(element_with_attrs("template", attrs, vec![row]))
+            }
+            _ => {
+                return Err(AxLowerError::InvalidTableEach {
+                    message: "expected a row",
+                })
+            }
+        };
+        native_rows.extend(row);
+    }
+    Ok(element_with_attrs("tbody", attrs, native_rows))
+}
+
+fn native_each_row(
+    children: Vec<AxNode>,
+    ownership: Vec<Attribute>,
+    optional: bool,
+) -> Result<Option<AxNode>, AxLowerError> {
+    let mut nodes = children
+        .into_iter()
+        .filter(|node| !node_is_blank(node) && !node_has_tag(node, "ax-each-render-unsupported"));
+    let node = nodes.next();
+    if node.is_none() && optional {
+        return Ok(None);
+    }
+    if let Some(AxNode::Element {
+        tag: "tr",
+        mut attrs,
+        children,
+    }) = node
+    {
+        if nodes.next().is_none() {
+            attrs.retain(|attribute| !ownership.iter().any(|owned| owned.name == attribute.name));
+            attrs.extend(ownership);
+            return Ok(Some(element_with_attrs("tr", attrs, children)));
+        }
+    }
+    Err(AxLowerError::InvalidTableEach {
+        message: "render exactly one <tr> per item and in <Empty> when provided",
+    })
+}
+
+fn node_has_tag(node: &AxNode, expected: &str) -> bool {
+    matches!(node, AxNode::Element { tag, .. } if *tag == expected)
+}
+
+fn node_is_blank(node: &AxNode) -> bool {
+    matches!(node, AxNode::Text(text) if text.trim().is_empty())
 }
 
 fn lower_component_children(
@@ -3059,6 +3174,34 @@ component ThemePicker() {
         };
 
         assert_eq!(children, vec![text("Custom")]);
+    }
+
+    #[test]
+    fn keyed_table_each_rejects_non_rows_and_mixed_ownership() {
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> { None };
+        for (before, row) in [
+            ("<tr><td>Static</td></tr>", "<tr><td>{post.id}</td></tr>"),
+            ("", "<div>{post.id}</div>"),
+        ] {
+            let source = format!(
+                r#"
+page TableProbe() {{
+  state posts = [{{ id: "first" }}]
+  return ASX {{
+    <table><tbody>
+      {before}
+      <Each items={{posts}} as="post" key={{post.id}}>{row}</Each>
+    </tbody></table>
+  }}
+}}
+"#
+            );
+            let document = parse_ax_auto(&source).expect("table probe should parse");
+            assert!(matches!(
+                lower_document(&document, &resolver),
+                Err(AxLowerError::InvalidTableEach { .. })
+            ));
+        }
     }
 
     #[test]
