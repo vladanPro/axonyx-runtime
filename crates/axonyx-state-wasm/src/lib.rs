@@ -23,6 +23,7 @@ const AX_EACH_RENDER_MAX_PATHS: usize = 256;
 const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
 const AX_EXPRESSION_STACK_MAX_VALUES: usize = 4096;
 const AX_EXPRESSION_LIST_LENGTH: u8 = 52;
+const AX_EXPRESSION_LIST_FILTER_EQ: u8 = 53;
 
 static mut STRING_BUFFER: [u8; AX_STATE_STRING_CAPACITY] = [0; AX_STATE_STRING_CAPACITY];
 static mut VALUE_BUFFER: [u8; AX_STATE_VALUE_CAPACITY] = [0; AX_STATE_VALUE_CAPACITY];
@@ -446,6 +447,21 @@ fn evaluate_expression_program(program: &[u8], dependencies: &[ExprValue]) -> Op
                     return None;
                 };
                 stack.push(ExprValue::Int(i64::try_from(items.len()).ok()?));
+            }
+            AX_EXPRESSION_LIST_FILTER_EQ => {
+                let field = read_program_string(program, &mut cursor)?;
+                let ExprValue::String(expected) = stack.pop()? else {
+                    return None;
+                };
+                let ExprValue::List(mut items) = stack.pop()? else {
+                    return None;
+                };
+                items.retain(|item| {
+                    matches!(item, ExprValue::Object(fields)
+                    if fields.iter().any(|(name, value)| name == &field
+                        && matches!(value, ExprValue::String(text) if text == &expected)))
+                });
+                stack.push(ExprValue::List(items));
             }
             _ => return None,
         }
@@ -1026,6 +1042,36 @@ mod tests {
         assert_eq!(
             decode_expr_value(result, 0),
             Some((ExprValue::Bool(true), 5))
+        );
+    }
+
+    #[test]
+    fn filters_record_lists_by_exact_text_in_source_order() {
+        let program = b"AXE\x01\x00\x00\x00\x00\x01\x00\x35\x06\x00\x00\x00status";
+        let row = |id: &str, status: &str| {
+            ExprValue::Object(vec![
+                ("id".to_string(), ExprValue::String(id.to_string())),
+                ("status".to_string(), ExprValue::String(status.to_string())),
+            ])
+        };
+        let first = row("first", "draft");
+        let last = row("last", "draft");
+        let input = ExprValue::List(vec![
+            first.clone(),
+            row("middle", "Draft"),
+            ExprValue::Object(vec![]),
+            last.clone(),
+        ]);
+        assert_eq!(
+            evaluate_expression_program(
+                program,
+                &[input.clone(), ExprValue::String("draft".to_string())]
+            ),
+            Some(ExprValue::List(vec![first, last]))
+        );
+        assert_eq!(
+            evaluate_expression_program(program, &[input, ExprValue::Bool(true)]),
+            None
         );
     }
 

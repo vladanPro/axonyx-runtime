@@ -1078,6 +1078,7 @@ const AX_EXPR_OPTIONAL_MEMBER: u8 = 42;
 const AX_EXPR_BUILD_LIST: u8 = 50;
 const AX_EXPR_BUILD_OBJECT: u8 = 51;
 const AX_EXPR_LIST_LENGTH: u8 = 52;
+const AX_EXPR_LIST_FILTER_EQ: u8 = 53;
 const AX_EXPRESSION_COLLECTION_MAX_ITEMS: usize = 1024;
 
 fn is_reactive_boolean_attr(name: &str) -> bool {
@@ -1284,6 +1285,36 @@ fn expand_pure_reactive_expression(
                     local_stack,
                     call_stack,
                 )?],
+            }
+        }
+        AxExpr::Call { path, args } if path.as_slice() == ["List", "filterEq"] => {
+            let [list, AxExpr::String(field), value] = args.as_slice() else {
+                return Err(
+                    "List.filterEq expects a list, literal field name, and text value".to_string(),
+                );
+            };
+            if field.is_empty() {
+                return Err("List.filterEq expects a nonempty field name".to_string());
+            }
+            AxExpr::Call {
+                path: path.clone(),
+                args: vec![
+                    expand_pure_reactive_expression(
+                        list,
+                        bindings,
+                        locals,
+                        local_stack,
+                        call_stack,
+                    )?,
+                    AxExpr::String(field.clone()),
+                    expand_pure_reactive_expression(
+                        value,
+                        bindings,
+                        locals,
+                        local_stack,
+                        call_stack,
+                    )?,
+                ],
             }
         }
         AxExpr::Call { path, args } => {
@@ -1499,6 +1530,17 @@ fn compile_reactive_expression_node(
             };
             compile_reactive_expression_node(value, bindings, dependencies, program)?;
             program.push(AX_EXPR_LIST_LENGTH);
+        }
+        AxExpr::Call { path, args } if path.as_slice() == ["List", "filterEq"] => {
+            let [list, AxExpr::String(field), value] = args.as_slice() else {
+                return Err(
+                    "List.filterEq expects a list, literal field name, and text value".to_string(),
+                );
+            };
+            compile_reactive_expression_node(list, bindings, dependencies, program)?;
+            compile_reactive_expression_node(value, bindings, dependencies, program)?;
+            program.push(AX_EXPR_LIST_FILTER_EQ);
+            push_program_string(program, field)?;
         }
         AxExpr::Call { path, .. } => {
             return Err(format!(

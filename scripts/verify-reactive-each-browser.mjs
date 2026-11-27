@@ -128,7 +128,7 @@ try {
     throw new Error(`expected one refresh fallback, got ${diagnostics.eachRefreshesRequired}`);
   }
 
-  const derived = page.locator('ax-state-each[data-ax-expression-0-target="each"]');
+  const derived = page.locator('#derived-row-set ax-state-each[data-ax-expression-0-target="each"]');
   const derivedRows = derived.locator(":scope > ax-each-item");
   const empty = derived.getByText("No rows", { exact: true });
   const keys = () => derivedRows.evaluateAll((nodes) => nodes.map((node) => node.dataset.axEachKey).join(","));
@@ -139,7 +139,7 @@ try {
   const existingHandle = await existing.elementHandle();
   await page.locator("#derived-reorder").click();
   await page.waitForFunction(() => document.querySelector(
-    'ax-state-each[data-ax-expression-0-target="each"] > ax-each-item',
+    '#derived-row-set ax-state-each[data-ax-expression-0-target="each"] > ax-each-item',
   )?.dataset.axEachKey === "b");
   if ((await keys()) !== "b,a"
     || !(await existing.evaluate((node, original) => node === original, existingHandle))) {
@@ -151,6 +151,24 @@ try {
   await page.locator("#derived-reset").click();
   await empty.waitFor({ state: "hidden" });
   if ((await keys()) !== "a,b") throw new Error("derived list did not restore rows after clearing");
+
+  const filtered = page.locator("#status-filter ax-state-each");
+  const filteredRows = filtered.locator(":scope > ax-each-item");
+  const expectedDrafts = ["First draft", "Second draft"];
+  if (JSON.stringify(await filteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)) {
+    throw new Error("initial render did not filter drafts in source order");
+  }
+  await page.locator("#filter-published").click();
+  await filtered.getByText("Published post", { exact: true }).waitFor();
+  if (await filteredRows.count() !== 1) throw new Error("published filter kept other rows");
+  await page.locator("#filter-archived").click();
+  await filtered.getByText("No matching posts", { exact: true }).waitFor();
+  if (await filteredRows.count() !== 0) throw new Error("no-match filter kept rows");
+  await page.locator("#filter-drafts").click();
+  await filtered.getByText("Second draft", { exact: true }).waitFor();
+  if (JSON.stringify(await filteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)) {
+    throw new Error("restoring the drafts filter lost rows or ordering");
+  }
   if (localRequests.length !== 0) throw new Error(`local reconciliation made requests: ${localRequests.join(", ")}`);
   if (consoleErrors.length !== 0) throw new Error(`browser console errors: ${consoleErrors.join(" | ")}`);
 

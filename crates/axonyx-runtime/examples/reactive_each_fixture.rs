@@ -15,6 +15,14 @@ page ReactiveEachProbe() {
   }
   state rowSets: List<List<Row>> = [[{ id: "a", title: "Alpha" }, { id: "b", title: "Beta" }], [{ id: "b", title: "Beta" }, { id: "a", title: "Alpha" }], []]
   state selectedRows: Int = 0
+  type PostStatus = "draft" | "published" | "archived"
+  type FilterPost {
+    id: String
+    title: String
+    status: PostStatus
+  }
+  state filterPosts: List<FilterPost> = [{ id: "draft-a", title: "First draft", status: "draft" }, { id: "published-b", title: "Published post", status: "published" }, { id: "draft-c", title: "Second draft", status: "draft" }]
+  state selectedStatus: String = "draft"
 
   return ASX {
     <>
@@ -44,10 +52,21 @@ page ReactiveEachProbe() {
       <button id="derived-reorder" on:click={selectedRows = 1}>Change order</button>
       <button id="derived-clear" on:click={selectedRows = 2}>Clear rows</button>
       <button id="derived-reset" on:click={selectedRows = 0}>Reset rows</button>
-      <Each items={rowSets[selectedRows]} as="row" key={row.id}>
-        <article>{row.title}</article>
-        <Empty><p>No rows</p></Empty>
-      </Each>
+      <section id="derived-row-set">
+        <Each items={rowSets[selectedRows]} as="row" key={row.id}>
+          <article>{row.title}</article>
+          <Empty><p>No rows</p></Empty>
+        </Each>
+      </section>
+      <section id="status-filter">
+        <button id="filter-drafts" on:click={selectedStatus = "draft"}>Draft</button>
+        <button id="filter-published" on:click={selectedStatus = "published"}>Published</button>
+        <button id="filter-archived" on:click={selectedStatus = "archived"}>Archived</button>
+        <Each items={List.filterEq(filterPosts, "status", selectedStatus)} as="post" key={post.id}>
+          <article>{post.title}</article>
+          <Empty><p>No matching posts</p></Empty>
+        </Each>
+      </section>
     </>
   }
 }

@@ -13,6 +13,10 @@ The format is intentionally simple while the project is still early-stage.
   `items={rowSets[selected]}`. WASM evaluates the source and the browser
   reconciles supported rows by key. Lists with no initial row template retain
   the existing refresh-required fallback when insertion needs that template.
+- Add `List.filterEq(posts, "status", selectedStatus)` for exact,
+  case-sensitive text matching in Pages and client WASM. It returns a
+  new list in the original order and skips missing or non-text fields. See
+  [reactive list filtering](docs/reactive-list-filter.md).
 
 ## axonyx-core / axonyx-runtime 0.8.5
 
