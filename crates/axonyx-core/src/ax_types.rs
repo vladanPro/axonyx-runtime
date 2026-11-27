@@ -938,6 +938,36 @@ impl AxDataContext {
                 }
                 Ok(AxType::Int)
             }
+            AxExpr::Call { path, args } if path.as_slice() == ["List", "filterEq"] => {
+                let [list, AxExpr::String(field), expected] = args.as_slice() else {
+                    return Err(AxTypeError::InvalidListFilterArguments);
+                };
+                if field.is_empty() {
+                    return Err(AxTypeError::InvalidListFilterArguments);
+                }
+                let item = match self.resolve_expr_type(list)? {
+                    AxType::List(item) => item,
+                    AxType::Unknown => Box::new(AxType::Unknown),
+                    other => {
+                        return Err(AxTypeError::InvalidListFilterSource {
+                            found: other.display_name(),
+                        })
+                    }
+                };
+                let field_type = self.resolve_member_type(&item, field)?;
+                let field_type = match &field_type {
+                    AxType::Optional(inner) => inner.as_ref(),
+                    other => other,
+                };
+                for ty in [field_type, &self.resolve_expr_type(expected)?] {
+                    if !self.is_filter_text_type(ty) {
+                        return Err(AxTypeError::InvalidListFilterTextType {
+                            found: ty.display_name(),
+                        });
+                    }
+                }
+                Ok(AxType::List(item))
+            }
             AxExpr::Call { .. } => Ok(AxType::Unknown),
         }
     }
@@ -996,6 +1026,14 @@ impl AxDataContext {
                 ty: other.display_name(),
                 field: property.to_string(),
             }),
+        }
+    }
+
+    fn is_filter_text_type(&self, ty: &AxType) -> bool {
+        match ty {
+            AxType::String | AxType::Unknown => true,
+            AxType::Record(name) => self.literal_union(name).is_some(),
+            _ => false,
         }
     }
 
@@ -1289,6 +1327,12 @@ fn is_type_identifier(input: &str) -> bool {
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AxTypeError {
+    #[error("List.filterEq expects a list, a nonempty literal field name, and a text value")]
+    InvalidListFilterArguments,
+    #[error("List.filterEq expects List<T>, found {found}")]
+    InvalidListFilterSource { found: String },
+    #[error("List.filterEq expects a text field and value, found {found}")]
+    InvalidListFilterTextType { found: String },
     #[error("List.length expects one argument, got {actual}")]
     InvalidListLengthArity { actual: usize },
     #[error("List.length expects List<T>, found {found}")]
@@ -1793,6 +1837,42 @@ mod tests {
 
         assert_eq!(error.path, "$.title");
         assert_eq!(error.actual, "missing");
+    }
+
+    #[test]
+    fn filters_a_typed_list_without_losing_its_record_contract() {
+        let posts = AxType::list(AxType::record("Post"));
+        let context = AxDataContext::new()
+            .with_record(
+                AxRecordType::new("Post")
+                    .field("status", AxType::record("Status"))
+                    .field("views", AxType::Int),
+            )
+            .with_literal_union("Status", vec!["draft".to_string(), "published".to_string()])
+            .with_binding("posts", posts.clone())
+            .with_binding("selected", AxType::record("Status"));
+        let filter = |field, expected| {
+            AxExpr::call(
+                ["List", "filterEq"],
+                [AxExpr::ident("posts"), AxExpr::string(field), expected],
+            )
+        };
+        assert_eq!(
+            context.resolve_expr_type(&filter("status", AxExpr::ident("selected"))),
+            Ok(posts)
+        );
+        assert!(matches!(
+            context.resolve_expr_type(&filter("typo", AxExpr::string("draft"))),
+            Err(AxTypeError::UnknownField { .. })
+        ));
+        assert!(matches!(
+            context.resolve_expr_type(&filter("views", AxExpr::string("10"))),
+            Err(AxTypeError::InvalidListFilterTextType { .. })
+        ));
+        assert!(matches!(
+            context.resolve_expr_type(&filter("status", AxExpr::Bool(true))),
+            Err(AxTypeError::InvalidListFilterTextType { .. })
+        ));
     }
 
     #[test]

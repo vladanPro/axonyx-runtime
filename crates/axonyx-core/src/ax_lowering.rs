@@ -1520,6 +1520,32 @@ fn eval_expr(
             }
         }
         AxExpr::Call { path, args } => {
+            if path.as_slice() == ["List", "filterEq"] {
+                let [list, AxExpr::String(field), expected] = args.as_slice() else {
+                    return Err(AxLowerError::UnsupportedExpression {
+                        message: "List.filterEq expects a list, literal field name, and text value"
+                            .to_string(),
+                    });
+                };
+                if field.is_empty() {
+                    return Err(AxLowerError::UnsupportedExpression {
+                        message: "List.filterEq expects a nonempty field name".to_string(),
+                    });
+                }
+                let items = eval_expr(list, functions, scope, resolver)?;
+                let expected = eval_expr(expected, functions, scope, resolver)?;
+                let (AxValue::List(mut items), AxValue::String(expected)) = (items, expected)
+                else {
+                    return Err(AxLowerError::UnsupportedExpression {
+                        message: "List.filterEq expects a list and a text value".to_string(),
+                    });
+                };
+                items.retain(|item| {
+                    matches!(item, AxValue::Record(fields)
+                        if matches!(fields.get(field), Some(AxValue::String(text)) if text == &expected))
+                });
+                return Ok(AxValue::List(items));
+            }
             let args = args
                 .iter()
                 .map(|arg| eval_expr(arg, functions, scope, resolver))
