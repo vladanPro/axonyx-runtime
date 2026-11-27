@@ -11,12 +11,14 @@ The format is intentionally simple while the project is still early-stage.
   Counting does not mutate the list or make a server request.
 - Support keyed `<Each>` over a derived reactive list, such as
   `items={rowSets[selected]}`. WASM evaluates the source and the browser
-  reconciles supported rows by key. Lists with no initial row template retain
-  the existing refresh-required fallback when insertion needs that template.
+  reconciles supported rows by key. When no row template is available,
+  insertion retains the existing refresh-required fallback.
 - Add `List.filterEq(posts, "status", selectedStatus)` for exact,
   case-sensitive text matching in Pages and client WASM. It returns a
   new list in the original order and skips missing or non-text fields. See
   [reactive list filtering](docs/reactive-list-filter.md).
+- Prepare a keyed row template for an initially unmatched filter over a
+  nonempty state list, without running server data callbacks for the sample.
 
 ## axonyx-core / axonyx-runtime 0.8.5
 

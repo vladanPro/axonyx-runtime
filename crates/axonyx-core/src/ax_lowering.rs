@@ -12,6 +12,7 @@ const AX_COMPONENT_INSTANCE_PATH: &str = "__ax_component_instance_path";
 const AX_EACH_RENDER_BINDING: &str = "__ax_each_render_binding";
 const AX_EACH_RENDER_PARAM_PREFIX: &str = "__ax_each_render_param:";
 const AX_EACH_RENDER_UNSUPPORTED: &str = "__ax_each_render_unsupported";
+const AX_EACH_TEMPLATE_PROBE: &str = "\0ax-each-template-probe";
 // The NUL prefix cannot be authored as an ASX tag. Keep compiled AST compatibility.
 const AX_SCOPED_HEAD: &str = "\0ax-scoped-head";
 
@@ -453,6 +454,18 @@ fn lower_statements(
                                 ],
                                 item_children,
                             ));
+                        }
+                    }
+                    if initially_empty {
+                        if let Some((kind, template)) = empty_filtered_each_template(
+                            block,
+                            key_expr,
+                            context,
+                            scope,
+                            slot_context,
+                        ) {
+                            key_kind = Some(kind);
+                            render_template = Some(template);
                         }
                     }
                     if let Some(empty_node) = empty_node {
@@ -1171,6 +1184,57 @@ fn eval_props(
     Ok(props)
 }
 
+fn empty_filtered_each_template(
+    block: &AxEachBlock,
+    key_expr: &AxExpr,
+    context: &LoweringContext<'_>,
+    scope: &BTreeMap<String, AxValue>,
+    slot_context: Option<&SlotContext<'_>>,
+) -> Option<(String, Vec<AxNode>)> {
+    block.expression_binding.as_ref()?;
+    let AxExpr::Call { path, args } = &block.source else {
+        return None;
+    };
+    let [AxExpr::Identifier(source), _, _] = args.as_slice() else {
+        return None;
+    };
+    if path.as_slice() != ["List", "filterEq"] {
+        return None;
+    }
+    let AxValue::List(items) = scope.get(source)? else {
+        return None;
+    };
+    // An excluded row is only a template seed, not permission to render page data.
+    let mut nested = BTreeMap::from([
+        (block.binding.clone(), items.first()?.clone()),
+        (AX_EACH_TEMPLATE_PROBE.to_string(), AxValue::Bool(true)),
+        (
+            AX_EACH_RENDER_BINDING.to_string(),
+            AxValue::String(block.binding.clone()),
+        ),
+    ]);
+    let no_data_resolver = |_: &[String], _: &[AxValue]| None;
+    let template_context = LoweringContext {
+        sources: context.sources,
+        resolver: &no_data_resolver,
+        import_resolver: context.import_resolver,
+        scoped_heads: None,
+    };
+    let key = eval_expr(
+        key_expr,
+        template_context.sources.functions,
+        &nested,
+        template_context.resolver,
+    )
+    .ok()?;
+    let (identity, _) = each_key_identity(&key).ok()?;
+    let (kind, _) = identity.split_once(':')?;
+    let template =
+        lower_statements(&block.body, &template_context, &mut nested, slot_context).ok()?;
+    (each_render_scope_is_supported(&nested) && each_render_template_is_safe(&template))
+        .then(|| (kind.to_string(), template))
+}
+
 fn each_value_to_json(value: &AxValue) -> serde_json::Value {
     use serde_json::Value;
 
@@ -1507,6 +1571,11 @@ fn eval_expr(
         AxExpr::OptionalMember { object, property } => {
             let value = match eval_expr(object, functions, scope, resolver) {
                 Ok(value) => value,
+                Err(error @ AxLowerError::UnknownIdentifier { .. })
+                    if scope.contains_key(AX_EACH_TEMPLATE_PROBE) =>
+                {
+                    return Err(error);
+                }
                 Err(AxLowerError::UnknownIdentifier { .. })
                 | Err(AxLowerError::UnknownMember { .. }) => return Ok(AxValue::Null),
                 Err(error) => return Err(error),
@@ -2990,6 +3059,44 @@ component ThemePicker() {
         };
 
         assert_eq!(children, vec![text("Custom")]);
+    }
+
+    #[test]
+    fn empty_filtered_each_does_not_resolve_server_data_for_sample_rows() {
+        let source = r#"
+page Filtered() {
+  state posts = [{ id: "one", status: "draft" }]
+  state selected: String = "published"
+  return ASX {
+    <Each items={List.filterEq(posts, "status", selected)} as="post" key={post.id}>
+      <article>{Server.detail(post.id)}</article>
+      <Empty><p>Nothing published</p></Empty>
+    </Each>
+  }
+}
+"#;
+        let document = parse_ax_auto(source).expect("reactive filter should parse");
+        let resolver = |_: &[String], _: &[AxValue]| -> Option<AxValue> {
+            panic!("an excluded row must not resolve server data");
+        };
+        let html = lower_document(&document, &resolver).expect("empty filter should render");
+        let mut statuses = Vec::new();
+        collect_attr_values(&html, "data-ax-each-render-status", &mut statuses);
+        assert_eq!(statuses, ["fallback"]);
+
+        for reference in ["privateLabel", "privateLabel?.text"] {
+            let document = parse_ax_auto(&source.replace("Server.detail(post.id)", reference))
+                .expect("reactive filter should parse");
+            let scope = BTreeMap::from([(
+                "privateLabel".to_string(),
+                AxValue::record([("text", AxValue::from("page-only server data"))]),
+            )]);
+            let html = lower_document_with_scope(&document, scope, &resolver)
+                .expect("an empty list must not depend on surrounding page data");
+            statuses.clear();
+            collect_attr_values(&html, "data-ax-each-render-status", &mut statuses);
+            assert_eq!(statuses, ["fallback"]);
+        }
     }
 
     #[test]

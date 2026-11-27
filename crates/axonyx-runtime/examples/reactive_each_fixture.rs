@@ -22,7 +22,7 @@ page ReactiveEachProbe() {
     status: PostStatus
   }
   state filterPosts: List<FilterPost> = [{ id: "draft-a", title: "First draft", status: "draft" }, { id: "published-b", title: "Published post", status: "published" }, { id: "draft-c", title: "Second draft", status: "draft" }]
-  state selectedStatus: String = "draft"
+  state selectedStatus: String = "archived"
 
   return ASX {
     <>

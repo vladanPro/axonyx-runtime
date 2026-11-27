@@ -18,7 +18,9 @@ changes filter the list locally through the WASM expression executor. The
 source list is not mutated, and the filter only sees rows already in state.
 Use a database query for filtering across unloaded pages.
 
-Keyed `Each` still needs an initial row template to insert elements locally.
-If the first render has no matches and provides no template, reconciliation
-reports that a refresh is required. This feature does not change native
-table-row rendering.
+When the first render has no matches, a filter over a named state list can
+use its first loaded item to prepare an inert row template. The sample cannot
+read surrounding page data or run server data callbacks. If the input itself
+is empty or the row body cannot be safely cloned, reconciliation still reports
+that a refresh is required. This feature does not change native table-row
+rendering.
