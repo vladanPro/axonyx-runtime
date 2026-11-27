@@ -155,8 +155,15 @@ try {
   const filtered = page.locator("#status-filter ax-state-each");
   const filteredRows = filtered.locator(":scope > ax-each-item");
   const expectedDrafts = ["First draft", "Second draft"];
+  if (await filteredRows.count()
+    || !(await filtered.getByText("No matching posts", { exact: true }).isVisible())
+    || (await filtered.getAttribute("data-ax-each-render-status")) !== "ready") {
+    throw new Error("initial no-match filter did not prepare a row template");
+  }
+  await page.locator("#filter-drafts").click();
+  await filtered.getByText("Second draft", { exact: true }).waitFor();
   if (JSON.stringify(await filteredRows.allTextContents()) !== JSON.stringify(expectedDrafts)) {
-    throw new Error("initial render did not filter drafts in source order");
+    throw new Error("initially empty filter did not insert drafts in source order");
   }
   await page.locator("#filter-published").click();
   await filtered.getByText("Published post", { exact: true }).waitFor();
