@@ -6,6 +6,10 @@ The format is intentionally simple while the project is still early-stage.
 
 ## Unreleased
 
+- Support `List.length(items)` in Pages. It returns an `Int` for a list in
+  the first server render and for supported reactive expressions in WASM.
+  Counting does not mutate the list or make a server request.
+
 ## axonyx-core / axonyx-runtime 0.8.5
 
 - Resolve `Title`, `Meta`, and `Link` from top-level page bindings in

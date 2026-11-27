@@ -1471,6 +1471,19 @@ fn eval_expr(
                 .iter()
                 .map(|arg| eval_expr(arg, functions, scope, resolver))
                 .collect::<Result<Vec<_>, _>>()?;
+            if path.as_slice() == ["List", "length"] {
+                let [AxValue::List(items)] = args.as_slice() else {
+                    return Err(AxLowerError::UnsupportedExpression {
+                        message: "List.length expects one List<T> argument".to_string(),
+                    });
+                };
+                let length = i64::try_from(items.len()).map_err(|_| {
+                    AxLowerError::UnsupportedExpression {
+                        message: "List.length exceeds the Int range".to_string(),
+                    }
+                })?;
+                return Ok(AxValue::Number(length));
+            }
             if let Some(function) = resolve_function(functions, path) {
                 return eval_function_call(function, &args, functions, scope, resolver);
             }

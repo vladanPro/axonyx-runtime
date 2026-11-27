@@ -17,6 +17,7 @@ page ReactiveEachProbe() {
       <span id="addition-suffix">{count + " items"}</span>
       <span id="addition-total">{count + ratio}</span>
       <span id="addition-flag">{"enabled=" + enabled}</span>
+      <span id="post-count">{List.length(posts)}</span>
       <button id="update" on:click={posts = [{ id: "first", title: "Alpha updated", disabled: false }, { id: "second", title: "Beta", disabled: false }]}>Update</button>
       <button id="insert" on:click={posts = [{ id: "first", title: "Alpha updated", disabled: false }, { id: "second", title: "Beta", disabled: false }, { id: "third", title: "<strong>Literal</strong>", disabled: false }]}>Insert</button>
       <button id="reorder" on:click={posts = [{ id: "third", title: "<strong>Literal</strong>", disabled: false }, { id: "first", title: "Alpha updated", disabled: false }, { id: "second", title: "Beta", disabled: false }]}>Reorder</button>
