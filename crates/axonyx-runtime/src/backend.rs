@@ -866,25 +866,7 @@ impl AxEnv {
     }
 
     pub fn from_env() -> Self {
-        load_dotenv_file(".env");
-
-        let mut env = Self::new();
-
-        for (key, value) in std::env::vars() {
-            if let Some(public_key) = key.strip_prefix("AX_PUBLIC_") {
-                env.public.insert(normalize_env_key(public_key), value);
-                continue;
-            }
-
-            if let Some(secret_key) = key.strip_prefix("AX_SECRET_") {
-                env.secret.insert(normalize_env_key(secret_key), value);
-                continue;
-            }
-
-            env.secret.insert(normalize_env_key(&key), value);
-        }
-
-        env
+        Self::from_env_file(".env", std::env::vars())
     }
 
     pub fn with_public(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
@@ -1077,31 +1059,48 @@ fn normalize_env_key(key: &str) -> String {
     key.trim().to_ascii_lowercase()
 }
 
-fn load_dotenv_file(path: impl AsRef<Path>) {
-    let Ok(contents) = fs::read_to_string(path) else {
-        return;
-    };
-
-    for line in contents.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-
-        let key = key.trim();
-        let value = value.trim().trim_matches('"').trim_matches('\'');
-        if key.is_empty() {
-            continue;
-        }
-
-        if std::env::var_os(key).is_none() {
-            unsafe {
-                std::env::set_var(key, value);
+impl AxEnv {
+    fn from_env_file(
+        path: impl AsRef<Path>,
+        vars: impl IntoIterator<Item = (String, String)>,
+    ) -> Self {
+        let mut env = Self::new();
+        // Dotenv provides defaults for this snapshot, not for the process.
+        if let Ok(contents) = fs::read_to_string(path) {
+            for line in contents.lines().map(str::trim) {
+                if line.starts_with('#') {
+                    continue;
+                }
+                let Some((key, value)) = line.split_once('=') else {
+                    continue;
+                };
+                let key = key.trim();
+                if !key.is_empty() {
+                    let value = value.trim().trim_matches('"').trim_matches('\'');
+                    env.entry(key).or_insert_with(|| value.to_string());
+                }
             }
+        }
+        for (key, value) in vars {
+            use std::collections::btree_map::Entry;
+            match env.entry(&key) {
+                Entry::Occupied(mut entry) => {
+                    entry.insert(value);
+                }
+                Entry::Vacant(entry) => {
+                    entry.insert(value);
+                }
+            }
+        }
+        env
+    }
+
+    fn entry(&mut self, key: &str) -> std::collections::btree_map::Entry<'_, String, String> {
+        if let Some(key) = key.strip_prefix("AX_PUBLIC_") {
+            self.public.entry(normalize_env_key(key))
+        } else {
+            let key = key.strip_prefix("AX_SECRET_").unwrap_or(key);
+            self.secret.entry(normalize_env_key(key))
         }
     }
 }
@@ -5410,35 +5409,35 @@ mod tests {
     }
 
     #[test]
-    fn from_env_collects_ax_public_and_secret_namespaces() {
-        let public_prev = std::env::var("AX_PUBLIC_APP_NAME").ok();
-        let secret_prev = std::env::var("AX_SECRET_DB_URL").ok();
+    fn from_env_file_uses_defaults_without_mutating_the_process() {
+        let id = Uuid::new_v4().simple().to_string();
+        let key = format!("AX_SECRET_TEST_{id}");
+        let path = std::env::temp_dir().join(format!("axonyx-dotenv-{id}"));
+        fs::write(
+            &path,
+            format!(
+                "# defaults\nAX_PUBLIC_APP_NAME=\"Local Axonyx\"\nAX_SECRET_DB_DIALECT=memory\n{key}='first=value'\n{key}=ignored\n"
+            ),
+        )
+        .unwrap();
 
-        std::env::set_var("AX_PUBLIC_APP_NAME", "Axonyx");
-        std::env::set_var("AX_SECRET_DB_URL", "postgres://local/axonyx");
-
-        let env = AxEnv::from_env();
-
-        assert_eq!(
-            env.public("app_name").expect("public key should exist"),
-            "Axonyx".to_string()
+        let resolved = AxEnv::from_env_file(
+            &path,
+            [("AX_SECRET_DB_DIALECT".to_string(), "sqlite".to_string())],
         );
+        assert_eq!(resolved.public("app_name").unwrap(), "Local Axonyx");
+        assert_eq!(resolved.secret("db_dialect").unwrap(), "sqlite");
         assert_eq!(
-            env.secret("db_url").expect("secret key should exist"),
-            "postgres://local/axonyx".to_string()
+            resolved.secret(&format!("test_{id}")).unwrap(),
+            "first=value"
         );
+        assert!(std::env::var_os(&key).is_none());
 
-        if let Some(value) = public_prev {
-            std::env::set_var("AX_PUBLIC_APP_NAME", value);
-        } else {
-            std::env::remove_var("AX_PUBLIC_APP_NAME");
-        }
-
-        if let Some(value) = secret_prev {
-            std::env::set_var("AX_SECRET_DB_URL", value);
-        } else {
-            std::env::remove_var("AX_SECRET_DB_URL");
-        }
+        fs::write(&path, format!("{key}=updated\n")).unwrap();
+        let reloaded = AxEnv::from_env_file(&path, std::env::vars());
+        assert_eq!(reloaded.secret(&format!("test_{id}")).unwrap(), "updated");
+        assert!(std::env::var_os(&key).is_none());
+        fs::remove_file(path).unwrap();
     }
 
     #[test]
